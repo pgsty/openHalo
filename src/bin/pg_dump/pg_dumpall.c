@@ -462,7 +462,7 @@ main(int argc, char *argv[])
 	}
 	else
 	{
-		conn = connectDatabase("halo0root", connstr, pghost, pgport, pguser,
+		conn = connectDatabase("postgres", connstr, pghost, pgport, pguser,
 							   prompt_password, false);
 		if (!conn)
 			conn = connectDatabase("template1", connstr, pghost, pgport, pguser,
@@ -470,7 +470,7 @@ main(int argc, char *argv[])
 
 		if (!conn)
 		{
-			pg_log_error("could not connect to databases \"halo0root\" or \"template1\"\n"
+			pg_log_error("could not connect to databases \"postgres\" or \"template1\"\n"
 						 "Please specify an alternative database.");
 			fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 					progname);
@@ -1339,7 +1339,7 @@ dropDBs(PGconn *conn)
 					   "ORDER BY datname");
 
 	if (PQntuples(res) > 0)
-		fprintf(OPF, "--\n-- Drop databases (except halo0root and template1)\n--\n\n");
+		fprintf(OPF, "--\n-- Drop databases (except postgres and template1)\n--\n\n");
 
 	for (i = 0; i < PQntuples(res); i++)
 	{
@@ -1352,7 +1352,7 @@ dropDBs(PGconn *conn)
 		 */
 		if (strcmp(dbname, "template1") != 0 &&
 			strcmp(dbname, "template0") != 0 &&
-			strcmp(dbname, "halo0root") != 0)
+			strcmp(dbname, "postgres") != 0)
 		{
 			fprintf(OPF, "DROP DATABASE %s%s;\n",
 					if_exists ? "IF EXISTS " : "",
@@ -1534,7 +1534,7 @@ dumpDatabases(PGconn *conn)
 		 * otherwise we'll merely restore their contents.  Other databases
 		 * should simply be created.
 		 */
-		if (strcmp(dbname, "template1") == 0 || strcmp(dbname, "halo0root") == 0)
+		if (strcmp(dbname, "template1") == 0 || strcmp(dbname, "postgres") == 0)
 		{
 			if (output_clean)
 				create_opts = "--clean --create";

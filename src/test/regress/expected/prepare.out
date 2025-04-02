@@ -58,10 +58,10 @@ SELECT name, statement, parameter_types FROM pg_prepared_statements;
 PREPARE q2(text) AS
 	SELECT datname, datistemplate, datallowconn
 	FROM pg_database WHERE datname = $1;
-EXECUTE q2('halo0root');
+EXECUTE q2('postgres');
   datname  | datistemplate | datallowconn 
 -----------+---------------+--------------
- halo0root | f             | t
+ postgres | f             | t
 (1 row)
 
 PREPARE q3(text, int, float, boolean, smallint) AS

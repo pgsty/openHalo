@@ -65,3 +65,7 @@ test/mysql/test_result
 contrib/querymap/tmp_check
 compile_flags.txt
 
+.idea/
+.code/
+.DS_Store
+

@@ -1475,11 +1475,11 @@ DropDatabase(ParseState *pstate, DropdbStmt *stmt)
 	bool		force = false;
 	ListCell   *lc;
 
-	if (strcasecmp(stmt->dbname, "halo0root") == 0)
+	if (strcasecmp(stmt->dbname, "postgres") == 0)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DATABASE_DROPPED),
-				errmsg("drop the root database (halo0root) is not allowed")));
+				errmsg("drop the root database (postgres) is not allowed")));
 	}
 
 	foreach(lc, stmt->options)

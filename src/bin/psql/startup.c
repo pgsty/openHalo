@@ -255,9 +255,9 @@ main(int argc, char *argv[])
 		values[3] = password;
 		keywords[4] = "dbname"; /* see do_connect() */
 		values[4] = (options.list_dbs && options.dbname == NULL) ?
-			"halo0root" : options.dbname;
+			"postgres" : options.dbname;
 		if (values[4] == NULL)
-			values[4] = "halo0root";
+			values[4] = "postgres";
 		keywords[5] = "fallback_application_name";
 		values[5] = pset.progname;
 		keywords[6] = "client_encoding";

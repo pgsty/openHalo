@@ -4178,10 +4178,10 @@ PostgresMain(int argc, char *argv[],
 	 */
 	process_postgres_switches(argc, argv, PGC_POSTMASTER, &dbname);
 
-	/* Must have gotten a database name, or have a default (the halo0root) */
+	/* Must have gotten a database name, or have a default (the postgres) */
 	if (dbname == NULL)
 	{
-		dbname = "halo0root";
+		dbname = "postgres";
 		if (dbname == NULL)
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -4316,7 +4316,7 @@ PostgresMain(int argc, char *argv[],
             }
             else 
             {
-                dbname = "halo0root";
+                dbname = "postgres";
             }
         } 
         else 

@@ -442,19 +442,19 @@ SELECT (
 
 SELECT COUNT(*) FROM pg_stat_statements WHERE query LIKE '%SELECT GROUPING%';
 
-\c halo0root
+\c postgres
 CREATE EXTENSION pg_stat_statements;
 CREATE TABLE pgss_test (id INT, name VARCHAR(30));
 SELECT * FROM pgss_test;
-SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'halo0root');
+SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
 SET pg_stat_statements.untrack_dbnames = '';
 SELECT * FROM pgss_test;
-SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'halo0root');
+SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
 SELECT * FROM pgss_test;
-SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'halo0root');
-SET pg_stat_statements.untrack_dbnames = 'halo0root';
+SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
+SET pg_stat_statements.untrack_dbnames = 'postgres';
 SELECT * FROM pgss_test;
-SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'halo0root');
+SELECT query, calls FROM pg_stat_statements WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'postgres');
 DROP EXTENSION pg_stat_statements;
 
 \c contrib_regression

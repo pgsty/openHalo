@@ -34,7 +34,7 @@ PREPARE q2(text) AS
 	SELECT datname, datistemplate, datallowconn
 	FROM pg_database WHERE datname = $1;
 
-EXECUTE q2('halo0root');
+EXECUTE q2('postgres');
 
 PREPARE q3(text, int, float, boolean, smallint) AS
 	SELECT * FROM tenk1 WHERE string4 = $1 AND (four = $2 OR

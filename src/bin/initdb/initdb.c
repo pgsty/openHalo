@@ -10,7 +10,7 @@
  * all its data, create the files that hold the global tables, create
  * a few other control files for it, and create three databases: the
  * template databases "template0" and "template1", and a default user
- * database "halo0root".
+ * database "postgres".
  *
  * The template databases are ordinary Halo databases.  template0
  * is never supposed to change after initdb, whereas template1 can be
@@ -19,7 +19,7 @@
  *
  * For largely-historical reasons, the template1 database is the one built
  * by the basic bootstrap process.  After it is complete, template0 and
- * the default database, halo0root, are made just by copying template1.
+ * the default database, postgres, are made just by copying template1.
  *
  * To create template1, we run the postgres (backend) program in bootstrap
  * mode and feed it data from the postgres.bki library file.  After this
@@ -1950,8 +1950,8 @@ make_postgres(FILE *cmdfd)
 {
 	const char *const *line;
 	static const char *const postgres_setup[] = {
-		"CREATE DATABASE halo0root;\n\n",
-		"COMMENT ON DATABASE halo0root IS 'default administrative connection database';\n\n",
+		"CREATE DATABASE postgres;\n\n",
+		"COMMENT ON DATABASE postgres IS 'default administrative connection database';\n\n",
 		NULL
 	};
 
