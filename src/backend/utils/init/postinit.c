@@ -806,7 +806,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
             }
             else 
             {
-                in_dbname = "halo0root";
+                in_dbname = "postgres";
             }
         }
         username = MyProcPort->user_name;

@@ -2025,7 +2025,7 @@ static void
 drop_database_if_exists(const char *dbname)
 {
 	header(_("dropping database \"%s\""), dbname);
-	psql_command("halo0root", "DROP DATABASE IF EXISTS \"%s\"", dbname);
+	psql_command("postgres", "DROP DATABASE IF EXISTS \"%s\"", dbname);
 }
 
 static void
@@ -2039,10 +2039,10 @@ create_database(const char *dbname)
 	 */
 	header(_("creating database \"%s\""), dbname);
 	if (encoding)
-		psql_command("halo0root", "CREATE DATABASE \"%s\" TEMPLATE=template0 ENCODING='%s'%s", dbname, encoding,
+		psql_command("postgres", "CREATE DATABASE \"%s\" TEMPLATE=template0 ENCODING='%s'%s", dbname, encoding,
 					 (nolocale) ? " LC_COLLATE='C' LC_CTYPE='C'" : "");
 	else
-		psql_command("halo0root", "CREATE DATABASE \"%s\" TEMPLATE=template0%s", dbname,
+		psql_command("postgres", "CREATE DATABASE \"%s\" TEMPLATE=template0%s", dbname,
 					 (nolocale) ? " LC_COLLATE='C' LC_CTYPE='C'" : "");
 	psql_command(dbname,
 				 "ALTER DATABASE \"%s\" SET lc_messages TO 'C';"
@@ -2068,17 +2068,17 @@ static void
 drop_role_if_exists(const char *rolename)
 {
 	header(_("dropping role \"%s\""), rolename);
-	psql_command("halo0root", "DROP ROLE IF EXISTS \"%s\"", rolename);
+	psql_command("postgres", "DROP ROLE IF EXISTS \"%s\"", rolename);
 }
 
 static void
 create_role(const char *rolename, const _stringlist *granted_dbs)
 {
 	header(_("creating role \"%s\""), rolename);
-	psql_command("halo0root", "CREATE ROLE \"%s\" WITH LOGIN", rolename);
+	psql_command("postgres", "CREATE ROLE \"%s\" WITH LOGIN", rolename);
 	for (; granted_dbs != NULL; granted_dbs = granted_dbs->next)
 	{
-		psql_command("halo0root", "GRANT ALL ON DATABASE \"%s\" TO \"%s\"",
+		psql_command("postgres", "GRANT ALL ON DATABASE \"%s\" TO \"%s\"",
 					 granted_dbs->str, rolename);
 	}
 }
@@ -2470,7 +2470,7 @@ regression_main(int argc, char *argv[],
 		 * Check if there is a postmaster running already.
 		 */
 		snprintf(buf2, sizeof(buf2),
-				 "\"%s%spsql\" -X halo0root <%s 2>%s",
+				 "\"%s%spsql\" -X postgres <%s 2>%s",
 				 bindir ? bindir : "",
 				 bindir ? "/" : "",
 				 DEVNULL, DEVNULL);
