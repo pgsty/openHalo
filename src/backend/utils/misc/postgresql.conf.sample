@@ -60,12 +60,12 @@
                                     # comma-separated list of addresses;
                                     # defaults to 'localhost'; use '*' for all
                                     # (change requires restart)
-#port = 5432				# (change requires restart)
-#max_connections = 100			# (change requires restart)
-#superuser_reserved_connections = 3	    # (change requires restart)
-unix_socket_directories = '/var/run/openhalo'	# comma-separated list of directories
-                                            # (change requires restart)
-#unix_socket_group = ''			# (change requires restart)
+#port = 5432				        # (change requires restart)
+#max_connections = 100			    # (change requires restart)
+#superuser_reserved_connections = 3	# (change requires restart)
+unix_socket_directories = '/tmp'	# comma-separated list of directories
+                                    # (change requires restart)
+#unix_socket_group = ''			    # (change requires restart)
 #unix_socket_permissions = 0777		# begin with 0 to use octal notation
                                     # (change requires restart)
 #bonjour = off				# advertise server via Bonjour
@@ -73,9 +73,9 @@ unix_socket_directories = '/var/run/openhalo'	# comma-separated list of director
 #bonjour_name = ''			# defaults to the computer name
                             # (change requires restart)
 
-#mysql.listener_on = true	                    # (enable MySQL listener; change requires restart)
-#mysql.port = 3306                              # (second_port is for MySQL mode; change requires restart)
-#mysql.halo_mysql_version = '5.7.32-log'        # (change requires restart)
+mysql.listener_on = true	                    # (enable MySQL listener; change requires restart)
+mysql.port = 3306                               # (second_port is for MySQL mode; change requires restart)
+mysql.halo_mysql_version = '5.7.32-log'         # (change requires restart)
 #mysql.ci_collation = true                      # (change requires restart)
 #mysql.explicit_defaults_for_timestamp = false  # (change requires restart)
 #mysql.auto_rollback_tx_on_error = false        # (change requires restart)
