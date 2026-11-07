@@ -27,6 +27,7 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_extension.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -177,6 +178,9 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	port = MyProcPort = pq_init(client_sock);
 	MemoryContextSwitchTo(oldcontext);
 
+	/* Is this connection served by a protocol extension? */
+	MyProtocolExtension = GetProtocolExtension(client_sock->protocol_id);
+
 	whereToSendOutput = DestRemote; /* now safe to ereport to client */
 
 	/* set these to empty in case they are needed before we set them up */
@@ -284,15 +288,38 @@ BackendInitialize(ClientSocket *client_sock, CAC_state cac)
 	RegisterTimeout(STARTUP_PACKET_TIMEOUT, StartupPacketTimeoutHandler);
 	enable_timeout_after(STARTUP_PACKET_TIMEOUT, AuthenticationTimeout * 1000);
 
-	/* Handle direct SSL handshake */
-	status = ProcessSSLStartup(port);
+	if (MyProtocolExtension)
+	{
+		/* The protocol extension performs its own handshake */
+		status = MyProtocolExtension->start(port);
 
-	/*
-	 * Receive the startup packet (which might turn out to be a cancel request
-	 * packet).
-	 */
-	if (status == STATUS_OK)
-		status = ProcessStartupPacket(port, false, false);
+		/* Do what ProcessStartupPacket() does after a valid startup packet */
+		if (status == STATUS_OK)
+		{
+			if (port->database_name == NULL || port->database_name[0] == '\0' ||
+				port->user_name == NULL || port->user_name[0] == '\0')
+				ereport(FATAL,
+						(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+						 errmsg("no PostgreSQL user name or database name specified")));
+			if (strlen(port->database_name) >= NAMEDATALEN)
+				port->database_name[NAMEDATALEN - 1] = '\0';
+			if (strlen(port->user_name) >= NAMEDATALEN)
+				port->user_name[NAMEDATALEN - 1] = '\0';
+			MyBackendType = B_BACKEND;
+		}
+	}
+	else
+	{
+		/* Handle direct SSL handshake */
+		status = ProcessSSLStartup(port);
+
+		/*
+		 * Receive the startup packet (which might turn out to be a cancel
+		 * request packet).
+		 */
+		if (status == STATUS_OK)
+			status = ProcessStartupPacket(port, false, false);
+	}
 
 	/*
 	 * If we're going to reject the connection due to database state, say so

@@ -104,6 +104,7 @@
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_extension.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
 #include "replication/logicallauncher.h"
@@ -233,6 +234,9 @@ int			ReservedConnections;
 #define MAXLISTEN	64
 static int	NumListenSockets = 0;
 static pgsocket *ListenSockets = NULL;
+
+/* Protocol id (0 = native) served by each entry of ListenSockets[] */
+static int	ListenSocketProtocols[MAXLISTEN];
 
 /* still more option variables */
 bool		EnableSSL = false;
@@ -1267,6 +1271,17 @@ PostmasterMain(int argc, char *argv[])
 	}
 
 	/*
+	 * Let protocol extensions open their own listen sockets.
+	 */
+	for (int i = 1; i <= NumProtocolExtensions(); i++)
+	{
+		const ProtocolExtensionConfig *proto = GetProtocolExtension(i);
+
+		if (proto->listen_init)
+			proto->listen_init();
+	}
+
+	/*
 	 * check that we have some socket to listen on
 	 */
 	if (NumListenSockets == 0)
@@ -1698,6 +1713,16 @@ ServerLoop(void)
 			if (events[i].events & WL_SOCKET_ACCEPT)
 			{
 				ClientSocket s;
+
+				s.protocol_id = 0;
+				for (int j = 0; j < NumListenSockets; j++)
+				{
+					if (ListenSockets[j] == events[i].fd)
+					{
+						s.protocol_id = ListenSocketProtocols[j];
+						break;
+					}
+				}
 
 				if (AcceptConnection(events[i].fd, &s) == STATUS_OK)
 					BackendStartup(&s);
@@ -3504,6 +3529,33 @@ TerminateChildren(int signal)
 		if (signal == SIGQUIT || signal == SIGKILL || signal == SIGABRT)
 			StartupStatus = STARTUP_SIGNALED;
 	}
+}
+
+/*
+ * ListenServerPortForProtocol -- open a listen socket served by a protocol
+ * extension.  Only valid while the postmaster is creating its sockets, i.e.
+ * from a ProtocolExtensionConfig->listen_init callback.
+ */
+int
+ListenServerPortForProtocol(int protocol_id, int family, const char *hostName,
+							unsigned short portNumber,
+							const char *unixSocketDir)
+{
+	int			first = NumListenSockets;
+	int			status;
+
+	if (GetProtocolExtension(protocol_id) == NULL)
+		elog(ERROR, "invalid protocol id %d", protocol_id);
+	if (ListenSockets == NULL)
+		elog(ERROR, "listen sockets can only be opened during postmaster startup");
+
+	status = ListenServerPort(family, hostName, portNumber, unixSocketDir,
+							  ListenSockets, &NumListenSockets, MAXLISTEN);
+
+	for (int i = first; i < NumListenSockets; i++)
+		ListenSocketProtocols[i] = protocol_id;
+
+	return status;
 }
 
 /*

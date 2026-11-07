@@ -76,6 +76,7 @@
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_extension.h"
 #include "postmaster/syslogger.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
@@ -3533,6 +3534,14 @@ static void
 send_message_to_frontend(ErrorData *edata)
 {
 	StringInfoData msgbuf;
+
+	/* Let a protocol extension report the message in its own format */
+	if (MyProtocolExtension)
+	{
+		if (MyProtocolExtension->send_message)
+			MyProtocolExtension->send_message(edata);
+		return;
+	}
 
 	/*
 	 * We no longer support pre-3.0 FE/BE protocol, except here.  If a client

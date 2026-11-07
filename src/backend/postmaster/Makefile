@@ -24,6 +24,7 @@ OBJS = \
 	pgarch.o \
 	pmchild.o \
 	postmaster.o \
+	protocol_extension.o \
 	startup.o \
 	syslogger.o \
 	walsummarizer.o \

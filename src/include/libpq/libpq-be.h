@@ -249,6 +249,7 @@ typedef struct ClientSocket
 {
 	pgsocket	sock;			/* File descriptor */
 	SockAddr	raddr;			/* remote addr (client) */
+	int			protocol_id;	/* protocol extension id, 0 = native */
 } ClientSocket;
 
 #ifdef USE_SSL

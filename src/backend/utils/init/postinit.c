@@ -40,6 +40,7 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_extension.h"
 #include "replication/slot.h"
 #include "replication/slotsync.h"
 #include "replication/walsender.h"
@@ -250,7 +251,10 @@ PerformAuthentication(Port *port)
 	 * Now perform authentication exchange.
 	 */
 	set_ps_display("authentication");
-	ClientAuthentication(port); /* might not return, if failure */
+	if (MyProtocolExtension && MyProtocolExtension->authenticate)
+		MyProtocolExtension->authenticate(port);	/* might not return */
+	else
+		ClientAuthentication(port); /* might not return, if failure */
 
 	/*
 	 * Done with authentication.  Disable the timeout, and log if needed.

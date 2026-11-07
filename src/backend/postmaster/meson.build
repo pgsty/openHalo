@@ -12,6 +12,7 @@ backend_sources += files(
   'pgarch.c',
   'pmchild.c',
   'postmaster.c',
+  'protocol_extension.c',
   'startup.c',
   'syslogger.c',
   'walsummarizer.c',

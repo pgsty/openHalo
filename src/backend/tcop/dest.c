@@ -40,6 +40,7 @@
 #include "executor/tstoreReceiver.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
+#include "postmaster/protocol_extension.h"
 
 
 /* ----------------
@@ -117,6 +118,11 @@ CreateDestReceiver(CommandDest dest)
 	 * receiver would be a bug (which gets easier to catch this way).
 	 */
 
+	if (MyProtocolExtension && MyProtocolExtension->create_dest_receiver &&
+		(dest == DestRemote || dest == DestRemoteExecute ||
+		 dest == DestRemoteSimple))
+		return MyProtocolExtension->create_dest_receiver(dest);
+
 	switch (dest)
 	{
 		case DestRemote:
@@ -171,6 +177,13 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 	char		completionTag[COMPLETION_TAG_BUFSIZE];
 	Size		len;
 
+	if (MyProtocolExtension)
+	{
+		if (MyProtocolExtension->end_command)
+			MyProtocolExtension->end_command(qc, dest);
+		return;
+	}
+
 	switch (dest)
 	{
 		case DestRemote:
@@ -217,6 +230,13 @@ EndReplicationCommand(const char *commandTag)
 void
 NullCommand(CommandDest dest)
 {
+	if (MyProtocolExtension)
+	{
+		if (MyProtocolExtension->null_command)
+			MyProtocolExtension->null_command(dest);
+		return;
+	}
+
 	switch (dest)
 	{
 		case DestRemote:
@@ -255,6 +275,13 @@ NullCommand(CommandDest dest)
 void
 ReadyForQuery(CommandDest dest)
 {
+	if (MyProtocolExtension)
+	{
+		if (MyProtocolExtension->send_ready_for_query)
+			MyProtocolExtension->send_ready_for_query(dest);
+		return;
+	}
+
 	switch (dest)
 	{
 		case DestRemote:

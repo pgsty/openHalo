@@ -39,6 +39,7 @@
 #include "libpq/protocol.h"
 #include "miscadmin.h"
 #include "parser/scansup.h"
+#include "postmaster/protocol_extension.h"
 #include "port/pg_bitutils.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
@@ -2640,10 +2641,18 @@ ReportGUCOption(struct config_generic *record)
 	{
 		StringInfoData msgbuf;
 
-		pq_beginmessage(&msgbuf, PqMsg_ParameterStatus);
-		pq_sendstring(&msgbuf, record->name);
-		pq_sendstring(&msgbuf, val);
-		pq_endmessage(&msgbuf);
+		if (MyProtocolExtension)
+		{
+			if (MyProtocolExtension->report_param_status)
+				MyProtocolExtension->report_param_status(record->name, val);
+		}
+		else
+		{
+			pq_beginmessage(&msgbuf, PqMsg_ParameterStatus);
+			pq_sendstring(&msgbuf, record->name);
+			pq_sendstring(&msgbuf, val);
+			pq_endmessage(&msgbuf);
+		}
 
 		/*
 		 * We need a long-lifespan copy.  If guc_strdup() fails due to OOM,

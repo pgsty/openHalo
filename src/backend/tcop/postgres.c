@@ -55,6 +55,7 @@
 #include "pgstat.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/protocol_extension.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
 #include "replication/slotsync.h"
@@ -482,7 +483,9 @@ ReadCommand(StringInfo inBuf)
 {
 	int			result;
 
-	if (whereToSendOutput == DestRemote)
+	if (MyProtocolExtension && MyProtocolExtension->read_command)
+		result = MyProtocolExtension->read_command(inBuf);
+	else if (whereToSendOutput == DestRemote)
 		result = SocketBackend(inBuf);
 	else
 		result = InteractiveBackend(inBuf);
@@ -651,6 +654,19 @@ pg_parse_query(const char *query_string)
 	TRACE_POSTGRESQL_QUERY_PARSE_DONE(query_string);
 
 	return raw_parsetree_list;
+}
+
+/*
+ * Parse a query string received from the client.  A protocol extension may
+ * supply its own SQL dialect here; everything else (SQL function bodies,
+ * extension scripts, ...) keeps using pg_parse_query().
+ */
+static List *
+pg_parse_client_query(const char *query_string)
+{
+	if (MyProtocolExtension && MyProtocolExtension->parse_query)
+		return MyProtocolExtension->parse_query(query_string);
+	return pg_parse_query(query_string);
 }
 
 /*
@@ -1062,7 +1078,7 @@ exec_simple_query(const char *query_string)
 	 * Do basic parsing of the query or queries (this should be safe even if
 	 * we are in aborted transaction state!)
 	 */
-	parsetree_list = pg_parse_query(query_string);
+	parsetree_list = pg_parse_client_query(query_string);
 
 	/* Log immediately if dictated by log_statement */
 	if (check_log_statement(parsetree_list))
@@ -1462,7 +1478,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	 * Do basic parsing of the query or queries (this should be safe even if
 	 * we are in aborted transaction state!)
 	 */
-	parsetree_list = pg_parse_query(query_string);
+	parsetree_list = pg_parse_client_query(query_string);
 
 	/*
 	 * We only allow a single user statement in a prepared statement. This is
@@ -4327,9 +4343,10 @@ PostgresMain(const char *dbname, const char *username)
 		InitWalSender();
 
 	/*
-	 * Send this backend's cancellation info to the frontend.
+	 * Send this backend's cancellation info to the frontend.  Protocol
+	 * extensions have their own way (if any) to cancel queries.
 	 */
-	if (whereToSendOutput == DestRemote)
+	if (whereToSendOutput == DestRemote && MyProtocolExtension == NULL)
 	{
 		StringInfoData buf;
 
@@ -4431,6 +4448,8 @@ PostgresMain(const char *dbname, const char *username)
 
 		/* Make sure libpq is in a good state */
 		pq_comm_reset();
+		if (MyProtocolExtension && MyProtocolExtension->comm_reset)
+			MyProtocolExtension->comm_reset();
 
 		/* Report the error to the client and/or server log */
 		EmitErrorReport();
@@ -4748,6 +4767,14 @@ PostgresMain(const char *dbname, const char *username)
 		 */
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
+
+		/* Give a protocol extension the chance to handle its own messages */
+		if (MyProtocolExtension && MyProtocolExtension->process_command &&
+			MyProtocolExtension->process_command(firstchar, &input_message))
+		{
+			send_ready_for_query = true;
+			continue;
+		}
 
 		switch (firstchar)
 		{
