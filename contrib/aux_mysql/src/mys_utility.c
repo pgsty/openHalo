@@ -21,21 +21,61 @@
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
 #include "commands/trigger.h"
+#include "commands/seclabel.h"
 #include "nodes/makefuncs.h"
 #include "tcop/utility.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
 #include "utils/syscache.h"
+#include "utils/array.h"
+#include "utils/acl.h"
+#include "miscadmin.h"
 
 #include "halo_mysql.h"
 #include "mys_parsenodes.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+static bool collation_provider_registered = false;
 
 /* row triggers maintained by mysql_table_setup() */
 #define ON_UPDATE_TRIGGER	"aux_mysql_on_update"
 #define AUTOINC_TRIGGER		"aux_mysql_auto_increment"
+
+/*
+ * Store the table default in PostgreSQL's provider-owned object labels.
+ * Unlike an OID-keyed extension table this follows rename/drop and pg_dump
+ * without an auxiliary table, event triggers or catalog/ABI modifications.
+ * This provider stores comparison metadata; it does not grant privileges.
+ */
+static void
+check_collation_label(const ObjectAddress *object, const char *label)
+{
+	if (object->classId != RelationRelationId || object->objectSubId != 0 ||
+		(get_rel_relkind(object->objectId) != RELKIND_RELATION &&
+		 get_rel_relkind(object->objectId) != RELKIND_PARTITIONED_TABLE))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("aux_mysql collation labels apply only to tables")));
+	if (label && strcmp(label, "case_insensitive") != 0 &&
+		strcmp(label, "case_sensitive") != 0 &&
+		strcmp(label, "ignore_accents") != 0 && strcmp(label, "default") != 0)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("invalid aux_mysql table collation label")));
+}
+
+const char *
+mys_table_default_collation(Oid relid)
+{
+	ObjectAddress object;
+	char *label;
+
+	ObjectAddressSet(object, RelationRelationId, relid);
+	label = GetSecurityLabel(&object, "aux_mysql");
+	if (label)
+		return label;
+	return halo_mysql_default_collation && halo_mysql_default_collation[0] ?
+		halo_mysql_default_collation : "default";
+}
 
 static void
 run_utility(Node *stmt, PlannedStmt *orig, const char *queryString,
@@ -163,6 +203,7 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	Constraint *identity = NULL;
 	AttrNumber	attnum = get_attnum(relid, colname);
 	bool		was_identity = attnum > 0 && column_is_identity(relid, attnum);
+	List	   *checks = NIL;
 	ListCell   *lc;
 
 	foreach(lc, def->constraints)
@@ -179,6 +220,8 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 				defexpr = c->raw_expr;
 			else if (c->contype == CONSTR_IDENTITY)
 				identity = c;
+			else if (c->contype == CONSTR_CHECK)
+				checks = lappend(checks, c);
 		}
 		else if (IsA(n, CommentStmt))
 			*after = lappend(*after, make_column_comment(relid, colname,
@@ -199,6 +242,31 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 		*cmds = lappend(*cmds, make_cmd(AT_ColumnDefault, colname, NULL));
 	else if (!identity)
 		*cmds = lappend(*cmds, make_cmd(AT_DropIdentity, colname, NULL));
+	/* Remove only our domain guard for this attribute, including after CHANGE. */
+	{
+		Relation rel = relation_open(relid, NoLock);
+		TupleConstr *constr = RelationGetDescr(rel)->constr;
+
+		if (constr)
+			for (int i = 0; i < constr->num_check; i++)
+			{
+				char *name = constr->check[i].ccname;
+				HeapTuple tuple;
+				ArrayType *keys;
+
+				if (strncmp(name, "aux_mysql_domain_", 17) != 0)
+					continue;
+				tuple = SearchSysCache1(CONSTROID,
+						ObjectIdGetDatum(get_relation_constraint_oid(relid, name, false)));
+				keys = DatumGetArrayTypeP(SysCacheGetAttrNotNull(CONSTROID, tuple,
+												Anum_pg_constraint_conkey));
+				if (ARR_NDIM(keys) == 1 && ARR_DIMS(keys)[0] == 1 &&
+					*((int16 *) ARR_DATA_PTR(keys)) == attnum)
+					*cmds = lappend(*cmds, make_cmd(AT_DropConstraint, pstrdup(name), NULL));
+				ReleaseSysCache(tuple);
+			}
+		relation_close(rel, NoLock);
+	}
 	flush_cmds(orig, cmds, pstmt, queryString, params, queryEnv);
 
 	/*
@@ -250,6 +318,8 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 		*cmds = lappend(*cmds, make_cmd(AT_AddIdentity, colname, (Node *) c));
 		*added_identity = true;
 	}
+	foreach_ptr(Constraint, check, checks)
+		*cmds = lappend(*cmds, make_cmd(AT_AddConstraint, NULL, (Node *) check));
 }
 
 static void
@@ -261,9 +331,11 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 	List	   *cmds = NIL;
 	List	   *after = NIL;
 	bool		added_identity = false;
+	bool		has_start = false;
+	int64		start = 1;
 	ListCell   *lc;
 
-	relid = RangeVarGetRelid(stmt->relation, AccessShareLock, stmt->missing_ok);
+	relid = RangeVarGetRelid(stmt->relation, AccessExclusiveLock, stmt->missing_ok);
 	if (!OidIsValid(relid))
 		return;
 
@@ -355,7 +427,10 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 						DefElem    *d = lfirst_node(DefElem, lc2);
 
 						if (strcmp(d->defname, "auto_increment") == 0)
-							mys_set_auto_increment(relid, defGetInt64(d));
+						{
+							start = defGetInt64(d);
+							has_start = true;
+						}
 						else if (strcmp(d->defname, "engine") == 0 ||
 								 strcmp(d->defname, "encryption") == 0)
 						{
@@ -390,6 +465,8 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 	/* a column that just became AUTO_INCREMENT continues after its maximum */
 	if (added_identity)
 		mys_sync_auto_increment(relid);
+	if (has_start)
+		mys_set_auto_increment(relid, start);
 
 	foreach(lc, after)
 		run_utility(lfirst(lc), pstmt, queryString, params, queryEnv);
@@ -488,7 +565,21 @@ mysql_table_setup(DoStmt *d, PlannedStmt *pstmt, const char *queryString,
 	for (ListCell *lc = lnext(d->args, list_head(d->args)); lc; lc = lnext(d->args, lc))
 	{
 		DefElem    *e = lfirst_node(DefElem, lc);
-		AttrNumber	attnum = get_attnum(relid, strVal(e->arg));
+		AttrNumber	attnum;
+
+		if (strcmp(e->defname, "default_collation") == 0)
+		{
+			ObjectAddress object;
+
+			ObjectAddressSet(object, RelationRelationId, relid);
+			if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
+				aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, get_rel_name(relid));
+			check_collation_label(&object, strVal(e->arg));
+			SetSecurityLabel(&object, "aux_mysql", strVal(e->arg));
+			CommandCounterIncrement();
+			continue;
+		}
+		attnum = get_attnum(relid, strVal(e->arg));
 
 		if (attnum <= 0 || attnum > natts)
 			continue;
@@ -554,6 +645,38 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				   DestReceiver *dest, QueryCompletion *qc)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
+
+	/* Do not change bare SECURITY LABEL semantics in ordinary PG sessions. */
+	if (IsA(parsetree, SecLabelStmt) &&
+		((SecLabelStmt *) parsetree)->provider &&
+		strcmp(((SecLabelStmt *) parsetree)->provider, "aux_mysql") == 0 &&
+		!collation_provider_registered)
+	{
+		register_label_provider("aux_mysql", check_collation_label);
+		collation_provider_registered = true;
+	}
+
+	/* Resolve ADD/MODIFY defaults at execution, including multi-statement DDL. */
+	if (mys_is_mysql_session() && halo_mysql_parser == MYS_PARSER_MYSQL &&
+		IsA(parsetree, AlterTableStmt))
+	{
+		AlterTableStmt *alter = copyObject((AlterTableStmt *) parsetree);
+		Oid relid = RangeVarGetRelid(alter->relation, AccessExclusiveLock, alter->missing_ok);
+
+		if (OidIsValid(relid))
+			foreach_node(AlterTableCmd, cmd, alter->cmds)
+				if (cmd->def && IsA(cmd->def, ColumnDef) &&
+					(cmd->subtype == AT_AddColumn || (int) cmd->subtype == AT_ModifyColumn ||
+					 (int) cmd->subtype == AT_ChangeColumn))
+					mys_rectify_column_collation((ColumnDef *) cmd->def,
+												mys_table_default_collation(relid));
+		pstmt = copyObject(pstmt);
+		pstmt->utilityStmt = parsetree = (Node *) alter;
+	}
+
+	if (IsA(parsetree, CreateExtensionStmt) &&
+		strcmp(((CreateExtensionStmt *) parsetree)->extname, "aux_mysql") == 0)
+		halo_mysql_lock_setup();
 
 	/* syntax error of a statement inside a transaction (mys_txn.c) */
 	if (mys_txn_is_deferred_error(parsetree))

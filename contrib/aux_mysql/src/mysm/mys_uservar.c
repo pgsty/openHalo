@@ -31,6 +31,15 @@ static bytea *copyUserVarValue(bytea *varValue);
 void 
 clearUserVars(void)
 {
+    HASH_SEQ_STATUS seq;
+    MysqlUserVariableItem *entry;
+
+    if (mysql_user_variables == NULL)
+        return;
+    hash_seq_init(&seq, mysql_user_variables);
+    while ((entry = hash_seq_search(&seq)) != NULL)
+        if (!entry->isnull)
+            pfree(entry->varValue);
     hash_destroy(mysql_user_variables);
     mysql_user_variables = NULL;
 }

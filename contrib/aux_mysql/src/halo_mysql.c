@@ -13,14 +13,16 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "access/xlog.h"
+#include "catalog/pg_extension.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/bgworker.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
+#include "storage/lmgr.h"
 #include "storage/shmem.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
@@ -32,6 +34,7 @@ PG_MODULE_MAGIC_EXT(.name = "aux_mysql", .version = "1.5");
 
 bool		halo_mysql_listener_on = true;
 int			halo_mysql_port = 3306;
+int			halo_mysql_max_allowed_packet = 64 * 1024 * 1024;
 char	   *halo_mysql_listen_addresses = NULL;
 char	   *halo_mysql_database = NULL;
 int			halo_mysql_parser = MYS_PARSER_MYSQL;
@@ -84,23 +87,39 @@ static const struct config_enum_entry parser_options[] = {
 	{NULL, 0, false}
 };
 
-/*
- * "aux_mysql setup" background worker: create the extension objects in
- * mysql.database once the server accepts connections, so that MySQL
- * clients work right after initdb and start (openHalo needed a manual
- * CREATE EXTENSION aux_mysql).  Runs once per postmaster start, as the
- * bootstrap superuser; does nothing if the extension is already there.
- */
-PGDLLEXPORT void halo_mysql_setup_main(Datum main_arg);
-
+/* Serialize automatic and explicit installation in this database. */
 void
-halo_mysql_setup_main(Datum main_arg)
+halo_mysql_lock_setup(void)
 {
-	BackgroundWorkerUnblockSignals();
-	BackgroundWorkerInitializeConnection(halo_mysql_database, NULL, 0);
+	LockDatabaseObject(ExtensionRelationId, InvalidOid, 0, AccessExclusiveLock);
+}
 
+/*
+ * Only a MySQL connection requests installation. PG restore/upgrade sessions
+ * never create objects as a side effect of starting the server. Run as the
+ * authenticated role, and finish before acknowledging the MySQL handshake.
+ */
+void
+halo_mysql_ensure_extension(void)
+{
 	SetCurrentStatementStartTimestamp();
 	StartTransactionCommand();
+	if (OidIsValid(get_extension_oid("aux_mysql", true)))
+	{
+		CommitTransactionCommand();
+		return;
+	}
+	if (!halo_mysql_auto_create_extension || IsBinaryUpgrade || RecoveryInProgress())
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("aux_mysql is not installed in database \"%s\"", halo_mysql_database),
+				 errhint("Install aux_mysql on the primary as a superuser before connecting.")));
+	if (!superuser())
+		ereport(FATAL,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("a superuser must install aux_mysql before the first MySQL connection"),
+				 errhint("Run CREATE EXTENSION aux_mysql in database \"%s\".", halo_mysql_database)));
+	halo_mysql_lock_setup();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (!OidIsValid(get_extension_oid("aux_mysql", true)))
 	{
@@ -120,24 +139,6 @@ halo_mysql_setup_main(Datum main_arg)
 	PopActiveSnapshot();
 	CommitTransactionCommand();
 	pgstat_report_activity(STATE_IDLE, NULL);
-	proc_exit(0);
-}
-
-static void
-register_setup_worker(void)
-{
-	BackgroundWorker worker;
-
-	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	/* not on a standby (the extension comes with replication) */
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
-	worker.bgw_restart_time = BGW_NEVER_RESTART;
-	snprintf(worker.bgw_library_name, BGW_MAXLEN, "aux_mysql");
-	snprintf(worker.bgw_function_name, BGW_MAXLEN, "halo_mysql_setup_main");
-	snprintf(worker.bgw_name, BGW_MAXLEN, "aux_mysql setup");
-	snprintf(worker.bgw_type, BGW_MAXLEN, "aux_mysql setup");
-	RegisterBackgroundWorker(&worker);
 }
 
 void
@@ -170,6 +171,13 @@ _PG_init(void)
 							   NULL,
 							   PGC_POSTMASTER, GUC_LIST_INPUT,
 							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("mysql.max_allowed_packet",
+							"Maximum incoming MySQL message or accumulated long-data bytes.",
+							"Set in postgresql.conf; reload to apply.",
+							&halo_mysql_max_allowed_packet,
+							64 * 1024 * 1024, 1024, 1024 * 1024 * 1024 - 1,
+							PGC_SIGHUP, 0, NULL, NULL, NULL);
 
 	DefineCustomStringVariable("mysql.database",
 							   "PostgreSQL database that MySQL clients connect to.",
@@ -243,10 +251,9 @@ _PG_init(void)
 							   NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("mysql.auto_create_extension",
-							 "Create the aux_mysql extension in mysql.database at startup.",
-							 "A background worker runs CREATE EXTENSION IF NOT EXISTS aux_mysql "
-							 "once the server accepts connections (not on standbys, not during "
-							 "pg_upgrade).",
+							 "Install aux_mysql on the first MySQL connection by a superuser.",
+							 "Disabled on standbys and during pg_upgrade. PostgreSQL connections "
+							 "never install the extension automatically.",
 							 &halo_mysql_auto_create_extension,
 							 true,
 							 PGC_POSTMASTER, 0,
@@ -258,11 +265,6 @@ _PG_init(void)
 	shmem_startup_hook = halo_mysql_shmem_startup;
 
 	mysql_utility_init();
-
-	/* pg_upgrade restores the extension itself: do not create it first */
-	if (halo_mysql_auto_create_extension && !IsBinaryUpgrade &&
-		halo_mysql_database != NULL && halo_mysql_database[0] != '\0')
-		register_setup_worker();
 
 #ifdef HALO_BABELFISH_API
 	mysql_babelfish_register();

@@ -4,6 +4,18 @@
 \echo Use "CREATE EXTENSION aux_mysql" to load this file. \quit
 
 CREATE SCHEMA IF NOT EXISTS mysql;
+CREATE FUNCTION mysql.column_extra(oid, integer) RETURNS text
+    AS '$libdir/aux_mysql', 'mys_column_extra' LANGUAGE C STRICT STABLE;
+-- A domain guard keeps the original integer type when identity uses its base.
+CREATE FUNCTION mysql.column_domain(oid, integer) RETURNS oid
+    LANGUAGE sql STRICT STABLE SET search_path = pg_catalog AS $$
+    SELECT d.refobjid FROM pg_constraint c JOIN pg_depend d
+      ON d.classid = 'pg_constraint'::regclass AND d.objid = c.oid
+      AND d.refclassid = 'pg_type'::regclass
+      JOIN pg_type t ON t.oid = d.refobjid AND t.typtype = 'd'
+    WHERE c.conrelid = $1 AND c.conkey = ARRAY[$2]::int2[]
+      AND c.contype = 'c' AND c.conname LIKE 'aux_mysql_domain_%'
+    LIMIT 1 $$;
 -- unqualified references inside the aux_mysql objects resolve to mysql first
 SET LOCAL search_path = mysql, pg_catalog, public;
 -- aux_mysql has forward references between SQL functions (as in a pg_dump)
@@ -34000,6 +34012,7 @@ SELECT
             when ty.typname='blob' then 'blob'
             when ty.typname='mediumblob' then 'mediumblob'
             when ty.typname='longblob' then 'longblob'
+            when ty.typname='float8' then 'double'
             when mysql.left(ty.typname, 5)='float' then 'float'
             when ty.typname='double' then 'double'
             when ty.typname='decimal' then 'decimal'
@@ -34088,6 +34101,7 @@ SELECT
             when ty.typname='blob' then 'blob'
             when ty.typname='mediumblob' then 'mediumblob'
             when ty.typname='longblob' then 'longblob'
+            when ty.typname='float8' then 'double'
             when mysql.left(ty.typname, 5)='float' then 'float'
             when ty.typname='double' then 'double'
             when ty.typname='decimal' then 'decimal'
@@ -34099,7 +34113,7 @@ SELECT
         from pg_catalog.pg_type ty
         where att.atttypid = ty.oid)::text as COLUMN_TYPE,
     (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as COLUMN_KEY,
-    (mysql.get_column_extra(mysql.amend_def_val_for_internal(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), att.attrelid))))::text as EXTRA,
+    mysql.column_extra(att.attrelid, att.attnum)::text as EXTRA,
     'select,insert,update,references'::varchar(256) as PRIVILEGES,
     col_description(att.attrelid, att.attnum)::varchar(512) as COLUMN_COMMENT,
     ''::text as GENERATION_EXPRESSION,
@@ -34192,7 +34206,8 @@ BEGIN
                     when ty.typname='blob' then 'blob'
                     when ty.typname='mediumblob' then 'mediumblob'
                     when ty.typname='longblob' then 'longblob'
-                    when mysql.left(ty.typname, 5)='float' then 'float'
+                    when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
                     when ty.typname='double' then 'double'
                     when ty.typname='decimal' then 'decimal'
                     when ty.typname='numeric' then 'decimal'
@@ -34205,7 +34220,7 @@ BEGIN
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
             (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), tabOid)))::text as Default,
-            (mysql.get_column_extra(mysql.amend_def_val_for_internal(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), tabOid))))::text as Extra
+            mysql.column_extra(att.attrelid, att.attnum)::text as Extra
         FROM pg_catalog.pg_attribute att
         WHERE att.attrelid = tabOid and att.attname != 'tableoid' and att.attname != 'cmax' and
                 att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
@@ -34301,7 +34316,8 @@ BEGIN
                     when ty.typname='blob' then 'blob'
                     when ty.typname='mediumblob' then 'mediumblob'
                     when ty.typname='longblob' then 'longblob'
-                    when mysql.left(ty.typname, 5)='float' then 'float'
+                    when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
                     when ty.typname='double' then 'double'
                     when ty.typname='decimal' then 'decimal'
                     when ty.typname='numeric' then 'decimal'
@@ -34315,7 +34331,7 @@ BEGIN
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
             (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), tabOid)))::text as Default,
-            (mysql.get_column_extra(mysql.amend_def_val_for_internal(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), tabOid))))::text as Extra,
+            mysql.column_extra(att.attrelid, att.attnum)::text as Extra,
             'select,insert,update,references'::varchar(256) as Privileges,
             (case when col_description(att.attrelid, att.attnum) is not null then col_description(att.attrelid, att.attnum) else '' end)::varchar(512) as Comment
         FROM pg_catalog.pg_attribute att
@@ -34663,7 +34679,7 @@ BEGIN
     ret := pg_catalog.concat('CREATE TABLE `', tabName, '` (');
 
     FOR records IN
-        select att.attname as column_name,
+        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) as extra, att.attname as column_name,
                 (pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adrelid = tabOid and ad.adnum = att.attnum), tabOid)) as column_default,
                 (case when att.attnotnull then 'NO' else 'YES' end) as is_nullable,
                 (select
@@ -34699,7 +34715,8 @@ BEGIN
                         when ty.typname='blob' then 'blob'
                         when ty.typname='mediumblob' then 'mediumblob'
                         when ty.typname='longblob' then 'longblob'
-                        when mysql.left(ty.typname, 5)='float' then 'float'
+                        when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
                         when ty.typname='double' then 'double'
                         when ty.typname='decimal' then 'decimal'
                         when ty.typname='numeric' then 'decimal'
@@ -34708,7 +34725,7 @@ BEGIN
                         else ty.typname
                     end
                     from pg_catalog.pg_type ty
-                    where att.atttypid = ty.oid)::varchar(64) as column_type,
+                    where coalesce(mysql.column_domain(att.attrelid, att.attnum), att.atttypid) = ty.oid)::varchar(64) as column_type,
                 col_description(att.attrelid, att.attnum) as column_comment,
                 att.attnum::int4 as attnum,
                 (select coll.collname from pg_collation coll where coll.oid = att.attcollation)::varchar(128) as column_collation
@@ -34717,9 +34734,9 @@ BEGIN
     LOOP
         if (0 < records.attnum) then
             if (0 < columnIndex) then
-                ret := pg_catalog.concat(ret, ',\n  ');
+                ret := pg_catalog.concat(ret, E',\n  ');
             else
-                ret := pg_catalog.concat(ret, '\n  ');
+                ret := pg_catalog.concat(ret, E'\n  ');
             end if;
 
             ret := pg_catalog.concat(ret, '`');
@@ -34729,7 +34746,15 @@ BEGIN
             if (records.is_nullable = 'NO') then
                 ret := pg_catalog.concat(ret, ' NOT NULL');
             end if;
-            if (records.column_default is not null) then
+            if (records.identity != '') then
+                ret := pg_catalog.concat(ret, ' AUTO_INCREMENT');
+                BEGIN
+                    execute format('select last_value + case when is_called then 1 else 0 end from %s',
+                        pg_get_serial_sequence(format('%I.%I', schName, tabName), records.column_name)) into autoInc;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    autoInc := NULL;
+                END;
+            elsif (records.column_default is not null) then
                 if (0 < position('nextval(' in records.column_default)) then
                     ret := pg_catalog.concat(ret, ' AUTO_INCREMENT');
                     execute format('select max(%s) from %I.%I', records.column_name, schName, tabName)
@@ -34748,12 +34773,15 @@ BEGIN
                 end if;
             end if;
 
+            if (position('on update' in records.extra) > 0) then
+                ret := pg_catalog.concat(ret, ' ', substring(records.extra from position('on update' in records.extra)));
+            end if;
             if (records.column_collation is not null) then
                 ret := pg_catalog.concat(ret, ' COLLATE ', records.column_collation);
             end if;
 
             if (records.column_comment is not null) then
-                ret := pg_catalog.concat(ret, ' COMMENT ''', records.column_comment, '''');
+                ret := pg_catalog.concat(ret, ' COMMENT ''', replace(records.column_comment, '''', ''''''), '''');
             end if;
 
             columnIndex := columnIndex + 1;
@@ -34771,7 +34799,7 @@ BEGIN
         --    from pg_index ind join pg_class cl on ind.indrelid = cl.oid
         --    where ind.indrelid = tabOid and cl.oid = tabOid
     LOOP
-        ret := pg_catalog.concat(ret, ',\n  ');
+        ret := pg_catalog.concat(ret, E',\n  ');
         columnNums := pg_catalog.replace(records.indkey::pg_catalog.text, ' '::pg_catalog.text, ','::pg_catalog.text);
         --execute format('select GROUP_CONCAT(attname separator \'`,`\')
         --                    from pg_attribute
@@ -34802,7 +34830,7 @@ BEGIN
         from pg_constraint cons
         where (cons.contype = 'f') and (cons.conrelid = tabOid)
     LOOP
-        ret := pg_catalog.concat(ret, ',\n  ');
+        ret := pg_catalog.concat(ret, E',\n  ');
         ret := pg_catalog.concat(ret, 'CONSTRAINT `');
         ret := pg_catalog.concat(ret, records.conname);
         ret := pg_catalog.concat(ret, '` FOREIGN KEY (`');
@@ -34840,9 +34868,9 @@ BEGIN
     FOR records IN
         select cons.conname, (select pg_get_constraintdef(cons.oid)) as consrc
         from pg_constraint cons
-        where (cons.contype = 'c') and (cons.conrelid = tabOid)
+        where (cons.contype = 'c') and (cons.conrelid = tabOid) and cons.conname not like 'aux_mysql_domain_%'
     LOOP
-        ret := pg_catalog.concat(ret, ',\n  ');
+        ret := pg_catalog.concat(ret, E',\n  ');
         ret := pg_catalog.concat(ret, 'CONSTRAINT ');
         ret := pg_catalog.concat(ret, records.conname);
         ret := pg_catalog.concat(ret, ' ');
@@ -34850,22 +34878,24 @@ BEGIN
     END LOOP;
 
     if (0 < autoInc) then
-        autoInc := autoInc + 1;
-        ret := pg_catalog.concat(ret, '\n) ENGINE=InnoDB AUTO_INCREMENT=', autoInc::text, ' DEFAULT CHARSET=utf8mb4');
+        -- identity metadata already supplies the next value
+        ret := pg_catalog.concat(ret, E'\n) ENGINE=InnoDB AUTO_INCREMENT=', autoInc::text, ' DEFAULT CHARSET=utf8mb4');
     else
-        ret := pg_catalog.concat(ret, '\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+        ret := pg_catalog.concat(ret, E'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
     end if;
 
+    ret := pg_catalog.concat(ret, ' COLLATE=', coalesce((select label from pg_catalog.pg_seclabel
+        where classoid = 'pg_class'::regclass and objoid = tabOid and objsubid = 0 and provider = 'aux_mysql'), 'case_insensitive'));
     tableComment := '';
     execute format('select ds.description from pg_description ds where ds.objoid = %s and objsubid = 0', tabOid) into tableComment;
     if (tableComment != '') then
-        ret := pg_catalog.concat(ret, ' COMMENT ''', tableComment, '''');
+        ret := pg_catalog.concat(ret, ' COMMENT ''', replace(tableComment, '''', ''''''), '''');
     end if;
 
     return ret;
 END;
 $$
-IMMUTABLE LANGUAGE plpgsql;
+STABLE LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION mysql.show_table_indexs_for_8(pg_catalog.text, pg_catalog.text)
 RETURNS setof RECORD
@@ -35017,7 +35047,8 @@ create view mys_informa_schema.routines as
                         when ty.typname='blob' then 'blob'
                         when ty.typname='mediumblob' then 'mediumblob'
                         when ty.typname='longblob' then 'longblob'
-                        when mysql.left(ty.typname, 5)='float' then 'float'
+                        when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
                         when ty.typname='double' then 'double'
                         when ty.typname='decimal' then 'decimal'
                         when ty.typname='numeric' then 'decimal'
@@ -35070,7 +35101,8 @@ create view mys_informa_schema.routines as
                         when ty.typname='blob' then 'blob'
                         when ty.typname='mediumblob' then 'mediumblob'
                         when ty.typname='longblob' then 'longblob'
-                        when mysql.left(ty.typname, 5)='float' then 'float'
+                        when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
                         when ty.typname='double' then 'double'
                         when ty.typname='decimal' then 'decimal'
                         when ty.typname='numeric' then 'decimal'

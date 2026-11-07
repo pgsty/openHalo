@@ -116,6 +116,7 @@ void setSystemVariableDatum(char *varName, Datum varConfValue,
                             Oid varValueType, bool isNull, 
                             bool isSessionSystemVar);
 bool isSystemVariable(char *varName);
+void resetSessionSystemVariables(void);
 
 
 #endif                          /* SYSTEMVAR_H */

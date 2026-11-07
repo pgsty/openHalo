@@ -43,6 +43,7 @@
 #include "mys_scanner.h"
 #include "parser/scansup.h"
 #include "mb/pg_wchar.h"
+#include "adapter/mysql/systemVar.h"
 }
 
 %{
@@ -565,7 +566,10 @@ other			.
 					// 	BEGIN(xq);
 					// else
 					// 	BEGIN(xe);
-                    BEGIN(xe);
+                    if (mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES)
+                        BEGIN(xq);
+                    else
+                        BEGIN(xe);
 					startlit();
 				}
 
@@ -618,6 +622,7 @@ other			.
 							 */
                             if (MYS_YYEXTRA(yyextra)->saw_underscore_binary)
                             {
+                                MYS_YYEXTRA(yyextra)->binary_token_end = yytext - yyextra->scanbuf;
                                 MYS_YYEXTRA(yyextra)->saw_underscore_binary = false;
                                 yylval->str = palloc(16 + yyextra->literallen);
                                 memset(yylval->str, '\0', 16);
@@ -680,7 +685,10 @@ other			.
 					// 	BEGIN(xdq);
 					// else
 					// 	BEGIN(xde);
-                    BEGIN(xde);
+                    if (mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES)
+                        BEGIN(xdq);
+                    else
+                        BEGIN(xde);
 					startlit();
 				}
 
@@ -725,6 +733,7 @@ other			.
 							 */
                             if (MYS_YYEXTRA(yyextra)->saw_underscore_binary)
                             {
+                                MYS_YYEXTRA(yyextra)->binary_token_end = yytext - yyextra->scanbuf;
                                 MYS_YYEXTRA(yyextra)->saw_underscore_binary = false;
                                 yylval->str = palloc(16 + yyextra->literallen);
                                 memset(yylval->str, '\0', 16);
@@ -1480,6 +1489,8 @@ unescape_single_char(unsigned char c, core_yyscan_t yyscanner)
 	{
 		case 'b':
 			return '\b';
+		case 'Z':
+			return 0x1a;		/* MySQL / older clients escape ASCII SUB as \Z. */
 		//case 'f':
 		//	return '\f';
 		case 'n':

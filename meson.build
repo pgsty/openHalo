@@ -26,6 +26,9 @@ project('postgresql',
   ]
 )
 
+# aux_mysql currently has a GNU make/PGXS build. Refuse an installation whose
+# default shared_preload_libraries names a library that Meson never builds.
+error('OpenHalo 18 requires GNU make: use ./configure && make && make install. Meson does not yet build aux_mysql.')
 
 
 ###############################################################

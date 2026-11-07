@@ -32,6 +32,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_index.h"
 #include "commands/defrem.h"
+#include "common/hashfn.h"
 #include "utils/formatting.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
@@ -307,16 +308,6 @@ mysql_collation_is_ci(const char *name)
  * without COLLATE the configured nondeterministic collation (PG18 supports
  * them for =, LIKE, GROUP BY, unique indexes ...).
  */
-static void
-apply_default_collation(ColumnDef *col)
-{
-	if (col->collClause != NULL ||
-		halo_mysql_default_collation == NULL || halo_mysql_default_collation[0] == '\0' ||
-		!is_string_column(col))
-		return;
-	col->collClause = make_collate_clause("mysql", halo_mysql_default_collation);
-}
-
 /*
  * Map the collation of a MySQL column definition to a PostgreSQL one
  * (openHalo 14.18, rectifyColumnCollate):
@@ -332,18 +323,17 @@ apply_default_collation(ColumnDef *col)
  * output can be replayed.  COLLATE on a non-string column is ignored, as
  * openHalo did.
  */
-static void
-rectify_column_collation(ColumnDef *col, bool table_ci)
+void
+mys_rectify_column_collation(ColumnDef *col, const char *table_collation)
 {
 	char	   *name;
 
 	if (col->collClause == NULL)
 	{
-		if (table_ci)
-			apply_default_collation(col);
-		else if (is_string_column(col))
-			col->collClause = make_collate_clause("mysql", "case_sensitive");
-		return;
+		if (!is_string_column(col))
+			return;
+		col->collClause = make_collate_clause("mysql", table_collation);
+
 	}
 
 	if (!is_string_column(col))
@@ -366,15 +356,25 @@ rectify_column_collation(ColumnDef *col, bool table_ci)
 }
 
 /* table-level COLLATE=: case-insensitive unless a non-_ci collation is given */
-static bool
-table_collation_is_ci(List *options)
+static const char *
+table_collation_name(List *options)
 {
 	foreach_node(DefElem, d, options)
 	{
 		if (strcmp(d->defname, "collate") == 0 && d->arg && IsA(d->arg, List))
-			return mysql_collation_is_ci(strVal(llast((List *) d->arg)));
+		{
+			char *name = strVal(llast((List *) d->arg));
+
+			if (pg_strcasecmp(name, "case_insensitive") == 0 ||
+				pg_strcasecmp(name, "case_sensitive") == 0 ||
+				pg_strcasecmp(name, "ignore_accents") == 0 ||
+				pg_strcasecmp(name, "default") == 0)
+				return asc_tolower(name, strlen(name));
+			return mysql_collation_is_ci(name) ? "case_insensitive" : "case_sensitive";
+		}
 	}
-	return true;
+	return halo_mysql_default_collation && halo_mysql_default_collation[0] ?
+		halo_mysql_default_collation : "default";
 }
 
 /*
@@ -438,7 +438,7 @@ make_table_setup(RangeVar *rel, List *on_update_add, List *on_update_drop)
  * like "int unsigned" to domains, but identity columns need a plain integer
  * type, so fall back to the domain's base type.
  */
-static void
+static Constraint *
 make_identity_column(ColumnDef *col, Constraint *c)
 {
 	Oid			typid;
@@ -454,8 +454,30 @@ make_identity_column(ColumnDef *col, Constraint *c)
 		Oid			base = getBaseType(typid);
 
 		if (base == INT2OID || base == INT4OID || base == INT8OID)
+		{
+			Constraint *check = makeNode(Constraint);
+			NullTest *test = makeNode(NullTest);
+			TypeCast *cast = makeNode(TypeCast);
+
+			/* Identity needs a base integer, but must retain all domain checks. */
+			cast->arg = make_colref(NULL, col->colname);
+			cast->typeName = makeTypeNameFromOid(typid, typmod);
+			cast->location = -1;
+			test->arg = (Expr *) cast;
+			test->nulltesttype = IS_NOT_NULL;
+			test->location = -1;
+			check->contype = CONSTR_CHECK;
+			check->is_enforced = true;
+			check->initially_valid = true;
+			check->raw_expr = (Node *) test;
+			check->location = -1;
+			check->conname = psprintf("aux_mysql_domain_%08x",
+						hash_bytes((const unsigned char *) col->colname, strlen(col->colname)));
 			col->typeName = makeTypeNameFromOid(base, -1);
+			return check;
+		}
 	}
+	return NULL;
 }
 
 static Node *
@@ -527,7 +549,18 @@ rewrite_create_stmt(CreateStmt *stmt)
 	List	   *on_update = NIL;
 	Constraint *identity = NULL;
 	ListCell   *lc;
-	bool		table_ci = table_collation_is_ci(stmt->options);
+	const char *table_collation = table_collation_name(stmt->options);
+
+	if (stmt->if_not_exists && OidIsValid(RangeVarGetRelid(stmt->relation, NoLock, true)))
+		return NIL;
+	/* LIKE copies the saved table default, independently of column overrides. */
+	foreach_ptr(Node, elt, stmt->tableElts)
+		if (IsA(elt, TableLikeClause))
+		{
+			Oid source = RangeVarGetRelid(((TableLikeClause *) elt)->relation,
+										 AccessShareLock, false);
+			table_collation = mys_table_default_collation(source);
+		}
 
 	foreach(lc, stmt->tableElts)
 	{
@@ -539,7 +572,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 			List	   *cons = NIL;
 			ListCell   *lc2;
 
-			rectify_column_collation(col, table_ci);
+			mys_rectify_column_collation(col, table_collation);
 			foreach(lc2, col->constraints)
 			{
 				Node	   *n = lfirst(lc2);
@@ -559,7 +592,10 @@ rewrite_create_stmt(CreateStmt *stmt)
 				{
 					Constraint *c = (Constraint *) n;
 
-					make_identity_column(col, c);
+					Constraint *check = make_identity_column(col, c);
+
+					if (check)
+						cons = lappend(cons, check);
 					identity = c;
 					cons = lappend(cons, c);
 				}
@@ -619,8 +655,14 @@ rewrite_create_stmt(CreateStmt *stmt)
 	stmt->options = options;
 
 	indexes = list_concat(indexes, comments);
-	if (on_update != NIL || identity != NULL)
-		indexes = lappend(indexes, make_table_setup(stmt->relation, on_update, NIL));
+	/* LIKE can acquire an identity only during PostgreSQL's transformation. */
+	{
+		DoStmt *setup = (DoStmt *) make_table_setup(stmt->relation, on_update, NIL);
+
+		setup->args = lappend(setup->args, makeDefElem("default_collation",
+									(Node *) makeString(pstrdup(table_collation)), -1));
+		indexes = lappend(indexes, setup);
+	}
 	return indexes;
 }
 
@@ -645,16 +687,18 @@ rewrite_alter_table(AlterTableStmt *stmt)
 		{
 			ColumnDef  *col = (ColumnDef *) cmd->def;
 			bool		found = false;
+			Constraint *check = NULL;
 
-			rectify_column_collation(col, true);
 			foreach_ptr(Node, n, col->constraints)
 			{
 				if (is_on_update_clause(n))
 					found = true;
 				/* AUTO_INCREMENT: identity, see mys_utility.c modify_column() */
 				else if (IsA(n, Constraint) && ((Constraint *) n)->contype == CONSTR_AUTOINC)
-					make_identity_column(col, (Constraint *) n);
+					check = make_identity_column(col, (Constraint *) n);
 			}
+			if (check)
+				col->constraints = lappend(col->constraints, check);
 			if (found)
 				on_update_add = lappend(on_update_add,
 										(int) cmd->subtype == AT_ChangeColumn ? col->colname : cmd->name);
@@ -670,7 +714,6 @@ rewrite_alter_table(AlterTableStmt *stmt)
 			List	   *cons = NIL;
 			ListCell   *lc2;
 
-			rectify_column_collation(col, true);
 			foreach(lc2, col->constraints)
 			{
 				Node	   *n = lfirst(lc2);
@@ -690,7 +733,10 @@ rewrite_alter_table(AlterTableStmt *stmt)
 					continue;
 				else if (IsA(n, Constraint) && ((Constraint *) n)->contype == CONSTR_AUTOINC)
 				{
-					make_identity_column(col, (Constraint *) n);
+					Constraint *check = make_identity_column(col, (Constraint *) n);
+
+					if (check)
+						cons = lappend(cons, check);
 					cons = lappend(cons, n);
 					setup = true;
 				}
@@ -1127,6 +1173,25 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 		ListCell   *lc2;
 
 		info->group_start = true;
+		if (IsA(rs->stmt, SelectStmt))
+		{
+			SelectStmt *sel = (SelectStmt *) rs->stmt;
+
+			if (list_length(sel->fromClause) == 1 && IsA(linitial(sel->fromClause), RangeFunction))
+			{
+				RangeFunction *rf = linitial_node(RangeFunction, sel->fromClause);
+				Node *fn = linitial((List *) linitial(rf->functions));
+
+				if (IsA(fn, FuncCall))
+				{
+					FuncCall *fc = (FuncCall *) fn;
+
+					info->diagnostic = list_length(fc->funcname) == 2 &&
+						strcmp(strVal(linitial(fc->funcname)), "mysql") == 0 &&
+						strcmp(strVal(lsecond(fc->funcname)), "show_diagnostics") == 0;
+				}
+			}
+		}
 		mys_txn_classify(rs->stmt, info);
 
 		switch ((int) nodeTag(rs->stmt))
@@ -1146,6 +1211,32 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 			case T_CreateStmt:
 				extra = rewrite_create_stmt((CreateStmt *) rs->stmt);
 				break;
+			case T_RenameStmt:
+				{
+					RenameStmt *rename = (RenameStmt *) rs->stmt;
+
+					/* PG14's fork stored the destination RangeVar in object. */
+					if (rename->renameType == OBJECT_TABLE && rename->object &&
+						IsA(rename->object, RangeVar))
+					{
+						RangeVar *target = (RangeVar *) rename->object;
+
+						rename->newname = target->relname;
+						rename->object = NULL;
+						if (target->schemaname)
+						{
+							AlterObjectSchemaStmt *move = makeNode(AlterObjectSchemaStmt);
+
+							move->objectType = OBJECT_TABLE;
+							move->relation = copyObject(rename->relation);
+							move->relation->relname = target->relname;
+							move->newschema = target->schemaname;
+							move->missing_ok = rename->missing_ok;
+							extra = list_make1(move);
+						}
+					}
+					break;
+				}
 			case T_InsertStmt:
 				{
 					InsertStmt *ins = (InsertStmt *) rs->stmt;

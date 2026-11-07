@@ -58,7 +58,7 @@ public class DriverTest {
             Statement s = c.createStatement();
             s.execute("drop table if exists jps");
             s.execute("create table jps (id int not null auto_increment primary key, i bigint, " +
-                      "d double, n decimal(10,3), v varchar(64), t text, dt datetime, " +
+                      "d double, n decimal(10,3), v varchar(64), t text, dt datetime(6), " +
                       "dd date, b blob, f tinyint)");
             PreparedStatement ins = c.prepareStatement(
                 "insert into jps (i, d, n, v, t, dt, dd, b, f) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",

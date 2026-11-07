@@ -61,6 +61,7 @@ extern void SequenceChangePersistence(Oid relid, char newrelpersistence);
 extern void DeleteSequenceTuple(Oid relid);
 extern void ResetSequence(Oid seq_relid);
 extern void ResetSequenceCaches(void);
+extern void SetSequenceValueAtLeast(Oid relid, int64 next, bool iscalled);
 
 extern void seq_redo(XLogReaderState *record);
 extern void seq_desc(StringInfo buf, XLogReaderState *record);

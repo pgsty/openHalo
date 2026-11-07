@@ -73,7 +73,7 @@ division_by_zero(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_DIVISION_BY_ZERO),
 				 errmsg("Division by 0")));
-	mys_add_warning();
+	mys_add_warning(1365, "Division by 0");
 }
 
 static Datum
@@ -327,58 +327,11 @@ typedef struct AutoIncCache
 	Oid			typid;
 } AutoIncCache;
 
-/* last_value of the sequence, or start - 1 if it was never used */
-static int64
-sequence_high_water(Oid seqoid, bool *found)
-{
-	LOCAL_FCINFO(lfcinfo, 1);
-	Datum		result;
-
-	InitFunctionCallInfoData(*lfcinfo, NULL, 1, InvalidOid, NULL, NULL);
-	lfcinfo->args[0].value = ObjectIdGetDatum(seqoid);
-	lfcinfo->args[0].isnull = false;
-	result = pg_sequence_last_value(lfcinfo);
-	*found = !lfcinfo->isnull;
-	return *found ? DatumGetInt64(result) : 0;
-}
-
-static int64
-sequence_start(Oid seqoid)
-{
-	foreach_node(DefElem, d, sequence_options(seqoid))
-	{
-		if (strcmp(d->defname, "start") == 0)
-			return defGetInt64(d);
-	}
-	return 1;
-}
-
-/*
- * Move the sequence forward so that it has returned at least "value"
- * (is_called) or will return "value" next (!is_called).  Never moves it
- * back.  The recheck runs under a lock that excludes concurrent nextval().
- */
+/* Atomic with nextval; uses the core sequence page lock, ACLs and WAL. */
 static void
 sequence_advance(Oid seqoid, int64 value, bool is_called)
 {
-	int64		high;
-	bool		used;
-	int64		target = is_called ? value : value - 1;
-
-	high = sequence_high_water(seqoid, &used);
-	if (!used)
-		high = sequence_start(seqoid) - 1;
-	if (target <= high)
-		return;
-
-	LockRelationOid(seqoid, ExclusiveLock);
-	high = sequence_high_water(seqoid, &used);
-	if (!used)
-		high = sequence_start(seqoid) - 1;
-	if (target > high)
-		DirectFunctionCall3(setval3_oid, ObjectIdGetDatum(seqoid),
-							Int64GetDatum(value), BoolGetDatum(is_called));
-	UnlockRelationOid(seqoid, ExclusiveLock);
+	SetSequenceValueAtLeast(seqoid, value, is_called);
 }
 
 /*
@@ -472,7 +425,8 @@ mys_autoinc_trigger(PG_FUNCTION_ARGS)
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_RESTRICTED_OPERATION);
 
-	sequence_advance(cache->seqoid, value, true);
+	if (value > 0)
+		sequence_advance(cache->seqoid, value, true);
 
 	SetUserIdAndSecContext(save_userid, save_sec_context);
 	return PointerGetDatum(tuple);
@@ -485,7 +439,7 @@ mys_autoinc_trigger(PG_FUNCTION_ARGS)
 void
 mys_sync_auto_increment(Oid relid)
 {
-	Relation	rel = relation_open(relid, AccessShareLock);
+	Relation	rel = relation_open(relid, AccessExclusiveLock);
 	TupleDesc	desc = RelationGetDescr(rel);
 	Oid			seqoid = InvalidOid;
 	AttrNumber	attnum = InvalidAttrNumber;
@@ -495,6 +449,11 @@ mys_sync_auto_increment(Oid relid)
 	TupleTableSlot *slot;
 	int64		max = 0;
 	bool		found = false;
+
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("AUTO_INCREMENT changes on partitioned tables are not supported")));
 
 	for (int i = 0; i < desc->natts; i++)
 	{
@@ -511,7 +470,7 @@ mys_sync_auto_increment(Oid relid)
 	if (!OidIsValid(seqoid) ||
 		(typid != INT2OID && typid != INT4OID && typid != INT8OID))
 	{
-		relation_close(rel, AccessShareLock);
+		relation_close(rel, NoLock);
 		return;
 	}
 
@@ -535,9 +494,9 @@ mys_sync_auto_increment(Oid relid)
 	ExecDropSingleTupleTableSlot(slot);
 	table_endscan(scan);
 	UnregisterSnapshot(snapshot);
-	relation_close(rel, AccessShareLock);
+	relation_close(rel, NoLock);
 
-	if (found)
+	if (found && max > 0)
 		sequence_advance(seqoid, max, true);
 }
 
@@ -564,10 +523,15 @@ table_is_empty(Relation rel)
 void
 mys_set_auto_increment(Oid relid, int64 next)
 {
-	Relation	rel = relation_open(relid, AccessShareLock);
+	Relation	rel = relation_open(relid, AccessExclusiveLock);
 	TupleDesc	desc = RelationGetDescr(rel);
 	Oid			seqoid = InvalidOid;
 	bool		empty = false;
+
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("AUTO_INCREMENT changes on partitioned tables are not supported")));
 
 	for (int i = 0; i < desc->natts; i++)
 	{
@@ -659,7 +623,7 @@ lenient_numeric_value(text *t)
 	char	   *num = numeric_prefix(s, &complete);
 
 	if (!complete)
-		mys_add_warning();		/* 1265 / 1366 */
+		mys_add_warning(1265, "Data truncated during numeric conversion");
 	return DatumGetNumeric(DirectFunctionCall3(numeric_in, CStringGetDatum(num),
 											   ObjectIdGetDatum(InvalidOid),
 											   Int32GetDatum(-1)));
@@ -679,12 +643,12 @@ mys_lenient_int(PG_FUNCTION_ARGS)
 
 	if (DatumGetBool(DirectFunctionCall2(numeric_lt, r, lod)))
 	{
-		mys_add_warning();		/* 1264 out of range */
+		mys_add_warning(1264, "Out of range value for column");
 		PG_RETURN_INT64(lo);
 	}
 	if (DatumGetBool(DirectFunctionCall2(numeric_gt, r, hid)))
 	{
-		mys_add_warning();
+		mys_add_warning(1264, "Out of range value for column");
 		PG_RETURN_INT64(hi);
 	}
 	PG_RETURN_DATUM(DirectFunctionCall1(numeric_int8, r));
@@ -730,13 +694,13 @@ mys_lenient_numeric(PG_FUNCTION_ARGS)
 							  ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
 	if (DatumGetBool(DirectFunctionCall2(numeric_gt, r, max)))
 	{
-		mys_add_warning();
+		mys_add_warning(1264, "Out of range value for column");
 		PG_RETURN_DATUM(max);
 	}
 	if (DatumGetBool(DirectFunctionCall2(numeric_lt, r,
 										 DirectFunctionCall1(numeric_uminus, max))))
 	{
-		mys_add_warning();
+		mys_add_warning(1264, "Out of range value for column");
 		PG_RETURN_DATUM(DirectFunctionCall1(numeric_uminus, max));
 	}
 	PG_RETURN_DATUM(r);
@@ -767,8 +731,47 @@ mys_lenient_varchar(PG_FUNCTION_ARGS)
 	cut = pg_mbcharcliplen(s, len, maxchars);
 	if (cut < len)
 	{
-		mys_add_warning();		/* 1265 data truncated */
+		mys_add_warning(1265, "Data truncated for column");
 		PG_RETURN_TEXT_P(cstring_to_text_with_len(s, cut));
 	}
 	PG_RETURN_TEXT_P(t);
+}
+
+/* Catalog-derived metadata shared by SHOW COLUMNS and SHOW CREATE TABLE. */
+PG_FUNCTION_INFO_V1(mys_column_extra);
+Datum
+mys_column_extra(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	int attnum = PG_GETARG_INT32(1);
+	Relation rel = relation_open(relid, AccessShareLock);
+	StringInfoData result;
+
+	initStringInfo(&result);
+	if (attnum > 0 && attnum <= RelationGetDescr(rel)->natts)
+	{
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+
+		if (att->attidentity)
+			appendStringInfoString(&result, "auto_increment");
+		if (rel->trigdesc)
+			for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+			{
+				Trigger *trigger = &rel->trigdesc->triggers[i];
+
+				if (strcmp(trigger->tgname, "aux_mysql_on_update") != 0)
+					continue;
+				for (int k = 0; k < trigger->tgnargs; k++)
+					if (atoi(trigger->tgargs[k]) == attnum)
+					{
+						if (result.len)
+							appendStringInfoChar(&result, ' ');
+						appendStringInfoString(&result, "on update CURRENT_TIMESTAMP");
+						if (att->atttypmod > 0)
+							appendStringInfo(&result, "(%d)", att->atttypmod);
+					}
+			}
+	}
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(result.data));
 }

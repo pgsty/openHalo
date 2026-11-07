@@ -1,0 +1,3 @@
+# SQL script, line, expected MySQL error number. All other errors fail.
+m1_pgsyntax.sql 6 1146
+m1_pgsyntax.sql 7 1062

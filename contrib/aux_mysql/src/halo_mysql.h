@@ -18,6 +18,7 @@
 
 /* GUC variables */
 extern int	halo_mysql_port;
+extern int	halo_mysql_max_allowed_packet;
 extern char *halo_mysql_listen_addresses;
 extern char *halo_mysql_database;
 extern bool halo_mysql_listener_on;
@@ -41,6 +42,8 @@ extern const ProtocolExtensionConfig mysql_protocol_config;
 #endif
 extern void mysql_listen_init(void);
 extern bool mys_is_mysql_session(void);
+extern void halo_mysql_ensure_extension(void);
+extern void halo_mysql_lock_setup(void);
 
 /* how a MySQL statement interacts with transactions (mys_txn.c) */
 typedef enum MysTxnKind
@@ -77,12 +80,13 @@ typedef struct MysStmtInfo
 	int8		set_autocommit;		/* SET autocommit = 0 / 1, -1 unknown */
 	bool		is_commit;			/* the client's COMMIT */
 	bool		is_write;			/* INSERT / UPDATE (strict mode rules) */
+	bool		diagnostic;			/* SHOW WARNINGS / ERRORS preserves diagnostics */
 	List	   *update_cols;		/* columns assigned by UPDATE / ON DUPLICATE KEY */
 } MysStmtInfo;
 
 /* mysql_proto.c */
 extern MysStmtInfo *mys_current_stmt_info(void);
-extern void mys_add_warning(void);
+extern void mys_add_warning(uint16 code, const char *message);
 
 /* mys_semantics.c */
 extern void mys_set_auto_increment(Oid relid, int64 next);
@@ -90,7 +94,10 @@ extern void mys_sync_auto_increment(Oid relid);
 
 /* mys_rewrite.c: ENGINE= / ENCRYPTION= -> table access method, or NULL */
 struct DefElem;
+struct ColumnDef;
 extern char *mys_engine_access_method(struct DefElem *d);
+extern void mys_rectify_column_collation(struct ColumnDef *col, const char *collation);
+extern const char *mys_table_default_collation(Oid relid);
 
 /* mys_utility.c: per-table setup after MySQL DDL (triggers) */
 #define MYS_TABLE_SETUP_MARKER	"halo_mysql_table_setup"
@@ -157,5 +164,6 @@ extern void mysql_utility_init(void);
 
 /* mysql_parser.c */
 extern List *mysql_raw_parser(const char *str);
+extern char *mys_normalize_query(const char *query, int len);
 
 #endif							/* HALO_MYSQL_H */

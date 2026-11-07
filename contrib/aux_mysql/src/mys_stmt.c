@@ -54,6 +54,7 @@
 #include "halo_mysql.h"
 #include "mys_proto.h"
 #include "mys_gramparse.h"
+#include "adapter/mysql/systemVar.h"
 
 /* MySQL's default max_prepared_stmt_count, applied per session here */
 #define MYS_MAX_PREPARED_STMTS	16382
@@ -68,6 +69,8 @@ typedef struct MysPrepStmt
 	uint16	   *param_types;	/* type | flags << 8, from the last bind */
 	bool		types_bound;
 	StringInfo *long_data;		/* COM_STMT_SEND_LONG_DATA, per parameter */
+	Size		long_data_bytes;
+	bool		long_data_error;
 } MysPrepStmt;
 
 static HTAB *stmt_hash = NULL;
@@ -222,7 +225,7 @@ append_string_literal(StringInfo buf, const char *s, int len, bool binary)
 	{
 		if (s[i] == '\'')
 			appendStringInfoString(buf, "''");
-		else if (s[i] == '\\')
+		else if (s[i] == '\\' && !(mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES))
 			appendStringInfoString(buf, "\\\\");
 		else
 			appendStringInfoChar(buf, s[i]);
@@ -748,6 +751,8 @@ mys_stmt_prepare(StringInfo pkt)
 	stmt->param_types = MemoryContextAllocZero(cxt, sizeof(uint16) * Max(nparams, 1));
 	stmt->types_bound = false;
 	stmt->long_data = MemoryContextAllocZero(cxt, sizeof(StringInfo) * Max(nparams, 1));
+	stmt->long_data_bytes = 0;
+	stmt->long_data_error = false;
 
 	/* COM_STMT_PREPARE_OK */
 	initStringInfo(&b);
@@ -810,6 +815,9 @@ mys_stmt_execute(StringInfo inBuf)
 	inBuf->cursor = 1;			/* command byte */
 	id = (uint32) need_uint(inBuf, 4);
 	stmt = lookup_stmt(id, "mysqld_stmt_execute", false);
+	if (stmt->long_data_error)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("long data exceeds mysql.max_allowed_packet; reset the statement")));
 	(void) need_uint(inBuf, 1); /* flags: cursors are not supported, the
 								 * whole result is sent */
 	(void) need_uint(inBuf, 4); /* iteration count, always 1 */
@@ -859,6 +867,7 @@ mys_stmt_execute(StringInfo inBuf)
 	}
 
 	/* result columns are named after the text with '?' (MySQL's naming) */
+	stmt->long_data_bytes = 0;
 	map = palloc(sizeof(MysTextMap));
 	map->orig = stmt->query;
 	map->nparams = stmt->nparams;
@@ -920,6 +929,8 @@ mys_stmt_reset(StringInfo pkt)
 			stmt->long_data[i] = NULL;
 		}
 	}
+	stmt->long_data_bytes = 0;
+	stmt->long_data_error = false;
 	mys_send_ok(0, 0, false, false);
 }
 
@@ -938,6 +949,13 @@ mys_stmt_send_long_data(StringInfo pkt)
 	stmt = lookup_stmt((uint32) id, "mysqld_stmt_send_long_data", true);
 	if (stmt == NULL || param >= (uint64) stmt->nparams)
 		return;
+	if (stmt->long_data_error ||
+		stmt->long_data_bytes + pkt->len - pkt->cursor > (Size) halo_mysql_max_allowed_packet)
+	{
+		stmt->long_data_error = true;
+		return;
+	}
+	stmt->long_data_bytes += pkt->len - pkt->cursor;
 
 	oldcxt = MemoryContextSwitchTo(stmt->cxt);
 	if (stmt->long_data[param] == NULL)

@@ -109,7 +109,7 @@ static void init_params(ParseState *pstate, List *options, bool for_identity,
 						Form_pg_sequence_data seqdataform,
 						bool *need_seq_rewrite,
 						List **owned_by);
-static void do_setval(Oid relid, int64 next, bool iscalled);
+static void do_setval(Oid relid, int64 next, bool iscalled, bool advance_only);
 static void process_owned_by(Relation seqrel, List *owned_by, bool for_identity);
 
 
@@ -942,7 +942,7 @@ lastval(PG_FUNCTION_ARGS)
  * sequence.
  */
 static void
-do_setval(Oid relid, int64 next, bool iscalled)
+do_setval(Oid relid, int64 next, bool iscalled, bool advance_only)
 {
 	SeqTable	elm;
 	Relation	seqrel;
@@ -969,6 +969,12 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
 	maxv = pgsform->seqmax;
 	minv = pgsform->seqmin;
+	/* Cached or cycling sequences cannot promise a monotonic next value. */
+	if (advance_only &&
+		(pgsform->seqincrement != 1 || pgsform->seqcache != 1 || pgsform->seqcycle))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("monotonic sequence advancement requires INCREMENT 1 CACHE 1 NO CYCLE")));
 	ReleaseSysCache(pgstuple);
 
 	/* read-only transactions may only modify temp sequences */
@@ -991,6 +997,20 @@ do_setval(Oid relid, int64 next, bool iscalled)
 				 errmsg("setval: value %" PRId64 " is out of bounds for sequence \"%s\" (%" PRId64 "..%" PRId64 ")",
 						next, RelationGetRelationName(seqrel),
 						minv, maxv)));
+
+	/*
+	 * Compare the actual pending value and is_called while holding the same
+	 * buffer lock as nextval.  A relation-lock upgrade here would deadlock
+	 * concurrent transactions that have already called nextval.
+	 */
+	if (advance_only &&
+		(next < seq->last_value ||
+		 (next == seq->last_value && (seq->is_called || !iscalled))))
+	{
+		UnlockReleaseBuffer(buf);
+		sequence_close(seqrel, NoLock);
+		return;
+	}
 
 	/* Set the currval() state only if iscalled = true */
 	if (iscalled)
@@ -1051,7 +1071,7 @@ setval_oid(PG_FUNCTION_ARGS)
 	Oid			relid = PG_GETARG_OID(0);
 	int64		next = PG_GETARG_INT64(1);
 
-	do_setval(relid, next, true);
+	do_setval(relid, next, true, false);
 
 	PG_RETURN_INT64(next);
 }
@@ -1067,9 +1087,16 @@ setval3_oid(PG_FUNCTION_ARGS)
 	int64		next = PG_GETARG_INT64(1);
 	bool		iscalled = PG_GETARG_BOOL(2);
 
-	do_setval(relid, next, iscalled);
+	do_setval(relid, next, iscalled, false);
 
 	PG_RETURN_INT64(next);
+}
+
+/* Atomic monotonic counterpart of setval, for extension-managed counters. */
+void
+SetSequenceValueAtLeast(Oid relid, int64 next, bool iscalled)
+{
+	do_setval(relid, next, iscalled, true);
 }
 
 

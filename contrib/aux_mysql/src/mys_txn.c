@@ -130,6 +130,11 @@ void
 mys_txn_classify(Node *stmt, MysStmtInfo *info)
 {
 	info->set_autocommit = -1;
+	if (info->diagnostic)
+	{
+		info->txn_kind = MYS_TXN_NEUTRAL;
+		return;
+	}
 
 	switch ((int) nodeTag(stmt))
 	{

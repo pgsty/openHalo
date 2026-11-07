@@ -49,13 +49,7 @@ su $OSUSER -c "$BIN/pg_ctl -D $DATA -l $DATA/../$(basename $DATA).log -w restart
 P="$BIN/psql -h /tmp -p $PGPORT -U postgres -qAt -v ON_ERROR_STOP=1"
 su $OSUSER -c "$P -c \"select 1 from pg_roles where rolname = 'dbuser_mysql'\"" | grep -q 1 || \
   su $OSUSER -c "$P -c \"create role dbuser_mysql login superuser password 'Mysql.123'\""
-# OpenHalo 18 creates the extension at startup (mysql.auto_create_extension);
-# wait for that worker instead of racing it, then make sure it exists
-for i in $(seq 1 30); do
-  su $OSUSER -c "$P -c \"select 1 from pg_extension where extname = 'aux_mysql'\"" | grep -q 1 && break
-  [ "$(su $OSUSER -c "$P -c 'show mysql.auto_create_extension'" 2>/dev/null)" = on ] || break
-  sleep 1
-done
-su $OSUSER -c "$P -c 'create extension if not exists aux_mysql cascade'" 2>&1 | grep -v NOTICE || true
+# Initialize explicitly for a test fixture; ordinary PG startup creates no SQL objects.
+su $OSUSER -c "$P -c 'create extension if not exists aux_mysql cascade'"
 su $OSUSER -c "$P -c 'create schema if not exists test authorization dbuser_mysql'"
 echo "instance ready: $DATA  pg=$PGPORT  mysql=$MYPORT  ($($BIN/postgres --version))"

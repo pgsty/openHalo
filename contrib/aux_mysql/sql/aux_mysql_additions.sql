@@ -1,6 +1,11 @@
 
 -- ==== aux_mysql additions (hand-written, not part of openHalo) ====
 
+CREATE FUNCTION mysql.show_diagnostics(boolean)
+    RETURNS TABLE ("Level" text, "Code" integer, "Message" text)
+    AS '$libdir/aux_mysql', 'mys_show_diagnostics'
+    LANGUAGE C STRICT VOLATILE;
+
 -- openHalo answered @@version in its protocol adapter from the
 -- mysql.halo_mysql_version setting; sysvar_core.c does the same, the row
 -- only makes the variable known to the system variable machinery.

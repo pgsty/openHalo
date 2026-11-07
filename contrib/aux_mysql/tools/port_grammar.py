@@ -567,5 +567,71 @@ rep('''					//n->collClause = collateClause;
 					(void) typeName;	/* only read by the code commented out above */
 ''')
 
+# The IF EXISTS spelling has two more tokens than the ordinary RENAME.
+start = s.index('| ALTER TABLE IF_P EXISTS relation_expr RENAME TO relation_expr')
+end = s.index('| ALTER SEQUENCE qualified_name RENAME TO name', start)
+f = s[start:end]
+assert f.count('n->object = (Node *)$6;') == 2
+s = s[:start] + f.replace('n->object = (Node *)$6;', 'n->object = (Node *)$8;') + s[end:]
+
+# FLOAT without a precision is single precision; DOUBLE remains float8.
+start = s.index('opt_float:')
+end = s.index('\n\t\t;', start)
+f = s[start:end]
+assert f.count('SystemTypeName("float8")') == 3
+# Retain FLOAT(25..53), but fix the unqualified/deprecated (M,D) forms.
+f = f.replace('$$ = SystemTypeName("float8");', '$$ = SystemTypeName("float4");')
+f = f.replace('else if ($2 <= 53)\n\t\t\t\t\t\t$$ = SystemTypeName("float4");',
+              'else if ($2 <= 53)\n\t\t\t\t\t\t$$ = SystemTypeName("float8");')
+s = s[:start] + f + s[end:]
+
+# DATETIME is a timestamp without time zone. A domain cannot carry a column's
+# precision; the old grammar discarded (N), making all prepared columns claim
+# six fractional digits. Keep the typmod on the native type instead.
+start = s.index("| DATETIME '(' Iconst ')'")
+end = s.index('| DATE\n', start)
+s = s[:start] + '''| DATETIME '(' Iconst ')'
+                {
+                    $$ = SystemTypeName("timestamp");
+                    $$->typmods = list_make1(makeIntConst($3, @3));
+                    $$->location = @1;
+                }
+            | DATETIME
+                {
+                    $$ = SystemTypeName("timestamp");
+                    $$->typmods = list_make1(makeIntConst(0, -1));
+                    $$->location = @1;
+                }
+            ''' + s[end:]
+
+# SHOW diagnostics reads the per-session diagnostic area through an SRF.
+rep('VariableShowStmt:\n', '''VariableShowStmt:
+            SHOW IDENT opt_select_limit
+                {
+                    SelectStmt *sel = makeNode(SelectStmt);
+                    RangeFunction *rf = makeNode(RangeFunction);
+                    ResTarget *target = makeNode(ResTarget);
+                    ColumnRef *star = makeNode(ColumnRef);
+                    FuncCall *call;
+
+                    if (pg_strcasecmp($2, "warnings") != 0 && pg_strcasecmp($2, "errors") != 0)
+                        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+                            errmsg("unsupported SHOW command: %s", $2), parser_errposition(@2)));
+                    call = makeFuncCall(list_make2(makeString("mysql"), makeString("show_diagnostics")),
+                        list_make1(makeBoolAConst(pg_strcasecmp($2, "errors") == 0, @2)),
+                        COERCE_EXPLICIT_CALL, @1);
+                    rf->functions = list_make1(list_make2(call, NIL));
+                    sel->fromClause = list_make1(rf);
+                    star->fields = list_make1(makeNode(A_Star));
+                    star->location = -1;
+                    target->val = (Node *) star;
+                    target->location = -1;
+                    sel->targetList = list_make1(target);
+                    insertSelectOptions(sel, NIL, NIL, $3, NULL, yyscanner);
+                    $$ = (Node *) sel;
+                }
+            |
+''')
+
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 print("ported grammar written to", dst)

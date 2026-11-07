@@ -37,7 +37,9 @@ get_bin_version(ClusterInfo *cluster)
 	FILE	   *output;
 	int			rc;
 	int			v1 = 0,
-				v2 = 0;
+				v2 = 0,
+				v3 = 0,
+				v4 = 0;
 
 	snprintf(cmd, sizeof(cmd), "\"%s/pg_ctl\" --version", cluster->bindir);
 	fflush(NULL);
@@ -53,6 +55,12 @@ get_bin_version(ClusterInfo *cluster)
 
 	if (sscanf(cmd_output, "%*s %*s %d.%d", &v1, &v2) < 1)
 		pg_fatal("could not get pg_ctl version output from %s", cmd);
+
+	/* The PG14 fork has different catalogs and a four-part brand version. */
+	if (cluster == &old_cluster &&
+		sscanf(cmd_output, "%*s %*s %d.%d.%d.%d", &v1, &v2, &v3, &v4) == 4 &&
+		v1 == 1 && v2 == 0 && v3 == 14)
+		pg_fatal("direct pg_upgrade from OpenHalo 14 is not supported; use a reviewed logical schema/data migration to OpenHalo 18 (see contrib/aux_mysql/MIGRATION.md)");
 
 	if (v1 < 10)
 	{

@@ -3,7 +3,7 @@
 openHalo's MySQL Supplementary Extension (version 1.5, same name and settings as in openHalo 1.0) on
 PostgreSQL 18. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
 aux_mysql held the SQL layer; here aux_mysql carries all of it, on top of the kernel's generic protocol
-extension hooks (this tree; the same patch also applies to IvorySQL, OrioleDB and Percona kernels). It must be
+extension hooks and its atomic sequence-advancement API. Other kernels need both APIs and separate validation. It must be
 loaded through `shared_preload_libraries` (the OpenHalo 18 default).
 
 ## Parameters
@@ -11,10 +11,11 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
 | Parameter | Default | |
 |---|---|---|
 | `mysql.listener_on` | on | enable the MySQL listener (restart) |
+| `mysql.max_allowed_packet` | 67108864 | incoming message / accumulated long-data byte limit; reload; read through `@@max_allowed_packet` |
 | `mysql.port` | 3306 | MySQL listener port, 0 disables it (restart) |
 | `mysql.listen_addresses` | (`listen_addresses`) | addresses of the MySQL listener (restart) |
 | `mysql.database` | `postgres` | database MySQL clients connect to; MySQL databases are its schemas |
-| `mysql.auto_create_extension` | on | a background worker runs `CREATE EXTENSION IF NOT EXISTS aux_mysql` in `mysql.database` at startup; not on standbys, not during `pg_upgrade` (restart) |
+| `mysql.auto_create_extension` | on | install synchronously on the first superuser MySQL connection; ordinary users need prior installation; disabled on standbys and during binary upgrade (restart) |
 | `mysql.halo_mysql_version` | `5.7.32-log` | version in the handshake, `version()` and `@@version`; below 8.0 the handshake announces `utf8mb4_general_ci` |
 | `mysql.default_authentication_plugin` | `caching_sha2_password` | or `mysql_clear_password` |
 | `mysql.auth_cache_size` | 1024 | caching_sha2_password fast-auth cache entries, 0 disables (restart) |
@@ -29,7 +30,8 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   TLS or RSA-OAEP) checked against the PostgreSQL SCRAM/MD5 verifier, so one password serves both protocols
   and `ALTER ROLE ... PASSWORD` invalidates the cache; TLS through PostgreSQL's `ssl_*` settings,
   `hostssl` and `pg_stat_ssl`; `pg_hba.conf`; `USE` / `COM_INIT_DB`.
-- **Prepared statements**: `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA` with binary result sets.
+- **Prepared statements**: `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA` with binary result sets;
+  `COM_RESET_CONNECTION` rolls back, clears variables/prepared statements/temp tables and resets session settings.
 - **Transactions**: `autocommit=0`, implicit commits before BEGIN / DDL / `SET autocommit=1`, statement-level
   rollback, a COMMIT of an aborted transaction reports an error.
 - **Semantics**: `/` returns DECIMAL, `DIV`, division by zero gives NULL plus a warning (error 1365 in strict
@@ -46,8 +48,9 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
 
 ## Known gaps
 
-- `SHOW WARNINGS` / `SHOW ERRORS`, `SHOW STATUS`, `SHOW VARIABLES LIKE`; `COM_RESET_CONNECTION` only closes
-  prepared statements; `information_schema` mapping is partial (GUI tools and ORMs need more).
+- `SHOW STATUS`, some `SHOW VARIABLES LIKE` forms; `information_schema` mapping is partial (GUI tools and ORMs need more).
+- Native ENUM/SET, negative and long-duration TIME, and direct PG14 physical upgrades remain unsupported;
+  [migration checks and explicit conversion examples](MIGRATION.md) describe the supported path.
 - Statement-level rollback uses a subtransaction per statement inside a transaction block: more than 64
   writing statements in one transaction overflow the PGPROC subxid cache; for bulk loads use autocommit or
   `mysql.statement_rollback = off`.
@@ -77,7 +80,11 @@ ECO_ROOT=/tmp/eco ECO_PRELOAD=aux_mysql tests/ecosystem/eco_check.sh <name> <pre
 ```
 
 `run.sh` runs the SQL scripts (`p*_*.sql` against `expected/`), PyMySQL, the raw `COM_STMT_*` protocol test,
-the mysql CLI and mysqlslap logins, and the Go / Connector/J driver tests when their toolchains are present.
+the mysql CLI and mysqlslap logins, and freshly rebuilt Go / Connector/J driver tests.
+Every run keeps separate logs. Exit 0 means all required groups passed; exit 1 means failures;
+exit 2 means missing dependencies (incomplete). Set `JAR` to the Connector/J jar and `LOG_DIR`
+to a new output directory. `sysbench.sh` separately counts completed and error-free scenarios;
+ignored database errors produce a nonzero exit. `ab_regress.py` additionally requires psycopg2.
 
 ## License
 

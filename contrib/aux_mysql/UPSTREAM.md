@@ -53,9 +53,9 @@ git show pg14:src/include/parser/mysql/mys_kwlist.h > src/parser/mys_kwlist.h
 | 25 | `f3518a1` | Improve show_create_table_impl / show_table_full_columns | SQL | 已移植（重新生成）：Collation 列、`SHOW CREATE TABLE` 的 `COLLATE` 显示 PG 排序规则名（`case_insensitive` 等，与上游一致）；aux_mysql 侧让这些名字可以回放 |
 | 26 | `3e43ac3` | fix #47: SHOW CHARACTER SET WHERE (#48) | 语法 | 已移植（重新生成）；`p5` 验证 |
 | 27 | `cdbd589` | Support ALTER USER (#50) | C | 已覆盖（同 11） |
-| 28 | `6d871d5` | Merge PG-14.18 (#52) | 内核 + C | 内核部分不适用（PG 18.6 已含这些修复）。MySQL 部分：① 删除 `mysql.ci_collation` GUC，大小写只由排序规则决定——aux_mysql 本来如此，同步删掉兼容层里恒为 false 的变量和 `bpchar.c`/`strfuncs.c` 中的分支；② 列排序规则映射从语法移到 `mys_parse_utilcmd.c`（表级 `COLLATE=` 参与判断，MODIFY 不带 COLLATE 回到 CI）——移植为 `mys_rewrite.c` 的 `rectify_column_collation()`，否则重新生成的语法会让 `COLLATE utf8mb4_bin` 直接报错；同时修掉表级 `COLLATE=` 被当成 reloption 传给 PG 的问题；③ `mys_tablecmds.c` / `mys_execMain.c` 是 PG back-patch 同步进分叉代码，aux_mysql 不分叉这些文件，不适用 |
+| 28 | `6d871d5` | Merge PG-14.18 (#52) | 内核 + C | 内核部分不适用（PG 18.6 已含这些修复）。MySQL 部分：① 删除 `mysql.ci_collation` GUC，大小写只由排序规则决定——aux_mysql 本来如此，同步删掉兼容层里恒为 false 的变量和 `bpchar.c`/`strfuncs.c` 中的分支；② 列排序规则映射从语法移到 `mys_parse_utilcmd.c`（表级 `COLLATE=` 参与判断，MODIFY 不带 COLLATE 回到 CI）——移植为 `mys_rewrite.c` 的列排序规则转换，否则重新生成的语法会让 `COLLATE utf8mb4_bin` 直接报错；同时修掉表级 `COLLATE=` 被当成 reloption 传给 PG 的问题；③ `mys_tablecmds.c` / `mys_execMain.c` 是 PG back-patch 同步进分叉代码，aux_mysql 不分叉这些文件，不适用 |
 | 29 | `6602ba8` | Merge PG-14.18 (#53) | — | 合并提交，无独立改动 |
-| 30 | `154ce7a` | Fix bugs | SQL + C | ① 语法错误后 `SHOW WARNINGS` 断连：不适用，aux_mysql 不断连（但 `SHOW WARNINGS` 本身尚未实现，见 HANDOFF P1）；② `mysql.setval()`：移植为 `mysSetval3Oid`，复用 aux_mysql 现有的单调推进实现（高水位 + 短时排他锁），不照搬直接改序列页的写法；③ 空表 `ALTER TABLE ... AUTO_INCREMENT=n` 直接重置计数器：已移植；④ `CREATE TABLE ... AUTO_INCREMENT=` 超过 int4：aux_mysql 已支持，`p5` 验证；⑤ MODIFY 自增列：aux_mysql 原来会报 “is an identity column”，已修复（保留 / 去掉 / 新增 AUTO_INCREMENT 三种情况，新增时从现有最大值之后继续）；⑥ 改排序规则时强制重写表：不适用，PG18 的 ALTER TYPE 自己处理 |
+| 30 | `154ce7a` | Fix bugs | SQL + C | ① 原“不适用”说法仅覆盖不断连，不代表功能等价；修复版补 SHOW WARNINGS/ERRORS 诊断区；② `mysql.setval()`：移植为 `mysSetval3Oid`，复用 aux_mysql 现有的单调推进实现（原高水位 + 排他锁实现存在倒退/死锁；现调用核心 SetSequenceValueAtLeast，在原序列页锁/WAL/权限路径中推进），不照搬直接改序列页的写法；③ 空表 `ALTER TABLE ... AUTO_INCREMENT=n` 直接重置计数器：已移植；④ `CREATE TABLE ... AUTO_INCREMENT=` 超过 int4：aux_mysql 已支持，`p5` 验证；⑤ MODIFY 自增列：aux_mysql 原来会报 “is an identity column”，已修复（保留 / 去掉 / 新增 AUTO_INCREMENT 三种情况，新增时从现有最大值之后继续）；⑥ 改排序规则时强制重写表：不适用，PG18 的 ALTER TYPE 自己处理 |
 | 31 | `c742044` | Supports compilation on macOS (#60) | C | 已移植：`uuid_short_core.c` 的 macOS 分支；语法里的 `ulong` 重新生成；`bpchar.c` 的 include 调整和 Makefile 的 ddsm 位置不适用（aux_mysql 有自己的 `pgsrc/` 拷贝和 PGXS Makefile） |
 | 32 | `e271848` | Update configure (#61) | 内核 | 不适用：PG14 configure（默认端口 1921→5432、删 SM3/C2/HSM 选项、版本串）；PG18 configure 原样 |
 | 33 | `ecd1942` | improve detail of transaction (#62) | C | 已覆盖：openHalo 在 COMMIT/ROLLBACK 后没清 `needStartNewTrx`；aux_mysql 的 autocommit 实现（`mys_txn.c`）没有这个状态位，`p3_txn` / `p5` 验证 COMMIT、ROLLBACK 后下一条语句开启新事务 |
@@ -63,13 +63,23 @@ git show pg14:src/include/parser/mysql/mys_kwlist.h > src/parser/mys_kwlist.h
 | 35 | `eb69c22` | Add acknowledgment for IMT Atlantique student project | 文档 | 原样保留 |
 | 36 | `90fc8d7` | Update COPYRIGHT | 文档 | 原样保留 |
 
-## 验证
+## 原移植时记录（不作为发布验收）
 
-- 内核：PG 18.6 + `pg18-protocol-hooks.patch`（debug + cassert），aux_mysql 编译无新增警告。
-- `tests/run.sh` 全绿，新增 `tests/p5_upstream.sql`（期望输出比对）覆盖上表中可观察的行为。
+- 原记录使用 PG18.6 + 协议补丁；独立审查发现新增与继承的编译警告，不能声称无新增警告。
+- 原 `run.sh` 只统计 m 脚本错误、缺驱动会静默跳过，原“全绿”不足以证明全部通过。修复版按错误预期和分组退出码判定，并报告跳过。
 - 手工核对：`CREATE USER ... IDENTIFIED BY` 建的用户能用 MySQL 协议登录；握手字符集 `8.0.30`→255、`5.7.32-log`→45；非超级用户执行 `mysql.getenv()` 被拒绝。
 
 ## 已知差异（未在本次处理）
 
-- `SHOW WARNINGS` / `SHOW ERRORS` 尚未实现（PG14 线有模拟实现）。
+- `SHOW WARNINGS` / `SHOW ERRORS` 已补基本诊断区，最多保留64条；不声称完整MySQL诊断系统。
 - `SHOW CREATE TABLE` 的 `COLLATE` 显示 PG 排序规则名，直接回放到真 MySQL 不通用。
+
+## 独立审查后的修复范围
+
+上表记录移植来源，不能证明每项边界正确。独立审查确认自增、LIKE、UNSIGNED、
+SHOW CREATE、表默认排序规则、协议时间/二进制、连接重置等回归。修复版新增
+`tests/ab_regress.py` 并修正 p5 对错误行为的期望；内核除原12文件协议补丁外，
+增加 commands/sequence.c、commands/sequence.h 的原子推进接口及 pg_upgrade 的
+旧OpenHalo版本拒绝提示。未改变PG节点/catalog布局，ClientSocket安装头布局变化仍在。
+当前支持范围及有意未恢复的PG14类型/升级能力见 [MIGRATION.md](MIGRATION.md)。
+发布通过数必须使用对应源码状态下的实际测试日志，不再沿用本历史记录的“全绿”。

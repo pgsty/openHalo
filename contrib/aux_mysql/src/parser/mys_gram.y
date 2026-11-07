@@ -2442,6 +2442,31 @@ FunctionSetResetClause:
 
 
 VariableShowStmt:
+            SHOW IDENT opt_select_limit
+                {
+                    SelectStmt *sel = makeNode(SelectStmt);
+                    RangeFunction *rf = makeNode(RangeFunction);
+                    ResTarget *target = makeNode(ResTarget);
+                    ColumnRef *star = makeNode(ColumnRef);
+                    FuncCall *call;
+
+                    if (pg_strcasecmp($2, "warnings") != 0 && pg_strcasecmp($2, "errors") != 0)
+                        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+                            errmsg("unsupported SHOW command: %s", $2), parser_errposition(@2)));
+                    call = makeFuncCall(list_make2(makeString("mysql"), makeString("show_diagnostics")),
+                        list_make1(makeBoolAConst(pg_strcasecmp($2, "errors") == 0, @2)),
+                        COERCE_EXPLICIT_CALL, @1);
+                    rf->functions = list_make1(list_make2(call, NIL));
+                    sel->fromClause = list_make1(rf);
+                    star->fields = list_make1(makeNode(A_Star));
+                    star->location = -1;
+                    target->val = (Node *) star;
+                    target->location = -1;
+                    sel->targetList = list_make1(target);
+                    insertSelectOptions(sel, NIL, NIL, $3, NULL, yyscanner);
+                    $$ = (Node *) sel;
+                }
+            |
 			//SHOW var_name
 			//	{
 			//		VariableShowStmt *n = makeNode(VariableShowStmt);
@@ -12341,7 +12366,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 					n->renameType = OBJECT_TABLE;
 					n->relation = $5;
 					// 为了传递新表名的schema
-                    n->object = (Node *)$6;
+                    n->object = (Node *)$8;
 					n->subname = NULL;
 					n->newname = NULL;
 					n->missing_ok = true;
@@ -12353,7 +12378,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 					n->renameType = OBJECT_TABLE;
 					n->relation = $5;
 					// 为了传递新表名的schema
-                    n->object = (Node *)$6;
+                    n->object = (Node *)$8;
 					n->subname = NULL;
 					n->newname = NULL;
 					n->missing_ok = true;
@@ -18239,11 +18264,11 @@ opt_float:	'(' Iconst ')'
             | '(' Iconst ',' Iconst ')'
                 {
                     // TOTO: float(M,D)怎么处理
-                    $$ = SystemTypeName("float8");
+                    $$ = SystemTypeName("float4");
                 }
 			| /*EMPTY*/
 				{
-					$$ = SystemTypeName("float8");
+					$$ = SystemTypeName("float4");
 				}
 		;
 
@@ -18719,20 +18744,16 @@ ConstDatetime:
 					$$->location = @1;
 				}
 			| DATETIME '(' Iconst ')'
-				{
-                    // $$ = SystemTypeName("timestamp");
-                    // $$->typmods = list_make1(makeIntConst($3, @3));
-                    $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-                                                             makeString("datetime")));
-					$$->location = @1;
+                {
+                    $$ = SystemTypeName("timestamp");
+                    $$->typmods = list_make1(makeIntConst($3, @3));
+                    $$->location = @1;
                 }
             | DATETIME
                 {
-                    // $$ = SystemTypeName("timestamp");
-                    // $$->typmods = list_make1(makeIntConst(0, -1));
-                    $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-                                                             makeString("datetime")));
-					$$->location = @1;
+                    $$ = SystemTypeName("timestamp");
+                    $$->typmods = list_make1(makeIntConst(0, -1));
+                    $$->location = @1;
                 }
             | DATE
                 {

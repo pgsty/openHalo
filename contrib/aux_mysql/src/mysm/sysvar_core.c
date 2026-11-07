@@ -48,6 +48,7 @@
 
 #include "postgres.h"
 #include "mysm_compat.h"
+#include "halo_mysql.h"
 #include "access/relscan.h"
 #include "access/sdir.h"
 #include "access/table.h"
@@ -208,6 +209,11 @@ GlobalSystemVariablesShmemInit(void)
 static bool
 getVersionVariable(const char *varName, char **varValue)
 {
+    if (pg_strcasecmp(varName, "max_allowed_packet") == 0)
+    {
+        *varValue = psprintf("%d", halo_mysql_max_allowed_packet);
+        return true;
+    }
     if (halo_mysql_version != NULL && pg_strcasecmp(varName, "version") == 0)
     {
         *varValue = pstrdup(halo_mysql_version);
@@ -279,6 +285,10 @@ setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
 {
     SystemVar *systemVar;
     bool found;
+
+    if (pg_strcasecmp(varName, "max_allowed_packet") == 0)
+        ereport(ERROR, (errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+                       errmsg("set mysql.max_allowed_packet in postgresql.conf and reload")));
 
     if (sessionSystemVars == NULL)
     {
@@ -813,6 +823,38 @@ initSessionSystemVars(SystemVar *systemVars[], int systemVarsNum)
         SystemVar *systemVar = systemVars[i];
         add2SessionSystemVars(systemVar);
     }
+}
+
+/* Reset an authenticated connection to current global/default values. */
+void
+resetSessionSystemVariables(void)
+{
+    MemoryContext old;
+    HASH_SEQ_STATUS scan;
+    SystemVar *entry;
+
+    if (sessionSystemVars == NULL)
+        initSystemVariables();
+    old = MemoryContextSwitchTo(TopMemoryContext);
+    hash_seq_init(&scan, sessionSystemVars);
+    while ((entry = hash_seq_search(&scan)) != NULL)
+    {
+        SystemVar copy = *entry;
+        SystemVar *global;
+
+        lockGlobalSystemVars();
+        global = hash_search(globalSystemVars, entry->varName, HASH_FIND, NULL);
+        if (entry->sessionDefValueFromGlobal && global)
+            strlcpy(copy.varConfValue, global->varConfValue, sizeof(copy.varConfValue));
+        else
+            strlcpy(copy.varConfValue, copy.varDefValue, sizeof(copy.varConfValue));
+        unlockGlobalSystemVars();
+        *entry = copy;
+        /* Applying values can allocate or throw: never hold the spinlock. */
+        applySystemVarValue(entry->varName, entry->varConfValue);
+    }
+    needCommitTrx = needStartNewTrx = false;
+    MemoryContextSwitchTo(old);
 }
 
 
@@ -1493,6 +1535,7 @@ applySystemVarValue(const char *varName, const char *varValue)
                                 MYS_MODE_NO_ZERO_DATE | MYS_MODE_ERROR_FOR_DIVISION_BY_ZERO},
                 {"NO_AUTO_CREATE_USER", MYS_MODE_NO_AUTO_CREATE_USER},
                 {"HIGH_NOT_PRECEDENCE", MYS_MODE_HIGH_NOT_PRECEDENCE},
+                {"PAD_CHAR_TO_FULL_LENGTH", MYS_MODE_PAD_CHAR_TO_FULL_LENGTH},
                 {NULL, 0}
             };
 

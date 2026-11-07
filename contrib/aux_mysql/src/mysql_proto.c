@@ -30,6 +30,8 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/discard.h"
+#include "funcapi.h"
 #include "common/string.h"
 #include "libpq/auth.h"
 #include "libpq/crypt.h"
@@ -52,12 +54,15 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/portal.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 
 #include "halo_mysql.h"
 #include "mys_proto.h"
 #include "adapter/mysql/adapter.h"
+#include "adapter/mysql/systemVar.h"
+#include "commands/mysql/mys_uservar.h"
 
 /* ----------------------------------------------------------------
  * Per-connection state
@@ -74,6 +79,69 @@ static int	client_auth_resp_len = 0;
 static bool handshake_done = false;
 static bool resultset_active = false;
 uint16		mys_warning_count = 0;
+
+#define MYS_MAX_DIAGNOSTICS 64
+static struct
+{
+	bool error;
+	uint16 code;
+	char *message;
+} diagnostics[MYS_MAX_DIAGNOSTICS];
+static int ndiagnostics = 0;
+static MemoryContext diagnostics_context = NULL;
+static bool diagnostics_pending = false;
+
+static void
+mys_clear_diagnostics(void)
+{
+	if (diagnostics_context)
+		MemoryContextReset(diagnostics_context);
+	ndiagnostics = 0;
+	mys_warning_count = 0;
+	diagnostics_pending = false;
+}
+
+static void
+mys_record_diagnostic(bool error, uint16 code, const char *message)
+{
+	if (diagnostics_pending)
+		mys_clear_diagnostics();
+	if (!diagnostics_context)
+		diagnostics_context = AllocSetContextCreate(TopMemoryContext,
+												   "MySQL diagnostics", ALLOCSET_SMALL_SIZES);
+	if (mys_warning_count < PG_UINT16_MAX)
+		mys_warning_count++;
+	if (ndiagnostics < MYS_MAX_DIAGNOSTICS)
+	{
+		diagnostics[ndiagnostics].error = error;
+		diagnostics[ndiagnostics].code = code;
+		diagnostics[ndiagnostics].message = MemoryContextStrdup(diagnostics_context, message);
+		ndiagnostics++;
+	}
+}
+
+PG_FUNCTION_INFO_V1(mys_show_diagnostics);
+Datum
+mys_show_diagnostics(PG_FUNCTION_ARGS)
+{
+	bool errors_only = PG_GETARG_BOOL(0);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
+	for (int i = 0; i < ndiagnostics; i++)
+	{
+		Datum values[3];
+		bool nulls[3] = {false, false, false};
+
+		if (errors_only && !diagnostics[i].error)
+			continue;
+		values[0] = CStringGetTextDatum(diagnostics[i].error ? "Error" : "Warning");
+		values[1] = Int32GetDatum(diagnostics[i].code);
+		values[2] = CStringGetTextDatum(diagnostics[i].message);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	return (Datum) 0;
+}
 
 #ifdef HALO_BABELFISH_API
 static List *bf_receivers = NIL;	/* result receiver state (MysDR) */
@@ -109,10 +177,10 @@ mys_current_stmt_info(void)
 
 /* a warning that is counted in the OK / EOF packet, without a log line */
 void
-mys_add_warning(void)
+mys_add_warning(uint16 code, const char *message)
 {
-	if (mys_is_mysql_session() && mys_warning_count < PG_UINT16_MAX)
-		mys_warning_count++;
+	if (mys_is_mysql_session())
+		mys_record_diagnostic(false, code, message);
 }
 
 /* does a later statement of this COM_QUERY send its own response? */
@@ -204,10 +272,11 @@ mys_read_packet(StringInfo buf)
 			return EOF;
 		len = hdr[0] | (hdr[1] << 8) | (hdr[2] << 16);
 		mys_seq = hdr[3] + 1;
-		if ((Size) buf->len + len >= MaxAllocSize - 1)
+		if ((Size) buf->len + len > (Size) halo_mysql_max_allowed_packet ||
+			(Size) buf->len + len >= MaxAllocSize - 1)
 			ereport(FATAL,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("MySQL packet too large")));
+					 errmsg("MySQL packet exceeds mysql.max_allowed_packet")));
 		enlargeStringInfo(buf, len);
 		if (len > 0 && pq_getbytes(buf->data + buf->len, len) == EOF)
 			return EOF;
@@ -237,6 +306,8 @@ mys_status_flags(bool more_results)
 		status |= SERVER_STATUS_IN_TRANS;
 	if (more_results)
 		status |= SERVER_MORE_RESULTS_EXISTS;
+	if (mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES)
+		status |= SERVER_STATUS_NO_BACKSLASH_ESCAPES;
 	return status;
 }
 
@@ -283,6 +354,8 @@ void
 mys_send_err(uint16 code, const char *sqlstate, const char *msg)
 {
 	StringInfoData b;
+
+	mys_record_diagnostic(true, code, msg);
 
 	initStringInfo(&b);
 	put_int1(&b, 0xff);
@@ -935,6 +1008,23 @@ mys_send_ready_for_query(CommandDest dest)
 
 	if (!handshake_done)
 	{
+		/* An installation error must close the connection, never send OK. */
+		PG_TRY();
+		{
+			halo_mysql_ensure_extension();
+		}
+		PG_CATCH();
+		{
+			ErrorData *edata;
+
+			MemoryContextSwitchTo(TopMemoryContext);
+			edata = CopyErrorData();
+			FlushErrorState();
+			ereport(FATAL,
+					(errcode(edata->sqlerrcode),
+					 errmsg("could not initialize MySQL session: %s", edata->message)));
+		}
+		PG_END_TRY();
 		handshake_done = true;
 		if (initial_db && initial_db[0] != '\0')
 		{
@@ -977,7 +1067,7 @@ mys_read_command(StringInfo inBuf)
 	if (mys_read_packet(inBuf) == EOF)
 		return EOF;
 
-	mys_warning_count = 0;
+	diagnostics_pending = true;
 	stmt_infos = NIL;
 	stmt_index = 0;
 	if (inBuf->len == 0)
@@ -992,14 +1082,6 @@ mys_read_command(StringInfo inBuf)
 			return PqMsg_Terminate;
 
 		case COM_QUERY:
-			/* strip the command byte; keep the NUL inside the message */
-			memmove(inBuf->data, inBuf->data + 1, inBuf->len - 1);
-			inBuf->len -= 1;
-			inBuf->data[inBuf->len] = '\0';
-			inBuf->len = strlen(inBuf->data) + 1;
-			inBuf->cursor = 0;
-			return PqMsg_Query;
-
 		case COM_STMT_EXECUTE:
 			{
 				/* becomes a regular query with the parameters rendered in */
@@ -1008,7 +1090,16 @@ mys_read_command(StringInfo inBuf)
 
 				PG_TRY();
 				{
-					mys_stmt_execute(inBuf);
+					if (cmd == COM_STMT_EXECUTE)
+						mys_stmt_execute(inBuf);
+					else
+					{
+						char *query = mys_normalize_query(inBuf->data + 1, inBuf->len - 1);
+
+						resetStringInfo(inBuf);
+						appendBinaryStringInfo(inBuf, query, strlen(query) + 1);
+						pfree(query);
+					}
 				}
 				PG_CATCH();
 				{
@@ -1053,9 +1144,33 @@ mys_process_command(int firstchar, StringInfo inBuf)
 			mys_send_ok(0, 0, false, false);
 			break;
 		case COM_RESET_CONNECTION:
-			mys_stmt_close_all();
-			mys_send_ok(0, 0, false, false);
-			break;
+			{
+				DiscardStmt discard = {0};
+				MemoryContext cxt = CurrentMemoryContext;
+				/* USE is a search_path assignment, including SQL USE statements. */
+				char *path = pstrdup(GetConfigOption("search_path", false, false));
+
+				AbortOutOfAnyTransaction();
+				MemoryContextSwitchTo(cxt);
+				mys_txn_recover();
+				mys_stmt_close_all();
+				mys_stmt_query_done();
+				clearUserVars();
+				StartTransactionCommand();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				discard.type = T_DiscardStmt;
+				discard.target = DISCARD_ALL;
+				DiscardCommand(&discard, true);
+				resetSessionSystemVariables();
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+				SetConfigOption("search_path", path, PGC_USERSET, PGC_S_SESSION);
+				affectedRows = 0;
+				lastInsertID = cur_insert_id = 0;
+				mys_clear_diagnostics();
+				mys_send_ok(0, 0, false, false);
+				break;
+			}
 		case COM_STMT_PREPARE:
 			mys_stmt_prepare(inBuf);
 			break;
@@ -1155,6 +1270,16 @@ mys_parse_query(const char *query_string)
 	}
 	stmt_index = 0;
 	cur_insert_id = 0;
+	foreach_ptr(MysStmtInfo, info, stmt_infos)
+	{
+		if (info->suppress_response)
+			continue;
+		if (!info->diagnostic)
+			mys_clear_diagnostics();
+		else
+			diagnostics_pending = false;
+		break;
+	}
 	return stmts;
 }
 
@@ -1214,6 +1339,17 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 		/* ROW_COUNT(): rows changed by the previous DML statement */
 		affectedRows = (qc->commandTag == CMDTAG_SELECT) ? -1 : (long long) affected;
 	}
+	/* A subsequent SHOW in the same packet reads the preceding statement. */
+	for (int i = stmt_index; i < list_length(stmt_infos); i++)
+	{
+		MysStmtInfo *next = list_nth(stmt_infos, i);
+
+		if (next->suppress_response)
+			continue;
+		if (!next->diagnostic)
+			mys_clear_diagnostics();
+		break;
+	}
 }
 
 #ifndef HALO_BABELFISH_API
@@ -1233,7 +1369,7 @@ mys_send_message(ErrorData *edata)
 	{
 		/* not the warnings of hidden BEGIN / COMMIT statements */
 		if (edata->elevel >= WARNING && !current_stmt_info()->txn_control)
-			mys_warning_count++;
+			mys_record_diagnostic(false, mys_errno(edata->sqlerrcode), edata->message);
 		return;
 	}
 
@@ -1346,7 +1482,7 @@ mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 	*charset = MYS_CHARSET_BINARY;
 
 	/* aux_mysql models tinyint, datetime, ... as domains */
-	typid = getBaseType(typid);
+	typid = getBaseTypeAndTypmod(typid, &typmod);
 
 	switch (typid)
 	{
@@ -1408,16 +1544,19 @@ mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 		case TIMETZOID:
 			*mtype = MYSQL_TYPE_TIME;
 			*len = 17;
+			*decimals = typmod >= 0 && typmod <= 6 ? typmod : 6;
 			*flags = BINARY_FLAG;
 			break;
 		case TIMESTAMPOID:
 			*mtype = MYSQL_TYPE_DATETIME;
 			*len = 26;
+			*decimals = typmod >= 0 && typmod <= 6 ? typmod : 6;
 			*flags = BINARY_FLAG;
 			break;
 		case TIMESTAMPTZOID:
 			*mtype = MYSQL_TYPE_TIMESTAMP;
 			*len = 26;
+			*decimals = typmod >= 0 && typmod <= 6 ? typmod : 6;
 			*flags = BINARY_FLAG;
 			break;
 		case BYTEAOID:
@@ -1597,6 +1736,18 @@ mys_append_value(StringInfo row, MysColumn *col, Datum value)
 				bytea	   *b = DatumGetByteaPP(value);
 
 				put_lenenc_str(row, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
+				return;
+			}
+		case BPCHAROID:
+			{
+				BpChar *b = DatumGetBpCharPP(value);
+				int len = VARSIZE_ANY_EXHDR(b);
+				char *s;
+
+				if (!(mys_sqlMode & MYS_MODE_PAD_CHAR_TO_FULL_LENGTH))
+					len = bpchartruelen(VARDATA_ANY(b), len);
+				s = pg_server_to_client(VARDATA_ANY(b), len);
+				put_lenenc_str(row, s, s == VARDATA_ANY(b) ? len : strlen(s));
 				return;
 			}
 
