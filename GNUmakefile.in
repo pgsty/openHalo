@@ -10,6 +10,11 @@ include $(top_builddir)/src/Makefile.global
 
 $(call recurse,all install,src config)
 
+# OpenHalo: the MySQL compatibility extension is part of the default build
+$(call recurse,all install,contrib/aux_mysql)
+all-contrib/aux_mysql-recurse: all-src-recurse
+install-contrib/aux_mysql-recurse: install-src-recurse
+
 docs:
 	$(MAKE) -C doc all
 
@@ -40,6 +45,7 @@ $(call recurse,install-world-bin,src config contrib,install)
 install-world-bin-contrib-recurse: install-world-bin-src-recurse
 
 $(call recurse,installdirs uninstall init-po update-po,doc src config)
+$(call recurse,uninstall,contrib/aux_mysql)
 
 $(call recurse,coverage,doc src config contrib)
 

@@ -1,0 +1,161 @@
+/*-------------------------------------------------------------------------
+ *
+ * halo_mysql.h
+ *	  MySQL compatibility extension for (patched) PostgreSQL 18.
+ *
+ * The wire protocol and SQL dialect support are derived from openHalo
+ * (https://github.com/pgsty/openhalo), GPL-3.0.
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef HALO_MYSQL_H
+#define HALO_MYSQL_H
+
+#include "nodes/pg_list.h"
+#ifndef HALO_BABELFISH_API
+#include "postmaster/protocol_extension.h"
+#endif
+
+/* GUC variables */
+extern int	halo_mysql_port;
+extern char *halo_mysql_listen_addresses;
+extern char *halo_mysql_database;
+extern bool halo_mysql_listener_on;
+extern char *halo_mysql_version;	/* mysql.halo_mysql_version (mys_compat.c) */
+extern int	halo_mysql_parser;
+
+typedef enum
+{
+	MYS_PARSER_MYSQL = 0,
+	MYS_PARSER_POSTGRES
+} MysParserMode;
+
+/* protocol id assigned by RegisterProtocolExtension() */
+extern int	halo_mysql_protocol_id;
+
+/* mysql_proto.c */
+#ifdef HALO_BABELFISH_API
+extern void mysql_babelfish_register(void);	/* Babelfish's protocol API */
+#else
+extern const ProtocolExtensionConfig mysql_protocol_config;
+#endif
+extern void mysql_listen_init(void);
+extern bool mys_is_mysql_session(void);
+
+/* how a MySQL statement interacts with transactions (mys_txn.c) */
+typedef enum MysTxnKind
+{
+	MYS_TXN_REGULAR = 0,		/* starts a transaction when autocommit = 0 */
+	MYS_TXN_NEUTRAL,			/* SET, SHOW, COMMIT AND CHAIN ... */
+	MYS_TXN_BEGIN,				/* BEGIN / START TRANSACTION */
+	MYS_TXN_END,				/* COMMIT / ROLLBACK */
+	MYS_TXN_IMPLICIT_COMMIT,	/* DDL and friends */
+	MYS_TXN_SET_AUTOCOMMIT,		/* SET autocommit = ... */
+	MYS_TXN_SAVEPOINT			/* SAVEPOINT / RELEASE / ROLLBACK TO */
+} MysTxnKind;
+
+/* hidden statements inserted by mys_txn.c */
+typedef enum MysTxnOp
+{
+	MYS_TXNOP_NONE = 0,
+	MYS_TXNOP_BEGIN,
+	MYS_TXNOP_COMMIT,
+	MYS_TXNOP_SAVEPOINT,		/* statement-level rollback point */
+	MYS_TXNOP_RELEASE
+} MysTxnOp;
+
+/* per-statement flags computed by mys_rewrite.c, consumed by mysql_proto.c */
+typedef struct MysStmtInfo
+{
+	bool		silent;				/* SET ...: send OK, not a result set */
+	bool		capture_insert_id;	/* hidden RETURNING of the AUTO_INCREMENT column */
+	bool		suppress_response;	/* helper statement of a multi-statement rewrite */
+	bool		group_start;		/* first PG statement of a MySQL statement */
+	bool		txn_control;		/* hidden statement (mys_txn.c) */
+	uint8		txn_op;				/* MysTxnOp of a hidden statement */
+	uint8		txn_kind;			/* MysTxnKind of the MySQL statement */
+	int8		set_autocommit;		/* SET autocommit = 0 / 1, -1 unknown */
+	bool		is_commit;			/* the client's COMMIT */
+	bool		is_write;			/* INSERT / UPDATE (strict mode rules) */
+	List	   *update_cols;		/* columns assigned by UPDATE / ON DUPLICATE KEY */
+} MysStmtInfo;
+
+/* mysql_proto.c */
+extern MysStmtInfo *mys_current_stmt_info(void);
+extern void mys_add_warning(void);
+
+/* mys_semantics.c */
+extern void mys_set_auto_increment(Oid relid, int64 next);
+extern void mys_sync_auto_increment(Oid relid);
+
+/* mys_rewrite.c: ENGINE= / ENCRYPTION= -> table access method, or NULL */
+struct DefElem;
+extern char *mys_engine_access_method(struct DefElem *d);
+
+/* mys_utility.c: per-table setup after MySQL DDL (triggers) */
+#define MYS_TABLE_SETUP_MARKER	"halo_mysql_table_setup"
+extern char *halo_mysql_default_collation;
+
+/* mys_txn.c */
+extern bool halo_mysql_statement_rollback;
+extern void mys_txn_classify(Node *stmt, MysStmtInfo *info);
+extern List *mys_txn_apply(List *stmts, List **infos);
+extern void mys_txn_stmt_done(MysStmtInfo *info);
+extern void mys_txn_recover(void);
+extern List *mys_txn_deferred_error(ErrorData *edata);
+extern bool mys_txn_is_deferred_error(Node *stmt);
+extern void mys_txn_raise_deferred_error(void);
+
+/* authentication plugin announced in the greeting */
+typedef enum
+{
+	MYS_AUTH_CACHING_SHA2 = 0,
+	MYS_AUTH_CLEARTEXT			/* legacy: AuthSwitch to mysql_clear_password */
+} MysAuthPlugin;
+
+extern int	halo_mysql_auth_plugin;
+extern int	halo_mysql_auth_cache_size;
+extern char *halo_mysql_rsa_private_key_file;
+
+/* mys_auth.c */
+extern Size mys_auth_shmem_size(void);
+extern void mys_auth_shmem_request(void);
+extern void mys_auth_shmem_startup(void);
+extern void mys_auth_postmaster_init(void);
+extern bool mys_sha2_fast_auth(const char *user, const char *shadow_pass,
+							   const char *nonce, int nonce_len,
+							   const uint8 *resp, int resp_len);
+extern void mys_sha2_cache_store(const char *user, const char *shadow_pass,
+								 const char *password);
+extern const char *mys_rsa_public_key(int *len);
+extern char *mys_rsa_decrypt_password(const uint8 *in, int inlen,
+									  const char *nonce, int nonce_len);
+
+/*
+ * Position map between a statement text with '?' markers (as prepared) and
+ * the text that is parsed (markers replaced by literals); lets mys_rewrite.c
+ * name result columns after the original text, as MySQL does.
+ */
+typedef struct MysTextMap
+{
+	const char *orig;
+	int			nparams;
+	const int  *orig_loc;		/* offset of each '?' in orig */
+	const int  *new_loc;		/* offset of its replacement in the parsed text */
+	const int  *new_len;		/* length of the replacement */
+} MysTextMap;
+
+/* mys_stmt.c: set while a prepared statement's text is parsed */
+extern MysTextMap *mys_text_map;
+
+/* mys_rewrite.c */
+extern List *mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string,
+								   List **infos);
+
+/* mys_utility.c */
+extern void mysql_utility_init(void);
+
+/* mysql_parser.c */
+extern List *mysql_raw_parser(const char *str);
+
+#endif							/* HALO_MYSQL_H */

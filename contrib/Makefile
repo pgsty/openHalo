@@ -8,6 +8,7 @@ SUBDIRS = \
 		amcheck		\
 		auth_delay	\
 		auto_explain	\
+		aux_mysql	\
 		basic_archive	\
 		basebackup_to_shell	\
 		bloom		\

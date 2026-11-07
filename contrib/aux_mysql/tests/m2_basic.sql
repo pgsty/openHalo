@@ -1,0 +1,10 @@
+select 1, 'a' as `col one`, 3 div 2, 5 % 3;
+select `id`, `name` from `t1` order by id limit 1, 1;
+select * from t1 where name = "alice";
+select concat('a','b');
+show databases;
+create table t2 (id int not null primary key, v varchar(10));
+insert into t2 values (1, 'x'), (2, "y");
+select * from t2;
+delete from t2 order by id desc limit 1;
+select * from t2;

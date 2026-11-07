@@ -1,0 +1,84 @@
+# aux_mysql
+
+openHalo's MySQL Supplementary Extension (version 1.5, same name and settings as in openHalo 1.0) on
+PostgreSQL 18. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
+aux_mysql held the SQL layer; here aux_mysql carries all of it, on top of the kernel's generic protocol
+extension hooks (this tree; the same patch also applies to IvorySQL, OrioleDB and Percona kernels). It must be
+loaded through `shared_preload_libraries` (the OpenHalo 18 default).
+
+## Parameters
+
+| Parameter | Default | |
+|---|---|---|
+| `mysql.listener_on` | on | enable the MySQL listener (restart) |
+| `mysql.port` | 3306 | MySQL listener port, 0 disables it (restart) |
+| `mysql.listen_addresses` | (`listen_addresses`) | addresses of the MySQL listener (restart) |
+| `mysql.database` | `postgres` | database MySQL clients connect to; MySQL databases are its schemas |
+| `mysql.auto_create_extension` | on | a background worker runs `CREATE EXTENSION IF NOT EXISTS aux_mysql` in `mysql.database` at startup; not on standbys, not during `pg_upgrade` (restart) |
+| `mysql.halo_mysql_version` | `5.7.32-log` | version in the handshake, `version()` and `@@version`; below 8.0 the handshake announces `utf8mb4_general_ci` |
+| `mysql.default_authentication_plugin` | `caching_sha2_password` | or `mysql_clear_password` |
+| `mysql.auth_cache_size` | 1024 | caching_sha2_password fast-auth cache entries, 0 disables (restart) |
+| `mysql.rsa_private_key_file` | `mysql_rsa_private_key.pem` | RSA key for the public key exchange, generated in the data directory if missing (restart) |
+| `mysql.statement_rollback` | on | a failing statement inside a transaction rolls back only itself (hidden savepoints) |
+| `mysql.default_collation` | `case_insensitive` | collation (schema `mysql`) of string columns without COLLATE; empty: database default |
+| `mysql.parser` | `mysql` | dialect of queries over the MySQL protocol: `mysql` or `postgres` |
+
+## What works
+
+- **Connections**: `caching_sha2_password` as in MySQL 8 (fast auth from a shared-memory cache, full auth over
+  TLS or RSA-OAEP) checked against the PostgreSQL SCRAM/MD5 verifier, so one password serves both protocols
+  and `ALTER ROLE ... PASSWORD` invalidates the cache; TLS through PostgreSQL's `ssl_*` settings,
+  `hostssl` and `pg_stat_ssl`; `pg_hba.conf`; `USE` / `COM_INIT_DB`.
+- **Prepared statements**: `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA` with binary result sets.
+- **Transactions**: `autocommit=0`, implicit commits before BEGIN / DDL / `SET autocommit=1`, statement-level
+  rollback, a COMMIT of an aborted transaction reports an error.
+- **Semantics**: `/` returns DECIMAL, `DIV`, division by zero gives NULL plus a warning (error 1365 in strict
+  mode), case-insensitive string columns by default (`*_ci`; `*_bin` and a non-`_ci` table `COLLATE=` stay
+  case-sensitive), lenient conversions when `sql_mode` is not strict, `ON UPDATE CURRENT_TIMESTAMP`,
+  AUTO_INCREMENT (identity columns: explicit values advance the counter, `ALTER TABLE ... AUTO_INCREMENT`,
+  MODIFY / CHANGE keeping, adding or dropping it).
+- **Dialect**: openHalo's MySQL grammar (backquotes, `LIMIT m,n`, `"strings"`, `UPDATE ... JOIN`, inline
+  `KEY`, `COMMENT`, `ALTER TABLE MODIFY/CHANGE/ADD INDEX/DROP PRIMARY KEY`, `ON DUPLICATE KEY UPDATE`,
+  `REPLACE`, `INSERT IGNORE`, `CREATE USER ... IDENTIFIED BY`, `SHOW DATABASES/TABLES/COLUMNS/INDEX/CREATE TABLE/
+  CHARACTER SET`, user and system variables, MySQL functions from aux_mysql), `ENGINE=` mapped to a table
+  access method of that name, `ENCRYPTION='Y'` to `tde_heap` when pg_tde is installed.
+- **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
+
+## Known gaps
+
+- `SHOW WARNINGS` / `SHOW ERRORS`, `SHOW STATUS`, `SHOW VARIABLES LIKE`; `COM_RESET_CONNECTION` only closes
+  prepared statements; `information_schema` mapping is partial (GUI tools and ORMs need more).
+- Statement-level rollback uses a subtransaction per statement inside a transaction block: more than 64
+  writing statements in one transaction overflow the PGPROC subxid cache; for bulk loads use autocommit or
+  `mysql.statement_rollback = off`.
+- `bigint unsigned` is an int8 domain (no values above 2^63-1); no zero dates; `'a' = 'A'` between two
+  literals is case-sensitive (literals use the database collation); `1.5e0` is numeric, not DOUBLE.
+- No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
+- `SHOW CREATE TABLE` shows PostgreSQL collation names (`COLLATE case_insensitive`); they replay into
+  aux_mysql, not into MySQL.
+- PostgreSQL's MVCC differs from InnoDB locking reads for concurrent delete + insert of the same key
+  (duplicate key errors where MySQL waits).
+
+## openHalo upstream
+
+The grammar (`src/parser/mys_gram.y`) and the SQL layer (`sql/aux_mysql.sql`) are generated from openHalo's
+PG14 sources (branch `pg14` of this repository) by `tools/port_grammar.py` and `tools/port_aux_sql.py`; each
+replacement asserts its match count, so upstream changes fail loudly. C code from openHalo lives in
+`src/mysm`, with its original copyright headers. `UPSTREAM.md` records how each upstream commit up to
+`90fc8d7` was ported.
+
+## Tests
+
+```sh
+tests/kernel_instance.sh <prefix> <pgdata> <pgport> <mysqlport>   # instance, user dbuser_mysql, schema test
+PGBIN=<prefix>/bin PGPORT=<pgport> MYSQL_PORT=<mysqlport> tests/run.sh
+MYSQL_PORT=<mysqlport> tests/sysbench.sh
+ECO_ROOT=/tmp/eco ECO_PRELOAD=aux_mysql tests/ecosystem/eco_check.sh <name> <prefix> <port>
+```
+
+`run.sh` runs the SQL scripts (`p*_*.sql` against `expected/`), PyMySQL, the raw `COM_STMT_*` protocol test,
+the mysql CLI and mysqlslap logins, and the Go / Connector/J driver tests when their toolchains are present.
+
+## License
+
+Derived from openHalo: GNU GPL v3 (`../../LICENSE`), openHalo copyright notice in `COPYRIGHT`.

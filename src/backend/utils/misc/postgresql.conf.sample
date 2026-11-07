@@ -65,7 +65,7 @@
 #max_connections = 100			# (change requires restart)
 #reserved_connections = 0		# (change requires restart)
 #superuser_reserved_connections = 3	# (change requires restart)
-#unix_socket_directories = '/tmp'	# comma-separated list of directories
+unix_socket_directories = '/tmp'	# comma-separated list of directories
 					# (change requires restart)
 #unix_socket_group = ''			# (change requires restart)
 #unix_socket_permissions = 0777		# begin with 0 to use octal notation
@@ -810,7 +810,8 @@
 
 #local_preload_libraries = ''
 #session_preload_libraries = ''
-#shared_preload_libraries = ''		# (change requires restart)
+shared_preload_libraries = 'aux_mysql'	# OpenHalo: MySQL compatibility
+					# (change requires restart)
 #jit_provider = 'llvmjit'		# JIT library to use
 
 # - Other Defaults -
@@ -887,3 +888,29 @@
 #------------------------------------------------------------------------------
 
 # Add settings for extensions here
+
+# - OpenHalo: MySQL protocol and dialect (aux_mysql) -
+
+# MySQL clients connect to mysql.port; the listener follows listen_addresses
+# unless mysql.listen_addresses is set.  MySQL databases are schemas inside
+# mysql.database, where the aux_mysql extension is created at startup.
+mysql.listener_on = true			# enable MySQL listener
+					# (change requires restart)
+mysql.port = 3306			# (change requires restart)
+mysql.halo_mysql_version = '5.7.32-log'	# version reported to MySQL clients
+#mysql.listen_addresses = ''		# empty: same as listen_addresses
+					# (change requires restart)
+#mysql.database = 'postgres'		# database MySQL clients land in
+#mysql.auto_create_extension = on	# CREATE EXTENSION aux_mysql there at
+					# startup (change requires restart)
+#mysql.default_authentication_plugin = 'caching_sha2_password'
+					# or mysql_clear_password
+#mysql.auth_cache_size = 1024		# caching_sha2_password fast-auth cache
+					# (change requires restart)
+#mysql.rsa_private_key_file = 'mysql_rsa_private_key.pem'
+					# generated in the data directory if missing
+					# (change requires restart)
+#mysql.statement_rollback = on		# roll back only the failing statement
+#mysql.default_collation = 'case_insensitive'
+					# collation of string columns without COLLATE
+#mysql.parser = 'mysql'			# dialect of the MySQL protocol: mysql, postgres

@@ -1,0 +1,13 @@
+create table t1 (id serial primary key, name varchar(32) not null, score numeric(10,2), created timestamptz default now(), data bytea);
+insert into t1(name, score, data) values ('alice', 90.5, 'A'), ('bob', null, null);
+select id, name, score, data from t1 order by id;
+update t1 set score = 60 where name = 'bob';
+select count(*) from t1 where score > 50;
+select * from nosuch;
+insert into t1(id, name) values (1, 'dup');
+select 1/0;
+begin;
+insert into t1(name) values ('carol');
+rollback;
+select count(*) as cnt from t1;
+select 1 as a; select 2 as b;

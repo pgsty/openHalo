@@ -1,0 +1,589 @@
+/*-------------------------------------------------------------------------
+ *
+ * mys_utility.c
+ *	  ProcessUtility hook: execute MySQL-only ALTER TABLE subcommands.
+ *
+ * openHalo implemented these in a forked tablecmds.c (mys_tablecmds.c,
+ * ~17k lines).  aux_mysql translates them into ordinary PostgreSQL
+ * utility statements at execution time, when the catalog can be consulted
+ * (e.g. to find the primary key name for DROP PRIMARY KEY).
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/relation.h"
+#include "access/xact.h"
+#include "catalog/dependency.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_trigger.h"
+#include "commands/defrem.h"
+#include "commands/trigger.h"
+#include "nodes/makefuncs.h"
+#include "tcop/utility.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
+#include "utils/syscache.h"
+
+#include "halo_mysql.h"
+#include "mys_parsenodes.h"
+
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+
+/* row triggers maintained by mysql_table_setup() */
+#define ON_UPDATE_TRIGGER	"aux_mysql_on_update"
+#define AUTOINC_TRIGGER		"aux_mysql_auto_increment"
+
+static void
+run_utility(Node *stmt, PlannedStmt *orig, const char *queryString,
+			ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	PlannedStmt *wrapper = makeNode(PlannedStmt);
+
+	wrapper->commandType = CMD_UTILITY;
+	wrapper->canSetTag = false;
+	wrapper->utilityStmt = stmt;
+	wrapper->stmt_location = orig->stmt_location;
+	wrapper->stmt_len = orig->stmt_len;
+
+	/*
+	 * Each generated command is a complete DDL command of its own: run it as
+	 * a QUERY so that event triggers fire for it.  Event-trigger based
+	 * extensions depend on that -- pg_tde decides whether a rewritten table
+	 * file is encrypted in its ddl_command_start trigger, so as a
+	 * SUBCOMMAND an ALTER of an encrypted table would write plaintext.
+	 */
+	ProcessUtility(wrapper, queryString, false, PROCESS_UTILITY_QUERY,
+				   params, queryEnv, None_Receiver, NULL);
+	CommandCounterIncrement();
+}
+
+static AlterTableCmd *
+make_cmd(AlterTableType subtype, char *name, Node *def)
+{
+	AlterTableCmd *cmd = makeNode(AlterTableCmd);
+
+	cmd->subtype = subtype;
+	cmd->name = name;
+	cmd->def = def;
+	cmd->behavior = DROP_RESTRICT;
+	return cmd;
+}
+
+static void
+flush_cmds(AlterTableStmt *orig, List **cmds, PlannedStmt *pstmt,
+		   const char *queryString, ParamListInfo params,
+		   QueryEnvironment *queryEnv)
+{
+	AlterTableStmt *stmt;
+
+	if (*cmds == NIL)
+		return;
+	stmt = makeNode(AlterTableStmt);
+	stmt->relation = copyObject(orig->relation);
+	stmt->objtype = OBJECT_TABLE;
+	stmt->missing_ok = orig->missing_ok;
+	stmt->cmds = *cmds;
+	run_utility((Node *) stmt, pstmt, queryString, params, queryEnv);
+	*cmds = NIL;
+}
+
+static Node *
+make_column_comment(Oid relid, char *colname, char *comment)
+{
+	CommentStmt *cs = makeNode(CommentStmt);
+
+	cs->objtype = OBJECT_COLUMN;
+	cs->object = (Node *) list_make3(makeString(get_namespace_name(get_rel_namespace(relid))),
+									 makeString(get_rel_name(relid)),
+									 makeString(colname));
+	cs->comment = comment;
+	return (Node *) cs;
+}
+
+static bool
+column_in_primary_key(Oid relid, const char *colname)
+{
+	Relation	rel = relation_open(relid, NoLock);
+	Oid			pkoid = RelationGetPrimaryKeyIndex(rel, true);
+	AttrNumber	attnum = get_attnum(relid, colname);
+	bool		found = false;
+
+	relation_close(rel, NoLock);
+
+	if (OidIsValid(pkoid) && attnum > 0)
+	{
+		Relation	idx = index_open(pkoid, AccessShareLock);
+
+		for (int i = 0; i < idx->rd_index->indnkeyatts; i++)
+			if (idx->rd_index->indkey.values[i] == attnum)
+				found = true;
+		index_close(idx, AccessShareLock);
+	}
+	return found;
+}
+
+static bool
+column_is_identity(Oid relid, AttrNumber attnum)
+{
+	HeapTuple	tp = SearchSysCache2(ATTNUM, ObjectIdGetDatum(relid), Int16GetDatum(attnum));
+	bool		result = false;
+
+	if (HeapTupleIsValid(tp))
+	{
+		result = ((Form_pg_attribute) GETSTRUCT(tp))->attidentity != '\0';
+		ReleaseSysCache(tp);
+	}
+	return result;
+}
+
+/*
+ * MODIFY/CHANGE [COLUMN] col <full column definition>: MySQL replaces the
+ * whole definition (type, nullability, default, AUTO_INCREMENT).
+ *
+ * AUTO_INCREMENT columns are identity columns (mys_rewrite.c): keep the
+ * identity when the new definition still says AUTO_INCREMENT (openHalo
+ * 154ce7a fixed the same case in its kernel), drop it when it does not, and
+ * add one -- counter after the current maximum -- when the column gains it.
+ */
+static void
+modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
+			  List **cmds, List **after, bool *added_identity,
+			  PlannedStmt *pstmt, const char *queryString,
+			  ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	ColumnDef  *tdef = makeNode(ColumnDef);
+	TypeCast   *using = makeNode(TypeCast);
+	ColumnRef  *cref = makeNode(ColumnRef);
+	bool		notnull = def->is_not_null;
+	Node	   *defexpr = NULL;
+	Constraint *identity = NULL;
+	AttrNumber	attnum = get_attnum(relid, colname);
+	bool		was_identity = attnum > 0 && column_is_identity(relid, attnum);
+	ListCell   *lc;
+
+	foreach(lc, def->constraints)
+	{
+		Node	   *n = lfirst(lc);
+
+		if (IsA(n, Constraint))
+		{
+			Constraint *c = (Constraint *) n;
+
+			if (c->contype == CONSTR_NOTNULL || c->contype == CONSTR_PRIMARY)
+				notnull = true;
+			else if (c->contype == CONSTR_DEFAULT)
+				defexpr = c->raw_expr;
+			else if (c->contype == CONSTR_IDENTITY)
+				identity = c;
+		}
+		else if (IsA(n, CommentStmt))
+			*after = lappend(*after, make_column_comment(relid, colname,
+														  ((CommentStmt *) n)->comment));
+	}
+	if (identity)
+	{
+		notnull = true;			/* AUTO_INCREMENT columns are NOT NULL */
+		defexpr = NULL;			/* and have no DEFAULT */
+	}
+
+	/*
+	 * Drop the old default first: it may not be castable to the new type.
+	 * An identity column has no default; drop the identity instead when the
+	 * new definition has no AUTO_INCREMENT.
+	 */
+	if (!was_identity)
+		*cmds = lappend(*cmds, make_cmd(AT_ColumnDefault, colname, NULL));
+	else if (!identity)
+		*cmds = lappend(*cmds, make_cmd(AT_DropIdentity, colname, NULL));
+	flush_cmds(orig, cmds, pstmt, queryString, params, queryEnv);
+
+	/*
+	 * The AUTO_INCREMENT trigger fires on UPDATE OF the identity column,
+	 * which blocks ALTER TYPE; the table setup that follows MODIFY / CHANGE
+	 * recreates it.
+	 */
+	if (was_identity)
+	{
+		DropStmt   *drop = makeNode(DropStmt);
+
+		drop->removeType = OBJECT_TRIGGER;
+		drop->objects = list_make1(list_make3(makeString(get_namespace_name(get_rel_namespace(relid))),
+											  makeString(get_rel_name(relid)),
+											  makeString(AUTOINC_TRIGGER)));
+		drop->behavior = DROP_RESTRICT;
+		drop->missing_ok = true;
+		run_utility((Node *) drop, pstmt, queryString, params, queryEnv);
+	}
+
+	/* ALTER COLUMN col TYPE t USING col::t  (MySQL converts implicitly) */
+	cref->fields = list_make1(makeString(colname));
+	cref->location = -1;
+	using->arg = (Node *) cref;
+	using->typeName = def->typeName;
+	using->location = -1;
+	tdef->colname = colname;
+	tdef->typeName = def->typeName;
+	tdef->collClause = def->collClause;
+	tdef->raw_default = (Node *) using;
+	*cmds = lappend(*cmds, make_cmd(AT_AlterColumnType, colname, (Node *) tdef));
+
+	if (notnull)
+		*cmds = lappend(*cmds, make_cmd(AT_SetNotNull, colname, NULL));
+	else if (!column_in_primary_key(relid, colname))
+		*cmds = lappend(*cmds, make_cmd(AT_DropNotNull, colname, NULL));
+
+	if (defexpr)
+		*cmds = lappend(*cmds, make_cmd(AT_ColumnDefault, colname, defexpr));
+
+	if (identity && !was_identity)
+	{
+		Constraint *c = makeNode(Constraint);
+
+		c->contype = CONSTR_IDENTITY;
+		c->generated_when = ATTRIBUTE_IDENTITY_BY_DEFAULT;
+		c->options = NIL;
+		c->location = -1;
+		*cmds = lappend(*cmds, make_cmd(AT_AddIdentity, colname, (Node *) c));
+		*added_identity = true;
+	}
+}
+
+static void
+mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryString,
+				  ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	Oid			relid;
+	Relation	rel;
+	List	   *cmds = NIL;
+	List	   *after = NIL;
+	bool		added_identity = false;
+	ListCell   *lc;
+
+	relid = RangeVarGetRelid(stmt->relation, AccessShareLock, stmt->missing_ok);
+	if (!OidIsValid(relid))
+		return;
+
+	/*
+	 * Only peek at the relation between sub-statements: an open relcache
+	 * reference would make ALTER TABLE fail with "being used by active
+	 * queries in this session".
+	 */
+#define REL_OPEN()	(rel = relation_open(relid, NoLock))
+#define REL_CLOSE()	relation_close(rel, NoLock)
+
+	foreach(lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+		switch ((int) cmd->subtype)
+		{
+			case AT_ModifyColumn:
+				modify_column(stmt, relid, cmd->name, (ColumnDef *) cmd->def, &cmds, &after,
+							  &added_identity, pstmt, queryString, params, queryEnv);
+				break;
+
+			case AT_ChangeColumn:
+				{
+					ColumnDef  *def = (ColumnDef *) cmd->def;
+
+					if (strcmp(cmd->name, def->colname) != 0)
+					{
+						RenameStmt *rn = makeNode(RenameStmt);
+
+						flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
+						rn->renameType = OBJECT_COLUMN;
+						rn->relationType = OBJECT_TABLE;
+						rn->relation = copyObject(stmt->relation);
+						rn->subname = cmd->name;
+						rn->newname = def->colname;
+						run_utility((Node *) rn, pstmt, queryString, params, queryEnv);
+					}
+					modify_column(stmt, relid, def->colname, def, &cmds, &after,
+								  &added_identity, pstmt, queryString, params, queryEnv);
+					break;
+				}
+
+			case AT_DropPrimaryKey:
+				{
+					Oid			pkoid;
+					Oid			conoid;
+
+					REL_OPEN();
+					pkoid = RelationGetPrimaryKeyIndex(rel, true);
+					REL_CLOSE();
+					conoid = OidIsValid(pkoid) ? get_index_constraint(pkoid) : InvalidOid;
+
+					if (!OidIsValid(conoid))
+						ereport(ERROR,
+								(errcode(ERRCODE_UNDEFINED_OBJECT),
+								 errmsg("Can't DROP 'PRIMARY'; check that column/key exists")));
+					cmds = lappend(cmds, make_cmd(AT_DropConstraint, get_constraint_name(conoid), NULL));
+					break;
+				}
+
+			case AT_DropIndex:
+				if (OidIsValid(get_relation_constraint_oid(relid, cmd->name, true)))
+					cmds = lappend(cmds, make_cmd(AT_DropConstraint, cmd->name, NULL));
+				else
+				{
+					DropStmt   *drop = makeNode(DropStmt);
+
+					flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
+					drop->removeType = OBJECT_INDEX;
+					drop->objects = list_make1(list_make2(makeString(get_namespace_name(get_rel_namespace(relid))),
+														  makeString(cmd->name)));
+					drop->behavior = DROP_RESTRICT;
+					run_utility((Node *) drop, pstmt, queryString, params, queryEnv);
+				}
+				break;
+
+			case AT_DropForeignKey:
+			case AT_DropCheck:
+				cmds = lappend(cmds, make_cmd(AT_DropConstraint, cmd->name, NULL));
+				break;
+
+			case AT_TableOption:
+				{
+					ListCell   *lc2;
+
+					foreach(lc2, (List *) cmd->def)
+					{
+						DefElem    *d = lfirst_node(DefElem, lc2);
+
+						if (strcmp(d->defname, "auto_increment") == 0)
+							mys_set_auto_increment(relid, defGetInt64(d));
+						else if (strcmp(d->defname, "engine") == 0 ||
+								 strcmp(d->defname, "encryption") == 0)
+						{
+							/* ENGINE=x / ENCRYPTION='Y': SET ACCESS METHOD */
+							char	   *am = mys_engine_access_method(d);
+
+							if (am)
+								cmds = lappend(cmds, make_cmd(AT_SetAccessMethod, am, NULL));
+						}
+						else if (strcmp(d->defname, "comment") == 0)
+						{
+							CommentStmt *cs = makeNode(CommentStmt);
+
+							cs->objtype = OBJECT_TABLE;
+							cs->object = (Node *) list_make2(makeString(get_namespace_name(get_rel_namespace(relid))),
+															 makeString(get_rel_name(relid)));
+							cs->comment = strVal(d->arg);
+							after = lappend(after, cs);
+						}
+						/* ENGINE, CHARSET ... : accepted, ignored */
+					}
+					break;
+				}
+
+			default:
+				cmds = lappend(cmds, cmd);
+				break;
+		}
+	}
+	flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
+
+	/* a column that just became AUTO_INCREMENT continues after its maximum */
+	if (added_identity)
+		mys_sync_auto_increment(relid);
+
+	foreach(lc, after)
+		run_utility(lfirst(lc), pstmt, queryString, params, queryEnv);
+}
+
+/* ----------------------------------------------------------------
+ * Per-table setup after MySQL DDL: triggers for ON UPDATE CURRENT_TIMESTAMP
+ * and the AUTO_INCREMENT counter (see mys_rewrite.c make_table_setup()).
+ * ----------------------------------------------------------------
+ */
+
+static bool
+is_table_setup(Node *stmt)
+{
+	DoStmt	   *d = (DoStmt *) stmt;
+
+	return IsA(stmt, DoStmt) && d->args != NIL &&
+		strcmp(linitial_node(DefElem, d->args)->defname, MYS_TABLE_SETUP_MARKER) == 0;
+}
+
+static void
+create_row_trigger(const char *nsp, const char *rel, const char *name,
+				   const char *func, int16 events, List *args, List *columns,
+				   PlannedStmt *pstmt, const char *queryString,
+				   ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	CreateTrigStmt *t = makeNode(CreateTrigStmt);
+
+	t->replace = true;
+	t->isconstraint = false;
+	t->trigname = pstrdup(name);
+	t->relation = makeRangeVar(pstrdup(nsp), pstrdup(rel), -1);
+	t->funcname = list_make2(makeString("mysql"), makeString(pstrdup(func)));
+	t->args = args;
+	t->row = true;
+	t->timing = TRIGGER_TYPE_BEFORE;
+	t->events = events;
+	t->columns = columns;
+	run_utility((Node *) t, pstmt, queryString, params, queryEnv);
+}
+
+static void
+mysql_table_setup(DoStmt *d, PlannedStmt *pstmt, const char *queryString,
+				  ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	RangeVar   *rv = (RangeVar *) linitial_node(DefElem, d->args)->arg;
+	Oid			relid = RangeVarGetRelid(rv, NoLock, true);
+	Relation	rel;
+	bool	   *on_update;
+	bool		had_on_update = false;
+	bool		had_autoinc = false;
+	char	   *identity = NULL;
+	char	   *nsp;
+	char	   *relname;
+	List	   *args = NIL;
+	int			natts;
+
+	if (!OidIsValid(relid))
+		return;
+
+	rel = relation_open(relid, AccessShareLock);
+	natts = RelationGetDescr(rel)->natts;
+	on_update = palloc0(sizeof(bool) * (natts + 1));
+	if (rel->trigdesc)
+	{
+		for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+		{
+			Trigger    *tg = &rel->trigdesc->triggers[i];
+
+			if (strcmp(tg->tgname, ON_UPDATE_TRIGGER) == 0)
+			{
+				had_on_update = true;
+				for (int k = 0; k < tg->tgnargs; k++)
+				{
+					int			attnum = atoi(tg->tgargs[k]);
+
+					if (attnum > 0 && attnum <= natts)
+						on_update[attnum] = true;
+				}
+			}
+			else if (strcmp(tg->tgname, AUTOINC_TRIGGER) == 0)
+				had_autoinc = true;
+		}
+	}
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), i);
+
+		if (!att->attisdropped && att->attidentity)
+			identity = pstrdup(NameStr(att->attname));
+	}
+	nsp = get_namespace_name(RelationGetNamespace(rel));
+	relname = pstrdup(RelationGetRelationName(rel));
+	relation_close(rel, AccessShareLock);
+
+	for (ListCell *lc = lnext(d->args, list_head(d->args)); lc; lc = lnext(d->args, lc))
+	{
+		DefElem    *e = lfirst_node(DefElem, lc);
+		AttrNumber	attnum = get_attnum(relid, strVal(e->arg));
+
+		if (attnum <= 0 || attnum > natts)
+			continue;
+		on_update[attnum] = strcmp(e->defname, "on_update_add") == 0;
+	}
+
+	for (int attnum = 1; attnum <= natts; attnum++)
+	{
+		if (on_update[attnum])
+			args = lappend(args, makeString(psprintf("%d", attnum)));
+	}
+	if (args != NIL)
+		create_row_trigger(nsp, relname, ON_UPDATE_TRIGGER, "on_update_current_timestamp",
+						   TRIGGER_TYPE_UPDATE, args, NIL,
+						   pstmt, queryString, params, queryEnv);
+	else if (had_on_update)
+	{
+		DropStmt   *drop = makeNode(DropStmt);
+
+		drop->removeType = OBJECT_TRIGGER;
+		drop->objects = list_make1(list_make3(makeString(nsp), makeString(relname),
+											  makeString(ON_UPDATE_TRIGGER)));
+		drop->behavior = DROP_RESTRICT;
+		run_utility((Node *) drop, pstmt, queryString, params, queryEnv);
+	}
+
+	/* UPDATE OF the identity column only: other updates do not need it */
+	if (identity && !had_autoinc)
+		create_row_trigger(nsp, relname, AUTOINC_TRIGGER, "auto_increment_advance",
+						   TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE, NIL,
+						   list_make1(makeString(identity)),
+						   pstmt, queryString, params, queryEnv);
+	else if (!identity && had_autoinc)
+	{
+		/* MODIFY dropped AUTO_INCREMENT */
+		DropStmt   *drop = makeNode(DropStmt);
+
+		drop->removeType = OBJECT_TRIGGER;
+		drop->objects = list_make1(list_make3(makeString(nsp), makeString(relname),
+											  makeString(AUTOINC_TRIGGER)));
+		drop->behavior = DROP_RESTRICT;
+		run_utility((Node *) drop, pstmt, queryString, params, queryEnv);
+	}
+}
+
+static bool
+has_mysql_subcommands(AlterTableStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->cmds)
+	{
+		if ((int) lfirst_node(AlterTableCmd, lc)->subtype > AT_MysBase)
+			return true;
+	}
+	return false;
+}
+
+static void
+mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+				   bool readOnlyTree, ProcessUtilityContext context,
+				   ParamListInfo params, QueryEnvironment *queryEnv,
+				   DestReceiver *dest, QueryCompletion *qc)
+{
+	Node	   *parsetree = pstmt->utilityStmt;
+
+	/* syntax error of a statement inside a transaction (mys_txn.c) */
+	if (mys_txn_is_deferred_error(parsetree))
+		mys_txn_raise_deferred_error();
+
+	if (is_table_setup(parsetree))
+	{
+		mysql_table_setup((DoStmt *) parsetree, pstmt, queryString, params, queryEnv);
+		return;
+	}
+
+	if (IsA(parsetree, AlterTableStmt) &&
+		has_mysql_subcommands((AlterTableStmt *) parsetree))
+	{
+		mysql_alter_table(copyObject((AlterTableStmt *) parsetree), pstmt,
+						  queryString, params, queryEnv);
+		return;
+	}
+
+	if (prev_ProcessUtility)
+		prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+							params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+}
+
+void
+mysql_utility_init(void)
+{
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = mys_ProcessUtility;
+}

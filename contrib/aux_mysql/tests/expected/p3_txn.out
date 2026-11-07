@@ -1,0 +1,100 @@
++--------------+
+| @@autocommit |
++--------------+
+| 0            |
++--------------+
++----------------+----------+
+| after rollback | count(*) |
++----------------+----------+
+| after rollback |        0 |
++----------------+----------+
++--------------+----------+
+| after commit | count(*) |
++--------------+----------+
+| after commit |        1 |
++--------------+----------+
++----------------------+----------+
+| after begin+rollback | count(*) |
++----------------------+----------+
+| after begin+rollback |        2 |
++----------------------+----------+
++--------------------+----------+
+| after ddl+rollback | count(*) |
++--------------------+----------+
+| after ddl+rollback |        3 |
++--------------------+----------+
++--------------+----------+
+| ddl survived | count(*) |
++--------------+----------+
+| ddl survived |        0 |
++--------------+----------+
++------------------------+----------+
+| after set autocommit=1 | count(*) |
++------------------------+----------+
+| after set autocommit=1 |        4 |
++------------------------+----------+
++--------------+
+| @@autocommit |
++--------------+
+| 0            |
++--------------+
++--------------+
+| @@autocommit |
++--------------+
+| 1            |
++--------------+
+--------------
+
+--------------
+
+ERROR 1062 (23505) at line 46: duplicate key value violates unique constraint "tx_pkey"
++-----------------+------------------------------+
+| multi-statement | group_concat(id order by id) |
++-----------------+------------------------------+
+| multi-statement | 1,2,3,4,5                    |
++-----------------+------------------------------+
+--------------
+insert into tx values (1, 'duplicate')
+--------------
+
+ERROR 1062 (23505) at line 54: duplicate key value violates unique constraint "tx_pkey"
++-------------------+------------------------------+
+| after error+begin | group_concat(id order by id) |
++-------------------+------------------------------+
+| after error+begin | 1,2,3,4,5,7,8                |
++-------------------+------------------------------+
+--------------
+selec 1
+--------------
+
+ERROR 1064 (42601) at line 63: syntax error at or near "selec"
+--------------
+select * from no_such_table
+--------------
+
+ERROR 1146 (42P01) at line 64: relation "no_such_table" does not exist
++--------------------+------------------------------+
+| after syntax error | group_concat(id order by id) |
++--------------------+------------------------------+
+| after syntax error | 1,2,3,4,5,7,8,9,10           |
++--------------------+------------------------------+
++--------------------+
+| statement_rollback |
++--------------------+
+| off                |
++--------------------+
+--------------
+insert into tx values (1, 'duplicate')
+--------------
+
+ERROR 1062 (23505) at line 79: duplicate key value violates unique constraint "tx_pkey"
+--------------
+commit
+--------------
+
+ERROR 1180 (40000) at line 80: Transaction was rolled back, not committed: an earlier statement failed
++--------------------+
+| statement_rollback |
++--------------------+
+| on                 |
++--------------------+
