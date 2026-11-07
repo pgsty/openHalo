@@ -1,9 +1,8 @@
 -- Tests for range data types.
 
-create type textrange as range (subtype=text, collation="C");
-
 --
 -- test input parser
+-- (type textrange was already made in test_setup.sql)
 --
 
 -- negative tests; should fail
@@ -40,6 +39,19 @@ select '[a,a]'::textrange;
 select '[a,a)'::textrange;
 select '(a,a]'::textrange;
 select '(a,a)'::textrange;
+
+-- Also try it with non-error-throwing API
+select pg_input_is_valid('(1,4)', 'int4range');
+select pg_input_is_valid('(1,4', 'int4range');
+select * from pg_input_error_info('(1,4', 'int4range');
+select pg_input_is_valid('(4,1)', 'int4range');
+select * from pg_input_error_info('(4,1)', 'int4range');
+select pg_input_is_valid('(4,zed)', 'int4range');
+select * from pg_input_error_info('(4,zed)', 'int4range');
+select pg_input_is_valid('[1,2147483647]', 'int4range');
+select * from pg_input_error_info('[1,2147483647]', 'int4range');
+select pg_input_is_valid('[2000-01-01,5874897-12-31]', 'daterange');
+select * from pg_input_error_info('[2000-01-01,5874897-12-31]', 'daterange');
 
 --
 -- create some test data and test the operators
@@ -422,15 +434,28 @@ select '[2010-01-01 01:00:00 -05, 2010-01-01 02:00:00 -08)'::tstzrange;
 select '[2010-01-01 01:00:00 -08, 2010-01-01 02:00:00 -05)'::tstzrange;
 set timezone to default;
 
+-- CREATE TYPE AS RANGE checks for USAGE on subtype
+CREATE ROLE regress_subtype;
+CREATE TYPE mytype AS (a INT, b INT);
+REVOKE USAGE ON TYPE mytype FROM PUBLIC;
+SET ROLE regress_subtype;
+CREATE TYPE myrange AS RANGE (subtype = mytype);
+RESET ROLE;
+GRANT USAGE ON TYPE mytype TO regress_subtype;
+SET ROLE regress_subtype;
+CREATE TYPE myrange AS RANGE (subtype = mytype);
+RESET ROLE;
+DROP TYPE mytype CASCADE;
+DROP ROLE regress_subtype;
+
 --
 -- Test user-defined range of floats
+-- (type float8range was already made in test_setup.sql)
 --
 
 --should fail
-create type float8range as range (subtype=float8, subtype_diff=float4mi);
+create type bogus_float8range as range (subtype=float8, subtype_diff=float4mi);
 
---should succeed
-create type float8range as range (subtype=float8, subtype_diff=float8mi);
 select '[123.001, 5.e9)'::float8range @> 888.882::float8;
 create table float8range_test(f8r float8range, i int);
 insert into float8range_test values(float8range(-100.00007, '1.111113e9'), 42);
@@ -550,7 +575,7 @@ select array[1,3] <@ arrayrange(array[1,2], array[2,1]);
 create type two_ints as (a int, b int);
 create type two_ints_range as range (subtype = two_ints);
 
--- with force_parallel_mode on, this exercises tqueue.c's range remapping
+-- with debug_parallel_query on, this exercises tqueue.c's range remapping
 select *, row_to_json(upper(t)) as u from
   (values (two_ints_range(row(1,2), row(3,4))),
           (two_ints_range(row(5,6), row(7,8)))) v(t);
@@ -564,11 +589,11 @@ drop type two_ints cascade;
 -- Check behavior when subtype lacks a hash function
 --
 
-create type cashrange as range (subtype = money);
+create type varbitrange as range (subtype = varbit);
 
 set enable_sort = off;  -- try to make it pick a hash setop implementation
 
-select '(2,5)'::cashrange except select '(5,6)'::cashrange;
+select '(01,10)'::varbitrange except select '(10,11)'::varbitrange;
 
 reset enable_sort;
 
@@ -618,3 +643,72 @@ create function inoutparam_fail(inout i anyelement, out r anyrange)
 --should fail
 create function table_fail(i anyelement) returns table(i anyelement, r anyrange)
   as $$ select $1, '[1,10]' $$ language sql;
+
+--
+-- Test support functions
+--
+
+-- empty range
+explain (verbose, costs off)
+select current_date <@ daterange 'empty';
+
+-- unbounded range
+explain (verbose, costs off)
+select current_date <@ daterange(NULL, NULL);
+
+-- only lower bound present
+explain (verbose, costs off)
+select current_date <@ daterange('2000-01-01', NULL, '[)');
+
+-- only upper bound present
+explain (verbose, costs off)
+select current_date <@ daterange(NULL, '2000-01-01', '(]');
+
+-- lower range "-Infinity" excluded
+explain (verbose, costs off)
+select current_date <@ daterange('-Infinity', '1997-04-10'::date, '()');
+
+-- lower range "-Infinity" included
+explain (verbose, costs off)
+select current_date <@ daterange('-Infinity', '1997-04-10'::date, '[)');
+
+-- upper range "Infinity" excluded
+explain (verbose, costs off)
+select current_date <@ daterange('2002-09-25'::date, 'Infinity', '[)');
+
+-- upper range "Infinity" included
+explain (verbose, costs off)
+select current_date <@ daterange('2002-09-25'::date, 'Infinity', '[]');
+
+-- should also work if we use "@>"
+explain (verbose, costs off)
+select daterange('-Infinity', '1997-04-10'::date, '()') @> current_date;
+
+explain (verbose, costs off)
+select daterange('2002-09-25'::date, 'Infinity', '[]') @> current_date;
+
+-- Check that volatile cases are not optimized
+explain (verbose, costs off)
+select now() <@ tstzrange('2024-01-20 00:00', '2024-01-21 00:00');
+explain (verbose, costs off)  -- unsafe!
+select clock_timestamp() <@ tstzrange('2024-01-20 00:00', '2024-01-21 00:00');
+explain (verbose, costs off)
+select clock_timestamp() <@ tstzrange('2024-01-20 00:00', NULL);
+
+-- test a custom range type with a non-default operator class
+create type textrange_supp as range (
+   subtype = text,
+   subtype_opclass = text_pattern_ops
+);
+
+create temp table text_support_test (t text collate "C");
+
+insert into text_support_test values ('a'), ('c'), ('d'), ('ch');
+
+explain (costs off)
+select * from text_support_test where t <@ textrange_supp('a', 'd');
+select * from text_support_test where t <@ textrange_supp('a', 'd');
+
+drop table text_support_test;
+
+drop type textrange_supp;

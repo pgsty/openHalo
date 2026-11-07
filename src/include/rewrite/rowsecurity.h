@@ -5,7 +5,7 @@
  *	  prototypes for rewrite/rowsecurity.c and the structures for managing
  *	  the row security policies for relations in relcache.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * -------------------------------------------------------------------------
@@ -45,12 +45,5 @@ extern void get_row_security_policies(Query *root,
 									  RangeTblEntry *rte, int rt_index,
 									  List **securityQuals, List **withCheckOptions,
 									  bool *hasRowSecurity, bool *hasSubLinks);
-
-
-extern void standard_get_row_security_policies(Query *root,
-									  		   RangeTblEntry *rte, int rt_index,
-									  		   List **securityQuals, List **withCheckOptions,
-									  		   bool *hasRowSecurity, bool *hasSubLinks);
-
 
 #endif							/* ROWSECURITY_H */

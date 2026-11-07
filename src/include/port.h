@@ -3,7 +3,7 @@
  * port.h
  *	  Header for src/port/ compatibility functions.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port.h
@@ -14,8 +14,6 @@
 #define PG_PORT_H
 
 #include <ctype.h>
-#include <netdb.h>
-#include <pwd.h>
 
 /*
  * Windows has enough specialized port stuff that we push most of it off
@@ -37,13 +35,18 @@ typedef SOCKET pgsocket;
 #define PGINVALID_SOCKET INVALID_SOCKET
 #endif
 
+/* if platform lacks socklen_t, we assume this will work */
+#ifndef HAVE_SOCKLEN_T
+typedef unsigned int socklen_t;
+#endif
+
 /* non-blocking */
 extern bool pg_set_noblock(pgsocket sock);
 extern bool pg_set_block(pgsocket sock);
 
 /* Portable path handling for Unix/Win32 (in path.c) */
 
-extern bool has_drive_prefix(const char *filename);
+extern bool has_drive_prefix(const char *path);
 extern char *first_dir_separator(const char *filename);
 extern char *last_dir_separator(const char *filename);
 extern char *first_path_var_separator(const char *pathlist);
@@ -51,10 +54,11 @@ extern void join_path_components(char *ret_path,
 								 const char *head, const char *tail);
 extern void canonicalize_path(char *path);
 extern void canonicalize_path_enc(char *path, int encoding);
-extern void make_native_path(char *path);
+extern void make_native_path(char *filename);
 extern void cleanup_path(char *path);
 extern bool path_contains_parent_reference(const char *path);
 extern bool path_is_relative_and_below_cwd(const char *path);
+extern bool path_is_safe_for_extraction(const char *path);
 extern bool path_is_prefix_of_path(const char *path1, const char *path2);
 extern char *make_absolute_path(const char *path);
 extern const char *get_progname(const char *argv0);
@@ -124,7 +128,8 @@ extern void pgfnames_cleanup(char **filenames);
 	case EHOSTUNREACH: \
 	case ENETDOWN: \
 	case ENETRESET: \
-	case ENETUNREACH
+	case ENETUNREACH: \
+	case ETIMEDOUT
 
 /* Portable locale initialization (in exec.c) */
 extern void set_pglocale_pgservice(const char *argv0, const char *app);
@@ -134,14 +139,14 @@ extern int	validate_exec(const char *path);
 extern int	find_my_exec(const char *argv0, char *retpath);
 extern int	find_other_exec(const char *argv0, const char *target,
 							const char *versionstr, char *retpath);
-extern char *pipe_read_line(char *cmd, char *line, int maxsize);
+extern char *pipe_read_line(char *cmd);
 
 /* Doesn't belong here, but this is used with find_other_exec(), so... */
-#define PG_BACKEND_VERSIONSTR "postgres (Halo) " PG_VERSION_PREFIX PG_VERSION "\n"
+#define PG_BACKEND_VERSIONSTR "postgres (PostgreSQL) " PG_VERSION "\n"
 
 #ifdef EXEC_BACKEND
 /* Disable ASLR before exec, for developer builds only (in exec.c) */
-extern int pg_disable_aslr(void);
+extern int	pg_disable_aslr(void);
 #endif
 
 
@@ -205,14 +210,23 @@ extern unsigned char pg_ascii_tolower(unsigned char ch);
 #undef printf
 #endif
 
-extern int	pg_vsnprintf(char *str, size_t count, const char *fmt, va_list args);
+extern int	pg_vsnprintf(char *str, size_t count, const char *fmt, va_list args) pg_attribute_printf(3, 0);
 extern int	pg_snprintf(char *str, size_t count, const char *fmt,...) pg_attribute_printf(3, 4);
-extern int	pg_vsprintf(char *str, const char *fmt, va_list args);
+extern int	pg_vsprintf(char *str, const char *fmt, va_list args) pg_attribute_printf(2, 0);
 extern int	pg_sprintf(char *str, const char *fmt,...) pg_attribute_printf(2, 3);
-extern int	pg_vfprintf(FILE *stream, const char *fmt, va_list args);
+extern int	pg_vfprintf(FILE *stream, const char *fmt, va_list args) pg_attribute_printf(2, 0);
 extern int	pg_fprintf(FILE *stream, const char *fmt,...) pg_attribute_printf(2, 3);
-extern int	pg_vprintf(const char *fmt, va_list args);
+extern int	pg_vprintf(const char *fmt, va_list args) pg_attribute_printf(1, 0);
 extern int	pg_printf(const char *fmt,...) pg_attribute_printf(1, 2);
+
+#ifndef WIN32
+/*
+ * We add a pg_ prefix as a warning that the Windows implementations have the
+ * non-standard side-effect of changing the current file position.
+ */
+#define pg_pread pread
+#define pg_pwrite pwrite
+#endif
 
 /*
  * We use __VA_ARGS__ for printf to prevent replacing references to
@@ -325,7 +339,6 @@ extern bool rmtree(const char *path, bool rmtopdir);
  * open() and fopen() replacements to allow deletion of open files and
  * passing of other special options.
  */
-#define		O_DIRECT	0x80000000
 extern HANDLE pgwin32_open_handle(const char *, int, bool);
 extern int	pgwin32_open(const char *, int,...);
 extern FILE *pgwin32_fopen(const char *, const char *);
@@ -355,11 +368,6 @@ extern FILE *pgwin32_popen(const char *command, const char *type);
 #define popen(a,b) pgwin32_popen(a,b)
 #define pclose(a) _pclose(a)
 
-/* New versions of MingW have gettimeofday, old mingw and msvc don't */
-#ifndef HAVE_GETTIMEOFDAY
-/* Last parameter not used */
-extern int	gettimeofday(struct timeval *tp, struct timezone *tzp);
-#endif
 #else							/* !WIN32 */
 
 /*
@@ -393,15 +401,6 @@ extern int	gettimeofday(struct timeval *tp, struct timezone *tzp);
 #define pgoff_t off_t
 #endif
 
-extern double pg_erand48(unsigned short xseed[3]);
-extern long pg_lrand48(void);
-extern long pg_jrand48(unsigned short xseed[3]);
-extern void pg_srand48(long seed);
-
-#ifndef HAVE_FLS
-extern int	fls(int mask);
-#endif
-
 #ifndef HAVE_GETPEEREID
 /* On Windows, Perl might have incompatible definitions of uid_t and gid_t. */
 #ifndef PLPERL_HAVE_UID_GID
@@ -429,16 +428,13 @@ extern int	getpeereid(int sock, uid_t *uid, gid_t *gid);
 extern void explicit_bzero(void *buf, size_t len);
 #endif
 
-#ifndef HAVE_STRTOF
-extern float strtof(const char *nptr, char **endptr);
-#endif
-
 #ifdef HAVE_BUGGY_STRTOF
 extern float pg_strtof(const char *nptr, char **endptr);
 #define strtof(a,b) (pg_strtof((a),(b)))
 #endif
 
-#ifndef HAVE_LINK
+#ifdef WIN32
+/* src/port/win32link.c */
 extern int	link(const char *src, const char *dst);
 #endif
 
@@ -452,25 +448,6 @@ extern char *mkdtemp(char *path);
 extern int	inet_aton(const char *cp, struct in_addr *addr);
 #endif
 
-/*
- * Windows and older Unix don't have pread(2) and pwrite(2).  We have
- * replacement functions, but they have slightly different semantics so we'll
- * use a name with a pg_ prefix to avoid confusion.
- */
-#ifdef HAVE_PREAD
-#define pg_pread pread
-#else
-extern ssize_t pg_pread(int fd, void *buf, size_t nbyte, off_t offset);
-#endif
-
-#ifdef HAVE_PWRITE
-#define pg_pwrite pwrite
-#else
-extern ssize_t pg_pwrite(int fd, const void *buf, size_t nbyte, off_t offset);
-#endif
-
-/* For pg_pwritev() and pg_preadv(), see port/pg_iovec.h. */
-
 #if !HAVE_DECL_STRLCAT
 extern size_t strlcat(char *dst, const char *src, size_t siz);
 #endif
@@ -483,57 +460,18 @@ extern size_t strlcpy(char *dst, const char *src, size_t siz);
 extern size_t strnlen(const char *str, size_t maxlen);
 #endif
 
-#if !defined(HAVE_RANDOM)
-extern long random(void);
+#if !HAVE_DECL_STRSEP
+extern char *strsep(char **stringp, const char *delim);
 #endif
 
-#ifndef HAVE_SETENV
-extern int	setenv(const char *name, const char *value, int overwrite);
-#endif
-
-#ifndef HAVE_UNSETENV
-extern int	unsetenv(const char *name);
-#endif
-
-#ifndef HAVE_SRANDOM
-extern void srandom(unsigned int seed);
-#endif
-
-#ifndef HAVE_DLOPEN
-extern void *dlopen(const char *file, int mode);
-extern void *dlsym(void *handle, const char *symbol);
-extern int	dlclose(void *handle);
-extern char *dlerror(void);
+#if !HAVE_DECL_TIMINGSAFE_BCMP
+extern int	timingsafe_bcmp(const void *b1, const void *b2, size_t len);
 #endif
 
 /*
- * In some older systems, the RTLD_NOW flag isn't defined and the mode
- * argument to dlopen must always be 1.
+ * Callers should use the qsort() macro defined below instead of calling
+ * pg_qsort() directly.
  */
-#if !HAVE_DECL_RTLD_NOW
-#define RTLD_NOW 1
-#endif
-
-/*
- * The RTLD_GLOBAL flag is wanted if available, but it doesn't exist
- * everywhere.  If it doesn't exist, set it to 0 so it has no effect.
- */
-#if !HAVE_DECL_RTLD_GLOBAL
-#define RTLD_GLOBAL 0
-#endif
-
-/* thread.h */
-#ifndef WIN32
-extern int	pqGetpwuid(uid_t uid, struct passwd *resultbuf, char *buffer,
-					   size_t buflen, struct passwd **result);
-#endif
-
-extern int	pqGethostbyname(const char *name,
-							struct hostent *resultbuf,
-							char *buffer, size_t buflen,
-							struct hostent **result,
-							int *herrno);
-
 extern void pg_qsort(void *base, size_t nel, size_t elsize,
 					 int (*cmp) (const void *, const void *));
 extern int	pg_qsort_strcmp(const void *a, const void *b);
@@ -548,10 +486,16 @@ extern void qsort_arg(void *base, size_t nel, size_t elsize,
 extern void qsort_interruptible(void *base, size_t nel, size_t elsize,
 								qsort_arg_comparator cmp, void *arg);
 
-extern void *bsearch_arg(const void *key, const void *base,
+extern void *bsearch_arg(const void *key, const void *base0,
 						 size_t nmemb, size_t size,
 						 int (*compar) (const void *, const void *, void *),
 						 void *arg);
+
+/* port/pg_localeconv_r.c */
+extern int	pg_localeconv_r(const char *lc_monetary,
+							const char *lc_numeric,
+							struct lconv *output);
+extern void pg_localeconv_free(struct lconv *lconv);
 
 /* port/chklocale.c */
 extern int	pg_get_encoding_from_locale(const char *ctype, bool write_message);
@@ -583,16 +527,39 @@ extern int	pg_mkdir_p(char *path, int omode);
 /* port/pqsignal.c (see also interfaces/libpq/legacy-pqsignal.c) */
 #ifdef FRONTEND
 #define pqsignal pqsignal_fe
+#else
+#define pqsignal pqsignal_be
 #endif
-typedef void (*pqsigfunc) (int signo);
-extern pqsigfunc pqsignal(int signo, pqsigfunc func);
+typedef void (*pqsigfunc) (SIGNAL_ARGS);
+extern void pqsignal(int signo, pqsigfunc func);
 
 /* port/quotes.c */
 extern char *escape_single_quotes_ascii(const char *src);
 
 /* common/wait_error.c */
-extern char *wait_result_to_str(int exit_status);
+extern char *wait_result_to_str(int exitstatus);
 extern bool wait_result_is_signal(int exit_status, int signum);
 extern bool wait_result_is_any_signal(int exit_status, bool include_command_not_found);
+extern int	wait_result_to_exit_code(int exit_status);
+
+/*
+ * Interfaces that we assume all Unix system have.  We retain individual macros
+ * for better documentation.
+ *
+ * For symlink-related functions, there is often no need to test these macros,
+ * because we provided basic support on Windows that can work with absolute
+ * paths to directories.  Code that wants to test for complete symlink support
+ * (including relative paths and non-directories) should be conditional on
+ * HAVE_READLINK or HAVE_SYMLINK.
+ */
+#ifndef WIN32
+#define HAVE_GETRLIMIT 1
+#define HAVE_POLL 1
+#define HAVE_POLL_H 1
+#define HAVE_READLINK 1
+#define HAVE_SETSID 1
+#define HAVE_SHM_OPEN 1
+#define HAVE_SYMLINK 1
+#endif
 
 #endif							/* PG_PORT_H */

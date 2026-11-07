@@ -52,7 +52,9 @@ CHECKPOINT
   </para>
 
   <para>
-   Only superusers can call <command>CHECKPOINT</command>.
+   Only superusers or users with the privileges of
+   the <xref linkend="predefined-role-pg-checkpoint"/>
+   role can call <command>CHECKPOINT</command>.
   </para>
  </refsect1>
 

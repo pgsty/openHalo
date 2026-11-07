@@ -4,7 +4,7 @@
  *	  prototypes for parse_relation.c.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_relation.h
@@ -16,8 +16,6 @@
 
 #include "parser/parse_node.h"
 
-
-#define JOIN_RESET_ALIAS "#HALO"
 
 extern ParseNamespaceItem *refnameNamespaceItem(ParseState *pstate,
 												const char *schemaname,
@@ -33,6 +31,7 @@ extern void checkNameSpaceConflicts(ParseState *pstate, List *namespace1,
 extern ParseNamespaceItem *GetNSItemByRangeTablePosn(ParseState *pstate,
 													 int varno,
 													 int sublevels_up);
+extern ParseNamespaceItem *GetNSItemByVar(ParseState *pstate, Var *var);
 extern RangeTblEntry *GetRTEByRangeTablePosn(ParseState *pstate,
 											 int varno,
 											 int sublevels_up);
@@ -43,6 +42,7 @@ extern Node *scanNSItemForColumn(ParseState *pstate, ParseNamespaceItem *nsitem,
 								 int location);
 extern Node *colNameToVar(ParseState *pstate, const char *colname, bool localonly,
 						  int location);
+extern void markNullableIfNeeded(ParseState *pstate, Var *var);
 extern void markVarForSelectPriv(ParseState *pstate, Var *var);
 extern Relation parserOpenTable(ParseState *pstate, const RangeVar *relation,
 								int lockmode);
@@ -90,7 +90,7 @@ extern ParseNamespaceItem *addRangeTableEntryForJoin(ParseState *pstate,
 													 List *aliasvars,
 													 List *leftcols,
 													 List *rightcols,
-													 Alias *joinalias,
+													 Alias *join_using_alias,
 													 Alias *alias,
 													 bool inFromCl);
 extern ParseNamespaceItem *addRangeTableEntryForCTE(ParseState *pstate,
@@ -101,21 +101,29 @@ extern ParseNamespaceItem *addRangeTableEntryForCTE(ParseState *pstate,
 extern ParseNamespaceItem *addRangeTableEntryForENR(ParseState *pstate,
 													RangeVar *rv,
 													bool inFromCl);
+extern ParseNamespaceItem *addRangeTableEntryForGroup(ParseState *pstate,
+													  List *groupClauses);
+extern RTEPermissionInfo *addRTEPermissionInfo(List **rteperminfos,
+											   RangeTblEntry *rte);
+extern RTEPermissionInfo *getRTEPermissionInfo(List *rteperminfos,
+											   RangeTblEntry *rte);
 extern bool isLockedRefname(ParseState *pstate, const char *refname);
 extern void addNSItemToQuery(ParseState *pstate, ParseNamespaceItem *nsitem,
 							 bool addToJoinList,
 							 bool addToRelNameSpace, bool addToVarNameSpace);
-extern void errorMissingRTE(ParseState *pstate, RangeVar *relation) pg_attribute_noreturn();
-extern void errorMissingColumn(ParseState *pstate,
-							   const char *relname, const char *colname, int location) pg_attribute_noreturn();
+pg_noreturn extern void errorMissingRTE(ParseState *pstate, RangeVar *relation);
+pg_noreturn extern void errorMissingColumn(ParseState *pstate,
+										   const char *relname, const char *colname, int location);
 extern void expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
+					  VarReturningType returning_type,
 					  int location, bool include_dropped,
 					  List **colnames, List **colvars);
-extern List *expandNSItemVars(ParseNamespaceItem *nsitem,
+extern List *expandNSItemVars(ParseState *pstate, ParseNamespaceItem *nsitem,
 							  int sublevels_up, int location,
 							  List **colnames);
 extern List *expandNSItemAttrs(ParseState *pstate, ParseNamespaceItem *nsitem,
-							   int sublevels_up, int location);
+							   int sublevels_up, bool require_col_privs,
+							   int location);
 extern int	attnameAttNum(Relation rd, const char *attname, bool sysColOK);
 extern const NameData *attnumAttName(Relation rd, int attid);
 extern Oid	attnumTypeId(Relation rd, int attid);

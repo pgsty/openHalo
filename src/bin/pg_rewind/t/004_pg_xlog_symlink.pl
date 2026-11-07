@@ -1,15 +1,15 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 #
 # Test pg_rewind when the target's pg_wal directory is a symlink.
 #
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use File::Copy;
 use File::Path qw(rmtree);
-use TestLib;
-use Test::More tests => 5;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 use FindBin;
 use lib $FindBin::RealBin;
@@ -20,7 +20,8 @@ sub run_test
 {
 	my $test_mode = shift;
 
-	my $primary_xlogdir = "${TestLib::tmp_check}/xlog_primary";
+	my $primary_xlogdir =
+	  "${PostgreSQL::Test::Utils::tmp_check}/xlog_primary";
 
 	rmtree($primary_xlogdir);
 	RewindTest::setup_cluster($test_mode);
@@ -51,7 +52,7 @@ sub run_test
 
 	# Insert a row in the old primary. This causes the primary and standby
 	# to have "diverged", it's no longer possible to just apply the
-	# standy's logs over primary directory - you need to rewind.
+	# standby's logs over primary directory - you need to rewind.
 	primary_psql("INSERT INTO tbl1 VALUES ('in primary, after promotion')");
 
 	# Also insert a new row in the standby, which won't be present in the
@@ -76,4 +77,4 @@ in standby, after promotion
 run_test('local');
 run_test('remote');
 
-exit(0);
+done_testing();

@@ -1,15 +1,17 @@
 #include "postgres.h"
 
+#include "miscadmin.h"
 #include "plpy_elog.h"
 #include "plpy_typeio.h"
-#include "plpython.h"
+#include "plpy_util.h"
 #include "utils/fmgrprotos.h"
 #include "utils/jsonb.h"
 #include "utils/numeric.h"
 
-PG_MODULE_MAGIC;
-
-void		_PG_init(void);
+PG_MODULE_MAGIC_EXT(
+					.name = "jsonb_plpython",
+					.version = PG_VERSION
+);
 
 /* for PLyObject_AsString in plpy_typeio.c */
 typedef char *(*PLyObject_AsString_t) (PyObject *plrv);
@@ -28,11 +30,9 @@ static PyObject *PLyObject_FromJsonbContainer(JsonbContainer *jsonb);
 static JsonbValue *PLyObject_ToJsonbValue(PyObject *obj,
 										  JsonbParseState **jsonb_state, bool is_elem);
 
-#if PY_MAJOR_VERSION >= 3
 typedef PyObject *(*PLyUnicode_FromStringAndSize_t)
 			(const char *s, Py_ssize_t size);
 static PLyUnicode_FromStringAndSize_t PLyUnicode_FromStringAndSize_p;
-#endif
 
 /*
  * Module initialize function: fetch function pointers for cross-module calls.
@@ -45,13 +45,10 @@ _PG_init(void)
 	PLyObject_AsString_p = (PLyObject_AsString_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLyObject_AsString",
 							   true, NULL);
-#if PY_MAJOR_VERSION >= 3
 	AssertVariableIsOfType(&PLyUnicode_FromStringAndSize, PLyUnicode_FromStringAndSize_t);
 	PLyUnicode_FromStringAndSize_p = (PLyUnicode_FromStringAndSize_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLyUnicode_FromStringAndSize",
 							   true, NULL);
-#endif
-
 	AssertVariableIsOfType(&PLy_elog_impl, PLy_elog_impl_t);
 	PLy_elog_impl_p = (PLy_elog_impl_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLy_elog_impl",
@@ -65,25 +62,25 @@ _PG_init(void)
 #define PLy_elog (PLy_elog_impl_p)
 
 /*
- * PLyString_FromJsonbValue
+ * PLyUnicode_FromJsonbValue
  *
  * Transform string JsonbValue to Python string.
  */
 static PyObject *
-PLyString_FromJsonbValue(JsonbValue *jbv)
+PLyUnicode_FromJsonbValue(JsonbValue *jbv)
 {
 	Assert(jbv->type == jbvString);
 
-	return PyString_FromStringAndSize(jbv->val.string.val, jbv->val.string.len);
+	return PLyUnicode_FromStringAndSize(jbv->val.string.val, jbv->val.string.len);
 }
 
 /*
- * PLyString_ToJsonbValue
+ * PLyUnicode_ToJsonbValue
  *
  * Transform Python string to JsonbValue.
  */
 static void
-PLyString_ToJsonbValue(PyObject *obj, JsonbValue *jbvElem)
+PLyUnicode_ToJsonbValue(PyObject *obj, JsonbValue *jbvElem)
 {
 	jbvElem->type = jbvString;
 	jbvElem->val.string.val = PLyObject_AsString(obj);
@@ -118,7 +115,7 @@ PLyObject_FromJsonbValue(JsonbValue *jsonbValue)
 			}
 
 		case jbvString:
-			return PLyString_FromJsonbValue(jsonbValue);
+			return PLyUnicode_FromJsonbValue(jsonbValue);
 
 		case jbvBool:
 			if (jsonbValue->val.boolean)
@@ -144,6 +141,9 @@ PLyObject_FromJsonbContainer(JsonbContainer *jsonb)
 	JsonbValue	v;
 	JsonbIterator *it;
 	PyObject   *result;
+
+	/* this can recurse via PLyObject_FromJsonbValue() */
+	check_stack_depth();
 
 	it = JsonbIteratorInit(jsonb);
 	r = JsonbIteratorNext(&it, &v, true);
@@ -210,7 +210,7 @@ PLyObject_FromJsonbContainer(JsonbContainer *jsonb)
 						if (r != WJB_KEY)
 							continue;
 
-						key = PLyString_FromJsonbValue(&v);
+						key = PLyUnicode_FromJsonbValue(&v);
 						if (!key)
 						{
 							Py_XDECREF(result_v);
@@ -273,7 +273,12 @@ PLyMapping_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
 	JsonbValue *volatile out;
 
 	pcount = PyMapping_Size(obj);
+	if (pcount < 0)
+		PLy_elog(ERROR, "could not get size of Python mapping");
+
 	items = PyMapping_Items(obj);
+	if (items == NULL)
+		PLy_elog(ERROR, "could not get items from Python mapping");
 
 	PG_TRY();
 	{
@@ -285,8 +290,15 @@ PLyMapping_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
 		{
 			JsonbValue	jbvKey;
 			PyObject   *item = PyList_GetItem(items, i);
-			PyObject   *key = PyTuple_GetItem(item, 0);
-			PyObject   *value = PyTuple_GetItem(item, 1);
+			PyObject   *key;
+			PyObject   *value;
+
+			/* The mapping's items() must yield key/value pairs */
+			if (item == NULL || !PyTuple_Check(item) || PyTuple_Size(item) < 2)
+				PLy_elog(ERROR, "items() of a Python mapping must return key/value pairs");
+
+			key = PyTuple_GetItem(item, 0);
+			value = PyTuple_GetItem(item, 1);
 
 			/* Python dictionary can have None as key */
 			if (key == Py_None)
@@ -298,7 +310,7 @@ PLyMapping_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
 			else
 			{
 				/* All others types of keys we serialize to string */
-				PLyString_ToJsonbValue(key, &jbvKey);
+				PLyUnicode_ToJsonbValue(key, &jbvKey);
 			}
 
 			(void) pushJsonbValue(jsonb_state, WJB_KEY, &jbvKey);
@@ -338,7 +350,10 @@ PLySequence_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
 		for (i = 0; i < pcount; i++)
 		{
 			value = PySequence_GetItem(obj, i);
-			Assert(value);
+
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (value == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", (int) i);
 
 			(void) PLyObject_ToJsonbValue(value, jsonb_state, true);
 			Py_XDECREF(value);
@@ -415,7 +430,10 @@ PLyObject_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state, bool is_ele
 {
 	JsonbValue *out;
 
-	if (!(PyString_Check(obj) || PyUnicode_Check(obj)))
+	/* this can recurse via PLyMapping_ToJsonbValue() */
+	check_stack_depth();
+
+	if (!PyUnicode_Check(obj))
 	{
 		if (PySequence_Check(obj))
 			return PLySequence_ToJsonbValue(obj, jsonb_state);
@@ -427,8 +445,8 @@ PLyObject_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state, bool is_ele
 
 	if (obj == Py_None)
 		out->type = jbvNull;
-	else if (PyString_Check(obj) || PyUnicode_Check(obj))
-		PLyString_ToJsonbValue(obj, out);
+	else if (PyUnicode_Check(obj))
+		PLyUnicode_ToJsonbValue(obj, out);
 
 	/*
 	 * PyNumber_Check() returns true for booleans, so boolean check should

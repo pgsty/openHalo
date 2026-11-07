@@ -26,7 +26,8 @@ INSERT INTO <replaceable class="parameter">table_name</replaceable> [ AS <replac
     [ OVERRIDING { SYSTEM | USER } VALUE ]
     { DEFAULT VALUES | VALUES ( { <replaceable class="parameter">expression</replaceable> | DEFAULT } [, ...] ) [, ...] | <replaceable class="parameter">query</replaceable> }
     [ ON CONFLICT [ <replaceable class="parameter">conflict_target</replaceable> ] <replaceable class="parameter">conflict_action</replaceable> ]
-    [ RETURNING * | <replaceable class="parameter">output_expression</replaceable> [ [ AS ] <replaceable class="parameter">output_name</replaceable> ] [, ...] ]
+    [ RETURNING [ WITH ( { OLD | NEW } AS <replaceable class="parameter">output_alias</replaceable> [, ...] ) ]
+                { * | <replaceable class="parameter">output_expression</replaceable> [ [ AS ] <replaceable class="parameter">output_name</replaceable> ] } [, ...] ]
 
 <phrase>where <replaceable class="parameter">conflict_target</replaceable> can be one of:</phrase>
 
@@ -113,10 +114,13 @@ INSERT INTO <replaceable class="parameter">table_name</replaceable> [ AS <replac
    <literal>INSERT</literal> privilege on the listed columns.
    Similarly, when <literal>ON CONFLICT DO UPDATE</literal> is specified, you
    only need <literal>UPDATE</literal> privilege on the column(s) that are
-   listed to be updated.  However, <literal>ON CONFLICT DO UPDATE</literal>
-   also requires <literal>SELECT</literal> privilege on any column whose
-   values are read in the <literal>ON CONFLICT DO UPDATE</literal>
-   expressions or <replaceable>condition</replaceable>.
+   listed to be updated.  However, all forms of <literal>ON CONFLICT</literal>
+   also require <literal>SELECT</literal> privilege on any column whose values
+   are read.  This includes any column mentioned in
+   <replaceable>conflict_target</replaceable> (including columns referred to
+   by the arbiter constraint), and any column mentioned in an
+   <literal>ON CONFLICT DO UPDATE</literal> <replaceable>expression</replaceable>,
+   or a <literal>WHERE</literal> clause <replaceable>condition</replaceable>.
   </para>
 
   <para>
@@ -294,6 +298,26 @@ INSERT INTO <replaceable class="parameter">table_name</replaceable> [ AS <replac
      </varlistentry>
 
      <varlistentry>
+      <term><replaceable class="parameter">output_alias</replaceable></term>
+      <listitem>
+       <para>
+        An optional substitute name for <literal>OLD</literal> or
+        <literal>NEW</literal> rows in the <literal>RETURNING</literal> list.
+       </para>
+
+       <para>
+        By default, old values from the target table can be returned by writing
+        <literal>OLD.<replaceable class="parameter">column_name</replaceable></literal>
+        or <literal>OLD.*</literal>, and new values can be returned by writing
+        <literal>NEW.<replaceable class="parameter">column_name</replaceable></literal>
+        or <literal>NEW.*</literal>.  When an alias is provided, these names are
+        hidden and the old or new rows must be referred to using the alias.
+        For example <literal>RETURNING WITH (OLD AS o, NEW AS n) o.*, n.*</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><replaceable class="parameter">output_expression</replaceable></term>
       <listitem>
        <para>
@@ -304,6 +328,23 @@ INSERT INTO <replaceable class="parameter">table_name</replaceable> [ AS <replac
         class="parameter">table_name</replaceable>.  Write
         <literal>*</literal> to return all columns of the inserted or updated
         row(s).
+       </para>
+
+       <para>
+        A column name or <literal>*</literal> may be qualified using
+        <literal>OLD</literal> or <literal>NEW</literal>, or the corresponding
+        <replaceable class="parameter">output_alias</replaceable> for
+        <literal>OLD</literal> or <literal>NEW</literal>, to cause old or new
+        values to be returned.  An unqualified column name, or
+        <literal>*</literal>, or a column name or <literal>*</literal>
+        qualified using the target table name or alias will return new values.
+       </para>
+
+       <para>
+        For a simple <command>INSERT</command>, all old values will be
+        <literal>NULL</literal>.  However, for an <command>INSERT</command>
+        with an <literal>ON CONFLICT DO UPDATE</literal> clause, the old
+        values may be non-<literal>NULL</literal>.
        </para>
       </listitem>
      </varlistentry>
@@ -556,6 +597,15 @@ INSERT INTO <replaceable class="parameter">table_name</replaceable> [ AS <replac
     </para>
    </tip>
 
+   <warning>
+    <para>
+      While <command>CREATE INDEX CONCURRENTLY</command> or <command>REINDEX
+      CONCURRENTLY</command> is running on a unique index, <command>INSERT
+      ... ON CONFLICT</command> statements on the same table may unexpectedly
+      fail with a unique violation.
+    </para>
+   </warning>
+
   </refsect2>
  </refsect1>
 
@@ -593,6 +643,13 @@ INSERT <replaceable>oid</replaceable> <replaceable class="parameter">count</repl
    the appropriate partition and inserted into it.  If the specified table
    is a partition, an error will occur if one of the input rows violates
    the partition constraint.
+  </para>
+
+  <para>
+   You may also wish to consider using <command>MERGE</command>, since that
+   allows mixing <command>INSERT</command>, <command>UPDATE</command>, and
+   <command>DELETE</command> within a single statement.
+   See <xref linkend="sql-merge"/>.
   </para>
  </refsect1>
 
@@ -707,6 +764,20 @@ INSERT INTO distributors (did, dname)
 </programlisting>
   </para>
   <para>
+   Insert or update new distributors as above, returning information
+   about any existing values that were updated, together with the new data
+   inserted.  Note that the returned values for <literal>old_did</literal>
+   and <literal>old_dname</literal> will be <literal>NULL</literal> for
+   non-conflicting rows:
+<programlisting>
+INSERT INTO distributors (did, dname)
+    VALUES (5, 'Gizmo Transglobal'), (6, 'Associated Computing, Inc')
+    ON CONFLICT (did) DO UPDATE SET dname = EXCLUDED.dname
+    RETURNING old.did AS old_did, old.dname AS old_dname,
+              new.did AS new_did, new.dname AS new_dname;
+</programlisting>
+  </para>
+  <para>
    Insert a distributor, or do nothing for rows proposed for insertion
    when an existing, excluded row (a row with a matching constrained
    column or columns after before row insert triggers fire) exists.
@@ -764,7 +835,9 @@ INSERT INTO distributors (did, dname) VALUES (10, 'Conrad International')
    Also, the case in
    which a column name list is omitted, but not all the columns are
    filled from the <literal>VALUES</literal> clause or <replaceable>query</replaceable>,
-   is disallowed by the standard.
+   is disallowed by the standard. If you prefer a more SQL standard
+   conforming statement than <literal>ON CONFLICT</literal>, see
+   <xref linkend="sql-merge"/>.
   </para>
 
   <para>

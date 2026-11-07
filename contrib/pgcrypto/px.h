@@ -44,21 +44,22 @@
  * PX error codes
  */
 #define PXE_OK						0
-#define PXE_ERR_GENERIC				-1
+/* -1 is unused */
 #define PXE_NO_HASH					-2
 #define PXE_NO_CIPHER				-3
-#define PXE_NOTBLOCKSIZE			-4
+/* -4 is unused */
 #define PXE_BAD_OPTION				-5
 #define PXE_BAD_FORMAT				-6
 #define PXE_KEY_TOO_BIG				-7
 #define PXE_CIPHER_INIT				-8
 #define PXE_HASH_UNUSABLE_FOR_HMAC	-9
-#define PXE_DEV_READ_ERROR			-10
+/* -10 is unused */
+/* -11 is unused */
 #define PXE_BUG						-12
 #define PXE_ARGUMENT_ERROR			-13
 #define PXE_UNKNOWN_SALT_ALGO		-14
 #define PXE_BAD_SALT_ROUNDS			-15
-#define PXE_MCRYPT_INTERNAL			-16
+/* -16 is unused */
 #define PXE_NO_RANDOM				-17
 #define PXE_DECRYPT_FAILED			-18
 #define PXE_ENCRYPT_FAILED			-19
@@ -74,7 +75,7 @@
 /* -108 is unused */
 #define PXE_PGP_MATH_FAILED			-109
 #define PXE_PGP_SHORT_ELGAMAL_KEY	-110
-/* -111 is unused */
+#define PXE_PGP_KEY_TOO_BIG			-111
 #define PXE_PGP_UNKNOWN_PUBALGO		-112
 #define PXE_PGP_WRONG_KEY			-113
 #define PXE_PGP_MULTIPLE_KEYS		-114
@@ -88,12 +89,20 @@
 #define PXE_PGP_UNSUPPORTED_PUBALGO -122
 #define PXE_PGP_MULTIPLE_SUBKEYS	-123
 
+typedef enum BuiltinCryptoOptions
+{
+	BC_ON,
+	BC_OFF,
+	BC_FIPS,
+}			BuiltinCryptoOptions;
 
 typedef struct px_digest PX_MD;
 typedef struct px_alias PX_Alias;
 typedef struct px_hmac PX_HMAC;
 typedef struct px_cipher PX_Cipher;
 typedef struct px_combo PX_Combo;
+
+extern int	builtin_crypto_enabled;
 
 struct px_digest
 {
@@ -143,8 +152,8 @@ struct px_cipher
 	unsigned	(*iv_size) (PX_Cipher *c);
 
 	int			(*init) (PX_Cipher *c, const uint8 *key, unsigned klen, const uint8 *iv);
-	int			(*encrypt) (PX_Cipher *c, const uint8 *data, unsigned dlen, uint8 *res);
-	int			(*decrypt) (PX_Cipher *c, const uint8 *data, unsigned dlen, uint8 *res);
+	int			(*encrypt) (PX_Cipher *c, int padding, const uint8 *data, unsigned dlen, uint8 *res, unsigned *rlen);
+	int			(*decrypt) (PX_Cipher *c, int padding, const uint8 *data, unsigned dlen, uint8 *res, unsigned *rlen);
 	void		(*free) (PX_Cipher *c);
 	/* private */
 	void	   *ptr;
@@ -172,14 +181,17 @@ int			px_find_hmac(const char *name, PX_HMAC **res);
 int			px_find_cipher(const char *name, PX_Cipher **res);
 int			px_find_combo(const char *name, PX_Combo **res);
 
-void		px_THROW_ERROR(int err) pg_attribute_noreturn();
+pg_noreturn void px_THROW_ERROR(int err);
 const char *px_strerror(int err);
 
-const char *px_resolve_alias(const PX_Alias *aliases, const char *name);
+const char *px_resolve_alias(const PX_Alias *list, const char *name);
 
 void		px_set_debug_handler(void (*handler) (const char *));
 
 void		px_memset(void *ptr, int c, size_t len);
+
+bool		CheckFIPSMode(void);
+void		CheckBuiltinCryptoMode(void);
 
 #ifdef PX_DEBUG
 void		px_debug(const char *fmt,...) pg_attribute_printf(1, 2);
@@ -207,10 +219,10 @@ void		px_debug(const char *fmt,...) pg_attribute_printf(1, 2);
 #define px_cipher_block_size(c)		(c)->block_size(c)
 #define px_cipher_iv_size(c)		(c)->iv_size(c)
 #define px_cipher_init(c, k, klen, iv)	(c)->init(c, k, klen, iv)
-#define px_cipher_encrypt(c, data, dlen, res) \
-					(c)->encrypt(c, data, dlen, res)
-#define px_cipher_decrypt(c, data, dlen, res) \
-					(c)->decrypt(c, data, dlen, res)
+#define px_cipher_encrypt(c, padding, data, dlen, res, rlen) \
+					(c)->encrypt(c, padding, data, dlen, res, rlen)
+#define px_cipher_decrypt(c, padding, data, dlen, res, rlen) \
+					(c)->decrypt(c, padding, data, dlen, res, rlen)
 #define px_cipher_free(c)		(c)->free(c)
 
 

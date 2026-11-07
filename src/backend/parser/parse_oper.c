@@ -3,7 +3,7 @@
  * parse_oper.c
  *		handle operator things for parser
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,9 +70,7 @@ static FuncDetailCode oper_select_candidate(int nargs,
 											Oid *input_typeids,
 											FuncCandidateList candidates,
 											Oid *operOid);
-static const char *op_signature_string(List *op, char oprkind,
-									   Oid arg1, Oid arg2);
-static void op_error(ParseState *pstate, List *op, char oprkind,
+static void op_error(ParseState *pstate, List *op,
 					 Oid arg1, Oid arg2,
 					 FuncDetailCode fdresult, int location);
 static bool make_oper_cache_key(ParseState *pstate, OprCacheKey *key,
@@ -110,26 +108,16 @@ LookupOperName(ParseState *pstate, List *opername, Oid oprleft, Oid oprright,
 	/* we don't use op_error here because only an exact match is wanted */
 	if (!noError)
 	{
-		char		oprkind;
-
-		if (!OidIsValid(oprleft))
-			oprkind = 'l';
-		else if (OidIsValid(oprright))
-			oprkind = 'b';
-		else
-		{
+		if (!OidIsValid(oprright))
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("postfix operators are not supported"),
 					 parser_errposition(pstate, location)));
-			oprkind = 0;		/* keep compiler quiet */
-		}
 
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("operator does not exist: %s",
-						op_signature_string(opername, oprkind,
-											oprleft, oprright)),
+						op_signature_string(opername, oprleft, oprright)),
 				 parser_errposition(pstate, location)));
 	}
 
@@ -446,7 +434,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 			make_oper_cache_entry(&key, operOid);
 	}
 	else if (!noError)
-		op_error(pstate, opname, 'b', ltypeId, rtypeId, fdresult, location);
+		op_error(pstate, opname, ltypeId, rtypeId, fdresult, location);
 
 	return (Operator) tup;
 }
@@ -483,7 +471,7 @@ compatible_oper(ParseState *pstate, List *op, Oid arg1, Oid arg2,
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("operator requires run-time type coercion: %s",
-						op_signature_string(op, 'b', arg1, arg2)),
+						op_signature_string(op, arg1, arg2)),
 				 parser_errposition(pstate, location)));
 
 	return (Operator) NULL;
@@ -597,7 +585,7 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 			make_oper_cache_entry(&key, operOid);
 	}
 	else if (!noError)
-		op_error(pstate, op, 'l', InvalidOid, arg, fdresult, location);
+		op_error(pstate, op, InvalidOid, arg, fdresult, location);
 
 	return (Operator) tup;
 }
@@ -610,14 +598,14 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
  * This is typically used in the construction of operator-not-found error
  * messages.
  */
-static const char *
-op_signature_string(List *op, char oprkind, Oid arg1, Oid arg2)
+const char *
+op_signature_string(List *op, Oid arg1, Oid arg2)
 {
 	StringInfoData argbuf;
 
 	initStringInfo(&argbuf);
 
-	if (oprkind != 'l')
+	if (OidIsValid(arg1))
 		appendStringInfo(&argbuf, "%s ", format_type_be(arg1));
 
 	appendStringInfoString(&argbuf, NameListToString(op));
@@ -631,7 +619,7 @@ op_signature_string(List *op, char oprkind, Oid arg1, Oid arg2)
  * op_error - utility routine to complain about an unresolvable operator
  */
 static void
-op_error(ParseState *pstate, List *op, char oprkind,
+op_error(ParseState *pstate, List *op,
 		 Oid arg1, Oid arg2,
 		 FuncDetailCode fdresult, int location)
 {
@@ -639,7 +627,7 @@ op_error(ParseState *pstate, List *op, char oprkind,
 		ereport(ERROR,
 				(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
 				 errmsg("operator is not unique: %s",
-						op_signature_string(op, oprkind, arg1, arg2)),
+						op_signature_string(op, arg1, arg2)),
 				 errhint("Could not choose a best candidate operator. "
 						 "You might need to add explicit type casts."),
 				 parser_errposition(pstate, location)));
@@ -647,7 +635,7 @@ op_error(ParseState *pstate, List *op, char oprkind,
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("operator does not exist: %s",
-						op_signature_string(op, oprkind, arg1, arg2)),
+						op_signature_string(op, arg1, arg2)),
 				 (!arg1 || !arg2) ?
 				 errhint("No operator matches the given name and argument type. "
 						 "You might need to add an explicit type cast.") :
@@ -713,7 +701,6 @@ make_op(ParseState *pstate, List *opname, Node *ltree, Node *rtree,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("operator is only a shell: %s",
 						op_signature_string(opname,
-											opform->oprkind,
 											opform->oprleft,
 											opform->oprright)),
 				 parser_errposition(pstate, location)));
@@ -748,6 +735,28 @@ make_op(ParseState *pstate, List *opname, Node *ltree, Node *rtree,
 											   nargs,
 											   opform->oprresult,
 											   false);
+
+	/*
+	 * Reject any attempt to call a function that takes or returns type
+	 * internal from SQL.  This is just like the check in ParseFuncOrColumn,
+	 * but for operator syntax.  (Despite that, we say "function" in the error
+	 * messages; doesn't seem worth having two sets of translatable strings.)
+	 */
+	for (int i = 0; i < nargs; i++)
+	{
+		if (declared_arg_types[i] == INTERNALOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("functions accepting type \"%s\" cannot be called explicitly",
+							"internal"),
+					 parser_errposition(pstate, location)));
+	}
+	if (rettype == INTERNALOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("functions returning type \"%s\" cannot be called explicitly",
+						"internal"),
+				 parser_errposition(pstate, location)));
 
 	/* perform the necessary typecasting of arguments */
 	make_fn_arguments(pstate, args, actual_arg_types, declared_arg_types);
@@ -827,7 +836,6 @@ make_scalar_array_op(ParseState *pstate, List *opname,
 				(errcode(ERRCODE_UNDEFINED_FUNCTION),
 				 errmsg("operator is only a shell: %s",
 						op_signature_string(opname,
-											opform->oprkind,
 											opform->oprleft,
 											opform->oprright)),
 				 parser_errposition(pstate, location)));
@@ -895,6 +903,7 @@ make_scalar_array_op(ParseState *pstate, List *opname,
 	result->opno = oprid(tup);
 	result->opfuncid = opform->oprcode;
 	result->hashfuncid = InvalidOid;
+	result->negfuncid = InvalidOid;
 	result->useOr = useOr;
 	/* inputcollid will be set by parse_collate.c */
 	result->args = args;
@@ -1016,7 +1025,7 @@ find_oper_cache_entry(OprCacheKey *key)
 
 	/* Look for an existing entry */
 	oprentry = (OprCacheEntry *) hash_search(OprCacheHash,
-											 (void *) key,
+											 key,
 											 HASH_FIND, NULL);
 	if (oprentry == NULL)
 		return InvalidOid;
@@ -1037,7 +1046,7 @@ make_oper_cache_entry(OprCacheKey *key, Oid opr_oid)
 	Assert(OprCacheHash != NULL);
 
 	oprentry = (OprCacheEntry *) hash_search(OprCacheHash,
-											 (void *) key,
+											 key,
 											 HASH_ENTER, NULL);
 	oprentry->opr_oid = opr_oid;
 }
@@ -1059,7 +1068,7 @@ InvalidateOprCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 	while ((hentry = (OprCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
 		if (hash_search(OprCacheHash,
-						(void *) &hentry->key,
+						&hentry->key,
 						HASH_REMOVE, NULL) == NULL)
 			elog(ERROR, "hash table corrupted");
 	}

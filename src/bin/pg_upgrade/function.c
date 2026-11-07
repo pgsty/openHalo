@@ -3,7 +3,7 @@
  *
  *	server-side function support
  *
- *	Copyright (c) 2010-2021, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/function.c
  */
 
@@ -11,6 +11,7 @@
 
 #include "access/transam.h"
 #include "catalog/pg_language_d.h"
+#include "common/int.h"
 #include "pg_upgrade.h"
 
 /*
@@ -29,126 +30,92 @@ library_name_compare(const void *p1, const void *p2)
 {
 	const char *str1 = ((const LibraryInfo *) p1)->name;
 	const char *str2 = ((const LibraryInfo *) p2)->name;
-	int			slen1 = strlen(str1);
-	int			slen2 = strlen(str2);
+	size_t		slen1 = strlen(str1);
+	size_t		slen2 = strlen(str2);
 	int			cmp = strcmp(str1, str2);
 
 	if (slen1 != slen2)
-		return slen1 - slen2;
+		return pg_cmp_size(slen1, slen2);
 	if (cmp != 0)
 		return cmp;
-	else
-		return ((const LibraryInfo *) p1)->dbnum -
-			((const LibraryInfo *) p2)->dbnum;
+	return pg_cmp_s32(((const LibraryInfo *) p1)->dbnum,
+					  ((const LibraryInfo *) p2)->dbnum);
 }
 
+/*
+ * Private state for get_loadable_libraries()'s UpgradeTask.
+ */
+struct loadable_libraries_state
+{
+	PGresult  **ress;			/* results for each database */
+	int			totaltups;		/* number of tuples in all results */
+};
+
+/*
+ * Callback function for processing results of query for
+ * get_loadable_libraries()'s UpgradeTask.  This function stores the results
+ * for later use within get_loadable_libraries().
+ */
+static void
+process_loadable_libraries(DbInfo *dbinfo, PGresult *res, void *arg)
+{
+	struct loadable_libraries_state *state = (struct loadable_libraries_state *) arg;
+
+	AssertVariableIsOfType(&process_loadable_libraries, UpgradeTaskProcessCB);
+
+	state->ress[dbinfo - old_cluster.dbarr.dbs] = res;
+	state->totaltups += PQntuples(res);
+}
 
 /*
  * get_loadable_libraries()
  *
- *	Fetch the names of all old libraries containing C-language functions.
+ *	Fetch the names of all old libraries containing either C-language functions
+ *	or are corresponding to logical replication output plugins.
+ *
  *	We will later check that they all exist in the new installation.
  */
 void
 get_loadable_libraries(void)
 {
-	PGresult  **ress;
 	int			totaltups;
 	int			dbnum;
-	bool		found_public_plpython_handler = false;
+	int			n_libinfos;
+	UpgradeTask *task = upgrade_task_create();
+	struct loadable_libraries_state state;
+	char	   *query;
 
-	ress = (PGresult **) pg_malloc(old_cluster.dbarr.ndbs * sizeof(PGresult *));
-	totaltups = 0;
+	state.ress = (PGresult **) pg_malloc(old_cluster.dbarr.ndbs * sizeof(PGresult *));
+	state.totaltups = 0;
 
-	/* Fetch all library names, removing duplicates within each DB */
-	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
-	{
-		DbInfo	   *active_db = &old_cluster.dbarr.dbs[dbnum];
-		PGconn	   *conn = connectToServer(&old_cluster, active_db->db_name);
+	query = psprintf("SELECT DISTINCT probin "
+					 "FROM pg_catalog.pg_proc "
+					 "WHERE prolang = %u AND "
+					 "probin IS NOT NULL AND "
+					 "oid >= %u",
+					 ClanguageId,
+					 FirstNormalObjectId);
 
-		/*
-		 * Fetch all libraries containing non-built-in C functions in this DB.
-		 */
-		ress[dbnum] = executeQueryOrDie(conn,
-										"SELECT DISTINCT probin "
-										"FROM pg_catalog.pg_proc "
-										"WHERE prolang = %u AND "
-										"probin IS NOT NULL AND "
-										"oid >= %u;",
-										ClanguageId,
-										FirstNormalObjectId);
-		totaltups += PQntuples(ress[dbnum]);
+	upgrade_task_add_step(task, query, process_loadable_libraries,
+						  false, &state);
 
-		/*
-		 * Systems that install plpython before 8.1 have
-		 * plpython_call_handler() defined in the "public" schema, causing
-		 * pg_dump to dump it.  However that function still references
-		 * "plpython" (no "2"), so it throws an error on restore.  This code
-		 * checks for the problem function, reports affected databases to the
-		 * user and explains how to remove them. 8.1 git commit:
-		 * e0dedd0559f005d60c69c9772163e69c204bac69
-		 * http://archives.postgresql.org/pgsql-hackers/2012-03/msg01101.php
-		 * http://archives.postgresql.org/pgsql-bugs/2012-05/msg00206.php
-		 */
-		if (GET_MAJOR_VERSION(old_cluster.major_version) <= 900)
-		{
-			PGresult   *res;
+	upgrade_task_run(task, &old_cluster);
+	upgrade_task_free(task);
 
-			res = executeQueryOrDie(conn,
-									"SELECT 1 "
-									"FROM pg_catalog.pg_proc p "
-									"    JOIN pg_catalog.pg_namespace n "
-									"    ON pronamespace = n.oid "
-									"WHERE proname = 'plpython_call_handler' AND "
-									"nspname = 'public' AND "
-									"prolang = %u AND "
-									"probin = '$libdir/plpython' AND "
-									"p.oid >= %u;",
-									ClanguageId,
-									FirstNormalObjectId);
-			if (PQntuples(res) > 0)
-			{
-				if (!found_public_plpython_handler)
-				{
-					pg_log(PG_WARNING,
-						   "\nThe old cluster has a \"plpython_call_handler\" function defined\n"
-						   "in the \"public\" schema which is a duplicate of the one defined\n"
-						   "in the \"pg_catalog\" schema.  You can confirm this by executing\n"
-						   "in psql:\n"
-						   "\n"
-						   "    \\df *.plpython_call_handler\n"
-						   "\n"
-						   "The \"public\" schema version of this function was created by a\n"
-						   "pre-8.1 install of plpython, and must be removed for pg_upgrade\n"
-						   "to complete because it references a now-obsolete \"plpython\"\n"
-						   "shared object file.  You can remove the \"public\" schema version\n"
-						   "of this function by running the following command:\n"
-						   "\n"
-						   "    DROP FUNCTION public.plpython_call_handler()\n"
-						   "\n"
-						   "in each affected database:\n"
-						   "\n");
-				}
-				pg_log(PG_WARNING, "    %s\n", active_db->db_name);
-				found_public_plpython_handler = true;
-			}
-			PQclear(res);
-		}
-
-		PQfinish(conn);
-	}
-
-	if (found_public_plpython_handler)
-		pg_fatal("Remove the problem functions from the old cluster to continue.\n");
-
-	os_info.libraries = (LibraryInfo *) pg_malloc(totaltups * sizeof(LibraryInfo));
+	/*
+	 * Allocate memory for required libraries and logical replication output
+	 * plugins.
+	 */
+	n_libinfos = state.totaltups + count_old_cluster_logical_slots();
+	os_info.libraries = (LibraryInfo *) pg_malloc(sizeof(LibraryInfo) * n_libinfos);
 	totaltups = 0;
 
 	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
 	{
-		PGresult   *res = ress[dbnum];
+		PGresult   *res = state.ress[dbnum];
 		int			ntups;
 		int			rowno;
+		LogicalSlotInfoArr *slot_arr = &old_cluster.dbarr.dbs[dbnum].slot_arr;
 
 		ntups = PQntuples(res);
 		for (rowno = 0; rowno < ntups; rowno++)
@@ -161,9 +128,27 @@ get_loadable_libraries(void)
 			totaltups++;
 		}
 		PQclear(res);
+
+		/*
+		 * Store the names of output plugins as well. There is a possibility
+		 * that duplicated plugins are set, but the consumer function
+		 * check_loadable_libraries() will avoid checking the same library, so
+		 * we do not have to consider their uniqueness here.
+		 */
+		for (int slotno = 0; slotno < slot_arr->nslots; slotno++)
+		{
+			if (slot_arr->slots[slotno].invalid)
+				continue;
+
+			os_info.libraries[totaltups].name = pg_strdup(slot_arr->slots[slotno].plugin);
+			os_info.libraries[totaltups].dbnum = dbnum;
+
+			totaltups++;
+		}
 	}
 
-	pg_free(ress);
+	pg_free(state.ress);
+	pg_free(query);
 
 	os_info.num_libraries = totaltups;
 }
@@ -183,12 +168,12 @@ check_loadable_libraries(void)
 	int			libnum;
 	int			was_load_failure = false;
 	FILE	   *script = NULL;
-	bool		found = false;
 	char		output_path[MAXPGPATH];
 
 	prep_status("Checking for presence of required libraries");
 
-	snprintf(output_path, sizeof(output_path), "loadable_libraries.txt");
+	snprintf(output_path, sizeof(output_path), "%s/%s",
+			 log_opts.basedir, "loadable_libraries.txt");
 
 	/*
 	 * Now we want to sort the library names into order.  This avoids multiple
@@ -196,7 +181,7 @@ check_loadable_libraries(void)
 	 * consistent order, which is important for reproducible behavior if one
 	 * library depends on another.
 	 */
-	qsort((void *) os_info.libraries, os_info.num_libraries,
+	qsort(os_info.libraries, os_info.num_libraries,
 		  sizeof(LibraryInfo), library_name_compare);
 
 	for (libnum = 0; libnum < os_info.num_libraries; libnum++)
@@ -209,22 +194,6 @@ check_loadable_libraries(void)
 		/* Did the library name change?  Probe it. */
 		if (libnum == 0 || strcmp(lib, os_info.libraries[libnum - 1].name) != 0)
 		{
-			/*
-			 * In Postgres 9.0, Python 3 support was added, and to do that, a
-			 * plpython2u language was created with library name plpython2.so
-			 * as a symbolic link to plpython.so.  In Postgres 9.1, only the
-			 * plpython2.so library was created, and both plpythonu and
-			 * plpython2u point to it.  For this reason, any reference to
-			 * library name "plpython" in an old PG <= 9.1 cluster must look
-			 * for "plpython2" in the new cluster.
-			 */
-			if (GET_MAJOR_VERSION(old_cluster.major_version) <= 900 &&
-				strcmp(lib, "$libdir/plpython") == 0)
-			{
-				lib = "$libdir/plpython2";
-				llen = strlen(lib);
-			}
-
 			strcpy(cmd, "LOAD '");
 			PQescapeStringConn(conn, cmd + strlen(cmd), lib, llen, NULL);
 			strcat(cmd, "'");
@@ -233,12 +202,10 @@ check_loadable_libraries(void)
 
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			{
-				found = true;
 				was_load_failure = true;
 
 				if (script == NULL && (script = fopen_priv(output_path, "w")) == NULL)
-					pg_fatal("could not open file \"%s\": %s\n",
-							 output_path, strerror(errno));
+					pg_fatal("could not open file \"%s\": %m", output_path);
 				fprintf(script, _("could not load library \"%s\": %s"),
 						lib,
 						PQerrorMessage(conn));
@@ -256,15 +223,15 @@ check_loadable_libraries(void)
 
 	PQfinish(conn);
 
-	if (found)
+	if (script)
 	{
 		fclose(script);
-		pg_log(PG_REPORT, "fatal\n");
+		pg_log(PG_REPORT, "fatal");
 		pg_fatal("Your installation references loadable libraries that are missing from the\n"
 				 "new installation.  You can add these libraries to the new installation,\n"
 				 "or remove the functions using them from the old installation.  A list of\n"
 				 "problem libraries is in the file:\n"
-				 "    %s\n\n", output_path);
+				 "    %s", output_path);
 	}
 	else
 		check_ok();

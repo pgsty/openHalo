@@ -8,7 +8,7 @@
  *
  * A TupleQueueReader reads tuples from a shm_mq and returns the tuples.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -51,7 +51,7 @@ struct TupleQueueReader
  * Returns true if successful, false if shm_mq has been detached.
  */
 static bool
-tqueueReceiveSlot(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag)
+tqueueReceiveSlot(TupleTableSlot *slot, DestReceiver *self)
 {
 	TQueueDestReceiver *tqueue = (TQueueDestReceiver *) self;
 	MinimalTuple tuple;
@@ -60,7 +60,7 @@ tqueueReceiveSlot(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTa
 
 	/* Send the tuple itself. */
 	tuple = ExecFetchSlotMinimalTuple(slot, &should_free);
-	result = shm_mq_send(tqueue->queue, tuple->t_len, tuple, false);
+	result = shm_mq_send(tqueue->queue, tuple->t_len, tuple, false, false);
 
 	if (should_free)
 		pfree(tuple);
@@ -80,7 +80,7 @@ tqueueReceiveSlot(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTa
  * Prepare to receive tuples from executor.
  */
 static void
-tqueueStartupReceiver(DestReceiver *self, int operation, TupleDesc typeinfo, CommandTag commandTag)
+tqueueStartupReceiver(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
 	/* do nothing */
 }

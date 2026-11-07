@@ -6,7 +6,7 @@
  * and interpreting backend output.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/fe_utils/string_utils.c
@@ -514,43 +514,6 @@ appendStringLiteralDQ(PQExpBuffer buf, const char *str, const char *dqprefix)
 	destroyPQExpBuffer(delimBuf);
 }
 
-void
-appendStringLiteralDQ2(int on_suffixes, PQExpBuffer buf, const char *str, const char *dqprefix)
-{
-	static const char suffixes[] = "_XXXXXXX";
-	int			nextchar = 0;
-	PQExpBuffer delimBuf = createPQExpBuffer();
-
-	/* start with $ + dqprefix if not NULL */
-	appendPQExpBufferChar(delimBuf, '$');
-	if (dqprefix)
-		appendPQExpBufferStr(delimBuf, dqprefix);
-
-	/*
-	 * Make sure we choose a delimiter which (without the trailing $) is not
-	 * present in the string being quoted. We don't check with the trailing $
-	 * because a string ending in $foo must not be quoted with $foo$.
-	 */
-	if(on_suffixes)
-	{
-		while (strstr(str, delimBuf->data) != NULL)
-		{
-			appendPQExpBufferChar(delimBuf, suffixes[nextchar++]);
-			nextchar %= sizeof(suffixes) - 1;
-		}
-	}
-
-	/* add trailing $ */
-	appendPQExpBufferChar(delimBuf, '$');
-
-	/* quote it and we are all done */
-	appendPQExpBufferStr(buf, delimBuf->data);
-	appendPQExpBufferStr(buf, str);
-	appendPQExpBufferStr(buf, delimBuf->data);
-
-	destroyPQExpBuffer(delimBuf);
-}
-
 
 /*
  * Convert a bytea value (presented as raw bytes) to an SQL string literal
@@ -843,6 +806,116 @@ appendPsqlMetaConnect(PQExpBuffer buf, const char *dbname)
 
 
 /*
+ * SplitGUCList --- parse a string containing identifiers or file names
+ *
+ * This is used to split the value of a GUC_LIST_QUOTE GUC variable, without
+ * presuming whether the elements will be taken as identifiers or file names.
+ * See comparable code in src/backend/utils/adt/varlena.c.
+ *
+ * Inputs:
+ *	rawstring: the input string; must be overwritable!	On return, it's
+ *			   been modified to contain the separated identifiers.
+ *	separator: the separator punctuation expected between identifiers
+ *			   (typically '.' or ',').  Whitespace may also appear around
+ *			   identifiers.
+ * Outputs:
+ *	namelist: receives a malloc'd, null-terminated array of pointers to
+ *			  identifiers within rawstring.  Caller should free this
+ *			  even on error return.
+ *
+ * Returns true if okay, false if there is a syntax error in the string.
+ */
+bool
+SplitGUCList(char *rawstring, char separator,
+			 char ***namelist)
+{
+	char	   *nextp = rawstring;
+	bool		done = false;
+	char	  **nextptr;
+
+	/*
+	 * Since we disallow empty identifiers, this is a conservative
+	 * overestimate of the number of pointers we could need.  Allow one for
+	 * list terminator.
+	 */
+	*namelist = nextptr =
+		pg_malloc_array(char *, (strlen(rawstring) / 2 + 2));
+	*nextptr = NULL;
+
+	while (isspace((unsigned char) *nextp))
+		nextp++;				/* skip leading whitespace */
+
+	if (*nextp == '\0')
+		return true;			/* allow empty string */
+
+	/* At the top of the loop, we are at start of a new identifier. */
+	do
+	{
+		char	   *curname;
+		char	   *endp;
+
+		if (*nextp == '"')
+		{
+			/* Quoted name --- collapse quote-quote pairs */
+			curname = nextp + 1;
+			for (;;)
+			{
+				endp = strchr(nextp + 1, '"');
+				if (endp == NULL)
+					return false;	/* mismatched quotes */
+				if (endp[1] != '"')
+					break;		/* found end of quoted name */
+				/* Collapse adjacent quotes into one quote, and look again */
+				memmove(endp, endp + 1, strlen(endp));
+				nextp = endp;
+			}
+			/* endp now points at the terminating quote */
+			nextp = endp + 1;
+		}
+		else
+		{
+			/* Unquoted name --- extends to separator or whitespace */
+			curname = nextp;
+			while (*nextp && *nextp != separator &&
+				   !isspace((unsigned char) *nextp))
+				nextp++;
+			endp = nextp;
+			if (curname == nextp)
+				return false;	/* empty unquoted name not allowed */
+		}
+
+		while (isspace((unsigned char) *nextp))
+			nextp++;			/* skip trailing whitespace */
+
+		if (*nextp == separator)
+		{
+			nextp++;
+			while (isspace((unsigned char) *nextp))
+				nextp++;		/* skip leading whitespace for next */
+			/* we expect another name, so done remains false */
+		}
+		else if (*nextp == '\0')
+			done = true;
+		else
+			return false;		/* invalid syntax */
+
+		/* Now safe to overwrite separator with a null */
+		*endp = '\0';
+
+		/*
+		 * Finished isolating current name --- add it to output array
+		 */
+		*nextptr++ = curname;
+
+		/* Loop back if we didn't reach end of string */
+	} while (!done);
+
+	*nextptr = NULL;
+	return true;
+}
+
+
+/*
  * Deconstruct the text representation of a 1-dimensional Postgres array
  * into individual items.
  *
@@ -926,6 +999,69 @@ parsePGArray(const char *atext, char ***itemarray, int *nitems)
 
 
 /*
+ * Append one element to the text representation of a 1-dimensional Postgres
+ * array.
+ *
+ * The caller must provide the initial '{' and closing '}' of the array.
+ * This function handles all else, including insertion of commas and
+ * quoting of values.
+ *
+ * We assume that typdelim is ','.
+ */
+void
+appendPGArray(PQExpBuffer buffer, const char *value)
+{
+	bool		needquote;
+	const char *tmp;
+
+	if (buffer->data[buffer->len - 1] != '{')
+		appendPQExpBufferChar(buffer, ',');
+
+	/* Decide if we need quotes; this should match array_out()'s choices. */
+	if (value[0] == '\0')
+		needquote = true;		/* force quotes for empty string */
+	else if (pg_strcasecmp(value, "NULL") == 0)
+		needquote = true;		/* force quotes for literal NULL */
+	else
+		needquote = false;
+
+	if (!needquote)
+	{
+		for (tmp = value; *tmp; tmp++)
+		{
+			char		ch = *tmp;
+
+			if (ch == '"' || ch == '\\' ||
+				ch == '{' || ch == '}' || ch == ',' ||
+			/* these match scanner_isspace(): */
+				ch == ' ' || ch == '\t' || ch == '\n' ||
+				ch == '\r' || ch == '\v' || ch == '\f')
+			{
+				needquote = true;
+				break;
+			}
+		}
+	}
+
+	if (needquote)
+	{
+		appendPQExpBufferChar(buffer, '"');
+		for (tmp = value; *tmp; tmp++)
+		{
+			char		ch = *tmp;
+
+			if (ch == '"' || ch == '\\')
+				appendPQExpBufferChar(buffer, '\\');
+			appendPQExpBufferChar(buffer, ch);
+		}
+		appendPQExpBufferChar(buffer, '"');
+	}
+	else
+		appendPQExpBufferStr(buffer, value);
+}
+
+
+/*
  * Format a reloptions array and append it to the given buffer.
  *
  * "prefix" is prepended to the option names; typically it's "" or "toast.".
@@ -946,8 +1082,7 @@ appendReloptionsArray(PQExpBuffer buffer, const char *reloptions,
 
 	if (!parsePGArray(reloptions, &options, &noptions))
 	{
-		if (options)
-			free(options);
+		free(options);
 		return false;
 	}
 
@@ -990,8 +1125,7 @@ appendReloptionsArray(PQExpBuffer buffer, const char *reloptions,
 			appendStringLiteral(buffer, value, encoding, std_strings);
 	}
 
-	if (options)
-		free(options);
+	free(options);
 
 	return true;
 }
@@ -1062,11 +1196,15 @@ processSQLNamePattern(PGconn *conn, PQExpBuffer buf, const char *pattern,
 	 * Convert shell-style 'pattern' into the regular expression(s) we want to
 	 * execute.  Quoting/escaping into SQL literal format will be done below
 	 * using appendStringLiteralConn().
+	 *
+	 * If the caller provided a schemavar, we want to split the pattern on
+	 * ".", otherwise not.
 	 */
 	patternToSQLRegex(PQclientEncoding(conn),
 					  (schemavar ? dbnamebuf : NULL),
-					  (schemavar ? &schemabuf: NULL),
-					  &namebuf, pattern, force_escape, true, dotcnt);
+					  (schemavar ? &schemabuf : NULL),
+					  &namebuf,
+					  pattern, force_escape, true, dotcnt);
 
 	/*
 	 * Now decide what we need to emit.  We may run under a hostile
@@ -1359,4 +1497,7 @@ patternToSQLRegex(int encoding, PQExpBuffer dbnamebuf, PQExpBuffer schemabuf,
 			appendPQExpBufferStr(dbnamebuf, curbuf->data);
 		termPQExpBuffer(curbuf);
 	}
+
+	if (want_literal_dbname)
+		termPQExpBuffer(&left_literal);
 }

@@ -34,7 +34,7 @@
  *		plan normally and pass back the results.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -48,7 +48,6 @@
 #include "executor/executor.h"
 #include "executor/nodeResult.h"
 #include "miscadmin.h"
-#include "utils/memutils.h"
 
 
 /* ----------------------------------------------------------------
@@ -195,7 +194,7 @@ ExecInitResult(Result *node, EState *estate, int eflags)
 	resstate->ps.ExecProcNode = ExecResult;
 
 	resstate->rs_done = false;
-	resstate->rs_checkqual = (node->resconstantqual == NULL) ? false : true;
+	resstate->rs_checkqual = (node->resconstantqual != NULL);
 
 	/*
 	 * Miscellaneous initialization
@@ -241,16 +240,6 @@ void
 ExecEndResult(ResultState *node)
 {
 	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
-
-	/*
 	 * shut down subplans
 	 */
 	ExecEndNode(outerPlanState(node));
@@ -259,14 +248,15 @@ ExecEndResult(ResultState *node)
 void
 ExecReScanResult(ResultState *node)
 {
+	PlanState  *outerPlan = outerPlanState(node);
+
 	node->rs_done = false;
-	node->rs_checkqual = (node->resconstantqual == NULL) ? false : true;
+	node->rs_checkqual = (node->resconstantqual != NULL);
 
 	/*
 	 * If chgParam of subnode is not null then plan will be re-scanned by
 	 * first ExecProcNode.
 	 */
-	if (node->ps.lefttree &&
-		node->ps.lefttree->chgParam == NULL)
-		ExecReScan(node->ps.lefttree);
+	if (outerPlan && outerPlan->chgParam == NULL)
+		ExecReScan(outerPlan);
 }

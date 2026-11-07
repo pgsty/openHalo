@@ -1,15 +1,27 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
-use Config;
-use PostgresNode;
-use TestLib;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
 use Test::More;
 
-my $node = get_new_node('main');
+# Use Test::Differences if installed, and select unified diff output.
+BEGIN
+{
+	eval {
+		require Test::Differences;
+		Test::Differences->import;
+		unified_diff();
+	};
+
+	# No dice -- fall back to 'is'
+	*eq_or_diff = \&is if $@;
+}
+
+my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->start;
 
@@ -19,28 +31,30 @@ my ($out, $err) = run_command([ 'libpq_pipeline', 'tests' ]);
 die "oops: $err" unless $err eq '';
 my @tests = split(/\s+/, $out);
 
-mkdir "$TestLib::tmp_check/traces";
+mkdir "$PostgreSQL::Test::Utils::tmp_check/traces";
 
 for my $testname (@tests)
 {
-	my @extraargs = ('-r', $numrows);
+	my @extraargs = ('-r' => $numrows);
 	my $cmptrace = grep(/^$testname$/,
 		qw(simple_pipeline nosync multi_pipelines prepared singlerow
 		  pipeline_abort pipeline_idle transaction
 		  disallowed_in_pipeline)) > 0;
 
 	# For a bunch of tests, generate a libpq trace file too.
-	my $traceout = "$TestLib::tmp_check/traces/$testname.trace";
+	my $traceout =
+	  "$PostgreSQL::Test::Utils::tmp_check/traces/$testname.trace";
 	if ($cmptrace)
 	{
-		push @extraargs, "-t", $traceout;
+		push @extraargs, "-t" => $traceout;
 	}
 
-	# Execute the test
+	# Execute the test using the latest protocol version.
 	$node->command_ok(
 		[
 			'libpq_pipeline', @extraargs,
-			$testname,        $node->connstr('postgres')
+			$testname,
+			$node->connstr('postgres') . " max_protocol_version=latest"
 		],
 		"libpq_pipeline $testname");
 
@@ -55,9 +69,18 @@ for my $testname (@tests)
 		$result = slurp_file_eval($traceout);
 		next unless $result ne "";
 
-		is($result, $expected, "$testname trace match");
+		eq_or_diff($result, $expected, "$testname trace match");
 	}
 }
+
+# There were changes to query cancellation in protocol version 3.2, so
+# test separately that it still works the old protocol version too.
+$node->command_ok(
+	[
+		'libpq_pipeline', 'cancel',
+		$node->connstr('postgres') . " max_protocol_version=3.0"
+	],
+	"libpq_pipeline cancel with protocol 3.0");
 
 $node->stop('fast');
 

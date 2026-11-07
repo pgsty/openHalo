@@ -26,6 +26,7 @@
  * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  */
 
 #include "c.h"
@@ -71,7 +72,7 @@ int
 getopt(int nargc, char *const *nargv, const char *ostr)
 {
 	static char *place = EMSG;	/* option letter processing */
-	char	   *oli;			/* option letter list index */
+	const char *oli;			/* option letter list index */
 
 	if (!*place)
 	{							/* update scanning pointer */

@@ -3,7 +3,7 @@
  * genam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,20 +24,18 @@
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/transam.h"
-#include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
-#include "utils/builtins.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
-#include "utils/syscache.h"
 
 
 /* ----------------------------------------------------------------
@@ -121,6 +119,7 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 	scan->ignore_killed_tuples = !scan->xactStartedInRecovery;
 
 	scan->opaque = NULL;
+	scan->instrument = NULL;
 
 	scan->xs_itup = NULL;
 	scan->xs_itupdesc = NULL;
@@ -158,8 +157,9 @@ IndexScanEnd(IndexScanDesc scan)
  *
  * Construct a string describing the contents of an index entry, in the
  * form "(key_name, ...)=(key_value, ...)".  This is currently used
- * for building unique-constraint and exclusion-constraint error messages,
- * so only key columns of the index are checked and printed.
+ * for building unique-constraint, exclusion-constraint error messages, and
+ * logical replication conflict error messages so only key columns of the index
+ * are checked and printed.
  *
  * Note that if the user does not have permissions to view all of the
  * columns involved then a NULL is returned.  Returning a partial key seems
@@ -176,7 +176,7 @@ IndexScanEnd(IndexScanDesc scan)
  */
 char *
 BuildIndexValueDescription(Relation indexRelation,
-						   Datum *values, bool *isnull)
+						   const Datum *values, const bool *isnull)
 {
 	StringInfoData buf;
 	Form_pg_index idxrec;
@@ -276,14 +276,15 @@ BuildIndexValueDescription(Relation indexRelation,
 }
 
 /*
- * Get the latestRemovedXid from the table entries pointed at by the index
- * tuples being deleted using an AM-generic approach.
+ * Get the snapshotConflictHorizon from the table entries pointed to by the
+ * index tuples being deleted using an AM-generic approach.
  *
- * This is a table_index_delete_tuples() shim used by index AMs that have
- * simple requirements.  These callers only need to consult the tableam to get
- * a latestRemovedXid value, and only expect to delete tuples that are already
- * known deletable.  When a latestRemovedXid value isn't needed in index AM's
- * deletion WAL record, it is safe for it to skip calling here entirely.
+ * This is a table_index_delete_tuples() shim used by index AMs that only need
+ * to consult the tableam to get a snapshotConflictHorizon value, and only
+ * expect to delete index tuples that are already known deletable (typically
+ * due to having LP_DEAD bits set).  When a snapshotConflictHorizon value
+ * isn't needed in index AM's deletion WAL record, it is safe for it to skip
+ * calling here entirely.
  *
  * We assume that caller index AM uses the standard IndexTuple representation,
  * with table TIDs stored in the t_tid field.  We also expect (and assert)
@@ -298,12 +299,14 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 									 int nitems)
 {
 	TM_IndexDeleteOp delstate;
-	TransactionId latestRemovedXid = InvalidTransactionId;
+	TransactionId snapshotConflictHorizon = InvalidTransactionId;
 	Page		ipage = BufferGetPage(ibuf);
 	IndexTuple	itup;
 
 	Assert(nitems > 0);
 
+	delstate.irel = irel;
+	delstate.iblknum = BufferGetBlockNumber(ibuf);
 	delstate.bottomup = false;
 	delstate.bottomupfreespace = 0;
 	delstate.ndeltids = 0;
@@ -313,16 +316,17 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 	/* identify what the index tuples about to be deleted point to */
 	for (int i = 0; i < nitems; i++)
 	{
+		OffsetNumber offnum = itemnos[i];
 		ItemId		iitemid;
 
-		iitemid = PageGetItemId(ipage, itemnos[i]);
+		iitemid = PageGetItemId(ipage, offnum);
 		itup = (IndexTuple) PageGetItem(ipage, iitemid);
 
 		Assert(ItemIdIsDead(iitemid));
 
 		ItemPointerCopy(&itup->t_tid, &delstate.deltids[i].tid);
 		delstate.deltids[i].id = delstate.ndeltids;
-		delstate.status[i].idxoffnum = InvalidOffsetNumber; /* unused */
+		delstate.status[i].idxoffnum = offnum;
 		delstate.status[i].knowndeletable = true;	/* LP_DEAD-marked */
 		delstate.status[i].promising = false;	/* unused */
 		delstate.status[i].freespace = 0;	/* unused */
@@ -331,7 +335,7 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 	}
 
 	/* determine the actual xid horizon */
-	latestRemovedXid = table_index_delete_tuples(hrel, &delstate);
+	snapshotConflictHorizon = table_index_delete_tuples(hrel, &delstate);
 
 	/* assert tableam agrees that all items are deletable */
 	Assert(delstate.ndeltids == nitems);
@@ -339,7 +343,7 @@ index_compute_xid_horizon_for_tuples(Relation irel,
 	pfree(delstate.deltids);
 	pfree(delstate.status);
 
-	return latestRemovedXid;
+	return snapshotConflictHorizon;
 }
 
 
@@ -371,7 +375,7 @@ index_compute_xid_horizon_for_tuples(Relation irel,
  *	nkeys, key: scan keys
  *
  * The attribute numbers in the scan key should be set for the heap case.
- * If we choose to index, we reset them to 1..n to reference the index
+ * If we choose to index, we convert them to 1..n to reference the index
  * columns.  Note this means there must be one scankey qualification per
  * index column!  This is checked by the Asserts in the normal, index-using
  * case, but won't be checked if the heapscan path is taken.
@@ -419,17 +423,22 @@ systable_beginscan(Relation heapRelation,
 	if (irel)
 	{
 		int			i;
+		ScanKey		idxkey;
 
-		/* Change attribute numbers to be index column numbers. */
+		idxkey = palloc_array(ScanKeyData, nkeys);
+
+		/* Convert attribute numbers to be index column numbers. */
 		for (i = 0; i < nkeys; i++)
 		{
 			int			j;
+
+			memcpy(&idxkey[i], &key[i], sizeof(ScanKeyData));
 
 			for (j = 0; j < IndexRelationGetNumberOfAttributes(irel); j++)
 			{
 				if (key[i].sk_attno == irel->rd_index->indkey.values[j])
 				{
-					key[i].sk_attno = j + 1;
+					idxkey[i].sk_attno = j + 1;
 					break;
 				}
 			}
@@ -438,9 +447,11 @@ systable_beginscan(Relation heapRelation,
 		}
 
 		sysscan->iscan = index_beginscan(heapRelation, irel,
-										 snapshot, nkeys, 0);
-		index_rescan(sysscan->iscan, key, nkeys, NULL, 0);
+										 snapshot, NULL, nkeys, 0);
+		index_rescan(sysscan->iscan, idxkey, nkeys, NULL, 0);
 		sysscan->scan = NULL;
+
+		pfree(idxkey);
 	}
 	else
 	{
@@ -566,17 +577,13 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 
 	Assert(tup == ExecFetchSlotHeapTuple(sysscan->slot, false, NULL));
 
-	/*
-	 * Trust that table_tuple_satisfies_snapshot() and its subsidiaries
-	 * (commonly LockBuffer() and HeapTupleSatisfiesMVCC()) do not themselves
-	 * acquire snapshots, so we need not register the snapshot.  Those
-	 * facilities are too low-level to have any business scanning tables.
-	 */
 	freshsnap = GetCatalogSnapshot(RelationGetRelid(sysscan->heap_rel));
+	freshsnap = RegisterSnapshot(freshsnap);
 
 	result = table_tuple_satisfies_snapshot(sysscan->heap_rel,
 											sysscan->slot,
 											freshsnap);
+	UnregisterSnapshot(freshsnap);
 
 	/*
 	 * Handle the concurrent abort while fetching the catalog tuple during
@@ -647,6 +654,7 @@ systable_beginscan_ordered(Relation heapRelation,
 {
 	SysScanDesc sysscan;
 	int			i;
+	ScanKey		idxkey;
 
 	/* REINDEX can probably be a hard error here ... */
 	if (ReindexIsProcessingIndex(RelationGetRelid(indexRelation)))
@@ -678,16 +686,20 @@ systable_beginscan_ordered(Relation heapRelation,
 		sysscan->snapshot = NULL;
 	}
 
-	/* Change attribute numbers to be index column numbers. */
+	idxkey = palloc_array(ScanKeyData, nkeys);
+
+	/* Convert attribute numbers to be index column numbers. */
 	for (i = 0; i < nkeys; i++)
 	{
 		int			j;
+
+		memcpy(&idxkey[i], &key[i], sizeof(ScanKeyData));
 
 		for (j = 0; j < IndexRelationGetNumberOfAttributes(indexRelation); j++)
 		{
 			if (key[i].sk_attno == indexRelation->rd_index->indkey.values[j])
 			{
-				key[i].sk_attno = j + 1;
+				idxkey[i].sk_attno = j + 1;
 				break;
 			}
 		}
@@ -696,9 +708,11 @@ systable_beginscan_ordered(Relation heapRelation,
 	}
 
 	sysscan->iscan = index_beginscan(heapRelation, indexRelation,
-									 snapshot, nkeys, 0);
-	index_rescan(sysscan->iscan, key, nkeys, NULL, 0);
+									 snapshot, NULL, nkeys, 0);
+	index_rescan(sysscan->iscan, idxkey, nkeys, NULL, 0);
 	sysscan->scan = NULL;
+
+	pfree(idxkey);
 
 	/*
 	 * If CheckXidAlive is set then set a flag to indicate that system table
@@ -798,7 +812,6 @@ systable_inplace_update_begin(Relation relation,
 							  HeapTuple *oldtupcopy,
 							  void **state)
 {
-	ScanKey		mutable_key = palloc(sizeof(ScanKeyData) * nkeys);
 	int			retries = 0;
 	SysScanDesc scan;
 	HeapTuple	oldtup;
@@ -838,9 +851,9 @@ systable_inplace_update_begin(Relation relation,
 		if (retries++ > 10000)
 			elog(ERROR, "giving up after too many tries to overwrite row");
 
-		memcpy(mutable_key, key, sizeof(ScanKeyData) * nkeys);
+		INJECTION_POINT("inplace-before-pin", NULL);
 		scan = systable_beginscan(relation, indexId, indexOK, snapshot,
-								  nkeys, mutable_key);
+								  nkeys, unconstify(ScanKeyData *, key));
 		oldtup = systable_getnext(scan);
 		if (!HeapTupleIsValid(oldtup))
 		{

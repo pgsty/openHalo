@@ -16,7 +16,7 @@
  * bitcode.
  *
  *
- * Copyright (c) 2016-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit_types.c
@@ -117,11 +117,9 @@ ExecEvalBoolSubroutineTemplate(ExprState *state,
 }
 
 /*
- * Clang represents stdbool.h style booleans that are returned by functions
- * differently (as i1) than stored ones (as i8). Therefore we do not just need
- * TypeBool (above), but also a way to determine the width of a returned
- * integer. This allows us to keep compatible with non-stdbool using
- * architectures.
+ * Clang represents bool returned by functions differently (as i1) than stored
+ * ones (as i8).  Therefore we do not just need TypeStorageBool (above), but
+ * also a way to determine the width of a returned integer.
  */
 extern bool FunctionReturningBool(void);
 bool
@@ -138,7 +136,9 @@ FunctionReturningBool(void)
 void	   *referenced_functions[] =
 {
 	ExecAggInitGroup,
-	ExecAggTransReparent,
+	ExecAggCopyTransValue,
+	ExecEvalPreOrderedDistinctSingle,
+	ExecEvalPreOrderedDistinctMulti,
 	ExecEvalAggOrderedTransDatum,
 	ExecEvalAggOrderedTransTuple,
 	ExecEvalArrayCoerce,
@@ -153,13 +153,16 @@ void	   *referenced_functions[] =
 	ExecEvalFuncExprFusage,
 	ExecEvalFuncExprStrictFusage,
 	ExecEvalGroupingFunc,
+	ExecEvalMergeSupportFunc,
 	ExecEvalMinMax,
 	ExecEvalNextValueExpr,
 	ExecEvalParamExec,
 	ExecEvalParamExtern,
+	ExecEvalParamSet,
 	ExecEvalRow,
 	ExecEvalRowNotNull,
 	ExecEvalRowNull,
+	ExecEvalCoerceViaIOSafe,
 	ExecEvalSQLValueFunction,
 	ExecEvalScalarArrayOp,
 	ExecEvalHashedScalarArrayOp,
@@ -167,6 +170,11 @@ void	   *referenced_functions[] =
 	ExecEvalSysVar,
 	ExecEvalWholeRowVar,
 	ExecEvalXmlExpr,
+	ExecEvalJsonConstructor,
+	ExecEvalJsonIsPredicate,
+	ExecEvalJsonCoercion,
+	ExecEvalJsonCoercionFinish,
+	ExecEvalJsonExprPath,
 	MakeExpandedObjectReadOnlyInternal,
 	slot_getmissingattrs,
 	slot_getsomeattrs_int,

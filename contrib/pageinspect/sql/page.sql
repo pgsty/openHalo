@@ -1,6 +1,7 @@
 CREATE EXTENSION pageinspect;
 
-CREATE TABLE test1 (a int, b int);
+-- Use a temp table so that effects of VACUUM are predictable
+CREATE TEMP TABLE test1 (a int, b int);
 INSERT INTO test1 VALUES (16777217, 131584);
 
 VACUUM (DISABLE_PAGE_SKIPPING) test1;  -- set up FSM
@@ -82,6 +83,25 @@ select t_bits, t_data from heap_page_items(get_raw_page('test8', 0));
 select tuple_data_split('test8'::regclass, t_data, t_infomask, t_infomask2, t_bits)
     from heap_page_items(get_raw_page('test8', 0));
 drop table test8;
+
+-- check storage of generated columns
+-- stored
+create table test9s (a int not null, b int generated always as (a * 2) stored);
+insert into test9s values (131584);
+select raw_flags, t_bits, t_data
+    from heap_page_items(get_raw_page('test9s', 0)), lateral heap_tuple_infomask_flags(t_infomask, t_infomask2);
+select tuple_data_split('test9s'::regclass, t_data, t_infomask, t_infomask2, t_bits)
+    from heap_page_items(get_raw_page('test9s', 0));
+drop table test9s;
+
+-- virtual
+create table test9v (a int not null, b int generated always as (a * 2) virtual);
+insert into test9v values (131584);
+select raw_flags, t_bits, t_data
+    from heap_page_items(get_raw_page('test9v', 0)), lateral heap_tuple_infomask_flags(t_infomask, t_infomask2);
+select tuple_data_split('test9v'::regclass, t_data, t_infomask, t_infomask2, t_bits)
+    from heap_page_items(get_raw_page('test9v', 0));
+drop table test9v;
 
 -- Failure with incorrect page size
 -- Suppress the DETAIL message, to allow the tests to work across various

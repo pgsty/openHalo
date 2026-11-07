@@ -35,10 +35,12 @@
 
 
 #include "postgres.h"
-#include "optimizer/geqo_random.h"
-#include "optimizer/geqo_recombination.h"
+#include "optimizer/geqo.h"
 
 #if defined(CX)
+
+#include "optimizer/geqo_random.h"
+#include "optimizer/geqo_recombination.h"
 
 /* cx
  *
@@ -115,7 +117,6 @@ cx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring,
 		for (i = 0; i < num_gene; i++)
 			if (tour1[i] != offspring[i])
 				num_diffs++;
-
 	}
 
 	return num_diffs;

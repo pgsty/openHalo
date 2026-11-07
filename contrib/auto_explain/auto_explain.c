@@ -3,7 +3,7 @@
  * auto_explain.c
  *
  *
- * Copyright (c) 2008-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2008-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/auto_explain/auto_explain.c
@@ -16,14 +16,20 @@
 
 #include "access/parallel.h"
 #include "commands/explain.h"
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
+#include "common/pg_prng.h"
 #include "executor/instrument.h"
-#include "jit/jit.h"
 #include "utils/guc.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "auto_explain",
+					.version = PG_VERSION
+);
 
 /* GUC variables */
 static int	auto_explain_log_min_duration = -1; /* msec or -1 */
+static int	auto_explain_log_parameter_max_length = -1; /* bytes or -1 */
 static bool auto_explain_log_analyze = false;
 static bool auto_explain_log_verbose = false;
 static bool auto_explain_log_buffers = false;
@@ -69,19 +75,16 @@ static bool current_query_sampled = false;
 	 (nesting_level == 0 || auto_explain_log_nested_statements) && \
 	 current_query_sampled)
 
-/* Saved hook values in case of unload */
+/* Saved hook values */
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
-void		_PG_init(void);
-void		_PG_fini(void);
-
 static void explain_ExecutorStart(QueryDesc *queryDesc, int eflags);
 static void explain_ExecutorRun(QueryDesc *queryDesc,
 								ScanDirection direction,
-								uint64 count, bool execute_once);
+								uint64 count);
 static void explain_ExecutorFinish(QueryDesc *queryDesc);
 static void explain_ExecutorEnd(QueryDesc *queryDesc);
 
@@ -95,12 +98,24 @@ _PG_init(void)
 	/* Define custom GUC variables. */
 	DefineCustomIntVariable("auto_explain.log_min_duration",
 							"Sets the minimum execution time above which plans will be logged.",
-							"Zero prints all plans. -1 turns this feature off.",
+							"-1 disables logging plans. 0 means log all plans.",
 							&auto_explain_log_min_duration,
 							-1,
 							-1, INT_MAX,
 							PGC_SUSET,
 							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("auto_explain.log_parameter_max_length",
+							"Sets the maximum length of query parameter values to log.",
+							"-1 means log values in full.",
+							&auto_explain_log_parameter_max_length,
+							-1,
+							-1, INT_MAX,
+							PGC_SUSET,
+							GUC_UNIT_BYTE,
 							NULL,
 							NULL,
 							NULL);
@@ -230,7 +245,7 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
-	EmitWarningsOnPlaceholders("auto_explain");
+	MarkGUCPrefixReserved("auto_explain");
 
 	/* Install hooks. */
 	prev_ExecutorStart = ExecutorStart_hook;
@@ -241,19 +256,6 @@ _PG_init(void)
 	ExecutorFinish_hook = explain_ExecutorFinish;
 	prev_ExecutorEnd = ExecutorEnd_hook;
 	ExecutorEnd_hook = explain_ExecutorEnd;
-}
-
-/*
- * Module unload callback
- */
-void
-_PG_fini(void)
-{
-	/* Uninstall hooks. */
-	ExecutorStart_hook = prev_ExecutorStart;
-	ExecutorRun_hook = prev_ExecutorRun;
-	ExecutorFinish_hook = prev_ExecutorFinish;
-	ExecutorEnd_hook = prev_ExecutorEnd;
 }
 
 /*
@@ -275,8 +277,7 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	if (nesting_level == 0)
 	{
 		if (auto_explain_log_min_duration >= 0 && !IsParallelWorker())
-			current_query_sampled = (random() < auto_explain_sample_rate *
-									 ((double) MAX_RANDOM_VALUE + 1));
+			current_query_sampled = (pg_prng_double(&pg_global_prng_state) < auto_explain_sample_rate);
 		else
 			current_query_sampled = false;
 	}
@@ -325,15 +326,15 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
  */
 static void
 explain_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
-					uint64 count, bool execute_once)
+					uint64 count)
 {
 	nesting_level++;
 	PG_TRY();
 	{
 		if (prev_ExecutorRun)
-			prev_ExecutorRun(queryDesc, direction, count, execute_once);
+			prev_ExecutorRun(queryDesc, direction, count);
 		else
-			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+			standard_ExecutorRun(queryDesc, direction, count);
 	}
 	PG_FINALLY();
 	{
@@ -398,11 +399,14 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			es->wal = (es->analyze && auto_explain_log_wal);
 			es->timing = (es->analyze && auto_explain_log_timing);
 			es->summary = es->analyze;
+			/* No support for MEMORY */
+			/* es->memory = false; */
 			es->format = auto_explain_log_format;
 			es->settings = auto_explain_log_settings;
 
 			ExplainBeginOutput(es);
 			ExplainQueryText(es, queryDesc);
+			ExplainQueryParameters(es, queryDesc->params, auto_explain_log_parameter_max_length);
 			ExplainPrintPlan(es, queryDesc);
 			if (es->analyze && auto_explain_log_triggers)
 				ExplainPrintTriggers(es, queryDesc);

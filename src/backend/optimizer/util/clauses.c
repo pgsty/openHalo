@@ -3,7 +3,7 @@
  * clauses.c
  *	  routines to manipulate qualification clauses
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,8 +20,6 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "catalog/pg_aggregate.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
@@ -31,6 +29,7 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/multibitmapset.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/subscripting.h"
 #include "nodes/supportnodes.h"
@@ -40,9 +39,10 @@
 #include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "parser/analyze.h"
-#include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_collate.h"
 #include "parser/parse_func.h"
+#include "parser/parse_oper.h"
 #include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "tcop/tcopprot.h"
@@ -50,6 +50,9 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/json.h"
+#include "utils/jsonb.h"
+#include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -91,6 +94,17 @@ typedef struct
 	List	   *safe_param_ids; /* PARAM_EXEC Param IDs to treat as safe */
 } max_parallel_hazard_context;
 
+/*
+ * Walker context for expression_has_grouping_conflict.  get_eqop is a callback
+ * that returns the equality operator used for grouping.  cb_context is opaque
+ * to the walker and is forwarded to get_eqop unchanged.
+ */
+typedef struct
+{
+	grouping_eqop_callback get_eqop;
+	void	   *cb_context;
+} grouping_walker_ctx;
+
 static bool contain_agg_clause_walker(Node *node, void *context);
 static bool find_window_functions_walker(Node *node, WindowFuncLists *lists);
 static bool contain_subplans_walker(Node *node, void *context);
@@ -108,6 +122,11 @@ static Relids find_nonnullable_rels_walker(Node *node, bool top_level);
 static List *find_nonnullable_vars_walker(Node *node, bool top_level);
 static bool is_strict_saop(ScalarArrayOpExpr *expr, bool falseOK);
 static bool convert_saop_to_hashed_saop_walker(Node *node, void *context);
+static bool grouping_conflict_walker(Node *node, grouping_walker_ctx *ctx);
+static bool grouping_check_operands(Oid opno, Oid inputcollid,
+									List *args, grouping_walker_ctx *ctx);
+static bool grouping_check_operand(Node *arg, Oid opno, Oid inputcollid,
+								   grouping_walker_ctx *ctx);
 static Node *eval_const_expressions_mutator(Node *node,
 											eval_const_expressions_context *context);
 static bool contain_non_const_walker(Node *node, void *context);
@@ -247,13 +266,10 @@ find_window_functions_walker(Node *node, WindowFuncLists *lists)
 		if (wfunc->winref > lists->maxWinRef)
 			elog(ERROR, "WindowFunc contains out-of-range winref %u",
 				 wfunc->winref);
-		/* eliminate duplicates, so that we avoid repeated computation */
-		if (!list_member(lists->windowFuncs[wfunc->winref], wfunc))
-		{
-			lists->windowFuncs[wfunc->winref] =
-				lappend(lists->windowFuncs[wfunc->winref], wfunc);
-			lists->numWindowFuncs++;
-		}
+
+		lists->windowFuncs[wfunc->winref] =
+			lappend(lists->windowFuncs[wfunc->winref], wfunc);
+		lists->numWindowFuncs++;
 
 		/*
 		 * We assume that the parser checked that there are no window
@@ -264,8 +280,7 @@ find_window_functions_walker(Node *node, WindowFuncLists *lists)
 		return false;
 	}
 	Assert(!IsA(node, SubLink));
-	return expression_tree_walker(node, find_window_functions_walker,
-								  (void *) lists);
+	return expression_tree_walker(node, find_window_functions_walker, lists);
 }
 
 
@@ -386,6 +401,52 @@ contain_mutable_functions_walker(Node *node, void *context)
 	if (check_functions_in_node(node, contain_mutable_functions_checker,
 								context))
 		return true;
+
+	if (IsA(node, JsonConstructorExpr))
+	{
+		const JsonConstructorExpr *ctor = (JsonConstructorExpr *) node;
+		ListCell   *lc;
+		bool		is_jsonb;
+
+		is_jsonb = ctor->returning->format->format_type == JS_FORMAT_JSONB;
+
+		/*
+		 * Check argument_type => json[b] conversions specifically.  We still
+		 * recurse to check 'args' below, but here we want to specifically
+		 * check whether or not the emitted clause would fail to be immutable
+		 * because of TimeZone, for example.
+		 */
+		foreach(lc, ctor->args)
+		{
+			Oid			typid = exprType(lfirst(lc));
+
+			if (is_jsonb ?
+				!to_jsonb_is_immutable(typid) :
+				!to_json_is_immutable(typid))
+				return true;
+		}
+
+		/* Check all subnodes */
+	}
+
+	if (IsA(node, JsonExpr))
+	{
+		JsonExpr   *jexpr = castNode(JsonExpr, node);
+		Const	   *cnst;
+
+		if (!IsA(jexpr->path_spec, Const))
+			return true;
+
+		cnst = castNode(Const, jexpr->path_spec);
+
+		Assert(cnst->consttype == JSONPATHOID);
+		if (cnst->constisnull)
+			return false;
+
+		if (jspIsMutable(DatumGetJsonPathP(cnst->constvalue),
+						 jexpr->passing_names, jexpr->passing_values))
+			return true;
+	}
 
 	if (IsA(node, SQLValueFunction))
 	{
@@ -964,7 +1025,7 @@ contain_nonstrict_functions_walker(Node *node, void *context)
 		/* an aggregate could return non-null with null input */
 		return true;
 	}
-	if (IsA(node, GroupingFunc))
+	else if (IsA(node, GroupingFunc))
 	{
 		/*
 		 * A GroupingFunc doesn't evaluate its arguments, and therefore must
@@ -972,12 +1033,12 @@ contain_nonstrict_functions_walker(Node *node, void *context)
 		 */
 		return true;
 	}
-	if (IsA(node, WindowFunc))
+	else if (IsA(node, WindowFunc))
 	{
 		/* a window function could return non-null with null input */
 		return true;
 	}
-	if (IsA(node, SubscriptingRef))
+	else if (IsA(node, SubscriptingRef))
 	{
 		SubscriptingRef *sbsref = (SubscriptingRef *) node;
 		const SubscriptRoutines *sbsroutines;
@@ -991,17 +1052,25 @@ contain_nonstrict_functions_walker(Node *node, void *context)
 			return true;
 		/* else fall through to check args */
 	}
-	if (IsA(node, DistinctExpr))
+	else if (IsA(node, DistinctExpr))
 	{
 		/* IS DISTINCT FROM is inherently non-strict */
 		return true;
 	}
-	if (IsA(node, NullIfExpr))
+	else if (IsA(node, NullIfExpr))
 	{
 		/* NULLIF is inherently non-strict */
 		return true;
 	}
-	if (IsA(node, BoolExpr))
+	else if (IsA(node, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
+
+		if (!is_strict_saop(expr, false))
+			return true;
+		/* else fall through to check args */
+	}
+	else if (IsA(node, BoolExpr))
 	{
 		BoolExpr   *expr = (BoolExpr *) node;
 
@@ -1015,28 +1084,26 @@ contain_nonstrict_functions_walker(Node *node, void *context)
 				break;
 		}
 	}
-	if (IsA(node, SubLink))
+	else if (IsA(node, SubLink))
 	{
 		/* In some cases a sublink might be strict, but in general not */
 		return true;
 	}
-	if (IsA(node, SubPlan))
+	else if (IsA(node, SubPlan))
 		return true;
-	if (IsA(node, AlternativeSubPlan))
+	else if (IsA(node, AlternativeSubPlan))
 		return true;
-	if (IsA(node, FieldStore))
+	else if (IsA(node, FieldStore))
 		return true;
-	if (IsA(node, CoerceViaIO))
+	else if (IsA(node, CoerceViaIO))
 	{
 		/*
 		 * CoerceViaIO is strict regardless of whether the I/O functions are,
-		 * so just go look at its argument; asking check_functions_in_node is
-		 * useless expense and could deliver the wrong answer.
+		 * so we should skip check_functions_in_node() and just fall through
+		 * to check the arguments.
 		 */
-		return contain_nonstrict_functions_walker((Node *) ((CoerceViaIO *) node)->arg,
-												  context);
 	}
-	if (IsA(node, ArrayCoerceExpr))
+	else if (IsA(node, ArrayCoerceExpr))
 	{
 		/*
 		 * ArrayCoerceExpr is strict at the array level, regardless of what
@@ -1046,29 +1113,33 @@ contain_nonstrict_functions_walker(Node *node, void *context)
 		return contain_nonstrict_functions_walker((Node *) ((ArrayCoerceExpr *) node)->arg,
 												  context);
 	}
-	if (IsA(node, CaseExpr))
+	else if (IsA(node, CaseExpr))
 		return true;
-	if (IsA(node, ArrayExpr))
+	else if (IsA(node, ArrayExpr))
 		return true;
-	if (IsA(node, RowExpr))
+	else if (IsA(node, RowExpr))
 		return true;
-	if (IsA(node, RowCompareExpr))
+	else if (IsA(node, RowCompareExpr))
 		return true;
-	if (IsA(node, CoalesceExpr))
+	else if (IsA(node, CoalesceExpr))
 		return true;
-	if (IsA(node, MinMaxExpr))
+	else if (IsA(node, MinMaxExpr))
 		return true;
-	if (IsA(node, XmlExpr))
+	else if (IsA(node, XmlExpr))
 		return true;
-	if (IsA(node, NullTest))
+	else if (IsA(node, NullTest))
 		return true;
-	if (IsA(node, BooleanTest))
+	else if (IsA(node, BooleanTest))
 		return true;
-
-	/* Check other function-containing nodes */
-	if (check_functions_in_node(node, contain_nonstrict_functions_checker,
-								context))
+	else if (IsA(node, JsonConstructorExpr))
 		return true;
+	else
+	{
+		/* Check other function-containing nodes */
+		if (check_functions_in_node(node, contain_nonstrict_functions_checker,
+									context))
+			return true;
+	}
 
 	return expression_tree_walker(node, contain_nonstrict_functions_walker,
 								  context);
@@ -1170,7 +1241,7 @@ contain_context_dependent_node_walker(Node *node, int *flags)
 			*flags |= CCDN_CASETESTEXPR_OK;
 			res = expression_tree_walker(node,
 										 contain_context_dependent_node_walker,
-										 (void *) flags);
+										 flags);
 			*flags = save_flags;
 			return res;
 		}
@@ -1194,7 +1265,7 @@ contain_context_dependent_node_walker(Node *node, int *flags)
 		return res;
 	}
 	return expression_tree_walker(node, contain_context_dependent_node_walker,
-								  (void *) flags);
+								  flags);
 }
 
 /*****************************************************************************
@@ -1249,6 +1320,7 @@ contain_leaked_vars_walker(Node *node, void *context)
 		case T_NullTest:
 		case T_BooleanTest:
 		case T_NextValueExpr:
+		case T_ReturningExpr:
 		case T_List:
 
 			/*
@@ -1463,7 +1535,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 	{
 		ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
 
-		if (is_strict_saop(expr, true))
+		if (is_strict_saop(expr, top_level))
 			result = find_nonnullable_rels_walker((Node *) expr->args, false);
 	}
 	else if (IsA(node, BoolExpr))
@@ -1577,6 +1649,31 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
 			 expr->booltesttype == IS_NOT_UNKNOWN))
 			result = find_nonnullable_rels_walker((Node *) expr->arg, false);
 	}
+	else if (IsA(node, SubPlan))
+	{
+		SubPlan    *splan = (SubPlan *) node;
+
+		/*
+		 * For some types of SubPlan, we can infer strictness from Vars in the
+		 * testexpr (the LHS of the original SubLink).
+		 *
+		 * For ANY_SUBLINK, if the subquery produces zero rows, the result is
+		 * always FALSE.  If the subquery produces more than one row, the
+		 * per-row results of the testexpr are combined using OR semantics.
+		 * Hence ANY_SUBLINK can be strict only at top level, but there it's
+		 * as strict as the testexpr is.
+		 *
+		 * For ROWCOMPARE_SUBLINK, if the subquery produces zero rows, the
+		 * result is always NULL.  Otherwise, the result is as strict as the
+		 * testexpr is.  So we can check regardless of top_level.
+		 *
+		 * We can't prove anything for other sublink types (in particular,
+		 * note that ALL_SUBLINK will return TRUE if the subquery is empty).
+		 */
+		if ((top_level && splan->subLinkType == ANY_SUBLINK) ||
+			splan->subLinkType == ROWCOMPARE_SUBLINK)
+			result = find_nonnullable_rels_walker(splan->testexpr, top_level);
+	}
 	else if (IsA(node, PlaceHolderVar))
 	{
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
@@ -1607,7 +1704,7 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
  * find_nonnullable_vars
  *		Determine which Vars are forced nonnullable by given clause.
  *
- * Returns a list of all level-zero Vars that are referenced in the clause in
+ * Returns the set of all level-zero Vars that are referenced in the clause in
  * such a way that the clause cannot possibly return TRUE if any of these Vars
  * is NULL.  (It is OK to err on the side of conservatism; hence the analysis
  * here is simplistic.)
@@ -1619,8 +1716,9 @@ find_nonnullable_rels_walker(Node *node, bool top_level)
  * the expression to have been AND/OR flattened and converted to implicit-AND
  * format.
  *
- * The result is a palloc'd List, but we have not copied the member Var nodes.
- * Also, we don't bother trying to eliminate duplicate entries.
+ * Attnos of the identified Vars are returned in a multibitmapset (a List of
+ * Bitmapsets).  List indexes correspond to relids (varnos), while the per-rel
+ * Bitmapsets hold varattnos offset by FirstLowInvalidHeapAttributeNumber.
  *
  * top_level is true while scanning top-level AND/OR structure; here, showing
  * the result is either FALSE or NULL is good enough.  top_level is false when
@@ -1649,7 +1747,9 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		Var		   *var = (Var *) node;
 
 		if (var->varlevelsup == 0)
-			result = list_make1(var);
+			result = mbms_add_member(result,
+									 var->varno,
+									 var->varattno - FirstLowInvalidHeapAttributeNumber);
 	}
 	else if (IsA(node, List))
 	{
@@ -1664,9 +1764,9 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		 */
 		foreach(l, (List *) node)
 		{
-			result = list_concat(result,
-								 find_nonnullable_vars_walker(lfirst(l),
-															  top_level));
+			result = mbms_add_members(result,
+									  find_nonnullable_vars_walker(lfirst(l),
+																   top_level));
 		}
 	}
 	else if (IsA(node, FuncExpr))
@@ -1688,7 +1788,7 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 	{
 		ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
 
-		if (is_strict_saop(expr, true))
+		if (is_strict_saop(expr, top_level))
 			result = find_nonnullable_vars_walker((Node *) expr->args, false);
 	}
 	else if (IsA(node, BoolExpr))
@@ -1698,7 +1798,12 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 		switch (expr->boolop)
 		{
 			case AND_EXPR:
-				/* At top level we can just recurse (to the List case) */
+
+				/*
+				 * At top level we can just recurse (to the List case), since
+				 * the result should be the union of what we can prove in each
+				 * arm.
+				 */
 				if (top_level)
 				{
 					result = find_nonnullable_vars_walker((Node *) expr->args,
@@ -1730,7 +1835,7 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 					if (result == NIL)	/* first subresult? */
 						result = subresult;
 					else
-						result = list_intersection(result, subresult);
+						result = mbms_int_members(result, subresult);
 
 					/*
 					 * If the intersection is empty, we can stop looking. This
@@ -1802,6 +1907,15 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
 			 expr->booltesttype == IS_NOT_UNKNOWN))
 			result = find_nonnullable_vars_walker((Node *) expr->arg, false);
 	}
+	else if (IsA(node, SubPlan))
+	{
+		SubPlan    *splan = (SubPlan *) node;
+
+		/* See analysis in find_nonnullable_rels_walker */
+		if ((top_level && splan->subLinkType == ANY_SUBLINK) ||
+			splan->subLinkType == ROWCOMPARE_SUBLINK)
+			result = find_nonnullable_vars_walker(splan->testexpr, top_level);
+	}
 	else if (IsA(node, PlaceHolderVar))
 	{
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
@@ -1820,8 +1934,8 @@ find_nonnullable_vars_walker(Node *node, bool top_level)
  * side of conservatism; hence the analysis here is simplistic.  In fact,
  * we only detect simple "var IS NULL" tests at the top level.)
  *
- * The result is a palloc'd List, but we have not copied the member Var nodes.
- * Also, we don't bother trying to eliminate duplicate entries.
+ * As with find_nonnullable_vars, we return the varattnos of the identified
+ * Vars in a multibitmapset.
  */
 List *
 find_forced_null_vars(Node *node)
@@ -1836,7 +1950,9 @@ find_forced_null_vars(Node *node)
 	var = find_forced_null_var(node);
 	if (var)
 	{
-		result = list_make1(var);
+		result = mbms_add_member(result,
+								 var->varno,
+								 var->varattno - FirstLowInvalidHeapAttributeNumber);
 	}
 	/* Otherwise, handle AND-conditions */
 	else if (IsA(node, List))
@@ -1847,8 +1963,8 @@ find_forced_null_vars(Node *node)
 		 */
 		foreach(l, (List *) node)
 		{
-			result = list_concat(result,
-								 find_forced_null_vars(lfirst(l)));
+			result = mbms_add_members(result,
+									  find_forced_null_vars((Node *) lfirst(l)));
 		}
 	}
 	else if (IsA(node, BoolExpr))
@@ -2033,14 +2149,16 @@ is_pseudo_constant_clause_relids(Node *clause, Relids relids)
  * NumRelids
  *		(formerly clause_relids)
  *
- * Returns the number of different relations referenced in 'clause'.
+ * Returns the number of different base relations referenced in 'clause'.
  */
 int
 NumRelids(PlannerInfo *root, Node *clause)
 {
+	int			result;
 	Relids		varnos = pull_varnos(root, clause);
-	int			result = bms_num_members(varnos);
 
+	varnos = bms_del_members(varnos, root->outer_join_rels);
+	result = bms_num_members(varnos);
 	bms_free(varnos);
 	return result;
 }
@@ -2183,7 +2301,8 @@ eval_const_expressions(PlannerInfo *root, Node *node)
  *
  * We'll use a hash table if all of the following conditions are met:
  * 1. The 2nd argument of the array contain only Consts.
- * 2. useOr is true.
+ * 2. useOr is true or there is a valid negator operator for the
+ *	  ScalarArrayOpExpr's opno.
  * 3. There's valid hash function for both left and righthand operands and
  *	  these hash functions are the same.
  * 4. If the array contains enough elements for us to consider it to be
@@ -2204,31 +2323,78 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 	if (IsA(node, ScalarArrayOpExpr))
 	{
 		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
-		Expr	   *arrayarg = (Expr *) lsecond(saop->args);
+		Node	   *leftarg = (Node *) linitial(saop->args);
+		Node	   *arrayarg = (Node *) lsecond(saop->args);
 		Oid			lefthashfunc;
 		Oid			righthashfunc;
 
-		if (saop->useOr && arrayarg && IsA(arrayarg, Const) &&
-			!((Const *) arrayarg)->constisnull &&
-			get_op_hash_functions(saop->opno, &lefthashfunc, &righthashfunc) &&
-			lefthashfunc == righthashfunc)
+		if (arrayarg && IsA(arrayarg, Const) &&
+			!((Const *) arrayarg)->constisnull)
 		{
-			Datum		arrdatum = ((Const *) arrayarg)->constvalue;
-			ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
-			int			nitems;
-
-			/*
-			 * Only fill in the hash functions if the array looks large enough
-			 * for it to be worth hashing instead of doing a linear search.
-			 */
-			nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
-
-			if (nitems >= MIN_ARRAY_SIZE_FOR_HASHED_SAOP)
+			if (saop->useOr)
 			{
-				/* Looks good. Fill in the hash functions */
-				saop->hashfuncid = lefthashfunc;
+				if (get_op_hash_functions_ext(saop->opno, exprType(leftarg),
+											  &lefthashfunc, &righthashfunc) &&
+					lefthashfunc == righthashfunc)
+				{
+					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
+					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
+					int			nitems;
+
+					/*
+					 * Only fill in the hash functions if the array looks
+					 * large enough for it to be worth hashing instead of
+					 * doing a linear search.
+					 */
+					nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+
+					if (nitems >= MIN_ARRAY_SIZE_FOR_HASHED_SAOP)
+					{
+						/* Looks good. Fill in the hash functions */
+						saop->hashfuncid = lefthashfunc;
+					}
+					return false;
+				}
 			}
-			return false;
+			else				/* !saop->useOr */
+			{
+				Oid			negator = get_negator(saop->opno);
+
+				/*
+				 * Check if this is a NOT IN using an operator whose negator
+				 * is hashable.  If so we can still build a hash table and
+				 * just ensure the lookup items are not in the hash table.
+				 */
+				if (OidIsValid(negator) &&
+					get_op_hash_functions_ext(negator, exprType(leftarg),
+											  &lefthashfunc, &righthashfunc) &&
+					lefthashfunc == righthashfunc)
+				{
+					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
+					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
+					int			nitems;
+
+					/*
+					 * Only fill in the hash functions if the array looks
+					 * large enough for it to be worth hashing instead of
+					 * doing a linear search.
+					 */
+					nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+
+					if (nitems >= MIN_ARRAY_SIZE_FOR_HASHED_SAOP)
+					{
+						/* Looks good. Fill in the hash functions */
+						saop->hashfuncid = lefthashfunc;
+
+						/*
+						 * Also set the negfuncid.  The executor will need
+						 * that to perform hashtable lookups.
+						 */
+						saop->negfuncid = get_opcode(negator);
+					}
+					return false;
+				}
+			}
 		}
 	}
 
@@ -2278,7 +2444,7 @@ estimate_expression_value(PlannerInfo *root, Node *node)
  */
 #define ece_generic_processing(node) \
 	expression_tree_mutator((Node *) (node), eval_const_expressions_mutator, \
-							(void *) context)
+							context)
 
 /*
  * Check whether all arguments of the given node were reduced to Consts.
@@ -2357,6 +2523,7 @@ eval_const_expressions_mutator(Node *node,
 							int16		typLen;
 							bool		typByVal;
 							Datum		pval;
+							Const	   *con;
 
 							get_typlenbyval(param->paramtype,
 											&typLen, &typByVal);
@@ -2364,13 +2531,15 @@ eval_const_expressions_mutator(Node *node,
 								pval = prm->value;
 							else
 								pval = datumCopy(prm->value, typByVal, typLen);
-							return (Node *) makeConst(param->paramtype,
-													  param->paramtypmod,
-													  param->paramcollid,
-													  (int) typLen,
-													  pval,
-													  prm->isnull,
-													  typByVal);
+							con = makeConst(param->paramtype,
+											param->paramtypmod,
+											param->paramcollid,
+											(int) typLen,
+											pval,
+											prm->isnull,
+											typByVal);
+							con->location = param->location;
+							return (Node *) con;
 						}
 					}
 				}
@@ -2411,7 +2580,7 @@ eval_const_expressions_mutator(Node *node,
 				args = (List *)
 					expression_tree_mutator((Node *) args,
 											eval_const_expressions_mutator,
-											(void *) context);
+											context);
 				/* ... and the filter expression, which isn't */
 				aggfilter = (Expr *)
 					eval_const_expressions_mutator((Node *) expr->aggfilter,
@@ -2425,6 +2594,7 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->inputcollid = expr->inputcollid;
 				newexpr->args = args;
 				newexpr->aggfilter = aggfilter;
+				newexpr->runCondition = expr->runCondition;
 				newexpr->winref = expr->winref;
 				newexpr->winstar = expr->winstar;
 				newexpr->winagg = expr->winagg;
@@ -2555,7 +2725,7 @@ eval_const_expressions_mutator(Node *node,
 				 */
 				args = (List *) expression_tree_mutator((Node *) expr->args,
 														eval_const_expressions_mutator,
-														(void *) context);
+														context);
 
 				/*
 				 * We must do our own check for NULLs because DistinctExpr has
@@ -2769,6 +2939,31 @@ eval_const_expressions_mutator(Node *node,
 				}
 				break;
 			}
+
+		case T_JsonValueExpr:
+			{
+				JsonValueExpr *jve = (JsonValueExpr *) node;
+				Node	   *raw_expr = (Node *) jve->raw_expr;
+				Node	   *formatted_expr = (Node *) jve->formatted_expr;
+
+				/*
+				 * If we can fold formatted_expr to a constant, we can elide
+				 * the JsonValueExpr altogether.  Otherwise we must process
+				 * raw_expr too.  But JsonFormat is a flat node and requires
+				 * no simplification, only copying.
+				 */
+				formatted_expr = eval_const_expressions_mutator(formatted_expr,
+																context);
+				if (formatted_expr && IsA(formatted_expr, Const))
+					return formatted_expr;
+
+				raw_expr = eval_const_expressions_mutator(raw_expr, context);
+
+				return (Node *) makeJsonValueExpr((Expr *) raw_expr,
+												  (Expr *) formatted_expr,
+												  copyObject(jve->format));
+			}
+
 		case T_SubPlan:
 		case T_AlternativeSubPlan:
 
@@ -3229,12 +3424,21 @@ eval_const_expressions_mutator(Node *node,
 											  fselect->resulttype,
 											  fselect->resulttypmod,
 											  fselect->resultcollid))
-						return (Node *) makeVar(((Var *) arg)->varno,
-												fselect->fieldnum,
-												fselect->resulttype,
-												fselect->resulttypmod,
-												fselect->resultcollid,
-												((Var *) arg)->varlevelsup);
+					{
+						Var		   *newvar;
+
+						newvar = makeVar(((Var *) arg)->varno,
+										 fselect->fieldnum,
+										 fselect->resulttype,
+										 fselect->resulttypmod,
+										 fselect->resultcollid,
+										 ((Var *) arg)->varlevelsup);
+						/* New Var has same OLD/NEW returning as old one */
+						newvar->varreturningtype = ((Var *) arg)->varreturningtype;
+						/* New Var is nullable by same rels as the old one */
+						newvar->varnullingrels = ((Var *) arg)->varnullingrels;
+						return (Node *) newvar;
+					}
 				}
 				if (arg && IsA(arg, RowExpr))
 				{
@@ -3920,7 +4124,7 @@ simplify_function(Oid funcid, Oid result_type, int32 result_typmod,
 		args = expand_function_arguments(args, false, result_type, func_tuple);
 		args = (List *) expression_tree_mutator((Node *) args,
 												eval_const_expressions_mutator,
-												(void *) context);
+												context);
 		/* Argument processing done, give it back to the caller */
 		*args_p = args;
 	}
@@ -4177,15 +4381,10 @@ fetch_function_defaults(HeapTuple func_tuple)
 {
 	List	   *defaults;
 	Datum		proargdefaults;
-	bool		isnull;
 	char	   *str;
 
-	/* The error cases here shouldn't happen, but check anyway */
-	proargdefaults = SysCacheGetAttr(PROCOID, func_tuple,
-									 Anum_pg_proc_proargdefaults,
-									 &isnull);
-	if (isnull)
-		elog(ERROR, "not enough default arguments");
+	proargdefaults = SysCacheGetAttrNotNull(PROCOID, func_tuple,
+											Anum_pg_proc_proargdefaults);
 	str = TextDatumGetCString(proargdefaults);
 	defaults = castNode(List, stringToNode(str));
 	pfree(str);
@@ -4214,7 +4413,7 @@ recheck_cast_function_args(List *args, Oid result_type,
 {
 	Form_pg_proc funcform = (Form_pg_proc) GETSTRUCT(func_tuple);
 	int			nargs;
-	Oid			actual_arg_types[FUNC_MAX_ARGS];
+	Oid			actual_arg_types[FUNC_MAX_ARGS] = {0};
 	Oid			declared_arg_types[FUNC_MAX_ARGS];
 	Oid			rettype;
 	ListCell   *lc;
@@ -4423,7 +4622,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 		return NULL;
 
 	/* Check permission to call function (fail later, if not) */
-	if (pg_proc_aclcheck(funcid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+	if (object_aclcheck(ProcedureRelationId, funcid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
 		return NULL;
 
 	/* Check whether a plugin wants to hook function entry/exit */
@@ -4456,12 +4655,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	fexpr->location = -1;
 
 	/* Fetch the function body */
-	tmp = SysCacheGetAttr(PROCOID,
-						  func_tuple,
-						  Anum_pg_proc_prosrc,
-						  &isNull);
-	if (isNull)
-		elog(ERROR, "null prosrc for function %u", funcid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, func_tuple, Anum_pg_proc_prosrc);
 	src = TextDatumGetCString(tmp);
 
 	/*
@@ -4472,7 +4666,7 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	callback_arg.prosrc = src;
 
 	sqlerrcontext.callback = sql_inline_error_callback;
-	sqlerrcontext.arg = (void *) &callback_arg;
+	sqlerrcontext.arg = &callback_arg;
 	sqlerrcontext.previous = error_context_stack;
 	error_context_stack = &sqlerrcontext;
 
@@ -4484,16 +4678,16 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	if (!isNull)
 	{
 		Node	   *n;
-		List	   *querytree_list;
+		List	   *query_list;
 
 		n = stringToNode(TextDatumGetCString(tmp));
 		if (IsA(n, List))
-			querytree_list = linitial_node(List, castNode(List, n));
+			query_list = linitial_node(List, castNode(List, n));
 		else
-			querytree_list = list_make1(n);
-		if (list_length(querytree_list) != 1)
+			query_list = list_make1(n);
+		if (list_length(query_list) != 1)
 			goto fail;
-		querytree = linitial(querytree_list);
+		querytree = linitial(query_list);
 
 		/*
 		 * Because we'll insist below that the querytree have an empty rtable
@@ -4573,10 +4767,10 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	 * needed; that's probably not important, but let's be careful.
 	 */
 	querytree_list = list_make1(querytree);
-	if (check_sql_fn_retval_ext(list_make1(querytree_list),
-								result_type, rettupdesc,
-								funcform->prokind,
-								false, NULL))
+	if (check_sql_fn_retval(list_make1(querytree_list),
+							result_type, rettupdesc,
+							funcform->prokind,
+							false))
 		goto fail;				/* reject whole-tuple-result cases */
 
 	/*
@@ -4774,8 +4968,7 @@ substitute_actual_parameters_mutator(Node *node,
 		/* We don't need to copy at this time (it'll get done later) */
 		return list_nth(context->args, param->paramid - 1);
 	}
-	return expression_tree_mutator(node, substitute_actual_parameters_mutator,
-								   (void *) context);
+	return expression_tree_mutator(node, substitute_actual_parameters_mutator, context);
 }
 
 /*
@@ -4966,7 +5159,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 		return NULL;
 
 	/* Check permission to call function (fail later, if not) */
-	if (pg_proc_aclcheck(func_oid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
+	if (object_aclcheck(ProcedureRelationId, func_oid, GetUserId(), ACL_EXECUTE) != ACLCHECK_OK)
 		return NULL;
 
 	/* Check whether a plugin wants to hook function entry/exit */
@@ -5015,12 +5208,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	oldcxt = MemoryContextSwitchTo(mycxt);
 
 	/* Fetch the function body */
-	tmp = SysCacheGetAttr(PROCOID,
-						  func_tuple,
-						  Anum_pg_proc_prosrc,
-						  &isNull);
-	if (isNull)
-		elog(ERROR, "null prosrc for function %u", func_oid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, func_tuple, Anum_pg_proc_prosrc);
 	src = TextDatumGetCString(tmp);
 
 	/*
@@ -5031,7 +5219,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	callback_arg.prosrc = src;
 
 	sqlerrcontext.callback = sql_inline_error_callback;
-	sqlerrcontext.arg = (void *) &callback_arg;
+	sqlerrcontext.arg = &callback_arg;
 	sqlerrcontext.previous = error_context_stack;
 	error_context_stack = &sqlerrcontext;
 
@@ -5080,7 +5268,7 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 		if (list_length(raw_parsetree_list) != 1)
 			goto fail;
 
-		querytree_list = pg_analyze_and_rewrite_params(linitial(raw_parsetree_list),
+		querytree_list = pg_analyze_and_rewrite_withcb(linitial(raw_parsetree_list),
 													   src,
 													   (ParserSetupHook) sql_fn_parser_setup,
 													   pinfo, NULL);
@@ -5125,10 +5313,10 @@ inline_set_returning_function(PlannerInfo *root, RangeTblEntry *rte)
 	 * shows it's returning a whole tuple result; otherwise what it's
 	 * returning is a single composite column which is not what we need.
 	 */
-	if (!check_sql_fn_retval_ext(list_make1(querytree_list),
-								 fexpr->funcresulttype, rettupdesc,
-								 funcform->prokind,
-								 true, NULL) &&
+	if (!check_sql_fn_retval(list_make1(querytree_list),
+							 fexpr->funcresulttype, rettupdesc,
+							 funcform->prokind,
+							 true) &&
 		(functypclass == TYPEFUNC_COMPOSITE ||
 		 functypclass == TYPEFUNC_COMPOSITE_DOMAIN ||
 		 functypclass == TYPEFUNC_RECORD))
@@ -5223,7 +5411,7 @@ substitute_actual_srf_parameters_mutator(Node *node,
 		context->sublevels_up++;
 		result = (Node *) query_tree_mutator((Query *) node,
 											 substitute_actual_srf_parameters_mutator,
-											 (void *) context,
+											 context,
 											 0);
 		context->sublevels_up--;
 		return result;
@@ -5248,7 +5436,7 @@ substitute_actual_srf_parameters_mutator(Node *node,
 	}
 	return expression_tree_mutator(node,
 								   substitute_actual_srf_parameters_mutator,
-								   (void *) context);
+								   context);
 }
 
 /*
@@ -5272,11 +5460,345 @@ pull_paramids_walker(Node *node, Bitmapset **context)
 		return false;
 	if (IsA(node, Param))
 	{
-		Param	   *param = (Param *)node;
+		Param	   *param = (Param *) node;
 
 		*context = bms_add_member(*context, param->paramid);
 		return false;
 	}
-	return expression_tree_walker(node, pull_paramids_walker,
-								  (void *) context);
+	return expression_tree_walker(node, pull_paramids_walker, context);
+}
+
+/*
+ * expression_has_grouping_conflict
+ *	  Detect whether 'expr' would distinguish rows that a grouping mechanism
+ *	  (GROUP BY, DISTINCT, DISTINCT ON, window PARTITION BY, or set operation)
+ *	  considers equal.
+ *
+ * The caller supplies a get_eqop callback (see clauses.h) so the same walker
+ * serves every grouping context.  The callback identifies a grouping column by
+ * returning a valid eqop for its Var.  A grouping column is safe to reference
+ * only if the reference yields the same result for every value the grouping
+ * treats as equal.  Otherwise, pushing the clause past the grouping could
+ * discard rows that the grouping would have combined into a single group.
+ *
+ * The reference is provably safe only when the grouping column is a direct
+ * operand of a comparison that tests the grouping's own equality.  Such an
+ * operand is rejected when the comparison's operator does not have equality
+ * semantics compatible with the grouping eqop, or, for a nondeterministic
+ * collation, when the comparison applies a collation other than the column's.
+ *
+ * For a nondeterministic collation, every other reference is rejected: a
+ * comparison under a different collation, and any function or operator over
+ * the column, because we cannot tell whether the function yields the same
+ * result for values the grouping treats as equal, and many do not.  A column
+ * with a deterministic collation is not restricted this way.
+ *
+ * This leaves one case uncaught: with a deterministic collation, a function
+ * over the column can still feed a finer comparison than the direct-operand
+ * check sees, for example record_image_ops over a rebuilt record, or scale()
+ * over numeric where two equal values differ in scale.  Catching it would
+ * require knowing that a type's equality is bitwise, which we do not test
+ * here.
+ *
+ * Returns true if any such conflict exists.
+ */
+bool
+expression_has_grouping_conflict(Node *expr,
+								 grouping_eqop_callback get_eqop,
+								 void *context)
+{
+	grouping_walker_ctx ctx;
+
+	if (expr == NULL)
+		return false;
+
+	ctx.get_eqop = get_eqop;
+	ctx.cb_context = context;
+
+	return grouping_conflict_walker(expr, &ctx);
+}
+
+/*
+ * Walker function for expression_has_grouping_conflict.
+ *
+ * A comparison node checks its direct operands with grouping_check_operand,
+ * which does not recurse into a grouping-column operand.  A grouping column
+ * therefore reaches the Var branch only when it is referenced in some other
+ * way: wrapped in a function or other expression, used as the whole qual (a
+ * bare boolean column), or used as an operand of an operator that is not a
+ * btree/hash member and so is not treated as a comparison here.
+ *
+ * Comparison nodes are OpExpr/ScalarArrayOpExpr whose operator is a btree/hash
+ * member, and RowCompareExpr (one operator and collation per column).  A
+ * simple CASE (CaseExpr with a non-NULL arg) is a comparison in disguise:
+ * parse analysis builds each WHEN as "OpExpr(CaseTestExpr op val)", with the
+ * CaseTestExpr standing in for the arg, so the arg is effectively an operand
+ * of each WHEN's comparison.  Those WHEN operators are always the type-default
+ * "=", matching the grouping eqop, so only a collation conflict is possible
+ * there.
+ */
+static bool
+grouping_conflict_walker(Node *node, grouping_walker_ctx *ctx)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+
+		/*
+		 * A grouping column reaches here when it was not handled as a direct
+		 * operand by a comparison node above (see the function header).  That
+		 * is safe for a deterministic collation, but not for a
+		 * nondeterministic one, where the reference may distinguish values
+		 * the grouping considers equal.  A bare boolean qual is safe too:
+		 * boolean is not collatable, so it takes the deterministic path here.
+		 */
+		if (OidIsValid(ctx->get_eqop(var, ctx->cb_context)) &&
+			OidIsValid(var->varcollid) &&
+			!get_collation_isdeterministic(var->varcollid))
+			return true;
+		return false;
+	}
+	else if (IsA(node, OpExpr))
+	{
+		OpExpr	   *opexpr = (OpExpr *) node;
+
+		if (op_is_safe_index_member(opexpr->opno))
+			return grouping_check_operands(opexpr->opno, opexpr->inputcollid,
+										   opexpr->args, ctx);
+		/* fall through */
+	}
+	else if (IsA(node, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
+
+		if (op_is_safe_index_member(saop->opno))
+			return grouping_check_operands(saop->opno, saop->inputcollid,
+										   saop->args, ctx);
+		/* fall through */
+	}
+	else if (IsA(node, RowCompareExpr))
+	{
+		RowCompareExpr *rcexpr = (RowCompareExpr *) node;
+		ListCell   *lc_l;
+		ListCell   *lc_r;
+		ListCell   *lc_o;
+		ListCell   *lc_c;
+
+		/* Each column is compared under its own operator and inputcollid. */
+		forfour(lc_l, rcexpr->largs,
+				lc_r, rcexpr->rargs,
+				lc_o, rcexpr->opnos,
+				lc_c, rcexpr->inputcollids)
+		{
+			Oid			opno = lfirst_oid(lc_o);
+			Oid			collid = lfirst_oid(lc_c);
+
+			if (grouping_check_operand((Node *) lfirst(lc_l), opno, collid, ctx) ||
+				grouping_check_operand((Node *) lfirst(lc_r), opno, collid, ctx))
+				return true;
+		}
+		return false;
+	}
+	else if (IsA(node, CaseExpr) && ((CaseExpr *) node)->arg != NULL)
+	{
+		CaseExpr   *cexpr = (CaseExpr *) node;
+		Node	   *arg = (Node *) cexpr->arg;
+
+		/* Look through RelabelType to find a direct Var arg. */
+		while (arg && IsA(arg, RelabelType))
+			arg = (Node *) ((RelabelType *) arg)->arg;
+
+		if (arg && IsA(arg, Var))
+		{
+			Var		   *var = (Var *) arg;
+
+			/*
+			 * The arg is a grouping column compared by every WHEN.  For a
+			 * nondeterministic collation, reject if any WHEN applies a
+			 * different collation.
+			 */
+			if (OidIsValid(ctx->get_eqop(var, ctx->cb_context)) &&
+				OidIsValid(var->varcollid) &&
+				!get_collation_isdeterministic(var->varcollid))
+			{
+				foreach_node(CaseWhen, cw, cexpr->args)
+				{
+					Oid			collid = exprInputCollation((Node *) cw->expr);
+
+					if (OidIsValid(collid) && collid != var->varcollid)
+						return true;
+				}
+			}
+		}
+		else if (grouping_conflict_walker((Node *) cexpr->arg, ctx))
+		{
+			/* arg is a complex expression; walked as a non-operand */
+			return true;
+		}
+
+		/*
+		 * Walk the WHEN conditions, their results, and the default result as
+		 * non-operands.  The WHEN conditions hold a CaseTestExpr in place of
+		 * the arg, so they contribute no grouping operand of their own, but
+		 * the condition expression or the substitution result may reference
+		 * another grouping column.
+		 */
+		foreach_node(CaseWhen, cw, cexpr->args)
+		{
+			if (grouping_conflict_walker((Node *) cw->expr, ctx) ||
+				grouping_conflict_walker((Node *) cw->result, ctx))
+				return true;
+		}
+		return grouping_conflict_walker((Node *) cexpr->defresult, ctx);
+	}
+
+	return expression_tree_walker(node, grouping_conflict_walker, ctx);
+}
+
+/*
+ * grouping_check_operands
+ *		Check every argument of a comparison node as a direct operand of the
+ *		comparison's operator 'opno' and collation 'inputcollid'.
+ */
+static bool
+grouping_check_operands(Oid opno, Oid inputcollid, List *args,
+						grouping_walker_ctx *ctx)
+{
+	ListCell   *lc;
+
+	foreach(lc, args)
+	{
+		if (grouping_check_operand((Node *) lfirst(lc), opno, inputcollid, ctx))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * grouping_check_operand
+ *		Handle one operand 'arg' of a comparison with operator 'opno' and
+ *		collation 'inputcollid'.
+ *
+ * If 'arg' is a grouping column (after looking through RelabelType), verify
+ * that comparison's operator has equality semantics compatible with the
+ * grouping eqop and, for a nondeterministic collation, that it uses the same
+ * collation; such a direct operand is then fully handled and is not recursed
+ * into.  Any other operand is walked normally, so a grouping column buried
+ * inside it is seen as a non-operand reference.
+ */
+static bool
+grouping_check_operand(Node *arg, Oid opno, Oid inputcollid,
+					   grouping_walker_ctx *ctx)
+{
+	Node	   *node = arg;
+
+	while (node && IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+
+	if (node && IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		Oid			grouping_eqop = ctx->get_eqop(var, ctx->cb_context);
+
+		if (OidIsValid(grouping_eqop))
+		{
+			/* incompatible equality semantics */
+			if (!equality_ops_are_compatible(opno, grouping_eqop))
+				return true;
+			/* nondeterministic collation compared under a different collation */
+			if (OidIsValid(var->varcollid) &&
+				!get_collation_isdeterministic(var->varcollid) &&
+				inputcollid != var->varcollid)
+				return true;
+		}
+		return false;			/* direct operand handled; do not recurse */
+	}
+
+	return grouping_conflict_walker(arg, ctx);
+}
+
+/*
+ * Build ScalarArrayOpExpr on top of 'exprs.' 'haveNonConst' indicates
+ * whether at least one of the expressions is not Const.  When it's false,
+ * the array constant is built directly; otherwise, we have to build a child
+ * ArrayExpr. The 'exprs' list gets freed if not directly used in the output
+ * expression tree.
+ */
+ScalarArrayOpExpr *
+make_SAOP_expr(Oid oper, Node *leftexpr, Oid coltype, Oid arraycollid,
+			   Oid inputcollid, List *exprs, bool haveNonConst)
+{
+	Node	   *arrayNode = NULL;
+	ScalarArrayOpExpr *saopexpr = NULL;
+	Oid			arraytype = get_array_type(coltype);
+
+	if (!OidIsValid(arraytype))
+		return NULL;
+
+	/*
+	 * Assemble an array from the list of constants.  It seems more profitable
+	 * to build a const array.  But in the presence of other nodes, we don't
+	 * have a specific value here and must employ an ArrayExpr instead.
+	 */
+	if (haveNonConst)
+	{
+		ArrayExpr  *arrayExpr = makeNode(ArrayExpr);
+
+		/* array_collid will be set by parse_collate.c */
+		arrayExpr->element_typeid = coltype;
+		arrayExpr->array_typeid = arraytype;
+		arrayExpr->multidims = false;
+		arrayExpr->elements = exprs;
+		arrayExpr->location = -1;
+
+		arrayNode = (Node *) arrayExpr;
+	}
+	else
+	{
+		int16		typlen;
+		bool		typbyval;
+		char		typalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			i = 0;
+		ArrayType  *arrayConst;
+		int			dims[1] = {list_length(exprs)};
+		int			lbs[1] = {1};
+
+		get_typlenbyvalalign(coltype, &typlen, &typbyval, &typalign);
+
+		elems = (Datum *) palloc(sizeof(Datum) * list_length(exprs));
+		nulls = (bool *) palloc(sizeof(bool) * list_length(exprs));
+		foreach_node(Const, value, exprs)
+		{
+			elems[i] = value->constvalue;
+			nulls[i++] = value->constisnull;
+		}
+
+		arrayConst = construct_md_array(elems, nulls, 1, dims, lbs,
+										coltype, typlen, typbyval, typalign);
+		arrayNode = (Node *) makeConst(arraytype, -1, arraycollid,
+									   -1, PointerGetDatum(arrayConst),
+									   false, false);
+
+		pfree(elems);
+		pfree(nulls);
+		list_free(exprs);
+	}
+
+	/* Build the SAOP expression node */
+	saopexpr = makeNode(ScalarArrayOpExpr);
+	saopexpr->opno = oper;
+	saopexpr->opfuncid = get_opcode(oper);
+	saopexpr->hashfuncid = InvalidOid;
+	saopexpr->negfuncid = InvalidOid;
+	saopexpr->useOr = true;
+	saopexpr->inputcollid = inputcollid;
+	saopexpr->args = list_make2(leftexpr, arrayNode);
+	saopexpr->location = -1;
+
+	return saopexpr;
 }

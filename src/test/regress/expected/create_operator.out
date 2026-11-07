@@ -7,13 +7,6 @@ CREATE OPERATOR ## (
    function = path_inter,
    commutator = ##
 );
-CREATE OPERATOR <% (
-   leftarg = point,
-   rightarg = widget,
-   procedure = pt_in_widget,
-   commutator = >% ,
-   negator = >=%
-);
 CREATE OPERATOR @#@ (
    rightarg = int8,		-- prefix
    procedure = factorial
@@ -25,11 +18,10 @@ CREATE OPERATOR #%# (
 ERROR:  operator right argument type must be specified
 DETAIL:  Postfix operators are not supported.
 -- Test operator created above
-SELECT point '(1,2)' <% widget '(0,0,3)' AS t,
-       point '(1,2)' <% widget '(0,0,1)' AS f;
- t | f 
----+---
- t | f
+SELECT @#@ 24;
+         ?column?         
+--------------------------
+ 620448401733239439360000
 (1 row)
 
 -- Test comments
@@ -268,6 +260,50 @@ CREATE OPERATOR #*# (
 );
 ERROR:  permission denied for type type_op6
 ROLLBACK;
+-- Should fail. An operator cannot be its own negator.
+BEGIN TRANSACTION;
+CREATE OPERATOR === (
+    leftarg = integer,
+    rightarg = integer,
+    procedure = int4eq,
+    negator = ===
+);
+ERROR:  operator cannot be its own negator
+ROLLBACK;
+-- Should fail. An operator cannot be its own negator. Here we check that
+-- this error is detected when replacing a shell operator.
+BEGIN TRANSACTION;
+-- create a shell operator for ===!!! by referencing it as a commutator
+CREATE OPERATOR === (
+    leftarg = integer,
+    rightarg = integer,
+    procedure = int4eq,
+    commutator = ===!!!
+);
+CREATE OPERATOR ===!!! (
+    leftarg = integer,
+    rightarg = integer,
+    procedure = int4ne,
+    negator = ===!!!
+);
+ERROR:  operator cannot be its own negator
+ROLLBACK;
+-- test that we can't use part of an existing commutator or negator pair
+-- as a commutator or negator
+CREATE OPERATOR === (
+    leftarg = integer,
+    rightarg = integer,
+    procedure = int4eq,
+    commutator = =
+);
+ERROR:  commutator operator = is already the commutator of operator =
+CREATE OPERATOR === (
+    leftarg = integer,
+    rightarg = integer,
+    procedure = int4eq,
+    negator = <>
+);
+ERROR:  negator operator <> is already the negator of operator =
 -- invalid: non-lowercase quoted identifiers
 CREATE OPERATOR ===
 (

@@ -11,9 +11,9 @@ EXTENSION = dblink
 DATA = dblink--1.2.sql dblink--1.1--1.2.sql dblink--1.0--1.1.sql
 PGFILEDESC = "dblink - connect to other PostgreSQL databases"
 
-REGRESS = paths dblink
+REGRESS = dblink
 REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
-EXTRA_CLEAN = sql/paths.sql expected/paths.out
+TAP_TESTS = 1
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

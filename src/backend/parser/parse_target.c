@@ -3,7 +3,7 @@
  * parse_target.c
  *	  handle target lists
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "funcapi.h"
@@ -22,7 +23,6 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_expr.h"
-#include "parser/parse_func.h"
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
@@ -30,8 +30,6 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/typcache.h"
-#include "nodes/mysql/mys_parsenodes.h"
 
 static void markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 								 Var *var, int levelsup);
@@ -42,7 +40,6 @@ static Node *transformAssignmentSubscripts(ParseState *pstate,
 										   int32 targetTypMod,
 										   Oid targetCollation,
 										   List *subscripts,
-										   bool isSlice,
 										   List *indirection,
 										   ListCell *next_indirection,
 										   Node *rhs,
@@ -62,7 +59,7 @@ static int	FigureColnameInternal(Node *node, char **name);
 
 
 /*
- * standard_transformTargetEntry()
+ * transformTargetEntry()
  *	Transform any ordinary "expression-type" node into a targetlist entry.
  *	This is exported so that parse_clause.c can generate targetlist entries
  *	for ORDER/GROUP BY items that are not already in the targetlist.
@@ -75,7 +72,7 @@ static int	FigureColnameInternal(Node *node, char **name);
  *			wanted in the final projected tuple.
  */
 TargetEntry *
-standard_transformTargetEntry(ParseState *pstate,
+transformTargetEntry(ParseState *pstate,
 					 Node *node,
 					 Node *expr,
 					 ParseExprKind exprKind,
@@ -113,7 +110,7 @@ standard_transformTargetEntry(ParseState *pstate,
 
 
 /*
- * standard_transformTargetList()
+ * transformTargetList()
  * Turns a list of ResTarget's into a list of TargetEntry's.
  *
  * This code acts mostly the same for SELECT, UPDATE, or RETURNING lists;
@@ -121,7 +118,7 @@ standard_transformTargetEntry(ParseState *pstate,
  * The exprKind parameter distinguishes these cases when necessary.
  */
 List *
-standard_transformTargetList(ParseState *pstate, List *targetlist,
+transformTargetList(ParseState *pstate, List *targetlist,
 					ParseExprKind exprKind)
 {
 	List	   *p_target = NIL;
@@ -207,7 +204,7 @@ standard_transformTargetList(ParseState *pstate, List *targetlist,
 
 
 /*
- * standard_transformExpressionList()
+ * transformExpressionList()
  *
  * This is the identical transformation to transformTargetList, except that
  * the input list elements are bare expressions without ResTarget decoration,
@@ -220,7 +217,7 @@ standard_transformTargetList(ParseState *pstate, List *targetlist,
  * an additional flag is needed for that.
  */
 List *
-standard_transformExpressionList(ParseState *pstate, List *exprlist,
+transformExpressionList(ParseState *pstate, List *exprlist,
 						ParseExprKind exprKind, bool allowDefault)
 {
 	List	   *result = NIL;
@@ -423,12 +420,15 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
 				tle->resorigcol = ste->resorigcol;
 			}
 			break;
+		case RTE_GROUP:
+			/* We couldn't get here: the RTE_GROUP RTE has not been added */
+			break;
 	}
 }
 
 
 /*
- * standard_transformAssignedExpr()
+ * transformAssignedExpr()
  *	This is used in INSERT and UPDATE statements only.  It prepares an
  *	expression for assignment to a column of the target table.
  *	This includes coercing the given value to the target column's type
@@ -452,7 +452,7 @@ markTargetListOrigin(ParseState *pstate, TargetEntry *tle,
  * exprLocation(expr) for errors that can happen in a default INSERT.
  */
 Expr *
-standard_transformAssignedExpr(ParseState *pstate,
+transformAssignedExpr(ParseState *pstate,
 					  Expr *expr,
 					  ParseExprKind exprKind,
 					  const char *colname,
@@ -683,7 +683,7 @@ updateTargetListEntry(ParseState *pstate,
  * in which case the location argument could probably be dropped.)
  */
 Node *
-standard_transformAssignmentIndirection(ParseState *pstate,
+transformAssignmentIndirection(ParseState *pstate,
 							   Node *basenode,
 							   const char *targetName,
 							   bool targetIsSubscripting,
@@ -698,7 +698,6 @@ standard_transformAssignmentIndirection(ParseState *pstate,
 {
 	Node	   *result;
 	List	   *subscripts = NIL;
-	bool		isSlice = false;
 	ListCell   *i;
 
 	if (indirection_cell && !basenode)
@@ -728,11 +727,7 @@ standard_transformAssignmentIndirection(ParseState *pstate,
 		Node	   *n = lfirst(i);
 
 		if (IsA(n, A_Indices))
-		{
 			subscripts = lappend(subscripts, n);
-			if (((A_Indices *) n)->is_slice)
-				isSlice = true;
-		}
 		else if (IsA(n, A_Star))
 		{
 			ereport(ERROR,
@@ -764,7 +759,6 @@ standard_transformAssignmentIndirection(ParseState *pstate,
 													 targetTypMod,
 													 targetCollation,
 													 subscripts,
-													 isSlice,
 													 indirection,
 													 i,
 													 rhs,
@@ -863,7 +857,6 @@ standard_transformAssignmentIndirection(ParseState *pstate,
 											 targetTypMod,
 											 targetCollation,
 											 subscripts,
-											 isSlice,
 											 indirection,
 											 NULL,
 											 rhs,
@@ -917,7 +910,6 @@ transformAssignmentSubscripts(ParseState *pstate,
 							  int32 targetTypMod,
 							  Oid targetCollation,
 							  List *subscripts,
-							  bool isSlice,
 							  List *indirection,
 							  ListCell *next_indirection,
 							  Node *rhs,
@@ -1156,7 +1148,7 @@ ExpandColumnRefStar(ParseState *pstate, ColumnRef *cref,
 		 *
 		 * Note: this code is a lot like transformColumnRef; it's tempting to
 		 * call that instead and then replace the resulting whole-row Var with
-		 * a list of Vars.  However, that would leave us with the RTE's
+		 * a list of Vars.  However, that would leave us with the relation's
 		 * selectedCols bitmap showing the whole row as needing select
 		 * permission, as well as the individual columns.  That would be
 		 * incorrect (since columns added later shouldn't need select
@@ -1323,6 +1315,7 @@ ExpandAllTables(ParseState *pstate, int location)
 							 expandNSItemAttrs(pstate,
 											   nsitem,
 											   0,
+											   true,
 											   location));
 	}
 
@@ -1385,15 +1378,16 @@ ExpandSingleTable(ParseState *pstate, ParseNamespaceItem *nsitem,
 	if (make_target_entry)
 	{
 		/* expandNSItemAttrs handles permissions marking */
-		return expandNSItemAttrs(pstate, nsitem, sublevels_up, location);
+		return expandNSItemAttrs(pstate, nsitem, sublevels_up, true, location);
 	}
 	else
 	{
 		RangeTblEntry *rte = nsitem->p_rte;
+		RTEPermissionInfo *perminfo = nsitem->p_perminfo;
 		List	   *vars;
 		ListCell   *l;
 
-		vars = expandNSItemVars(nsitem, sublevels_up, location, NULL);
+		vars = expandNSItemVars(pstate, nsitem, sublevels_up, location, NULL);
 
 		/*
 		 * Require read access to the table.  This is normally redundant with
@@ -1404,7 +1398,10 @@ ExpandSingleTable(ParseState *pstate, ParseNamespaceItem *nsitem,
 		 * target relation of UPDATE/DELETE, which cannot be under a join.)
 		 */
 		if (rte->rtekind == RTE_RELATION)
-			rte->requiredPerms |= ACL_SELECT;
+		{
+			Assert(perminfo != NULL);
+			perminfo->requiredPerms |= ACL_SELECT;
+		}
 
 		/* Require read access to each column */
 		foreach(l, vars)
@@ -1437,11 +1434,11 @@ ExpandRowReference(ParseState *pstate, Node *expr,
 	/*
 	 * If the rowtype expression is a whole-row Var, we can expand the fields
 	 * as simple Vars.  Note: if the RTE is a relation, this case leaves us
-	 * with the RTE's selectedCols bitmap showing the whole row as needing
-	 * select permission, as well as the individual columns.  However, we can
-	 * only get here for weird notations like (table.*).*, so it's not worth
-	 * trying to clean up --- arguably, the permissions marking is correct
-	 * anyway for such cases.
+	 * with its RTEPermissionInfo's selectedCols bitmap showing the whole row
+	 * as needing select permission, as well as the individual columns.
+	 * However, we can only get here for weird notations like (table.*).*, so
+	 * it's not worth trying to clean up --- arguably, the permissions marking
+	 * is correct anyway for such cases.
 	 */
 	if (IsA(expr, Var) &&
 		((Var *) expr)->varattno == InvalidAttrNumber)
@@ -1449,7 +1446,7 @@ ExpandRowReference(ParseState *pstate, Node *expr,
 		Var		   *var = (Var *) expr;
 		ParseNamespaceItem *nsitem;
 
-		nsitem = GetNSItemByRangeTablePosn(pstate, var->varno, var->varlevelsup);
+		nsitem = GetNSItemByVar(pstate, var);
 		return ExpandSingleTable(pstate, nsitem, var->varlevelsup, var->location, make_target_entry);
 	}
 
@@ -1553,8 +1550,8 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 				   *lvar;
 		int			i;
 
-		expandRTE(rte, var->varno, 0, var->location, false,
-				  &names, &vars);
+		expandRTE(rte, var->varno, 0, var->varreturningtype,
+				  var->location, false, &names, &vars);
 
 		tupleDesc = CreateTemplateTupleDesc(list_length(vars));
 		i = 1;
@@ -1686,6 +1683,12 @@ expandRecordVariable(ParseState *pstate, Var *var, int levelsup)
 				}
 				/* else fall through to inspect the expression */
 			}
+			break;
+		case RTE_GROUP:
+
+			/*
+			 * We couldn't get here: the RTE_GROUP RTE has not been added.
+			 */
 			break;
 	}
 
@@ -1826,6 +1829,10 @@ FigureColnameInternal(Node *node, char **name)
 			/* make GROUPING() act like a regular function */
 			*name = "grouping";
 			return 2;
+		case T_MergeSupportFunc:
+			/* make MERGE_ACTION() act like a regular function */
+			*name = "merge_action";
+			return 2;
 		case T_SubLink:
 			switch (((SubLink *) node)->subLinkType)
 			{
@@ -1913,11 +1920,6 @@ FigureColnameInternal(Node *node, char **name)
 				case SVFOP_CURRENT_TIME_N:
 					*name = "current_time";
 					return 2;
-				
-				case SVFOP_CURRENT_TIMEZONE:
-					*name = "current_timezone";
-					return 2;
-				
 				case SVFOP_CURRENT_TIMESTAMP:
 				case SVFOP_CURRENT_TIMESTAMP_N:
 					*name = "current_timestamp";
@@ -1981,214 +1983,60 @@ FigureColnameInternal(Node *node, char **name)
 			}
 			break;
 		case T_XmlSerialize:
+			/* make XMLSERIALIZE act like a regular function */
 			*name = "xmlserialize";
 			return 2;
-        
-        case T_SysVarRef:
-            {
-                SysVarRef *sysVarRef = (SysVarRef *) node;
-                *name = psprintf("@@%s", sysVarRef->sysVarName);
-                return 2;
-            }
-        
-
+		case T_JsonParseExpr:
+			/* make JSON act like a regular function */
+			*name = "json";
+			return 2;
+		case T_JsonScalarExpr:
+			/* make JSON_SCALAR act like a regular function */
+			*name = "json_scalar";
+			return 2;
+		case T_JsonSerializeExpr:
+			/* make JSON_SERIALIZE act like a regular function */
+			*name = "json_serialize";
+			return 2;
+		case T_JsonObjectConstructor:
+			/* make JSON_OBJECT act like a regular function */
+			*name = "json_object";
+			return 2;
+		case T_JsonArrayConstructor:
+		case T_JsonArrayQueryConstructor:
+			/* make JSON_ARRAY act like a regular function */
+			*name = "json_array";
+			return 2;
+		case T_JsonObjectAgg:
+			/* make JSON_OBJECTAGG act like a regular function */
+			*name = "json_objectagg";
+			return 2;
+		case T_JsonArrayAgg:
+			/* make JSON_ARRAYAGG act like a regular function */
+			*name = "json_arrayagg";
+			return 2;
+		case T_JsonFuncExpr:
+			/* make SQL/JSON functions act like a regular function */
+			switch (((JsonFuncExpr *) node)->op)
+			{
+				case JSON_EXISTS_OP:
+					*name = "json_exists";
+					return 2;
+				case JSON_QUERY_OP:
+					*name = "json_query";
+					return 2;
+				case JSON_VALUE_OP:
+					*name = "json_value";
+					return 2;
+					/* JSON_TABLE_OP can't happen here. */
+				default:
+					elog(ERROR, "unrecognized JsonExpr op: %d",
+						 (int) ((JsonFuncExpr *) node)->op);
+			}
+			break;
 		default:
 			break;
 	}
 
 	return strength;
 }
-
-
-
-/*
- * checkMergeInsertTargets -
- *	1、  generate a list of INSERT column targets if not supplied, or
- *	  test supplied column names to make sure they are in target table.
- *	  Also return an integer list of the columns' attribute numbers.
- *	2、 modify a list of INSERT column targets like INSERT (t.tid, t.balance) VALUES(2,10);
- */
-List *
-checkMergeInsertTargets(ParseState *pstate, List *cols, List **attrnos)
-{
-	*attrnos = NIL;
-
-	if (cols == NIL)
-	{
-		/*
-		 * Generate default column list for INSERT.
-		 */
-		int			numcol = RelationGetNumberOfAttributes(pstate->p_target_relation);
-
-		int			i;
-
-		for (i = 0; i < numcol; i++)
-		{
-			ResTarget  *col;
-			Form_pg_attribute attr;
-
-			attr = TupleDescAttr(pstate->p_target_relation->rd_att, i);
-
-			if (attr->attisdropped)
-				continue;
-
-			col = makeNode(ResTarget);
-			col->name = pstrdup(NameStr(attr->attname));
-			col->indirection = NIL;
-			col->val = NULL;
-			col->location = -1;
-			cols = lappend(cols, col);
-			*attrnos = lappend_int(*attrnos, i + 1);
-		}
-	}
-	else
-	{
-		/*
-		 * Do initial validation of user-supplied INSERT column list.
-		 */
-		Bitmapset  *wholecols = NULL;
-		Bitmapset  *partialcols = NULL;
-		ListCell   *tl;
-
-		foreach(tl, cols)
-		{
-			ResTarget  *col = (ResTarget *) lfirst(tl);
-			int len;
-			len = list_length(col->indirection);
-			
-			if(len == 2 && col->name)
-			{
-				char	*t_name =NULL;
-				int		attrno;
-				t_name = strVal(lfirst(list_head(col->indirection)));
-				/* Lookup column name, ereport on failure */
-				attrno = attnameAttNum(pstate->p_target_relation, t_name, false);
-				if (attrno == InvalidAttrNumber)
-				{	
-					/*check the column (example. t.tid) in the same table*/
-					ParseNamespaceItem *nsitem = (ParseNamespaceItem *) lsecond(pstate->p_namespace);
-					if(nsitem && nsitem->p_names && nsitem->p_names->aliasname && strcmp(nsitem->p_names->aliasname, t_name) == 0)
-					{  
-						/*get real column name*/
-						Node *n = llast(col->indirection);
-
-						if(n && nodeTag(n) == T_String)
-						{/*modify ResTarget*/
-							// col->name = pstrdup(((Value*)n)->val.str);
-							col->name = strVal(n);
-							t_name = col->name;
-							col->indirection = NIL;
-							attrno = attnameAttNum(pstate->p_target_relation, t_name, false);
-						}
-					}
-					if(attrno == InvalidAttrNumber)
-					{
-						ereport(ERROR,
-								(errcode(ERRCODE_UNDEFINED_COLUMN),
-								errmsg("column \"%s\" of relation \"%s\" does not exist",
-										t_name,
-										RelationGetRelationName(pstate->p_target_relation)),
-								parser_errposition(pstate, col->location)));
-					}
-				}
-								/*
-				* Check for duplicates, but only of whole columns --- we allow
-				* INSERT INTO foo (col.subcol1, col.subcol2)
-				*/
-				if (col->indirection == NIL)
-				{
-					/* whole column; must not have any other assignment */
-					if (bms_is_member(attrno, wholecols) ||
-						bms_is_member(attrno, partialcols))
-						ereport(ERROR,
-								(errcode(ERRCODE_DUPLICATE_COLUMN),
-								errmsg("column \"%s\" specified more than once",
-										t_name),
-								parser_errposition(pstate, col->location)));
-					wholecols = bms_add_member(wholecols, attrno);
-				}
-				else
-				{
-					/* partial column; must not have any whole assignment */
-					if (bms_is_member(attrno, wholecols))
-						ereport(ERROR,
-								(errcode(ERRCODE_DUPLICATE_COLUMN),
-								errmsg("column \"%s\" specified more than once",
-										t_name),
-								parser_errposition(pstate, col->location)));
-					partialcols = bms_add_member(partialcols, attrno);
-				}
-
-				*attrnos = lappend_int(*attrnos, attrno);
-			}
-			else
-			{
-				char	   *t_name = col->name;
-				int			attrno;
-
-				/* Lookup column name, ereport on failure */
-				attrno = attnameAttNum(pstate->p_target_relation, t_name, false);
-
-				if (attrno == InvalidAttrNumber)
-				{	/*check the column (example. t.tid) in the same table*/
-					ParseNamespaceItem *nsitem = (ParseNamespaceItem *) lsecond(pstate->p_namespace);
-					if(nsitem && nsitem->p_names && nsitem->p_names->aliasname && list_length(col->indirection) == 1 &&
-						strcmp(nsitem->p_names->aliasname, t_name) == 0)
-					{  
-						/*get real column name*/
-						Node *n = linitial(col->indirection);
-
-						if (n && nodeTag(n) == T_String)
-							{/*modify ResTarget*/
-								col->name = strVal(n);
-								t_name = col->name;
-								col->indirection = NIL;
-								attrno = attnameAttNum(pstate->p_target_relation, t_name, false);
-							}
-					}
-					if(attrno == InvalidAttrNumber)
-					{
-						ereport(ERROR,
-								(errcode(ERRCODE_UNDEFINED_COLUMN),
-								errmsg("column \"%s\" of relation \"%s\" does not exist",
-										t_name,
-										RelationGetRelationName(pstate->p_target_relation)),
-								parser_errposition(pstate, col->location)));
-					}
-				}
-				/*
-				* Check for duplicates, but only of whole columns --- we allow
-				* INSERT INTO foo (col.subcol1, col.subcol2)
-				*/
-				if (col->indirection == NIL)
-				{
-					/* whole column; must not have any other assignment */
-					if (bms_is_member(attrno, wholecols) ||
-						bms_is_member(attrno, partialcols))
-						ereport(ERROR,
-								(errcode(ERRCODE_DUPLICATE_COLUMN),
-								errmsg("column \"%s\" specified more than once",
-										t_name),
-								parser_errposition(pstate, col->location)));
-					wholecols = bms_add_member(wholecols, attrno);
-				}
-				else
-				{
-					/* partial column; must not have any whole assignment */
-					if (bms_is_member(attrno, wholecols))
-						ereport(ERROR,
-								(errcode(ERRCODE_DUPLICATE_COLUMN),
-								errmsg("column \"%s\" specified more than once",
-										t_name),
-								parser_errposition(pstate, col->location)));
-					partialcols = bms_add_member(partialcols, attrno);
-				}
-
-				*attrnos = lappend_int(*attrnos, attrno);
-			}
-		}
-	}
-
-	return cols;
-}
-

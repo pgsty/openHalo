@@ -181,7 +181,7 @@
  * 7) Mark state 3 final because state 5 of source NFA is marked as final.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -191,11 +191,14 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_collation_d.h"
 #include "regex/regexport.h"
 #include "trgm.h"
 #include "tsearch/ts_locale.h"
+#include "utils/formatting.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 /*
  * Uncomment (or use -DTRGM_REGEXP_DEBUG) to print debug info,
@@ -480,7 +483,7 @@ static TRGM *createTrgmNFAInternal(regex_t *regex, TrgmPackedGraph **graph,
 static void RE_compile(regex_t *regex, text *text_re,
 					   int cflags, Oid collation);
 static void getColorInfo(regex_t *regex, TrgmNFA *trgmNFA);
-static bool convertPgWchar(pg_wchar c, trgm_mb_char *result);
+static int	convertPgWchar(pg_wchar c, trgm_mb_char *result);
 static void transformGraph(TrgmNFA *trgmNFA);
 static void processState(TrgmNFA *trgmNFA, TrgmState *state);
 static void addKey(TrgmNFA *trgmNFA, TrgmState *state, TrgmStateKey *key);
@@ -541,27 +544,16 @@ createTrgmNFA(text *text_re, Oid collation,
 	 * Stage 1: Compile the regexp into a NFA, using the regexp library.
 	 */
 #ifdef IGNORECASE
-	RE_compile(&regex, text_re, REG_ADVANCED | REG_ICASE, collation);
+	RE_compile(&regex, text_re,
+			   REG_ADVANCED | REG_NOSUB | REG_ICASE, collation);
 #else
-	RE_compile(&regex, text_re, REG_ADVANCED, collation);
+	RE_compile(&regex, text_re,
+			   REG_ADVANCED | REG_NOSUB, collation);
 #endif
 
-	/*
-	 * Since the regexp library allocates its internal data structures with
-	 * malloc, we need to use a PG_TRY block to ensure that pg_regfree() gets
-	 * done even if there's an error.
-	 */
-	PG_TRY();
-	{
-		trg = createTrgmNFAInternal(&regex, graph, rcontext);
-	}
-	PG_FINALLY();
-	{
-		pg_regfree(&regex);
-	}
-	PG_END_TRY();
+	trg = createTrgmNFAInternal(&regex, graph, rcontext);
 
-	/* Clean up all the cruft we created */
+	/* Clean up all the cruft we created (including regex) */
 	MemoryContextSwitchTo(oldcontext);
 	MemoryContextDelete(tmpcontext);
 
@@ -816,10 +808,11 @@ getColorInfo(regex_t *regex, TrgmNFA *trgmNFA)
 		for (j = 0; j < charsCount; j++)
 		{
 			trgm_mb_char c;
+			int			clen = convertPgWchar(chars[j], &c);
 
-			if (!convertPgWchar(chars[j], &c))
+			if (!clen)
 				continue;		/* ok to ignore it altogether */
-			if (ISWORDCHR(c.bytes))
+			if (ISWORDCHR(c.bytes, clen))
 				colorInfo->wordChars[colorInfo->wordCharsCount++] = c;
 			else
 				colorInfo->containsNonWord = true;
@@ -831,13 +824,15 @@ getColorInfo(regex_t *regex, TrgmNFA *trgmNFA)
 
 /*
  * Convert pg_wchar to multibyte format.
- * Returns false if the character should be ignored completely.
+ * Returns 0 if the character should be ignored completely, else returns its
+ * byte length.
  */
-static bool
+static int
 convertPgWchar(pg_wchar c, trgm_mb_char *result)
 {
 	/* "s" has enough space for a multibyte character and a trailing NUL */
 	char		s[MAX_MULTIBYTE_CHAR_LEN + 1];
+	int			clen;
 
 	/*
 	 * We can ignore the NUL character, since it can never appear in a PG text
@@ -845,11 +840,11 @@ convertPgWchar(pg_wchar c, trgm_mb_char *result)
 	 * reconstructing trigrams.
 	 */
 	if (c == 0)
-		return false;
+		return 0;
 
 	/* Do the conversion, making sure the result is NUL-terminated */
 	memset(s, 0, sizeof(s));
-	pg_wchar2mb_with_len(&c, s, 1);
+	clen = pg_wchar2mb_with_len(&c, s, 1);
 
 	/*
 	 * In IGNORECASE mode, we can ignore uppercase characters.  We assume that
@@ -857,21 +852,21 @@ convertPgWchar(pg_wchar c, trgm_mb_char *result)
 	 * within each color, since we used the REG_ICASE option; so there's no
 	 * need to process the uppercase version.
 	 *
-	 * XXX this code is dependent on the assumption that lowerstr() works the
-	 * same as the regex engine's internal case folding machinery.  Might be
-	 * wiser to expose pg_wc_tolower and test whether c == pg_wc_tolower(c).
-	 * On the other hand, the trigrams in the index were created using
-	 * lowerstr(), so we're probably screwed if there's any incompatibility
-	 * anyway.
+	 * XXX this code is dependent on the assumption that str_tolower() works
+	 * the same as the regex engine's internal case folding machinery.  Might
+	 * be wiser to expose pg_wc_tolower and test whether c ==
+	 * pg_wc_tolower(c). On the other hand, the trigrams in the index were
+	 * created using str_tolower(), so we're probably screwed if there's any
+	 * incompatibility anyway.
 	 */
 #ifdef IGNORECASE
 	{
-		char	   *lowerCased = lowerstr(s);
+		char	   *lowerCased = str_tolower(s, clen, DEFAULT_COLLATION_OID);
 
 		if (strcmp(lowerCased, s) != 0)
 		{
 			pfree(lowerCased);
-			return false;
+			return 0;
 		}
 		pfree(lowerCased);
 	}
@@ -879,7 +874,7 @@ convertPgWchar(pg_wchar c, trgm_mb_char *result)
 
 	/* Fill result with exactly MAX_MULTIBYTE_CHAR_LEN bytes */
 	memcpy(result->bytes, s, MAX_MULTIBYTE_CHAR_LEN);
-	return true;
+	return clen;
 }
 
 

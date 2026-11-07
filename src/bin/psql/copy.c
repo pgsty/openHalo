@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/copy.c
  */
@@ -288,8 +288,7 @@ do_copy(const char *args)
 		{
 			if (options->program)
 			{
-				fflush(stdout);
-				fflush(stderr);
+				fflush(NULL);
 				errno = 0;
 				copystream = popen(options->file, PG_BINARY_R);
 			}
@@ -307,10 +306,9 @@ do_copy(const char *args)
 		{
 			if (options->program)
 			{
-				fflush(stdout);
-				fflush(stderr);
-				errno = 0;
+				fflush(NULL);
 				disable_sigpipe_trap();
+				errno = 0;
 				copystream = popen(options->file, PG_BINARY_W);
 			}
 			else
@@ -369,7 +367,7 @@ do_copy(const char *args)
 
 	/* run it like a user command, but with copystream as data source/sink */
 	pset.copyStream = copystream;
-	success = SendQuery(query.data);
+	success = SendQuery(query.data, options->from ? 1 : 0);
 	pset.copyStream = NULL;
 	termPQExpBuffer(&query);
 
@@ -389,11 +387,11 @@ do_copy(const char *args)
 
 					pg_log_error("%s: %s", options->file,
 								 reason ? reason : "");
-					if (reason)
-						free(reason);
+					free(reason);
 				}
 				success = false;
 			}
+			SetShellResultVariables(pclose_rc);
 			restore_sigpipe_trap();
 		}
 		else
@@ -497,11 +495,13 @@ handleCopyOut(PGconn *conn, FILE *copystream, PGresult **res)
  * sends data to complete a COPY ... FROM STDIN command
  *
  * conn should be a database connection that you just issued COPY FROM on
- * and got back a PGRES_COPY_IN result.
+ * and got back a PGRES_COPY_IN result.  Alternatively, if conn is NULL,
+ * we read and discard the appropriate amount of data from copystream.
  * copystream is the file stream to read the data from.
  * isbinary can be set from PQbinaryTuples().
- * The final status for the COPY is returned into *res (but note
- * we already reported the error, if it's not a success result).
+ * The final status for the COPY is returned into *res; but note
+ * we already reported the error, if it's not a success result.
+ * Also, if conn is NULL then *res is not touched.
  *
  * result is true if successful, false if not.
  */
@@ -516,6 +516,12 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 	char		buf[COPYBUFSIZ];
 	bool		showprompt;
 
+	/* We want to prompt if interactive input ... */
+	showprompt = isatty(fileno(copystream));
+	/* ... but if we're just discarding data, don't bother the user at all */
+	if (showprompt && !conn)
+		return true;
+
 	/*
 	 * Establish longjmp destination for exiting from wait-for-input. (This is
 	 * only effective while sigint_interrupt_enabled is TRUE.)
@@ -525,24 +531,19 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 		/* got here with longjmp */
 
 		/* Terminate data transfer */
-		PQputCopyEnd(conn,
-					 (PQprotocolVersion(conn) < 3) ? NULL :
-					 _("canceled by user"));
+		if (conn)
+			PQputCopyEnd(conn,
+						 (PQprotocolVersion(conn) < 3) ? NULL :
+						 _("canceled by user"));
 
 		OK = false;
 		goto copyin_cleanup;
 	}
 
-	/* Prompt if interactive input */
-	if (isatty(fileno(copystream)))
-	{
-		showprompt = true;
-		if (!pset.quiet)
-			puts(_("Enter data to be copied followed by a newline.\n"
-				   "End with a backslash and a period on a line by itself, or an EOF signal."));
-	}
-	else
-		showprompt = false;
+	/* Issue initial prompt if interactive input */
+	if (showprompt && !pset.quiet)
+		puts(_("Enter data to be copied followed by a newline.\n"
+			   "End with a backslash and a period on a line by itself, or an EOF signal."));
 
 	OK = true;
 
@@ -571,7 +572,7 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 			if (buflen <= 0)
 				break;
 
-			if (PQputCopyData(conn, buf, buflen) <= 0)
+			if (conn && PQputCopyData(conn, buf, buflen) <= 0)
 			{
 				OK = false;
 				break;
@@ -581,13 +582,21 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 	else
 	{
 		bool		copydone = false;
+		int			buflen;
+		bool		at_line_begin = true;
 
+		/*
+		 * In text mode, we have to read the input one line at a time, so that
+		 * we can stop reading at the EOF marker (\.).  We mustn't read beyond
+		 * the EOF marker, because if the data was inlined in a SQL script, we
+		 * would eat up the commands after the EOF marker.
+		 */
+		buflen = 0;
 		while (!copydone)
-		{						/* for each input line ... */
-			bool		firstload;
-			bool		linedone;
+		{
+			char	   *fgresult;
 
-			if (showprompt)
+			if (at_line_begin && showprompt)
 			{
 				const char *prompt = get_prompt(PROMPT_COPY, NULL);
 
@@ -595,64 +604,79 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 				fflush(stdout);
 			}
 
-			firstload = true;
-			linedone = false;
+			/* enable longjmp while waiting for input */
+			sigint_interrupt_enabled = true;
 
-			while (!linedone)
-			{					/* for each bufferload in line ... */
+			fgresult = fgets(&buf[buflen], COPYBUFSIZ - buflen, copystream);
+
+			sigint_interrupt_enabled = false;
+
+			if (!fgresult)
+				copydone = true;
+			else
+			{
 				int			linelen;
-				char	   *fgresult;
 
-				/* enable longjmp while waiting for input */
-				sigint_interrupt_enabled = true;
-
-				fgresult = fgets(buf, sizeof(buf), copystream);
-
-				sigint_interrupt_enabled = false;
-
-				if (!fgresult)
-				{
-					copydone = true;
-					break;
-				}
-
-				linelen = strlen(buf);
+				linelen = strlen(fgresult);
+				buflen += linelen;
 
 				/* current line is done? */
-				if (linelen > 0 && buf[linelen - 1] == '\n')
-					linedone = true;
-
-				/* check for EOF marker, but not on a partial line */
-				if (firstload)
+				if (buf[buflen - 1] == '\n')
 				{
 					/*
-					 * This code erroneously assumes '\.' on a line alone
-					 * inside a quoted CSV string terminates the \copy.
-					 * https://www.postgresql.org/message-id/E1TdNVQ-0001ju-GO@wrigleys.postgresql.org
-					 * https://www.postgresql.org/message-id/bfcd57e4-8f23-4c3e-a5db-2571d09208e2@beta.fastmail.com
+					 * When at the beginning of the line and the data is
+					 * inlined, check for EOF marker.  If the marker is found,
+					 * we must stop at this point.  If not, the \. line can be
+					 * sent to the server, and we let it decide whether it's
+					 * an EOF or not depending on the format: in TEXT mode, \.
+					 * will be interpreted as an EOF, in CSV, it will not.
 					 */
-					if (strcmp(buf, "\\.\n") == 0 ||
-						strcmp(buf, "\\.\r\n") == 0)
+					if (at_line_begin && copystream == pset.cur_cmd_source)
 					{
-						copydone = true;
-						break;
+						if ((linelen == 3 && memcmp(fgresult, "\\.\n", 3) == 0) ||
+							(linelen == 4 && memcmp(fgresult, "\\.\r\n", 4) == 0))
+						{
+							copydone = true;
+
+							/*
+							 * Remove the EOF marker from the data sent.  In
+							 * CSV mode, the EOF marker must be removed,
+							 * otherwise it would be interpreted by the server
+							 * as valid data.
+							 */
+							*fgresult = '\0';
+							buflen -= linelen;
+						}
 					}
 
-					firstload = false;
+					if (copystream == pset.cur_cmd_source)
+					{
+						pset.lineno++;
+						pset.stmt_lineno++;
+					}
+					at_line_begin = true;
 				}
-
-				if (PQputCopyData(conn, buf, linelen) <= 0)
-				{
-					OK = false;
-					copydone = true;
-					break;
-				}
+				else
+					at_line_begin = false;
 			}
 
-			if (copystream == pset.cur_cmd_source)
+			/*
+			 * If the buffer is full, or we've reached the EOF, flush it.
+			 *
+			 * Make sure there's always space for four more bytes in the
+			 * buffer, plus a NUL terminator.  That way, an EOF marker is
+			 * never split across two fgets() calls, which simplifies the
+			 * logic.
+			 */
+			if (buflen >= COPYBUFSIZ - 5 || (copydone && buflen > 0))
 			{
-				pset.lineno++;
-				pset.stmt_lineno++;
+				if (conn && PQputCopyData(conn, buf, buflen) <= 0)
+				{
+					OK = false;
+					break;
+				}
+
+				buflen = 0;
 			}
 		}
 	}
@@ -667,7 +691,8 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 	 * keep the version checks just in case you're using a pre-v14 libpq.so at
 	 * runtime)
 	 */
-	if (PQputCopyEnd(conn,
+	if (conn &&
+		PQputCopyEnd(conn,
 					 (OK || PQprotocolVersion(conn) < 3) ? NULL :
 					 _("aborted because of read failure")) <= 0)
 		OK = false;
@@ -683,6 +708,10 @@ copyin_cleanup:
 	 * set.  This also clears the error flag, but we already checked that.
 	 */
 	clearerr(copystream);
+
+	/* Done if we don't have a connection to clean up */
+	if (!conn)
+		return OK;
 
 	/*
 	 * Check command status and return to normal libpq state.

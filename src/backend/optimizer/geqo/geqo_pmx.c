@@ -34,10 +34,12 @@
 /*************************************************************/
 
 #include "postgres.h"
-#include "optimizer/geqo_random.h"
-#include "optimizer/geqo_recombination.h"
+#include "optimizer/geqo.h"
 
 #if defined(PMX)
+
+#include "optimizer/geqo_random.h"
+#include "optimizer/geqo_recombination.h"
 
 /* pmx
  *
@@ -131,7 +133,6 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 
 				j++;
 			}
-
 		}
 
 		if (!(found))
@@ -140,7 +141,6 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 			indx[mx_fail] = k;
 			mx_fail++;
 		}
-
 	}							/* ... for */
 
 
@@ -172,9 +172,7 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 
 				j++;
 			}
-
 		}						/* ... for	 */
-
 	}							/* ... if	 */
 
 
@@ -206,12 +204,10 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 
 						j++;
 					}
-
 				}				/* ... if	 */
 
 				i++;
 			}					/* end while */
-
 		}
 	}							/* ... for	 */
 

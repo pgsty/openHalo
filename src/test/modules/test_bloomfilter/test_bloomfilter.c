@@ -3,7 +3,7 @@
  * test_bloomfilter.c
  *		Test false positive rate of Bloom filter.
  *
- * Copyright (c) 2018-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2018-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_bloomfilter/test_bloomfilter.c
@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "common/pg_prng.h"
 #include "fmgr.h"
 #include "lib/bloomfilter.h"
 #include "miscadmin.h"
@@ -75,7 +76,7 @@ create_and_test_bloom(int power, int64 nelements, int callerseed)
 	int64		nfalsepos;
 	bloom_filter *filter;
 
-	bloom_work_mem = (1L << power) / 8L / 1024L;
+	bloom_work_mem = ((int64) 1 << power) / (8 * 1024);
 
 	elog(DEBUG1, "bloom_work_mem (KB): %d", bloom_work_mem);
 
@@ -83,9 +84,8 @@ create_and_test_bloom(int power, int64 nelements, int callerseed)
 	 * Generate random seed, or use caller's.  Seed should always be a
 	 * positive value less than or equal to PG_INT32_MAX, to ensure that any
 	 * random seed can be recreated through callerseed if the need arises.
-	 * (Don't assume that RAND_MAX cannot exceed PG_INT32_MAX.)
 	 */
-	seed = callerseed < 0 ? random() % PG_INT32_MAX : callerseed;
+	seed = callerseed < 0 ? pg_prng_int32p(&pg_global_prng_state) : callerseed;
 
 	/* Create Bloom filter, populate it, and report on false positive rate */
 	filter = bloom_create(nelements, bloom_work_mem, seed);

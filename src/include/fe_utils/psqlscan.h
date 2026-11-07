@@ -10,7 +10,7 @@
  * backslash commands.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/fe_utils/psqlscan.h
@@ -26,13 +26,16 @@
 /* Abstract type for lexer's internal state */
 typedef struct PsqlScanStateData *PsqlScanState;
 
+/* Abstract type for state save/restore */
+typedef struct PsqlScanStateSave PsqlScanStateSave;
+
 /* Termination states for psql_scan() */
 typedef enum
 {
 	PSCAN_SEMICOLON,			/* found command-ending semicolon */
 	PSCAN_BACKSLASH,			/* found backslash command */
 	PSCAN_INCOMPLETE,			/* end of line, SQL statement incomplete */
-	PSCAN_EOL					/* end of line, SQL possibly complete */
+	PSCAN_EOL,					/* end of line, SQL possibly complete */
 } PsqlScanResult;
 
 /* Prompt type returned by psql_scan() */
@@ -45,7 +48,7 @@ typedef enum _promptStatus
 	PROMPT_DOUBLEQUOTE,
 	PROMPT_DOLLARQUOTE,
 	PROMPT_PAREN,
-	PROMPT_COPY
+	PROMPT_COPY,
 } promptStatus_t;
 
 /* Quoting request types for get_variable() callback */
@@ -54,7 +57,7 @@ typedef enum
 	PQUOTE_PLAIN,				/* just return the actual value */
 	PQUOTE_SQL_LITERAL,			/* add quotes to make a valid SQL literal */
 	PQUOTE_SQL_IDENT,			/* quote if needed to make a SQL identifier */
-	PQUOTE_SHELL_ARG			/* quote if needed to be safe in a shell cmd */
+	PQUOTE_SHELL_ARG,			/* quote if needed to be safe in a shell cmd */
 } PsqlScanQuoteType;
 
 /* Callback functions to be used by the lexer */
@@ -85,6 +88,11 @@ extern void psql_scan_reset(PsqlScanState state);
 
 extern void psql_scan_reselect_sql_lexer(PsqlScanState state);
 
+extern int	psql_scan_count_copy_from_stdin(PsqlScanState state);
+
 extern bool psql_scan_in_quote(PsqlScanState state);
+
+extern void psql_scan_get_location(PsqlScanState state,
+								   int *lineno, int *offset);
 
 #endif							/* PSQLSCAN_H */

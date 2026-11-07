@@ -3,7 +3,7 @@
  * pquery.c
  *	  POSTGRES process query command code
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,6 +19,7 @@
 
 #include "access/xact.h"
 #include "commands/prepare.h"
+#include "executor/executor.h"
 #include "executor/tstoreReceiver.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -157,7 +158,7 @@ ProcessQuery(PlannedStmt *plan,
 	/*
 	 * Run the plan to completion.
 	 */
-	ExecutorRun(queryDesc, ForwardScanDirection, 0L, true);
+	ExecutorRun(queryDesc, ForwardScanDirection, 0);
 
 	/*
 	 * Build command completion status data, if caller wants one.
@@ -178,11 +179,9 @@ ProcessQuery(PlannedStmt *plan,
 			case CMD_DELETE:
 				SetQueryCompletion(qc, CMDTAG_DELETE, queryDesc->estate->es_processed);
 				break;
-			
 			case CMD_MERGE:
 				SetQueryCompletion(qc, CMDTAG_MERGE, queryDesc->estate->es_processed);
 				break;
-			
 			default:
 				SetQueryCompletion(qc, CMDTAG_UNKNOWN, queryDesc->estate->es_processed);
 				break;
@@ -442,8 +441,8 @@ PortalStart(Portal portal, ParamListInfo params,
 	QueryDesc  *queryDesc;
 	int			myeflags;
 
-	AssertArg(PortalIsValid(portal));
-	AssertState(portal->status == PORTAL_DEFINED);
+	Assert(PortalIsValid(portal));
+	Assert(portal->status == PORTAL_DEFINED);
 
 	/*
 	 * Set up global portal context pointers.
@@ -672,8 +671,6 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
  * isTopLevel: true if query is being executed at backend "top level"
  * (that is, directly from a client command message)
  *
- * run_once: ignored, present only to avoid an API break in stable branches.
- *
  * dest: where to send output of primary (canSetTag) query
  *
  * altdest: where to send output of non-primary queries
@@ -685,7 +682,7 @@ PortalSetResultFormat(Portal portal, int nFormats, int16 *formats)
  * suspended due to exhaustion of the count parameter.
  */
 bool
-PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
+PortalRun(Portal portal, long count, bool isTopLevel,
 		  DestReceiver *dest, DestReceiver *altdest,
 		  QueryCompletion *qc)
 {
@@ -698,7 +695,7 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 	MemoryContext savePortalContext;
 	MemoryContext saveMemoryContext;
 
-	AssertArg(PortalIsValid(portal));
+	Assert(PortalIsValid(portal));
 
 	TRACE_POSTGRESQL_QUERY_EXECUTE_START();
 
@@ -921,8 +918,7 @@ PortalRunSelect(Portal portal,
 		else
 		{
 			PushActiveSnapshot(queryDesc->snapshot);
-			ExecutorRun(queryDesc, direction, (uint64) count,
-						false);
+			ExecutorRun(queryDesc, direction, (uint64) count);
 			nprocessed = queryDesc->estate->es_processed;
 			PopActiveSnapshot();
 		}
@@ -961,8 +957,7 @@ PortalRunSelect(Portal portal,
 		else
 		{
 			PushActiveSnapshot(queryDesc->snapshot);
-			ExecutorRun(queryDesc, direction, (uint64) count,
-						false);
+			ExecutorRun(queryDesc, direction, (uint64) count);
 			nprocessed = queryDesc->estate->es_processed;
 			PopActiveSnapshot();
 		}
@@ -1009,8 +1004,8 @@ FillPortalStore(Portal portal, bool isTopLevel)
 									portal->holdStore,
 									portal->holdContext,
 									false,
-									NULL,
-									NULL);
+									portal->tupDesc,
+									gettext_noop("query result type does not match portal result type"));
 
 	switch (portal->strategy)
 	{
@@ -1066,14 +1061,7 @@ RunFromStore(Portal portal, ScanDirection direction, uint64 count,
 
 	slot = MakeSingleTupleTableSlot(portal->tupDesc, &TTSOpsMinimalTuple);
 
-    if (portal->commandTag != CMDTAG_EXECUTE)
-    {
-        dest->rStartup(dest, CMD_SELECT, portal->tupDesc, portal->commandTag);
-    }
-    else 
-    {
-        dest->rStartup(dest, CMD_SELECT, portal->tupDesc, portal->qc.commandTag);
-    }
+	dest->rStartup(dest, CMD_SELECT, portal->tupDesc);
 
 	if (ScanDirectionIsNoMovement(direction))
 	{
@@ -1103,16 +1091,8 @@ RunFromStore(Portal portal, ScanDirection direction, uint64 count,
 			 * has closed and no more tuples can be sent. If that's the case,
 			 * end the loop.
 			 */
-            if (portal->commandTag != CMDTAG_EXECUTE)
-            {
-                if (!dest->receiveSlot(slot, dest, portal->commandTag))
-                    break;
-            }
-            else 
-            {
-                if (!dest->receiveSlot(slot, dest, portal->qc.commandTag))
-                    break;
-            }
+			if (!dest->receiveSlot(slot, dest))
+				break;
 
 			ExecClearTuple(slot);
 
@@ -1370,24 +1350,15 @@ PortalRunMulti(Portal portal,
 		PopActiveSnapshot();
 
 	/*
-	 * If a query completion data was supplied, use it.  Otherwise use the
-	 * portal's query completion data.
-	 *
-	 * Exception: Clients expect INSERT/UPDATE/DELETE tags to have counts, so
-	 * fake them with zeros.  This can happen with DO INSTEAD rules if there
-	 * is no replacement query of the same type as the original.  We print "0
-	 * 0" here because technically there is no query of the matching tag type,
-	 * and printing a non-zero count for a different query type seems wrong,
-	 * e.g.  an INSERT that does an UPDATE instead should not print "0 1" if
-	 * one row was updated.  See QueryRewrite(), step 3, for details.
+	 * If a command tag was requested and we did not fill in a run-time-
+	 * determined tag above, copy the parse-time tag from the Portal.  (There
+	 * might not be any tag there either, in edge cases such as empty prepared
+	 * statements.  That's OK.)
 	 */
-	if (qc && qc->commandTag == CMDTAG_UNKNOWN)
-	{
-		if (portal->qc.commandTag != CMDTAG_UNKNOWN)
-			CopyQueryCompletion(qc, &portal->qc);
-		/* If the caller supplied a qc, we should have set it by now. */
-		Assert(qc->commandTag != CMDTAG_UNKNOWN);
-	}
+	if (qc &&
+		qc->commandTag == CMDTAG_UNKNOWN &&
+		portal->qc.commandTag != CMDTAG_UNKNOWN)
+		CopyQueryCompletion(qc, &portal->qc);
 }
 
 /*
@@ -1414,7 +1385,7 @@ PortalRunFetch(Portal portal,
 	MemoryContext savePortalContext;
 	MemoryContext oldContext;
 
-	AssertArg(PortalIsValid(portal));
+	Assert(PortalIsValid(portal));
 
 	/*
 	 * Check for improper portal use, and mark portal active.
@@ -1706,13 +1677,8 @@ DoPortalRewind(Portal portal)
 	if (portal->atStart && !portal->atEnd)
 		return;
 
-	/*
-	 * Otherwise, cursor should allow scrolling.  However, we're only going to
-	 * enforce that policy fully beginning in v15.  In older branches, insist
-	 * on this only if the portal has a holdStore.  That prevents users from
-	 * seeing that the holdStore may not have all the rows of the query.
-	 */
-	if ((portal->cursorOptions & CURSOR_OPT_NO_SCROLL) && portal->holdStore)
+	/* Otherwise, cursor must allow scrolling */
+	if (portal->cursorOptions & CURSOR_OPT_NO_SCROLL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("cursor can only scan forward"),

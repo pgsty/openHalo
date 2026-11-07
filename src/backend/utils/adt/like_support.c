@@ -23,7 +23,7 @@
  * from LIKE to indexscan limits rather harder than one might think ...
  * but that's the basic idea.)
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,7 +37,6 @@
 #include <math.h>
 
 #include "access/htup_details.h"
-#include "access/stratnum.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
@@ -62,13 +61,17 @@ typedef enum
 	Pattern_Type_Like_IC,
 	Pattern_Type_Regex,
 	Pattern_Type_Regex_IC,
-	Pattern_Type_Prefix
+	Pattern_Type_Prefix,
 } Pattern_Type;
 
 typedef enum
 {
-	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact
+	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact,
 } Pattern_Prefix_Status;
+
+/* non-collatable comparisons, eg for bytea, are always deterministic */
+#define NONDETERMINISTIC(coll) \
+	(OidIsValid(coll) && !get_collation_isdeterministic(coll))
 
 static Node *like_regex_support(Node *rawreq, Pattern_Type ptype);
 static List *match_pattern_prefix(Node *leftop,
@@ -101,7 +104,7 @@ static Selectivity regex_selectivity(const char *patt, int pattlen,
 									 bool case_insensitive,
 									 int fixed_prefix_len);
 static int	pattern_char_isalpha(char c, bool is_multibyte,
-								 pg_locale_t locale, bool locale_is_c);
+								 pg_locale_t locale);
 static Const *make_greater_string(const Const *str_const, FmgrInfo *ltproc,
 								  Oid collation);
 static Datum string_to_datum(const char *str, Oid datatype);
@@ -142,6 +145,14 @@ texticregexeq_support(PG_FUNCTION_ARGS)
 	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
 
 	PG_RETURN_POINTER(like_regex_support(rawreq, Pattern_Type_Regex_IC));
+}
+
+Datum
+text_starts_with_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	PG_RETURN_POINTER(like_regex_support(rawreq, Pattern_Type_Prefix));
 }
 
 /* Common code for the above */
@@ -247,6 +258,7 @@ match_pattern_prefix(Node *leftop,
 	Oid			eqopr;
 	Oid			ltopr;
 	Oid			geopr;
+	Oid			preopr = InvalidOid;
 	bool		collation_aware;
 	Expr	   *expr;
 	FmgrInfo	ltproc;
@@ -263,22 +275,6 @@ match_pattern_prefix(Node *leftop,
 		((Const *) rightop)->constisnull)
 		return NIL;
 	patt = (Const *) rightop;
-
-	/*
-	 * Not supported if the expression collation is nondeterministic.  The
-	 * optimized equality or prefix tests use bytewise comparisons, which is
-	 * not consistent with nondeterministic collations.  The actual
-	 * pattern-matching implementation functions will later error out that
-	 * pattern-matching is not supported with nondeterministic collations. (We
-	 * could also error out here, but by doing it later we get more precise
-	 * error messages.)  (It should be possible to support at least
-	 * Pattern_Prefix_Exact, but no point as long as the actual
-	 * pattern-matching implementations don't support it.)
-	 *
-	 * expr_coll is not set for a non-collation-aware data type such as bytea.
-	 */
-	if (expr_coll && !get_collation_isdeterministic(expr_coll))
-		return NIL;
 
 	/*
 	 * Try to extract a fixed prefix from the pattern.
@@ -303,12 +299,20 @@ match_pattern_prefix(Node *leftop,
 	switch (ldatatype)
 	{
 		case TEXTOID:
-			if (opfamily == TEXT_PATTERN_BTREE_FAM_OID ||
-				opfamily == TEXT_SPGIST_FAM_OID)
+			if (opfamily == TEXT_PATTERN_BTREE_FAM_OID)
 			{
 				eqopr = TextEqualOperator;
 				ltopr = TextPatternLessOperator;
 				geopr = TextPatternGreaterEqualOperator;
+				collation_aware = false;
+			}
+			else if (opfamily == TEXT_SPGIST_FAM_OID)
+			{
+				eqopr = TextEqualOperator;
+				ltopr = TextPatternLessOperator;
+				geopr = TextPatternGreaterEqualOperator;
+				/* This opfamily has direct support for prefixing */
+				preopr = TextPrefixOperator;
 				collation_aware = false;
 			}
 			else
@@ -362,20 +366,6 @@ match_pattern_prefix(Node *leftop,
 	}
 
 	/*
-	 * If necessary, verify that the index's collation behavior is compatible.
-	 * For an exact-match case, we don't have to be picky.  Otherwise, insist
-	 * that the index collation be "C".  Note that here we are looking at the
-	 * index's collation, not the expression's collation -- this test is *not*
-	 * dependent on the LIKE/regex operator's collation.
-	 */
-	if (collation_aware)
-	{
-		if (!(pstatus == Pattern_Prefix_Exact ||
-			  lc_collate_is_c(indexcollation)))
-			return NIL;
-	}
-
-	/*
 	 * If necessary, coerce the prefix constant to the right type.  The given
 	 * prefix constant is either text or bytea type, therefore the only case
 	 * where we need to do anything is when converting text to bpchar.  Those
@@ -397,10 +387,22 @@ match_pattern_prefix(Node *leftop,
 	 * us to not be concerned with specific opclasses (except for the legacy
 	 * "pattern" cases); any index that correctly implements the operators
 	 * will work.
+	 *
+	 * This case will work for LIKE/regex expressions with nondeterministic
+	 * collation, so long as the index's collation is the same.  If the
+	 * expression's collation is deterministic, we can even use an index whose
+	 * collation differs from the expression's.  All deterministic collations
+	 * agree on equality (it's bitwise), while we assume that an index with
+	 * nondeterministic collation will return a superset of the bitwise-equal
+	 * entries.  Since the "=" indexqual is marked as lossy by default, we'll
+	 * apply the LIKE/regex operator as a recheck, and that will filter out
+	 * any non-matching entries.
 	 */
 	if (pstatus == Pattern_Prefix_Exact)
 	{
 		if (!op_in_opfamily(eqopr, opfamily))
+			return NIL;
+		if (indexcollation != expr_coll && NONDETERMINISTIC(expr_coll))
 			return NIL;
 		expr = make_opclause(eqopr, BOOLOID, false,
 							 (Expr *) leftop, (Expr *) prefix,
@@ -410,8 +412,40 @@ match_pattern_prefix(Node *leftop,
 	}
 
 	/*
-	 * Otherwise, we have a nonempty required prefix of the values.
-	 *
+	 * Anything other than Pattern_Prefix_Exact is not supported if the
+	 * expression collation is nondeterministic.  The optimized equality or
+	 * prefix tests use bytewise comparisons, which is not consistent with
+	 * nondeterministic collations.
+	 */
+	if (NONDETERMINISTIC(expr_coll))
+		return NIL;
+
+	/*
+	 * Otherwise, we have a nonempty required prefix of the values.  Some
+	 * opclasses support prefix checks directly, otherwise we'll try to
+	 * generate a range constraint.
+	 */
+	if (OidIsValid(preopr) && op_in_opfamily(preopr, opfamily))
+	{
+		expr = make_opclause(preopr, BOOLOID, false,
+							 (Expr *) leftop, (Expr *) prefix,
+							 InvalidOid, indexcollation);
+		result = list_make1(expr);
+		return result;
+	}
+
+	/*
+	 * Since we need a range constraint, it's only going to work reliably if
+	 * the index is collation-insensitive or has "C" collation.  Note that
+	 * here we are looking at the index's collation, not the expression's
+	 * collation -- this test is *not* dependent on the LIKE/regex operator's
+	 * collation.
+	 */
+	if (collation_aware &&
+		!pg_newlocale_from_collation(indexcollation)->collate_is_c)
+		return NIL;
+
+	/*
 	 * We can always say "x >= prefix".
 	 */
 	if (!op_in_opfamily(geopr, opfamily))
@@ -975,7 +1009,6 @@ like_fixed_prefix(Const *patt_const, bool case_insensitive, Oid collation,
 				match_pos;
 	bool		is_multibyte = (pg_database_encoding_max_length() > 1);
 	pg_locale_t locale = 0;
-	bool		locale_is_c = false;
 
 	/* the right-hand const is type text or bytea */
 	Assert(typeid == BYTEAOID || typeid == TEXTOID);
@@ -987,24 +1020,19 @@ like_fixed_prefix(Const *patt_const, bool case_insensitive, Oid collation,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("case insensitive matching not supported on type bytea")));
 
-		/* If case-insensitive, we need locale info */
-		if (lc_ctype_is_c(collation))
-			locale_is_c = true;
-		else if (collation != DEFAULT_COLLATION_OID)
+		if (!OidIsValid(collation))
 		{
-			if (!OidIsValid(collation))
-			{
-				/*
-				 * This typically means that the parser could not resolve a
-				 * conflict of implicit collations, so report it that way.
-				 */
-				ereport(ERROR,
-						(errcode(ERRCODE_INDETERMINATE_COLLATION),
-						 errmsg("could not determine which collation to use for ILIKE"),
-						 errhint("Use the COLLATE clause to set the collation explicitly.")));
-			}
-			locale = pg_newlocale_from_collation(collation);
+			/*
+			 * This typically means that the parser could not resolve a
+			 * conflict of implicit collations, so report it that way.
+			 */
+			ereport(ERROR,
+					(errcode(ERRCODE_INDETERMINATE_COLLATION),
+					 errmsg("could not determine which collation to use for ILIKE"),
+					 errhint("Use the COLLATE clause to set the collation explicitly.")));
 		}
+
+		locale = pg_newlocale_from_collation(collation);
 	}
 
 	if (typeid != BYTEAOID)
@@ -1041,7 +1069,7 @@ like_fixed_prefix(Const *patt_const, bool case_insensitive, Oid collation,
 
 		/* Stop if case-varying character (it's sort of a wildcard) */
 		if (case_insensitive &&
-			pattern_char_isalpha(patt[pos], is_multibyte, locale, locale_is_c))
+			pattern_char_isalpha(patt[pos], is_multibyte, locale))
 			break;
 
 		match[match_pos++] = patt[pos];
@@ -1166,7 +1194,6 @@ pattern_fixed_prefix(Const *patt, Pattern_Type ptype, Oid collation,
 		case Pattern_Type_Prefix:
 			/* Prefix type work is trivial.  */
 			result = Pattern_Prefix_Partial;
-			*rest_selec = 1.0;	/* all */
 			*prefix = makeConst(patt->consttype,
 								patt->consttypmod,
 								patt->constcollid,
@@ -1176,6 +1203,8 @@ pattern_fixed_prefix(Const *patt, Pattern_Type ptype, Oid collation,
 										  patt->constlen),
 								patt->constisnull,
 								patt->constbyval);
+			if (rest_selec != NULL)
+				*rest_selec = 1.0;	/* all */
 			break;
 		default:
 			elog(ERROR, "unrecognized ptype: %d", (int) ptype);
@@ -1474,21 +1503,17 @@ regex_selectivity(const char *patt, int pattlen, bool case_insensitive,
  */
 static int
 pattern_char_isalpha(char c, bool is_multibyte,
-					 pg_locale_t locale, bool locale_is_c)
+					 pg_locale_t locale)
 {
-	if (locale_is_c)
+	if (locale->ctype_is_c)
 		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 	else if (is_multibyte && IS_HIGHBIT_SET(c))
 		return true;
-	else if (locale && locale->provider == COLLPROVIDER_ICU)
+	else if (locale->provider != COLLPROVIDER_LIBC)
 		return IS_HIGHBIT_SET(c) ||
 			(c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-#ifdef HAVE_LOCALE_T
-	else if (locale && locale->provider == COLLPROVIDER_LIBC)
-		return isalpha_l((unsigned char) c, locale->info.lt);
-#endif
 	else
-		return isalpha((unsigned char) c);
+		return isalpha_l((unsigned char) c, locale->info.lt);
 }
 
 
@@ -1580,7 +1605,7 @@ make_greater_string(const Const *str_const, FmgrInfo *ltproc, Oid collation)
 		else
 			workstr = TextDatumGetCString(str_const->constvalue);
 		len = strlen(workstr);
-		if (lc_collate_is_c(collation) || len == 0)
+		if (len == 0 || pg_newlocale_from_collation(collation)->collate_is_c)
 			cmpstr = str_const->constvalue;
 		else
 		{

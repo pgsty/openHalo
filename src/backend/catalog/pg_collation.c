@@ -3,7 +3,7 @@
  * pg_collation.c
  *	  routines to support manipulation of the pg_collation relation
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,9 +14,7 @@
  */
 #include "postgres.h"
 
-#include "access/genam.h"
 #include "access/htup_details.h"
-#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
@@ -26,8 +24,6 @@
 #include "catalog/pg_namespace.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
-#include "utils/fmgroids.h"
-#include "utils/pg_locale.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -49,6 +45,8 @@ CollationCreate(const char *collname, Oid collnamespace,
 				bool collisdeterministic,
 				int32 collencoding,
 				const char *collcollate, const char *collctype,
+				const char *colllocale,
+				const char *collicurules,
 				const char *collversion,
 				bool if_not_exists,
 				bool quiet)
@@ -58,18 +56,18 @@ CollationCreate(const char *collname, Oid collnamespace,
 	HeapTuple	tup;
 	Datum		values[Natts_pg_collation];
 	bool		nulls[Natts_pg_collation];
-	NameData	name_name,
-				name_collate,
-				name_ctype;
+	NameData	name_name;
 	Oid			oid;
 	ObjectAddress myself,
 				referenced;
 
-	AssertArg(collname);
-	AssertArg(collnamespace);
-	AssertArg(collowner);
-	AssertArg(collcollate);
-	AssertArg(collctype);
+	Assert(collname);
+	Assert(collnamespace);
+	Assert(collowner);
+	Assert((collprovider == COLLPROVIDER_LIBC &&
+			collcollate && collctype && !colllocale) ||
+		   (collprovider != COLLPROVIDER_LIBC &&
+			!collcollate && !collctype && colllocale));
 
 	/*
 	 * Make sure there is no existing collation of same name & encoding.
@@ -184,10 +182,22 @@ CollationCreate(const char *collname, Oid collnamespace,
 	values[Anum_pg_collation_collprovider - 1] = CharGetDatum(collprovider);
 	values[Anum_pg_collation_collisdeterministic - 1] = BoolGetDatum(collisdeterministic);
 	values[Anum_pg_collation_collencoding - 1] = Int32GetDatum(collencoding);
-	namestrcpy(&name_collate, collcollate);
-	values[Anum_pg_collation_collcollate - 1] = NameGetDatum(&name_collate);
-	namestrcpy(&name_ctype, collctype);
-	values[Anum_pg_collation_collctype - 1] = NameGetDatum(&name_ctype);
+	if (collcollate)
+		values[Anum_pg_collation_collcollate - 1] = CStringGetTextDatum(collcollate);
+	else
+		nulls[Anum_pg_collation_collcollate - 1] = true;
+	if (collctype)
+		values[Anum_pg_collation_collctype - 1] = CStringGetTextDatum(collctype);
+	else
+		nulls[Anum_pg_collation_collctype - 1] = true;
+	if (colllocale)
+		values[Anum_pg_collation_colllocale - 1] = CStringGetTextDatum(colllocale);
+	else
+		nulls[Anum_pg_collation_colllocale - 1] = true;
+	if (collicurules)
+		values[Anum_pg_collation_collicurules - 1] = CStringGetTextDatum(collicurules);
+	else
+		nulls[Anum_pg_collation_collicurules - 1] = true;
 	if (collversion)
 		values[Anum_pg_collation_collversion - 1] = CStringGetTextDatum(collversion);
 	else

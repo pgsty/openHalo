@@ -1,3 +1,0 @@
-comment = 'MySQL Supplementary Extension'
-default_version = '1.5'
-module_pathname = '$libdir/mysm'

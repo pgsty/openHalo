@@ -3,7 +3,7 @@
  * hashsearch.c
  *	  search code for postgres hash tables
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,8 +37,8 @@ static void _hash_readnext(IndexScanDesc scan, Buffer *bufp,
  *		be pinned but not locked, and so->currPos.itemIndex identifies
  *		which item was previously returned.
  *
- *		On successful exit, scan->xs_ctup.t_self is set to the TID
- *		of the next heap tuple. so->currPos is updated as needed.
+ *		On successful exit, scan->xs_heaptid is set to the TID of the next
+ *		heap tuple.  so->currPos is updated as needed.
  *
  *		On failure exit (no more tuples), we return false with pin
  *		held on bucket page but no pins or locks held on overflow
@@ -71,7 +71,6 @@ _hash_next(IndexScanDesc scan, ScanDirection dir)
 			if (BlockNumberIsValid(blkno))
 			{
 				buf = _hash_getbuf(rel, blkno, HASH_READ, LH_OVERFLOW_PAGE);
-				TestForOldSnapshot(scan->xs_snapshot, rel, BufferGetPage(buf));
 				if (!_hash_readpage(scan, &buf, dir))
 					end_of_scan = true;
 			}
@@ -91,7 +90,6 @@ _hash_next(IndexScanDesc scan, ScanDirection dir)
 			{
 				buf = _hash_getbuf(rel, blkno, HASH_READ,
 								   LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
-				TestForOldSnapshot(scan->xs_snapshot, rel, BufferGetPage(buf));
 
 				/*
 				 * We always maintain the pin on bucket page for whole scan
@@ -186,8 +184,7 @@ _hash_readnext(IndexScanDesc scan,
 	if (block_found)
 	{
 		*pagep = BufferGetPage(*bufp);
-		TestForOldSnapshot(scan->xs_snapshot, rel, *pagep);
-		*opaquep = (HashPageOpaque) PageGetSpecialPointer(*pagep);
+		*opaquep = HashPageGetOpaque(*pagep);
 	}
 }
 
@@ -232,8 +229,7 @@ _hash_readprev(IndexScanDesc scan,
 		*bufp = _hash_getbuf(rel, blkno, HASH_READ,
 							 LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
 		*pagep = BufferGetPage(*bufp);
-		TestForOldSnapshot(scan->xs_snapshot, rel, *pagep);
-		*opaquep = (HashPageOpaque) PageGetSpecialPointer(*pagep);
+		*opaquep = HashPageGetOpaque(*pagep);
 
 		/*
 		 * We always maintain the pin on bucket page for whole scan operation,
@@ -258,7 +254,7 @@ _hash_readprev(IndexScanDesc scan,
 
 		LockBuffer(*bufp, BUFFER_LOCK_SHARE);
 		*pagep = BufferGetPage(*bufp);
-		*opaquep = (HashPageOpaque) PageGetSpecialPointer(*pagep);
+		*opaquep = HashPageGetOpaque(*pagep);
 
 		/* move to the end of bucket chain */
 		while (BlockNumberIsValid((*opaquep)->hasho_nextblkno))
@@ -283,7 +279,7 @@ _hash_readprev(IndexScanDesc scan,
  *		overflow page, both pin and lock are released whereas if it is a bucket
  *		page then it is pinned but not locked and data about the matching
  *		tuple(s) on the page has been loaded into so->currPos,
- *		scan->xs_ctup.t_self is set to the heap TID of the current tuple.
+ *		scan->xs_heaptid is set to the heap TID of the current tuple.
  *
  *		On failure exit (no more tuples), we return false, with pin held on
  *		bucket page but no pins or locks held on overflow page.
@@ -302,6 +298,8 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 	HashScanPosItem *currItem;
 
 	pgstat_count_index_scan(rel);
+	if (scan->instrument)
+		scan->instrument->nsearches++;
 
 	/*
 	 * We do not support hash scans with no index qualification, because we
@@ -351,8 +349,7 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 	buf = _hash_getbucketbuf_from_hashkey(rel, hashkey, HASH_READ, NULL);
 	PredicateLockPage(rel, BufferGetBlockNumber(buf), scan->xs_snapshot);
 	page = BufferGetPage(buf);
-	TestForOldSnapshot(scan->xs_snapshot, rel, page);
-	opaque = (HashPageOpaque) PageGetSpecialPointer(page);
+	opaque = HashPageGetOpaque(page);
 	bucket = opaque->hasho_bucket;
 
 	so->hashso_bucket_buf = buf;
@@ -387,7 +384,6 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 		old_buf = _hash_getbuf(rel, old_blkno, HASH_READ, LH_BUCKET_PAGE);
-		TestForOldSnapshot(scan->xs_snapshot, rel, BufferGetPage(old_buf));
 
 		/*
 		 * remember the split bucket buffer so as to use it later for
@@ -398,7 +394,7 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
-		opaque = (HashPageOpaque) PageGetSpecialPointer(page);
+		opaque = HashPageGetOpaque(page);
 		Assert(opaque->hasho_bucket == bucket);
 
 		if (H_BUCKET_BEING_POPULATED(opaque))
@@ -463,7 +459,7 @@ _hash_readpage(IndexScanDesc scan, Buffer *bufP, ScanDirection dir)
 	Assert(BufferIsValid(buf));
 	_hash_checkpage(rel, buf, LH_BUCKET_PAGE | LH_OVERFLOW_PAGE);
 	page = BufferGetPage(buf);
-	opaque = (HashPageOpaque) PageGetSpecialPointer(page);
+	opaque = HashPageGetOpaque(page);
 
 	so->currPos.buf = buf;
 	so->currPos.currPage = BufferGetBlockNumber(buf);

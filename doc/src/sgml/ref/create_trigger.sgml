@@ -131,7 +131,7 @@ CREATE [ OR REPLACE ] [ CONSTRAINT ] TRIGGER <replaceable class="parameter">name
      <row>
       <entry align="center"><command>TRUNCATE</command></entry>
       <entry align="center">&mdash;</entry>
-      <entry align="center">Tables</entry>
+      <entry align="center">Tables and foreign tables</entry>
      </row>
      <row>
       <entry align="center" morerows="1"><literal>AFTER</literal></entry>
@@ -142,7 +142,7 @@ CREATE [ OR REPLACE ] [ CONSTRAINT ] TRIGGER <replaceable class="parameter">name
      <row>
       <entry align="center"><command>TRUNCATE</command></entry>
       <entry align="center">&mdash;</entry>
-      <entry align="center">Tables</entry>
+      <entry align="center">Tables and foreign tables</entry>
      </row>
      <row>
       <entry align="center" morerows="1"><literal>INSTEAD OF</literal></entry>
@@ -175,12 +175,10 @@ CREATE [ OR REPLACE ] [ CONSTRAINT ] TRIGGER <replaceable class="parameter">name
   </para>
 
   <para>
-   <indexterm>
-    <primary>trigger</primary>
-    <secondary>constraint trigger</secondary>
-   </indexterm>
    When the <literal>CONSTRAINT</literal> option is specified, this command creates a
-   <firstterm>constraint trigger</firstterm>.  This is the same as a regular trigger
+   <firstterm>constraint trigger</firstterm>.<indexterm><primary>trigger</primary>
+   <secondary>constraint trigger</secondary></indexterm>
+   This is the same as a regular trigger
    except that the timing of the trigger firing can be adjusted using
    <link linkend="sql-set-constraints"><command>SET CONSTRAINTS</command></link>.
    Constraint triggers must be <literal>AFTER ROW</literal> triggers on plain
@@ -199,9 +197,11 @@ CREATE [ OR REPLACE ] [ CONSTRAINT ] TRIGGER <replaceable class="parameter">name
    of the rows inserted, deleted, or modified by the current SQL statement.
    This feature lets the trigger see a global view of what the statement did,
    not just one row at a time.  This option is only allowed for
-   an <literal>AFTER</literal> trigger that is not a constraint trigger; also, if
-   the trigger is an <literal>UPDATE</literal> trigger, it must not specify
-   a <replaceable class="parameter">column_name</replaceable> list.
+   an <literal>AFTER</literal> trigger on a plain table (not a foreign table).
+   The trigger should not be a constraint trigger.  Also, if the trigger is
+   an <literal>UPDATE</literal> trigger, it must not specify
+   a <replaceable class="parameter">column_name</replaceable> list when using
+   this option.
    <literal>OLD TABLE</literal> may only be specified once, and only for a trigger
    that can fire on <literal>UPDATE</literal> or <literal>DELETE</literal>; it creates a
    transition relation containing the <firstterm>before-images</firstterm> of all rows

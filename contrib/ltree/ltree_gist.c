@@ -10,6 +10,7 @@
 #include "access/stratnum.h"
 #include "crc32.h"
 #include "ltree.h"
+#include "utils/array.h"
 
 #define NEXTVAL(x) ( (lquery*)( (char*)(x) + INTALIGN( VARSIZE(x) ) ) )
 #define ISEQ(a,b)	( (a)->numlevel == (b)->numlevel && ltree_compare(a,b)==0 )
@@ -22,8 +23,9 @@ ltree_gist_in(PG_FUNCTION_ARGS)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("ltree_gist_in() not implemented")));
-	PG_RETURN_DATUM(0);
+			 errmsg("cannot accept a value of type %s", "ltree_gist")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 Datum
@@ -31,8 +33,9 @@ ltree_gist_out(PG_FUNCTION_ARGS)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("ltree_gist_out() not implemented")));
-	PG_RETURN_DATUM(0);
+			 errmsg("cannot display a value of type %s", "ltree_gist")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 ltree_gist *
@@ -40,7 +43,7 @@ ltree_gist_alloc(bool isalltrue, BITVECP sign, int siglen,
 				 ltree *left, ltree *right)
 {
 	int32		size = LTG_HDRSIZE + (isalltrue ? 0 : siglen) +
-	(left ? VARSIZE(left) + (right ? VARSIZE(right) : 0) : 0);
+		(left ? VARSIZE(left) + (right ? VARSIZE(right) : 0) : 0);
 	ltree_gist *result = palloc(size);
 
 	SET_VARSIZE(result, size);
@@ -137,7 +140,7 @@ ltree_same(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(result);
 
 	if (LTG_ISONENODE(a))
-		*result = (ISEQ(LTG_NODE(a), LTG_NODE(b))) ? true : false;
+		*result = ISEQ(LTG_NODE(a), LTG_NODE(b));
 	else
 	{
 		int32		i;
@@ -261,11 +264,11 @@ ltree_penalty(PG_FUNCTION_ARGS)
 	ltree_gist *newval = (ltree_gist *) DatumGetPointer(((GISTENTRY *) PG_GETARG_POINTER(1))->key);
 	float	   *penalty = (float *) PG_GETARG_POINTER(2);
 	int			siglen = LTREE_GET_SIGLEN();
-	int32		cmpr,
+	float		cmpr,
 				cmpl;
 
-	cmpl = ltree_compare(LTG_GETLNODE(origval, siglen), LTG_GETLNODE(newval, siglen));
-	cmpr = ltree_compare(LTG_GETRNODE(newval, siglen), LTG_GETRNODE(origval, siglen));
+	cmpl = ltree_compare_distance(LTG_GETLNODE(origval, siglen), LTG_GETLNODE(newval, siglen));
+	cmpr = ltree_compare_distance(LTG_GETRNODE(newval, siglen), LTG_GETRNODE(origval, siglen));
 
 	*penalty = Max(cmpl, 0) + Max(cmpr, 0);
 
@@ -325,7 +328,7 @@ ltree_picksplit(PG_FUNCTION_ARGS)
 		array[j].r = LTG_GETLNODE(lu, siglen);
 	}
 
-	qsort((void *) &array[FirstOffsetNumber], maxoff - FirstOffsetNumber + 1,
+	qsort(&array[FirstOffsetNumber], maxoff - FirstOffsetNumber + 1,
 		  sizeof(RIX), treekey_cmp);
 
 	lu_l = lu_r = ru_l = ru_r = NULL;

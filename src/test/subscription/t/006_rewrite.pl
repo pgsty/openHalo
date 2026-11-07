@@ -1,19 +1,19 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Test logical replication behavior with heap rewrites
 use strict;
-use warnings;
-use PostgresNode;
-use TestLib;
-use Test::More tests => 2;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
-my $node_publisher = get_new_node('publisher');
+my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
-my $node_subscriber = get_new_node('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
+$node_subscriber->init;
 $node_subscriber->start;
 
 my $ddl = "CREATE TABLE test1 (a int, b text);";
@@ -61,3 +61,5 @@ is( $node_subscriber->safe_psql('postgres', q{SELECT a, b, c FROM test1}),
 
 $node_subscriber->stop;
 $node_publisher->stop;
+
+done_testing();

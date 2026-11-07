@@ -1,21 +1,21 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # This test checks that constraints work on subscriber
 use strict;
-use warnings;
-use PostgresNode;
-use TestLib;
-use Test::More tests => 6;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 # Initialize publisher node
-my $node_publisher = get_new_node('publisher');
+my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
 # Create subscriber node
-my $node_subscriber = get_new_node('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
+$node_subscriber->init;
 $node_subscriber->start;
 
 # Setup structure on publisher
@@ -137,3 +137,5 @@ is($result, qq(2|1|2),
 
 $node_subscriber->stop('fast');
 $node_publisher->stop('fast');
+
+done_testing();

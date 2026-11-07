@@ -3,7 +3,7 @@
  * pgstatapprox.c
  *		  Bloat estimation functions
  *
- * Copyright (c) 2014-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/pgstattuple/pgstatapprox.c
@@ -14,21 +14,15 @@
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
-#include "access/multixact.h"
 #include "access/relation.h"
-#include "access/transam.h"
 #include "access/visibilitymap.h"
-#include "access/xact.h"
-#include "catalog/namespace.h"
 #include "catalog/pg_am_d.h"
 #include "commands/vacuum.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
-#include "storage/lmgr.h"
 #include "storage/procarray.h"
-#include "utils/builtins.h"
 
 PG_FUNCTION_INFO_V1(pgstattuple_approx);
 PG_FUNCTION_INFO_V1(pgstattuple_approx_v1_5);
@@ -38,7 +32,7 @@ Datum		pgstattuple_approx_internal(Oid relid, FunctionCallInfo fcinfo);
 typedef struct output_type
 {
 	uint64		table_len;
-	uint64		scanned_percent;
+	double		scanned_percent;
 	uint64		tuple_count;
 	uint64		tuple_len;
 	double		tuple_percent;
@@ -106,14 +100,7 @@ statapprox_heap(Relation rel, output_type *stat)
 
 		page = BufferGetPage(buf);
 
-		/*
-		 * It's not safe to call PageGetHeapFreeSpace() on new pages, so we
-		 * treat them as being free space for our purposes.
-		 */
-		if (!PageIsNew(page))
-			stat->free_space += PageGetHeapFreeSpace(page);
-		else
-			stat->free_space += BLCKSZ - SizeOfPageHeaderData;
+		stat->free_space += PageGetExactFreeSpace(page);
 
 		/* We may count the page as scanned even if it's new/empty */
 		scanned++;
@@ -203,7 +190,7 @@ statapprox_heap(Relation rel, output_type *stat)
 	 */
 	if (nblocks != 0)
 	{
-		stat->scanned_percent = 100 * scanned / nblocks;
+		stat->scanned_percent = 100.0 * scanned / nblocks;
 		stat->tuple_percent = 100.0 * stat->tuple_len / stat->table_len;
 		stat->dead_tuple_percent = 100.0 * stat->dead_tuple_len / stat->table_len;
 		stat->free_percent = 100.0 * stat->free_space / stat->table_len;
@@ -289,8 +276,9 @@ pgstattuple_approx_internal(Oid relid, FunctionCallInfo fcinfo)
 		  rel->rd_rel->relkind == RELKIND_TOASTVALUE))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("\"%s\" is not a table, materialized view, or TOAST table",
-						RelationGetRelationName(rel))));
+				 errmsg("relation \"%s\" is of wrong relation kind",
+						RelationGetRelationName(rel)),
+				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 
 	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

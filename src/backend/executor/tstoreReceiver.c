@@ -11,7 +11,7 @@
  * Also optionally, we can apply a tuple conversion map before storing.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -44,16 +44,16 @@ typedef struct
 } TStoreState;
 
 
-static bool tstoreReceiveSlot_notoast(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag);
-static bool tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag);
-static bool tstoreReceiveSlot_tupmap(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag);
+static bool tstoreReceiveSlot_notoast(TupleTableSlot *slot, DestReceiver *self);
+static bool tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self);
+static bool tstoreReceiveSlot_tupmap(TupleTableSlot *slot, DestReceiver *self);
 
 
 /*
  * Prepare to receive tuples from executor.
  */
 static void
-tstoreStartupReceiver(DestReceiver *self, int operation, TupleDesc typeinfo, CommandTag commandTag)
+tstoreStartupReceiver(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
 	TStoreState *myState = (TStoreState *) self;
 	bool		needtoast = false;
@@ -65,7 +65,7 @@ tstoreStartupReceiver(DestReceiver *self, int operation, TupleDesc typeinfo, Com
 	{
 		for (i = 0; i < natts; i++)
 		{
-			Form_pg_attribute attr = TupleDescAttr(typeinfo, i);
+			CompactAttribute *attr = TupleDescCompactAttr(typeinfo, i);
 
 			if (attr->attisdropped)
 				continue;
@@ -119,7 +119,7 @@ tstoreStartupReceiver(DestReceiver *self, int operation, TupleDesc typeinfo, Com
  * This is for the easy case where we don't have to detoast nor map anything.
  */
 static bool
-tstoreReceiveSlot_notoast(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag)
+tstoreReceiveSlot_notoast(TupleTableSlot *slot, DestReceiver *self)
 {
 	TStoreState *myState = (TStoreState *) self;
 
@@ -133,7 +133,7 @@ tstoreReceiveSlot_notoast(TupleTableSlot *slot, DestReceiver *self, CommandTag c
  * This is for the case where we have to detoast any toasted values.
  */
 static bool
-tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag)
+tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self)
 {
 	TStoreState *myState = (TStoreState *) self;
 	TupleDesc	typeinfo = slot->tts_tupleDescriptor;
@@ -154,7 +154,7 @@ tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self, CommandTag c
 	for (i = 0; i < natts; i++)
 	{
 		Datum		val = slot->tts_values[i];
-		Form_pg_attribute attr = TupleDescAttr(typeinfo, i);
+		CompactAttribute *attr = TupleDescCompactAttr(typeinfo, i);
 
 		if (!attr->attisdropped && attr->attlen == -1 && !slot->tts_isnull[i])
 		{
@@ -189,7 +189,7 @@ tstoreReceiveSlot_detoast(TupleTableSlot *slot, DestReceiver *self, CommandTag c
  * This is for the case where we must apply a tuple conversion map.
  */
 static bool
-tstoreReceiveSlot_tupmap(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag)
+tstoreReceiveSlot_tupmap(TupleTableSlot *slot, DestReceiver *self)
 {
 	TStoreState *myState = (TStoreState *) self;
 

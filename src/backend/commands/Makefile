@@ -12,8 +12,6 @@ subdir = src/backend/commands
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-SUBDIRS = mysql
-
 OBJS = \
 	aggregatecmds.o \
 	alter.o \
@@ -36,6 +34,9 @@ OBJS = \
 	dropcmds.o \
 	event_trigger.o \
 	explain.o \
+	explain_dr.o \
+	explain_format.o \
+	explain_state.o \
 	extension.o \
 	foreigncmds.o \
 	functioncmds.o \
@@ -61,6 +62,7 @@ OBJS = \
 	typecmds.o \
 	user.o \
 	vacuum.o \
+	vacuumparallel.o \
 	variable.o \
 	view.o
 

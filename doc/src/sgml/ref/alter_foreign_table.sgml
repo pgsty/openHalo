@@ -32,7 +32,7 @@ ALTER FOREIGN TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceab
 
 <phrase>where <replaceable class="parameter">action</replaceable> is one of:</phrase>
 
-    ADD [ COLUMN ] <replaceable class="parameter">column_name</replaceable> <replaceable class="parameter">data_type</replaceable> [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">column_constraint</replaceable> [ ... ] ]
+    ADD [ COLUMN ] [ IF NOT EXISTS ] <replaceable class="parameter">column_name</replaceable> <replaceable class="parameter">data_type</replaceable> [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">column_constraint</replaceable> [ ... ] ]
     DROP [ COLUMN ] [ IF EXISTS ] <replaceable class="parameter">column_name</replaceable> [ RESTRICT | CASCADE ]
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> [ SET DATA ] TYPE <replaceable class="parameter">data_type</replaceable> [ COLLATE <replaceable class="parameter">collation</replaceable> ]
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET DEFAULT <replaceable class="parameter">expression</replaceable>
@@ -41,7 +41,7 @@ ALTER FOREIGN TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceab
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET STATISTICS <replaceable class="parameter">integer</replaceable>
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET ( <replaceable class="parameter">attribute_option</replaceable> = <replaceable class="parameter">value</replaceable> [, ... ] )
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> RESET ( <replaceable class="parameter">attribute_option</replaceable> [, ... ] )
-    ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET STORAGE { PLAIN | EXTERNAL | EXTENDED | MAIN }
+    ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> SET STORAGE { PLAIN | EXTERNAL | EXTENDED | MAIN | DEFAULT }
     ALTER [ COLUMN ] <replaceable class="parameter">column_name</replaceable> OPTIONS ( [ ADD | SET | DROP ] <replaceable class="parameter">option</replaceable> ['<replaceable class="parameter">value</replaceable>'] [, ... ])
     ADD <replaceable class="parameter">table_constraint</replaceable> [ NOT VALID ]
     VALIDATE CONSTRAINT <replaceable class="parameter">constraint_name</replaceable>
@@ -67,11 +67,13 @@ ALTER FOREIGN TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceab
 
   <variablelist>
    <varlistentry>
-    <term><literal>ADD COLUMN</literal></term>
+    <term><literal>ADD [ COLUMN ] [ IF NOT EXISTS ]</literal></term>
     <listitem>
      <para>
       This form adds a new column to the foreign table, using the same syntax as
       <link linkend="sql-createforeigntable"><command>CREATE FOREIGN TABLE</command></link>.
+      If <literal>IF NOT EXISTS</literal> is specified and a column already
+      exists with this name, no error is thrown.
       Unlike the case when adding a column to a regular table, nothing happens
       to the underlying storage: this action simply declares that
       some new column is now accessible through the foreign table.
@@ -80,7 +82,7 @@ ALTER FOREIGN TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceab
    </varlistentry>
 
    <varlistentry>
-    <term><literal>DROP COLUMN [ IF EXISTS ]</literal></term>
+    <term><literal>DROP [ COLUMN ] [ IF EXISTS ]</literal></term>
     <listitem>
      <para>
       This form drops a column from a foreign table.
@@ -173,7 +175,8 @@ ALTER FOREIGN TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceab
      <para>
       This form adds a new constraint to a foreign table, using the same
       syntax as <link linkend="sql-createforeigntable"><command>CREATE FOREIGN TABLE</command></link>.
-      Currently only <literal>CHECK</literal> constraints are supported.
+      Currently only <literal>CHECK</literal> and <literal>NOT NULL</literal>
+      constraints are supported.
      </para>
 
      <para>
@@ -182,7 +185,8 @@ ALTER FOREIGN TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceab
       declares that some new condition should be assumed to hold for all rows
       in the foreign table.  (See the discussion
       in <link linkend="sql-createforeigntable"><command>CREATE FOREIGN TABLE</command></link>.)
-      If the constraint is marked <literal>NOT VALID</literal>, then it isn't
+      If the constraint is marked <literal>NOT VALID</literal> (allowed only for
+      the <literal>CHECK</literal> case), then it isn't
       assumed to hold, but is only recorded for possible future use.
      </para>
     </listitem>
@@ -320,9 +324,9 @@ ALTER FOREIGN TABLE [ IF EXISTS ] <replaceable class="parameter">name</replaceab
    You must own the table to use <command>ALTER FOREIGN TABLE</command>.
    To change the schema of a foreign table, you must also have
    <literal>CREATE</literal> privilege on the new schema.
-   To alter the owner, you must also be a direct or indirect member of the new
-   owning role, and that role must have <literal>CREATE</literal> privilege on
-   the table's schema.  (These restrictions enforce that altering the owner
+   To alter the owner, you must be able to <literal>SET ROLE</literal> to the
+   new owning role, and that role must have <literal>CREATE</literal> privilege
+   on the table's schema.  (These restrictions enforce that altering the owner
    doesn't do anything you couldn't do by dropping and recreating the table.
    However, a superuser can alter ownership of any table anyway.)
    To add a column or alter a column type, you must also

@@ -9,7 +9,10 @@ SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot_p', 'test
 
 SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot_t2', 'test_decoding', true);
 
+BEGIN;
+SET LOCAL output_plugin_libraries = nonexistent;
 SELECT pg_create_logical_replication_slot('foo', 'nonexistent');
+ROLLBACK;
 
 -- here we want to start a new session and wait till old one is gone
 select pg_backend_pid() as oldpid \gset
@@ -27,6 +30,12 @@ end';
 -- should fail because the temporary slots were dropped automatically
 SELECT pg_drop_replication_slot('regression_slot_t');
 SELECT pg_drop_replication_slot('regression_slot_t2');
+
+-- monitoring functions for slot directories
+SELECT count(*) >= 0 AS ok FROM pg_ls_logicalmapdir();
+SELECT count(*) >= 0 AS ok FROM pg_ls_logicalsnapdir();
+SELECT count(*) >= 0 AS ok FROM pg_ls_replslotdir('regression_slot_p');
+SELECT count(*) >= 0 AS ok FROM pg_ls_replslotdir('not_existing_slot'); -- fails
 
 -- permanent slot has survived
 SELECT pg_drop_replication_slot('regression_slot_p');
@@ -170,3 +179,17 @@ ORDER BY o.slot_name, c.slot_name;
 SELECT pg_drop_replication_slot('orig_slot2');
 SELECT pg_drop_replication_slot('copied_slot2_no_change');
 SELECT pg_drop_replication_slot('copied_slot2_notemp');
+
+-- Test failover option of slots.
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_true_slot', 'test_decoding', false, false, true);
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_false_slot', 'test_decoding', false, false, false);
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_default_slot', 'test_decoding', false, false);
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_true_temp_slot', 'test_decoding', true, false, true);
+SELECT 'init' FROM pg_create_physical_replication_slot('physical_slot');
+
+SELECT slot_name, slot_type, failover FROM pg_replication_slots;
+
+SELECT pg_drop_replication_slot('failover_true_slot');
+SELECT pg_drop_replication_slot('failover_false_slot');
+SELECT pg_drop_replication_slot('failover_default_slot');
+SELECT pg_drop_replication_slot('physical_slot');

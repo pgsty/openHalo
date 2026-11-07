@@ -3,7 +3,7 @@
  * recovery_gen.c
  *		Generator for recovery configuration
  *
- * Portions Copyright (c) 2011-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2011-2025, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -14,13 +14,19 @@
 #include "fe_utils/string_utils.h"
 
 static char *escape_quotes(const char *src);
+static char *FindDbnameInConnOpts(PQconninfoOption *conn_opts);
 
 /*
  * Write recovery configuration contents into a fresh PQExpBuffer, and
  * return it.
+ *
+ * This accepts the dbname which will be appended to the primary_conninfo.
+ * The dbname will be ignored by walreceiver process but slotsync worker uses
+ * it to connect to the primary server.
  */
 PQExpBuffer
-GenerateRecoveryConfig(PGconn *pgconn, char *replication_slot)
+GenerateRecoveryConfig(PGconn *pgconn, const char *replication_slot,
+					   char *dbname)
 {
 	PQconninfoOption *connOptions;
 	PQExpBufferData conninfo_buf;
@@ -31,10 +37,7 @@ GenerateRecoveryConfig(PGconn *pgconn, char *replication_slot)
 
 	contents = createPQExpBuffer();
 	if (!contents)
-	{
-		pg_log_error("out of memory");
-		exit(1);
-	}
+		pg_fatal("out of memory");
 
 	/*
 	 * In PostgreSQL 12 and newer versions, standby_mode is gone, replaced by
@@ -45,10 +48,7 @@ GenerateRecoveryConfig(PGconn *pgconn, char *replication_slot)
 
 	connOptions = PQconninfo(pgconn);
 	if (connOptions == NULL)
-	{
-		pg_log_error("out of memory");
-		exit(1);
-	}
+		pg_fatal("out of memory");
 
 	initPQExpBuffer(&conninfo_buf);
 	for (PQconninfoOption *opt = connOptions; opt && opt->keyword; opt++)
@@ -72,11 +72,22 @@ GenerateRecoveryConfig(PGconn *pgconn, char *replication_slot)
 		appendPQExpBuffer(&conninfo_buf, "%s=", opt->keyword);
 		appendConnStrVal(&conninfo_buf, opt->val);
 	}
-	if (PQExpBufferDataBroken(conninfo_buf))
+
+	if (dbname)
 	{
-		pg_log_error("out of memory");
-		exit(1);
+		/*
+		 * If dbname is specified in the connection, append the dbname. This
+		 * will be used later for logical replication slot synchronization.
+		 */
+		if (conninfo_buf.len != 0)
+			appendPQExpBufferChar(&conninfo_buf, ' ');
+
+		appendPQExpBuffer(&conninfo_buf, "%s=", "dbname");
+		appendConnStrVal(&conninfo_buf, dbname);
 	}
+
+	if (PQExpBufferDataBroken(conninfo_buf))
+		pg_fatal("out of memory");
 
 	/*
 	 * Escape the connection string, so that it can be put in the config file.
@@ -96,10 +107,7 @@ GenerateRecoveryConfig(PGconn *pgconn, char *replication_slot)
 	}
 
 	if (PQExpBufferBroken(contents))
-	{
-		pg_log_error("out of memory");
-		exit(1);
-	}
+		pg_fatal("out of memory");
 
 	PQconninfoFree(connOptions);
 
@@ -114,7 +122,7 @@ GenerateRecoveryConfig(PGconn *pgconn, char *replication_slot)
  * configuration is written to recovery.conf.
  */
 void
-WriteRecoveryConfig(PGconn *pgconn, char *target_dir, PQExpBuffer contents)
+WriteRecoveryConfig(PGconn *pgconn, const char *target_dir, PQExpBuffer contents)
 {
 	char		filename[MAXPGPATH];
 	FILE	   *cf;
@@ -130,16 +138,10 @@ WriteRecoveryConfig(PGconn *pgconn, char *target_dir, PQExpBuffer contents)
 
 	cf = fopen(filename, use_recovery_conf ? "w" : "a");
 	if (cf == NULL)
-	{
-		pg_log_error("could not open file \"%s\": %m", filename);
-		exit(1);
-	}
+		pg_fatal("could not open file \"%s\": %m", filename);
 
 	if (fwrite(contents->data, contents->len, 1, cf) != 1)
-	{
-		pg_log_error("could not write to file \"%s\": %m", filename);
-		exit(1);
-	}
+		pg_fatal("could not write to file \"%s\": %m", filename);
 
 	fclose(cf);
 
@@ -148,10 +150,7 @@ WriteRecoveryConfig(PGconn *pgconn, char *target_dir, PQExpBuffer contents)
 		snprintf(filename, MAXPGPATH, "%s/%s", target_dir, "standby.signal");
 		cf = fopen(filename, "w");
 		if (cf == NULL)
-		{
-			pg_log_error("could not create file \"%s\": %m", filename);
-			exit(1);
-		}
+			pg_fatal("could not create file \"%s\": %m", filename);
 
 		fclose(cf);
 	}
@@ -167,9 +166,71 @@ escape_quotes(const char *src)
 	char	   *result = escape_single_quotes_ascii(src);
 
 	if (!result)
-	{
-		pg_log_error("out of memory");
-		exit(1);
-	}
+		pg_fatal("out of memory");
 	return result;
+}
+
+/*
+ * FindDbnameInConnOpts
+ *
+ * This is a helper function for GetDbnameFromConnectionOptions(). Extract
+ * the value of dbname from PQconninfoOption parameters, if it's present.
+ * Returns a strdup'd result or NULL.
+ */
+static char *
+FindDbnameInConnOpts(PQconninfoOption *conn_opts)
+{
+	for (PQconninfoOption *conn_opt = conn_opts;
+		 conn_opt->keyword != NULL;
+		 conn_opt++)
+	{
+		if (strcmp(conn_opt->keyword, "dbname") == 0 &&
+			conn_opt->val != NULL && conn_opt->val[0] != '\0')
+			return pg_strdup(conn_opt->val);
+	}
+	return NULL;
+}
+
+/*
+ * GetDbnameFromConnectionOptions
+ *
+ * This is a special purpose function to retrieve the dbname from either the
+ * 'connstr' specified by the caller or from the environment variables.
+ *
+ * Returns NULL, if dbname is not specified by the user in the given
+ * connection options.
+ */
+char *
+GetDbnameFromConnectionOptions(const char *connstr)
+{
+	PQconninfoOption *conn_opts;
+	char	   *err_msg = NULL;
+	char	   *dbname;
+
+	/* First try to get the dbname from connection string. */
+	if (connstr)
+	{
+		conn_opts = PQconninfoParse(connstr, &err_msg);
+		if (conn_opts == NULL)
+			pg_fatal("%s", err_msg);
+
+		dbname = FindDbnameInConnOpts(conn_opts);
+
+		PQconninfoFree(conn_opts);
+		if (dbname)
+			return dbname;
+	}
+
+	/*
+	 * Next try to get the dbname from default values that are available from
+	 * the environment.
+	 */
+	conn_opts = PQconndefaults();
+	if (conn_opts == NULL)
+		pg_fatal("out of memory");
+
+	dbname = FindDbnameInConnOpts(conn_opts);
+
+	PQconninfoFree(conn_opts);
+	return dbname;
 }

@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/prompt.c
  */
@@ -31,8 +31,10 @@
  *		sockets, "[local:/dir/name]" if not default
  * %m - like %M, but hostname only (before first dot), or always "[local]"
  * %p - backend pid
+ * %P - pipeline status: on, off or abort
  * %> - database server port number
  * %n - database user name
+ * %s - service
  * %/ - current database
  * %~ - like %/ but "~" when database name equals user name
  * %w - whitespace of the same width as the most recent output of PROMPT1
@@ -165,6 +167,15 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					if (pset.db)
 						strlcpy(buf, session_username(), sizeof(buf));
 					break;
+					/* service name */
+				case 's':
+					{
+						const char *service_name = GetVariable(pset.vars, "SERVICE");
+
+						if (service_name)
+							strlcpy(buf, service_name, sizeof(buf));
+					}
+					break;
 					/* backend pid */
 				case 'p':
 					if (pset.db)
@@ -175,7 +186,20 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 							snprintf(buf, sizeof(buf), "%d", pid);
 					}
 					break;
+					/* pipeline status */
+				case 'P':
+					if (pset.db)
+					{
+						PGpipelineStatus status = PQpipelineStatus(pset.db);
 
+						if (status == PQ_PIPELINE_ON)
+							strlcpy(buf, "on", sizeof(buf));
+						else if (status == PQ_PIPELINE_ABORTED)
+							strlcpy(buf, "abort", sizeof(buf));
+						else
+							strlcpy(buf, "off", sizeof(buf));
+					}
+					break;
 				case '0':
 				case '1':
 				case '2':
@@ -266,8 +290,10 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					{
 						int			cmdend = strcspn(p + 1, "`");
 						char	   *file = pnstrdup(p + 1, cmdend);
-						FILE	   *fd = popen(file, "r");
+						FILE	   *fd;
 
+						fflush(NULL);
+						fd = popen(file, "r");
 						if (fd)
 						{
 							if (fgets(buf, sizeof(buf), fd) == NULL)
@@ -316,7 +342,6 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					buf[0] = *p;
 					buf[1] = '\0';
 					break;
-
 			}
 			esc = false;
 		}

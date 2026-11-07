@@ -2,7 +2,7 @@
  *
  * filemap.h
  *
- * Copyright (c) 2013-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2025, PostgreSQL Global Development Group
  *-------------------------------------------------------------------------
  */
 #ifndef FILEMAP_H
@@ -10,7 +10,7 @@
 
 #include "datapagemap.h"
 #include "storage/block.h"
-#include "storage/relfilenode.h"
+#include "storage/relfilelocator.h"
 
 /* these enum values are sorted in the order we want actions to be processed */
 typedef enum
@@ -24,7 +24,7 @@ typedef enum
 	FILE_ACTION_NONE,			/* no action (we might still copy modified
 								 * blocks based on the parsed WAL) */
 	FILE_ACTION_TRUNCATE,		/* truncate local file to 'newsize' bytes */
-	FILE_ACTION_REMOVE			/* remove local file / directory / symlink */
+	FILE_ACTION_REMOVE,			/* remove local file / directory / symlink */
 } file_action_t;
 
 typedef enum
@@ -33,7 +33,7 @@ typedef enum
 
 	FILE_TYPE_REGULAR,
 	FILE_TYPE_DIRECTORY,
-	FILE_TYPE_SYMLINK
+	FILE_TYPE_SYMLINK,
 } file_type_t;
 
 /*
@@ -103,7 +103,7 @@ extern void process_source_file(const char *path, file_type_t type,
 extern void process_target_file(const char *path, file_type_t type,
 								size_t size, const char *link_target);
 extern void process_target_wal_block_change(ForkNumber forknum,
-											RelFileNode rnode,
+											RelFileLocator rlocator,
 											BlockNumber blkno);
 
 extern filemap_t *decide_file_actions(void);

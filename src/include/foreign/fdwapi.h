@@ -3,7 +3,7 @@
  * fdwapi.h
  *	  API for foreign-data wrappers
  *
- * Copyright (c) 2010-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *
  * src/include/foreign/fdwapi.h
  *
@@ -15,8 +15,6 @@
 #include "access/parallel.h"
 #include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
-#include "tcop/utility.h"
-#include "executor/execdesc.h"
 
 /* To avoid including explain.h here, reference ExplainState thus: */
 struct ExplainState;
@@ -280,7 +278,6 @@ typedef struct FdwRoutine
 	ForeignAsyncRequest_function ForeignAsyncRequest;
 	ForeignAsyncConfigureWait_function ForeignAsyncConfigureWait;
 	ForeignAsyncNotify_function ForeignAsyncNotify;
-
 } FdwRoutine;
 
 

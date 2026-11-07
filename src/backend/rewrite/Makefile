@@ -19,6 +19,6 @@ OBJS = \
 	rewriteRemove.o \
 	rewriteSearchCycle.o \
 	rewriteSupport.o \
-	rowsecurity.o 
+	rowsecurity.o
 
 include $(top_srcdir)/src/backend/common.mk

@@ -4,7 +4,7 @@
  *
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_func.h
@@ -27,7 +27,7 @@ typedef enum
 	FUNCDETAIL_PROCEDURE,		/* found a matching procedure */
 	FUNCDETAIL_AGGREGATE,		/* found a matching aggregate function */
 	FUNCDETAIL_WINDOWFUNC,		/* found a matching window function */
-	FUNCDETAIL_COERCION			/* it's a type coercion request */
+	FUNCDETAIL_COERCION,		/* it's a type coercion request */
 } FuncDetailCode;
 
 
@@ -70,10 +70,5 @@ extern Oid	LookupFuncWithArgs(ObjectType objtype, ObjectWithArgs *func,
 
 extern void check_srf_call_placement(ParseState *pstate, Node *last_srf,
 									 int location);
-
-
-extern void preTransformWindowAgg(ParseState *pstate, WindowFunc *wfunc, List *funcname, 
-								  bool agg_distinct, List *agg_order, Node *last_srf, bool retset);
-
 
 #endif							/* PARSE_FUNC_H */

@@ -17,7 +17,10 @@
 #include "utils/array.h"
 #include "utils/float.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "cube",
+					.version = PG_VERSION
+);
 
 /*
  * Taken from the intarray contrib header
@@ -96,7 +99,7 @@ int32		cube_cmp_v0(NDBOX *a, NDBOX *b);
 bool		cube_contains_v0(NDBOX *a, NDBOX *b);
 bool		cube_overlap_v0(NDBOX *a, NDBOX *b);
 NDBOX	   *cube_union_v0(NDBOX *a, NDBOX *b);
-void		rt_cube_size(NDBOX *a, double *sz);
+void		rt_cube_size(NDBOX *a, double *size);
 NDBOX	   *g_cube_binary_union(NDBOX *r1, NDBOX *r2, int *sizep);
 bool		g_cube_leaf_consistent(NDBOX *key, NDBOX *query, StrategyNumber strategy);
 bool		g_cube_internal_consistent(NDBOX *key, NDBOX *query, StrategyNumber strategy);
@@ -119,13 +122,15 @@ cube_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
 	NDBOX	   *result;
+	Size		scanbuflen;
+	yyscan_t	scanner;
 
-	cube_scanner_init(str);
+	cube_scanner_init(str, &scanbuflen, &scanner);
 
-	if (cube_yyparse(&result) != 0)
-		cube_yyerror(&result, "cube parser failed");
+	cube_yyparse(&result, scanbuflen, fcinfo->context, scanner);
 
-	cube_scanner_finish();
+	/* We might as well run this even on failure. */
+	cube_scanner_finish(scanner);
 
 	PG_RETURN_NDBOX_P(result);
 }
@@ -925,7 +930,7 @@ rt_cube_size(NDBOX *a, double *size)
 	{
 		result = 1.0;
 		for (i = 0; i < DIM(a); i++)
-			result *= Abs(UR_COORD(a, i) - LL_COORD(a, i));
+			result *= fabs(UR_COORD(a, i) - LL_COORD(a, i));
 	}
 	*size = result;
 }

@@ -8,6 +8,7 @@
 #include "fmgr.h"
 #include "port/pg_bitutils.h"
 #include "trgm.h"
+#include "varatt.h"
 
 /* gist_trgm_ops opclass options */
 typedef struct
@@ -55,15 +56,21 @@ PG_FUNCTION_INFO_V1(gtrgm_options);
 Datum
 gtrgm_in(PG_FUNCTION_ARGS)
 {
-	elog(ERROR, "not implemented");
-	PG_RETURN_DATUM(0);
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot accept a value of type %s", "gtrgm")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 Datum
 gtrgm_out(PG_FUNCTION_ARGS)
 {
-	elog(ERROR, "not implemented");
-	PG_RETURN_DATUM(0);
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cannot display a value of type %s", "gtrgm")));
+
+	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
 static TRGM *
@@ -95,11 +102,11 @@ makesign(BITVECP sign, TRGM *a, int siglen)
 	trgm	   *ptr = GETARR(a);
 	int32		tmp = 0;
 
-	MemSet((void *) sign, 0, siglen);
+	MemSet(sign, 0, siglen);
 	SETBIT(sign, SIGLENBIT(siglen));	/* set last unused bit */
 	for (k = 0; k < len; k++)
 	{
-		CPTRGM(((char *) &tmp), ptr + k);
+		CPTRGM(&tmp, ptr + k);
 		HASH(sign, tmp, siglen);
 	}
 }
@@ -179,7 +186,7 @@ cnt_sml_sign_common(TRGM *qtrg, BITVECP sign, int siglen)
 
 	for (k = 0; k < len; k++)
 	{
-		CPTRGM(((char *) &tmp), ptr + k);
+		CPTRGM(&tmp, ptr + k);
 		count += GETBIT(sign, HASHVAL(tmp, siglen));
 	}
 
@@ -221,7 +228,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 	if (cache == NULL ||
 		cache->strategy != strategy ||
 		VARSIZE(cache->query) != querysize ||
-		memcmp((char *) cache->query, (char *) query, querysize) != 0)
+		memcmp(cache->query, query, querysize) != 0)
 	{
 		gtrgm_consistent_cache *newcache;
 		TrgmPackedGraph *graph = NULL;
@@ -277,12 +284,12 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 		newcache->strategy = strategy;
 		newcache->query = (text *)
 			((char *) newcache + MAXALIGN(sizeof(gtrgm_consistent_cache)));
-		memcpy((char *) newcache->query, (char *) query, querysize);
+		memcpy(newcache->query, query, querysize);
 		if (qtrg)
 		{
 			newcache->trigrams = (TRGM *)
 				((char *) newcache->query + MAXALIGN(querysize));
-			memcpy((char *) newcache->trigrams, (char *) qtrg, qtrgsize);
+			memcpy((char *) newcache->trigrams, qtrg, qtrgsize);
 			/* release qtrg in case it was made in fn_mcxt */
 			pfree(qtrg);
 		}
@@ -292,7 +299,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 
 		if (cache)
 			pfree(cache);
-		fcinfo->flinfo->fn_extra = (void *) newcache;
+		fcinfo->flinfo->fn_extra = newcache;
 		cache = newcache;
 	}
 
@@ -366,7 +373,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 				res = true;
 				for (k = 0; k < len; k++)
 				{
-					CPTRGM(((char *) &tmp), ptr + k);
+					CPTRGM(&tmp, ptr + k);
 					if (!GETBIT(sign, HASHVAL(tmp, siglen)))
 					{
 						res = false;
@@ -419,7 +426,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 					check = (bool *) palloc(len * sizeof(bool));
 					for (k = 0; k < len; k++)
 					{
-						CPTRGM(((char *) &tmp), ptr + k);
+						CPTRGM(&tmp, ptr + k);
 						check[k] = GETBIT(sign, HASHVAL(tmp, siglen));
 					}
 					res = trigramsMatchGraph(cache->graph, check);
@@ -545,7 +552,7 @@ unionkey(BITVECP sbase, TRGM *add, int siglen)
 
 		for (i = 0; i < ARRNELEM(add); i++)
 		{
-			CPTRGM(((char *) &tmp), ptr + i);
+			CPTRGM(&tmp, ptr + i);
 			HASH(sbase, tmp, siglen);
 		}
 	}
@@ -692,9 +699,12 @@ gtrgm_penalty(PG_FUNCTION_ARGS)
 	if (ISARRKEY(newval))
 	{
 		char	   *cache = (char *) fcinfo->flinfo->fn_extra;
-		TRGM	   *cachedVal = (TRGM *) (cache + MAXALIGN(siglen));
+		TRGM	   *cachedVal = NULL;
 		Size		newvalsize = VARSIZE(newval);
 		BITVECP		sign;
+
+		if (cache != NULL)
+			cachedVal = (TRGM *) (cache + MAXALIGN(siglen));
 
 		/*
 		 * Cache the sign data across multiple calls with the same newval.
@@ -748,7 +758,7 @@ fillcache(CACHESIGN *item, TRGM *key, BITVECP sign, int siglen)
 	else if (ISALLTRUE(key))
 		item->allistrue = true;
 	else
-		memcpy((void *) item->sign, (void *) GETSIGN(key), siglen);
+		memcpy(item->sign, GETSIGN(key), siglen);
 }
 
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
@@ -865,7 +875,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 		size_beta = hemdistcache(&(cache[seed_2]), &(cache[j]), siglen);
 		costvector[j - 1].cost = abs(size_alpha - size_beta);
 	}
-	qsort((void *) costvector, maxoff, sizeof(SPLITCOST), comparecost);
+	qsort(costvector, maxoff, sizeof(SPLITCOST), comparecost);
 
 	for (k = 0; k < maxoff; k++)
 	{
@@ -890,7 +900,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			else
 				size_alpha = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ? GETSIGN(datum_l) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else
@@ -903,7 +913,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			else
 				size_beta = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ? GETSIGN(datum_r) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else
@@ -914,7 +924,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_l) || cache[j].allistrue)
 			{
 				if (!ISALLTRUE(datum_l))
-					MemSet((void *) GETSIGN(datum_l), 0xff, siglen);
+					memset(GETSIGN(datum_l), 0xff, siglen);
 			}
 			else
 			{
@@ -930,7 +940,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_r) || cache[j].allistrue)
 			{
 				if (!ISALLTRUE(datum_r))
-					MemSet((void *) GETSIGN(datum_r), 0xff, siglen);
+					memset(GETSIGN(datum_r), 0xff, siglen);
 			}
 			else
 			{

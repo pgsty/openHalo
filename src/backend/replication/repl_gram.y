@@ -3,7 +3,7 @@
  *
  * repl_gram.y				- Parser for the replication commands
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,40 +17,40 @@
 
 #include "access/xlogdefs.h"
 #include "nodes/makefuncs.h"
+#include "nodes/parsenodes.h"
 #include "nodes/replnodes.h"
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
 
-
-/* Result of the parsing is returned here */
-Node *replication_parse_result;
+#include "repl_gram.h"
 
 
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
  * so we can easily have it use palloc instead of malloc.  This prevents
- * memory leaks if we error out during parsing.  Note this only works with
- * bison >= 2.0.  However, in bison 1.875 the default is to use alloca()
- * if possible, so there's not really much problem anyhow, at least if
- * you're building with gcc.
+ * memory leaks if we error out during parsing.
  */
 #define YYMALLOC palloc
 #define YYFREE   pfree
 
 %}
 
+%parse-param {Node **replication_parse_result_p}
+%parse-param {yyscan_t yyscanner}
+%lex-param   {yyscan_t yyscanner}
+%pure-parser
 %expect 0
 %name-prefix="replication_yy"
 
-%union {
-		char					*str;
-		bool					boolval;
-		uint32					uintval;
-
-		XLogRecPtr				recptr;
-		Node					*node;
-		List					*list;
-		DefElem					*defelt;
+%union
+{
+	char	   *str;
+	bool		boolval;
+	uint32		uintval;
+	XLogRecPtr	recptr;
+	Node	   *node;
+	List	   *list;
+	DefElem	   *defelt;
 }
 
 /* Non-keyword tokens */
@@ -61,52 +61,49 @@ Node *replication_parse_result;
 /* Keyword tokens. */
 %token K_BASE_BACKUP
 %token K_IDENTIFY_SYSTEM
+%token K_READ_REPLICATION_SLOT
 %token K_SHOW
 %token K_START_REPLICATION
 %token K_CREATE_REPLICATION_SLOT
 %token K_DROP_REPLICATION_SLOT
+%token K_ALTER_REPLICATION_SLOT
 %token K_TIMELINE_HISTORY
-%token K_LABEL
-%token K_PROGRESS
-%token K_FAST
 %token K_WAIT
-%token K_NOWAIT
-%token K_MAX_RATE
-%token K_WAL
-%token K_TABLESPACE_MAP
-%token K_NOVERIFY_CHECKSUMS
 %token K_TIMELINE
 %token K_PHYSICAL
 %token K_LOGICAL
 %token K_SLOT
 %token K_RESERVE_WAL
 %token K_TEMPORARY
+%token K_TWO_PHASE
 %token K_EXPORT_SNAPSHOT
 %token K_NOEXPORT_SNAPSHOT
 %token K_USE_SNAPSHOT
-%token K_MANIFEST
-%token K_MANIFEST_CHECKSUMS
+%token K_UPLOAD_MANIFEST
 
 %type <node>	command
 %type <node>	base_backup start_replication start_logical_replication
-				create_replication_slot drop_replication_slot identify_system
-				timeline_history show
-%type <list>	base_backup_opt_list
-%type <defelt>	base_backup_opt
+				create_replication_slot drop_replication_slot
+				alter_replication_slot identify_system read_replication_slot
+				timeline_history show upload_manifest
+%type <list>	generic_option_list
+%type <defelt>	generic_option
 %type <uintval>	opt_timeline
 %type <list>	plugin_options plugin_opt_list
 %type <defelt>	plugin_opt_elem
 %type <node>	plugin_opt_arg
-%type <str>		opt_slot var_name
+%type <str>		opt_slot var_name ident_or_keyword
 %type <boolval>	opt_temporary
-%type <list>	create_slot_opt_list
-%type <defelt>	create_slot_opt
+%type <list>	create_slot_options create_slot_legacy_opt_list
+%type <defelt>	create_slot_legacy_opt
 
 %%
 
 firstcmd: command opt_semicolon
 				{
-					replication_parse_result = $1;
+					*replication_parse_result_p = $1;
+
+					(void) yynerrs; /* suppress compiler warning */
 				}
 			;
 
@@ -121,8 +118,11 @@ command:
 			| start_logical_replication
 			| create_replication_slot
 			| drop_replication_slot
+			| alter_replication_slot
+			| read_replication_slot
 			| timeline_history
 			| show
+			| upload_manifest
 			;
 
 /*
@@ -132,6 +132,18 @@ identify_system:
 			K_IDENTIFY_SYSTEM
 				{
 					$$ = (Node *) makeNode(IdentifySystemCmd);
+				}
+			;
+
+/*
+ * READ_REPLICATION_SLOT %s
+ */
+read_replication_slot:
+			K_READ_REPLICATION_SLOT var_name
+				{
+					ReadReplicationSlotCmd *n = makeNode(ReadReplicationSlotCmd);
+					n->slotname = $2;
+					$$ = (Node *) n;
 				}
 			;
 
@@ -152,82 +164,25 @@ var_name:	IDENT	{ $$ = $1; }
 		;
 
 /*
- * BASE_BACKUP [LABEL '<label>'] [PROGRESS] [FAST] [WAL] [NOWAIT]
- * [MAX_RATE %d] [TABLESPACE_MAP] [NOVERIFY_CHECKSUMS]
- * [MANIFEST %s] [MANIFEST_CHECKSUMS %s]
+ * BASE_BACKUP [ ( option [ 'value' ] [, ...] ) ]
  */
 base_backup:
-			K_BASE_BACKUP base_backup_opt_list
+			K_BASE_BACKUP '(' generic_option_list ')'
 				{
 					BaseBackupCmd *cmd = makeNode(BaseBackupCmd);
-					cmd->options = $2;
+					cmd->options = $3;
+					$$ = (Node *) cmd;
+				}
+			| K_BASE_BACKUP
+				{
+					BaseBackupCmd *cmd = makeNode(BaseBackupCmd);
 					$$ = (Node *) cmd;
 				}
 			;
 
-base_backup_opt_list:
-			base_backup_opt_list base_backup_opt
-				{ $$ = lappend($1, $2); }
-			| /* EMPTY */
-				{ $$ = NIL; }
-			;
-
-base_backup_opt:
-			K_LABEL SCONST
-				{
-				  $$ = makeDefElem("label",
-								   (Node *)makeString($2), -1);
-				}
-			| K_PROGRESS
-				{
-				  $$ = makeDefElem("progress",
-								   (Node *)makeInteger(true), -1);
-				}
-			| K_FAST
-				{
-				  $$ = makeDefElem("fast",
-								   (Node *)makeInteger(true), -1);
-				}
-			| K_WAL
-				{
-				  $$ = makeDefElem("wal",
-								   (Node *)makeInteger(true), -1);
-				}
-			| K_NOWAIT
-				{
-				  $$ = makeDefElem("nowait",
-								   (Node *)makeInteger(true), -1);
-				}
-			| K_MAX_RATE UCONST
-				{
-				  $$ = makeDefElem("max_rate",
-								   (Node *)makeInteger($2), -1);
-				}
-			| K_TABLESPACE_MAP
-				{
-				  $$ = makeDefElem("tablespace_map",
-								   (Node *)makeInteger(true), -1);
-				}
-			| K_NOVERIFY_CHECKSUMS
-				{
-				  $$ = makeDefElem("noverify_checksums",
-								   (Node *)makeInteger(true), -1);
-				}
-			| K_MANIFEST SCONST
-				{
-				  $$ = makeDefElem("manifest",
-								   (Node *)makeString($2), -1);
-				}
-			| K_MANIFEST_CHECKSUMS SCONST
-				{
-				  $$ = makeDefElem("manifest_checksums",
-								   (Node *)makeString($2), -1);
-				}
-			;
-
 create_replication_slot:
-			/* CREATE_REPLICATION_SLOT slot TEMPORARY PHYSICAL RESERVE_WAL */
-			K_CREATE_REPLICATION_SLOT IDENT opt_temporary K_PHYSICAL create_slot_opt_list
+			/* CREATE_REPLICATION_SLOT slot [TEMPORARY] PHYSICAL [options] */
+			K_CREATE_REPLICATION_SLOT IDENT opt_temporary K_PHYSICAL create_slot_options
 				{
 					CreateReplicationSlotCmd *cmd;
 					cmd = makeNode(CreateReplicationSlotCmd);
@@ -237,8 +192,8 @@ create_replication_slot:
 					cmd->options = $5;
 					$$ = (Node *) cmd;
 				}
-			/* CREATE_REPLICATION_SLOT slot TEMPORARY LOGICAL plugin */
-			| K_CREATE_REPLICATION_SLOT IDENT opt_temporary K_LOGICAL IDENT create_slot_opt_list
+			/* CREATE_REPLICATION_SLOT slot [TEMPORARY] LOGICAL plugin [options] */
+			| K_CREATE_REPLICATION_SLOT IDENT opt_temporary K_LOGICAL IDENT create_slot_options
 				{
 					CreateReplicationSlotCmd *cmd;
 					cmd = makeNode(CreateReplicationSlotCmd);
@@ -251,33 +206,43 @@ create_replication_slot:
 				}
 			;
 
-create_slot_opt_list:
-			create_slot_opt_list create_slot_opt
+create_slot_options:
+			'(' generic_option_list ')'			{ $$ = $2; }
+			| create_slot_legacy_opt_list		{ $$ = $1; }
+			;
+
+create_slot_legacy_opt_list:
+			create_slot_legacy_opt_list create_slot_legacy_opt
 				{ $$ = lappend($1, $2); }
 			| /* EMPTY */
 				{ $$ = NIL; }
 			;
 
-create_slot_opt:
+create_slot_legacy_opt:
 			K_EXPORT_SNAPSHOT
 				{
-				  $$ = makeDefElem("export_snapshot",
-								   (Node *)makeInteger(true), -1);
+				  $$ = makeDefElem("snapshot",
+								   (Node *) makeString("export"), -1);
 				}
 			| K_NOEXPORT_SNAPSHOT
 				{
-				  $$ = makeDefElem("export_snapshot",
-								   (Node *)makeInteger(false), -1);
+				  $$ = makeDefElem("snapshot",
+								   (Node *) makeString("nothing"), -1);
 				}
 			| K_USE_SNAPSHOT
 				{
-				  $$ = makeDefElem("use_snapshot",
-								   (Node *)makeInteger(true), -1);
+				  $$ = makeDefElem("snapshot",
+								   (Node *) makeString("use"), -1);
 				}
 			| K_RESERVE_WAL
 				{
 				  $$ = makeDefElem("reserve_wal",
-								   (Node *)makeInteger(true), -1);
+								   (Node *) makeBoolean(true), -1);
+				}
+			| K_TWO_PHASE
+				{
+				  $$ = makeDefElem("two_phase",
+								   (Node *) makeBoolean(true), -1);
 				}
 			;
 
@@ -301,8 +266,20 @@ drop_replication_slot:
 				}
 			;
 
+/* ALTER_REPLICATION_SLOT slot (options) */
+alter_replication_slot:
+			K_ALTER_REPLICATION_SLOT IDENT '(' generic_option_list ')'
+				{
+					AlterReplicationSlotCmd *cmd;
+					cmd = makeNode(AlterReplicationSlotCmd);
+					cmd->slotname = $2;
+					cmd->options = $4;
+					$$ = (Node *) cmd;
+				}
+			;
+
 /*
- * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %d]
+ * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %u]
  */
 start_replication:
 			K_START_REPLICATION opt_slot opt_physical RECPTR opt_timeline
@@ -332,7 +309,7 @@ start_logical_replication:
 				}
 			;
 /*
- * TIMELINE_HISTORY %d
+ * TIMELINE_HISTORY %u
  */
 timeline_history:
 			K_TIMELINE_HISTORY UCONST
@@ -350,6 +327,15 @@ timeline_history:
 					$$ = (Node *) cmd;
 				}
 			;
+
+/* UPLOAD_MANIFEST doesn't currently accept any arguments */
+upload_manifest:
+			K_UPLOAD_MANIFEST
+				{
+					UploadManifestCmd *cmd = makeNode(UploadManifestCmd);
+
+					$$ = (Node *) cmd;
+				}
 
 opt_physical:
 			K_PHYSICAL
@@ -409,6 +395,54 @@ plugin_opt_arg:
 			| /* EMPTY */					{ $$ = NULL; }
 		;
 
-%%
+generic_option_list:
+			generic_option_list ',' generic_option
+				{ $$ = lappend($1, $3); }
+			| generic_option
+				{ $$ = list_make1($1); }
+			;
 
-#include "repl_scanner.c"
+generic_option:
+			ident_or_keyword
+				{
+					$$ = makeDefElem($1, NULL, -1);
+				}
+			| ident_or_keyword IDENT
+				{
+					$$ = makeDefElem($1, (Node *) makeString($2), -1);
+				}
+			| ident_or_keyword SCONST
+				{
+					$$ = makeDefElem($1, (Node *) makeString($2), -1);
+				}
+			| ident_or_keyword UCONST
+				{
+					$$ = makeDefElem($1, (Node *) makeInteger($2), -1);
+				}
+			;
+
+ident_or_keyword:
+			IDENT							{ $$ = $1; }
+			| K_BASE_BACKUP					{ $$ = "base_backup"; }
+			| K_IDENTIFY_SYSTEM				{ $$ = "identify_system"; }
+			| K_SHOW						{ $$ = "show"; }
+			| K_START_REPLICATION			{ $$ = "start_replication"; }
+			| K_CREATE_REPLICATION_SLOT	{ $$ = "create_replication_slot"; }
+			| K_DROP_REPLICATION_SLOT		{ $$ = "drop_replication_slot"; }
+			| K_ALTER_REPLICATION_SLOT		{ $$ = "alter_replication_slot"; }
+			| K_TIMELINE_HISTORY			{ $$ = "timeline_history"; }
+			| K_WAIT						{ $$ = "wait"; }
+			| K_TIMELINE					{ $$ = "timeline"; }
+			| K_PHYSICAL					{ $$ = "physical"; }
+			| K_LOGICAL						{ $$ = "logical"; }
+			| K_SLOT						{ $$ = "slot"; }
+			| K_RESERVE_WAL					{ $$ = "reserve_wal"; }
+			| K_TEMPORARY					{ $$ = "temporary"; }
+			| K_TWO_PHASE					{ $$ = "two_phase"; }
+			| K_EXPORT_SNAPSHOT				{ $$ = "export_snapshot"; }
+			| K_NOEXPORT_SNAPSHOT			{ $$ = "noexport_snapshot"; }
+			| K_USE_SNAPSHOT				{ $$ = "use_snapshot"; }
+			| K_UPLOAD_MANIFEST				{ $$ = "upload_manifest"; }
+		;
+
+%%

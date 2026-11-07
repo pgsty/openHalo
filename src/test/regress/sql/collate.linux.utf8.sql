@@ -188,6 +188,9 @@ SELECT to_date('01 ŞUB 2010', 'DD TMMON YYYY');
 SELECT to_date('01 Şub 2010', 'DD TMMON YYYY');
 SELECT to_date('1234567890ab 2010', 'TMMONTH YYYY'); -- fail
 
+SELECT to_date('01 Aralık 2010', 'DD TMMONTH YYYY');
+SELECT to_date('01 aralık 2010', 'DD TMMONTH YYYY');
+SELECT to_date('2010 01 araLık', 'YYYY DD TMMONTH');
 
 -- backwards parsing
 
@@ -359,7 +362,7 @@ CREATE SCHEMA test_schema;
 do $$
 BEGIN
   EXECUTE 'CREATE COLLATION test0 (locale = ' ||
-          quote_literal(current_setting('lc_collate')) || ');';
+          quote_literal((SELECT datcollate FROM pg_database WHERE datname = current_database())) || ');';
 END
 $$;
 CREATE COLLATION test0 FROM "C"; -- fail, duplicate name
@@ -368,9 +371,9 @@ CREATE COLLATION IF NOT EXISTS test0 (locale = 'foo'); -- ok, skipped
 do $$
 BEGIN
   EXECUTE 'CREATE COLLATION test1 (lc_collate = ' ||
-          quote_literal(current_setting('lc_collate')) ||
+          quote_literal((SELECT datcollate FROM pg_database WHERE datname = current_database())) ||
           ', lc_ctype = ' ||
-          quote_literal(current_setting('lc_ctype')) || ');';
+          quote_literal((SELECT datctype FROM pg_database WHERE datname = current_database())) || ');';
 END
 $$;
 CREATE COLLATION test3 (lc_collate = 'en_US.utf8'); -- fail, need lc_ctype
@@ -410,6 +413,10 @@ DROP ROLE regress_test_role;
 
 ALTER COLLATION "en_US" REFRESH VERSION;
 
+-- also test for database while we are here
+SELECT current_database() AS datname \gset
+ALTER DATABASE :"datname" REFRESH COLLATION VERSION;
+
 
 -- dependencies
 
@@ -441,6 +448,11 @@ select textrange_en_us('A','Z') @> 'b'::text;
 
 drop type textrange_c;
 drop type textrange_en_us;
+
+
+-- standard collations
+
+SELECT * FROM collate_test2 ORDER BY b COLLATE UCS_BASIC;
 
 
 -- nondeterministic collations

@@ -6,7 +6,7 @@
  * with the walreceiver process. Functions implementing walreceiver itself
  * are in walreceiver.c.
  *
- * Portions Copyright (c) 2010-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -23,10 +23,11 @@
 #include <signal.h>
 
 #include "access/xlog_internal.h"
+#include "access/xlogrecovery.h"
 #include "pgstat.h"
-#include "postmaster/startup.h"
 #include "replication/walreceiver.h"
 #include "storage/pmsignal.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
 
@@ -66,7 +67,7 @@ WalRcvShmemInit(void)
 		ConditionVariableInit(&WalRcv->walRcvStoppedCV);
 		SpinLockInit(&WalRcv->mutex);
 		pg_atomic_init_u64(&WalRcv->writtenUpto, 0);
-		WalRcv->latch = NULL;
+		WalRcv->procno = INVALID_PROC_NUMBER;
 	}
 }
 
@@ -248,7 +249,7 @@ RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr, const char *conninfo,
 	WalRcvData *walrcv = WalRcv;
 	bool		launch = false;
 	pg_time_t	now = (pg_time_t) time(NULL);
-	Latch	   *latch;
+	ProcNumber	walrcv_proc;
 
 	/*
 	 * We always start at the beginning of the segment. That prevents a broken
@@ -265,11 +266,6 @@ RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr, const char *conninfo,
 	Assert(walrcv->walRcvState == WALRCV_STOPPED ||
 		   walrcv->walRcvState == WALRCV_WAITING);
 
-	if (conninfo != NULL)
-		strlcpy((char *) walrcv->conninfo, conninfo, MAXCONNINFO);
-	else
-		walrcv->conninfo[0] = '\0';
-
 	/*
 	 * Use configured replication slot if present, and ignore the value of
 	 * create_temp_slot as the slot name should be persistent.  Otherwise, use
@@ -278,7 +274,7 @@ RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr, const char *conninfo,
 	 */
 	if (slotname != NULL && slotname[0] != '\0')
 	{
-		strlcpy((char *) walrcv->slotname, slotname, NAMEDATALEN);
+		strlcpy(walrcv->slotname, slotname, NAMEDATALEN);
 		walrcv->is_temp_slot = false;
 	}
 	else
@@ -287,10 +283,19 @@ RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr, const char *conninfo,
 		walrcv->is_temp_slot = create_temp_slot;
 	}
 
+	/*
+	 * While waiting for instructions, the WAL receiver uses the same
+	 * connection, so do not clobber the user-visible conninfo already saved.
+	 */
 	if (walrcv->walRcvState == WALRCV_STOPPED)
 	{
 		launch = true;
 		walrcv->walRcvState = WALRCV_STARTING;
+
+		if (conninfo != NULL)
+			strlcpy(walrcv->conninfo, conninfo, MAXCONNINFO);
+		else
+			walrcv->conninfo[0] = '\0';
 	}
 	else
 		walrcv->walRcvState = WALRCV_RESTARTING;
@@ -309,14 +314,14 @@ RequestXLogStreaming(TimeLineID tli, XLogRecPtr recptr, const char *conninfo,
 	walrcv->receiveStart = recptr;
 	walrcv->receiveStartTLI = tli;
 
-	latch = walrcv->latch;
+	walrcv_proc = walrcv->procno;
 
 	SpinLockRelease(&walrcv->mutex);
 
 	if (launch)
 		SendPostmasterSignal(PMSIGNAL_START_WALRECEIVER);
-	else if (latch)
-		SetLatch(latch);
+	else if (walrcv_proc != INVALID_PROC_NUMBER)
+		SetLatch(&GetPGProcByNumber(walrcv_proc)->procLatch);
 }
 
 /*

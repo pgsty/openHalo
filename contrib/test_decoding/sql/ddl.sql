@@ -93,6 +93,22 @@ COMMIT;
 /* display results */
 SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
 
+-- MERGE support
+BEGIN;
+MERGE INTO replication_example t
+	USING (SELECT i as id, i as data, i as num FROM generate_series(-20, 5) i) s
+	ON t.id = s.id
+	WHEN MATCHED AND t.id < 0 THEN
+		UPDATE SET somenum = somenum + 1
+	WHEN MATCHED AND t.id >= 0 THEN
+		DELETE
+	WHEN NOT MATCHED THEN
+		INSERT VALUES (s.*);
+COMMIT;
+
+/* display results */
+SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
+
 CREATE TABLE tr_unique(id2 serial unique NOT NULL, data int);
 INSERT INTO tr_unique(data) VALUES(10);
 ALTER TABLE tr_unique RENAME TO tr_pkey;
@@ -220,7 +236,7 @@ SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'inc
 -- test whether a known, but not yet logged toplevel xact, followed by a
 -- subxact commit is handled correctly
 BEGIN;
-SELECT pg_current_xact_id() != '0'; -- so no fixed xid apears in the outfile
+SELECT pg_current_xact_id() != '0'; -- so no fixed xid appears in the outfile
 SAVEPOINT a;
 INSERT INTO tr_sub(path) VALUES ('4-top-1-#1');
 RELEASE SAVEPOINT a;

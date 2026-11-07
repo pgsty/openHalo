@@ -11,7 +11,7 @@ ifeq ($(PORTNAME), win32)
 override python_libspec =
 endif
 
-override CPPFLAGS := -I. -I$(srcdir) $(python_includespec) $(CPPFLAGS)
+override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS) $(python_includespec)
 
 rpathdir = $(python_libdir)
 
@@ -35,9 +35,6 @@ OBJS = \
 	plpy_util.o
 
 DATA = $(NAME)u.control $(NAME)u--1.0.sql
-ifeq ($(python_majorversion),2)
-DATA += plpythonu.control plpythonu--1.0.sql
-endif
 
 # header files to install - it's not clear which of these might be needed
 # so install them all.
@@ -78,11 +75,6 @@ endif # win32
 SHLIB_LINK = $(python_libspec) $(python_additional_libs) $(filter -lintl,$(LIBS))
 
 REGRESS_OPTS = --dbname=$(PL_TESTDB)
-# Only load plpythonu with Python 2.  The test files themselves load
-# the versioned language plpython(2|3)u.
-ifeq ($(python_majorversion),2)
-REGRESS_OPTS += --load-extension=plpythonu
-endif
 
 REGRESS = \
 	plpython_schema \
@@ -109,8 +101,6 @@ REGRESS = \
 	plpython_transaction \
 	plpython_drop
 
-REGRESS_PLPYTHON3_MANGLE := $(REGRESS)
-
 include $(top_srcdir)/src/Makefile.shlib
 
 all: all-lib
@@ -121,23 +111,19 @@ $(OBJS): | submake-generated-headers
 install: all install-lib install-data
 
 installdirs: installdirs-lib
-	$(MKDIR_P) '$(DESTDIR)$(datadir)/extension' '$(DESTDIR)$(includedir_server)' '$(DESTDIR)$(pgxsdir)/src/pl/plpython'
+	$(MKDIR_P) '$(DESTDIR)$(datadir)/extension' '$(DESTDIR)$(includedir_server)'
 
 uninstall: uninstall-lib uninstall-data
 
 install-data: installdirs
 	$(INSTALL_DATA) $(addprefix $(srcdir)/, $(DATA)) '$(DESTDIR)$(datadir)/extension/'
 	$(INSTALL_DATA) $(addprefix $(srcdir)/, $(INCS)) '$(DESTDIR)$(includedir_server)'
-	$(INSTALL_DATA) $(srcdir)/regress-python3-mangle.mk '$(DESTDIR)$(pgxsdir)/src/pl/plpython'
 
 uninstall-data:
 	rm -f $(addprefix '$(DESTDIR)$(datadir)/extension'/, $(notdir $(DATA)))
 	rm -f $(addprefix '$(DESTDIR)$(includedir_server)'/, $(INCS))
 
 .PHONY: install-data uninstall-data
-
-
-include $(srcdir)/regress-python3-mangle.mk
 
 
 check: submake-pg-regress
@@ -157,6 +143,7 @@ clean distclean: clean-lib
 ifeq ($(PORTNAME), win32)
 	rm -f python${pytverstr}.def
 endif
+	rm -f spiexceptions.h
 
 
 # Force this dependency to be known even without dependency info built:
@@ -164,8 +151,3 @@ plpy_plpymodule.o: spiexceptions.h
 
 spiexceptions.h: $(top_srcdir)/src/backend/utils/errcodes.txt generate-spiexceptions.pl
 	$(PERL) $(srcdir)/generate-spiexceptions.pl $< > $@
-
-distprep: spiexceptions.h
-
-maintainer-clean: distclean
-	rm -f spiexceptions.h

@@ -4,7 +4,7 @@
  *	  delete & vacuum routines for the postgres GIN
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,7 +19,6 @@
 #include "access/xloginsert.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
-#include "postmaster/autovacuum.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -217,7 +216,7 @@ ginDeletePage(GinVacuumState *gvs, BlockNumber deleteBlkno, BlockNumber leftBlkn
 		data.rightLink = GinPageGetOpaque(page)->rightlink;
 		data.deleteXid = GinPageGetDeleteXid(page);
 
-		XLogRegisterData((char *) &data, sizeof(ginxlogDeletePage));
+		XLogRegisterData(&data, sizeof(ginxlogDeletePage));
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_DELETE_PAGE);
 		PageSetLSN(page, recptr);
@@ -395,6 +394,13 @@ ginVacuumPostingTreeLeaves(GinVacuumState *gvs, BlockNumber blkno)
 
 		if (blkno == InvalidBlockNumber)
 			break;
+
+		/*
+		 * A safe point to delay/accept interrupts: the previous page has been
+		 * unlocked and released, so we hold no buffer content lock (nor any
+		 * other LWLock) here and CHECK_FOR_INTERRUPTS() can do its job.
+		 */
+		vacuum_delay_point(false);
 
 		buffer = ReadBufferExtended(gvs->index, MAIN_FORKNUM, blkno,
 									RBM_NORMAL, gvs->strategy);
@@ -590,7 +596,7 @@ ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		/*
 		 * and cleanup any pending inserts
 		 */
-		ginInsertCleanup(&gvs.ginstate, !IsAutoVacuumWorkerProcess(),
+		ginInsertCleanup(&gvs.ginstate, !AmAutoVacuumWorkerProcess(),
 						 false, true, stats);
 	}
 
@@ -663,12 +669,12 @@ ginbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			UnlockReleaseBuffer(buffer);
 		}
 
-		vacuum_delay_point();
+		vacuum_delay_point(false);
 
 		for (i = 0; i < nRoot; i++)
 		{
 			ginVacuumPostingTree(&gvs, rootOfPostingTree[i]);
-			vacuum_delay_point();
+			vacuum_delay_point(false);
 		}
 
 		if (blkno == InvalidBlockNumber)	/* rightmost page */
@@ -701,7 +707,7 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	 */
 	if (info->analyze_only)
 	{
-		if (IsAutoVacuumWorkerProcess())
+		if (AmAutoVacuumWorkerProcess())
 		{
 			initGinState(&ginstate, index);
 			ginInsertCleanup(&ginstate, false, true, true, stats);
@@ -717,7 +723,7 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 	{
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 		initGinState(&ginstate, index);
-		ginInsertCleanup(&ginstate, !IsAutoVacuumWorkerProcess(),
+		ginInsertCleanup(&ginstate, !AmAutoVacuumWorkerProcess(),
 						 false, true, stats);
 	}
 
@@ -749,7 +755,7 @@ ginvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 		Buffer		buffer;
 		Page		page;
 
-		vacuum_delay_point();
+		vacuum_delay_point(false);
 
 		buffer = ReadBufferExtended(index, MAIN_FORKNUM, blkno,
 									RBM_NORMAL, info->strategy);

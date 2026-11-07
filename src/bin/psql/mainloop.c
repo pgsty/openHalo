@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/mainloop.c
  */
@@ -69,7 +69,7 @@ MainLoop(FILE *source)
 	/* Create working state */
 	scan_state = psql_scan_create(&psqlscan_callbacks);
 	cond_stack = conditional_stack_create();
-	psql_scan_set_passthrough(scan_state, (void *) cond_stack);
+	psql_scan_set_passthrough(scan_state, cond_stack);
 
 	query_buf = createPQExpBuffer();
 	previous_buf = createPQExpBuffer();
@@ -77,10 +77,7 @@ MainLoop(FILE *source)
 	if (PQExpBufferBroken(query_buf) ||
 		PQExpBufferBroken(previous_buf) ||
 		PQExpBufferBroken(history_buf))
-	{
-		pg_log_error("out of memory");
-		exit(EXIT_FAILURE);
-	}
+		pg_fatal("out of memory");
 
 	/* main loop to get queries and execute them */
 	while (successResult == EXIT_SUCCESS)
@@ -214,7 +211,7 @@ MainLoop(FILE *source)
 			strncmp(line, "PGDMP", 5) == 0)
 		{
 			free(line);
-			puts(_("The input is a Halo custom-format dump.\n"
+			puts(_("The input is a PostgreSQL custom-format dump.\n"
 				   "Use the pg_restore command-line client to restore this dump to a database.\n"));
 			fflush(stdout);
 			successResult = EXIT_FAILURE;
@@ -398,10 +395,7 @@ MainLoop(FILE *source)
 			prompt_status = prompt_tmp;
 
 			if (PQExpBufferBroken(query_buf))
-			{
-				pg_log_error("out of memory");
-				exit(EXIT_FAILURE);
-			}
+				pg_fatal("out of memory");
 
 			/*
 			 * Increase statement line number counter for each linebreak added
@@ -442,7 +436,9 @@ MainLoop(FILE *source)
 				/* execute query unless we're in an inactive \if branch */
 				if (conditional_active(cond_stack))
 				{
-					success = SendQuery(query_buf->data);
+					/* count_copy_from_stdin should be reliable here */
+					success = SendQuery(query_buf->data,
+										psql_scan_count_copy_from_stdin(scan_state));
 					slashCmdStatus = success ? PSQL_CMD_SEND : PSQL_CMD_ERROR;
 					pset.stmt_lineno = 1;
 
@@ -454,9 +450,10 @@ MainLoop(FILE *source)
 						query_buf = swap_buf;
 					}
 					resetPQExpBuffer(query_buf);
+					/* reset parsing state, too */
+					psql_scan_reset(scan_state);
 
 					added_nl_pos = -1;
-					/* we need not do psql_scan_reset() here */
 				}
 				else
 				{
@@ -518,7 +515,7 @@ MainLoop(FILE *source)
 					/* should not see this in inactive branch */
 					Assert(conditional_active(cond_stack));
 
-					success = SendQuery(query_buf->data);
+					success = SendQuery(query_buf->data, -1);
 
 					/* transfer query to previous_buf by pointer-swapping */
 					{
@@ -528,8 +525,7 @@ MainLoop(FILE *source)
 						query_buf = swap_buf;
 					}
 					resetPQExpBuffer(query_buf);
-
-					/* flush any paren nesting info after forced send */
+					/* reset parsing state, too */
 					psql_scan_reset(scan_state);
 				}
 				else if (slashCmdStatus == PSQL_CMD_NEWEDIT)
@@ -564,9 +560,20 @@ MainLoop(FILE *source)
 				break;
 		}
 
-		/* Add line to pending history if we didn't execute anything yet */
-		if (pset.cur_cmd_interactive && !line_saved_in_history)
-			pg_append_history(line, history_buf);
+		/*
+		 * Add line to pending history if we didn't do so already.  Then, if
+		 * the query buffer is still empty, flush out any unsent history
+		 * entry.  This means that empty lines (containing only whitespace and
+		 * perhaps a dash-dash comment) that precede a query will be recorded
+		 * as separate history entries, not as part of that query.
+		 */
+		if (pset.cur_cmd_interactive)
+		{
+			if (!line_saved_in_history)
+				pg_append_history(line, history_buf);
+			if (query_buf->len == 0)
+				pg_send_history(history_buf);
+		}
 
 		psql_scan_finish(scan_state);
 		free(line);
@@ -605,7 +612,8 @@ MainLoop(FILE *source)
 		/* execute query unless we're in an inactive \if branch */
 		if (conditional_active(cond_stack))
 		{
-			success = SendQuery(query_buf->data);
+			success = SendQuery(query_buf->data,
+								psql_scan_count_copy_from_stdin(scan_state));
 		}
 		else
 		{

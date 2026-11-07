@@ -2,7 +2,7 @@
  *
  *	  EUC_JP, SJIS and MULE_INTERNAL
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -27,7 +27,10 @@
  */
 #include "sjis.map"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "euc_jp_and_sjis",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(euc_jp_to_sjis);
 PG_FUNCTION_INFO_V1(sjis_to_euc_jp);
@@ -54,8 +57,8 @@ static int	sjis2mic(const unsigned char *sjis, unsigned char *p, int len, bool n
 static int	mic2sjis(const unsigned char *mic, unsigned char *p, int len, bool noError);
 static int	euc_jp2mic(const unsigned char *euc, unsigned char *p, int len, bool noError);
 static int	mic2euc_jp(const unsigned char *mic, unsigned char *p, int len, bool noError);
-static int	euc_jp2sjis(const unsigned char *mic, unsigned char *p, int len, bool noError);
-static int	sjis2euc_jp(const unsigned char *mic, unsigned char *p, int len, bool noError);
+static int	euc_jp2sjis(const unsigned char *euc, unsigned char *p, int len, bool noError);
+static int	sjis2euc_jp(const unsigned char *sjis, unsigned char *p, int len, bool noError);
 
 Datum
 euc_jp_to_sjis(PG_FUNCTION_ARGS)

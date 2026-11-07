@@ -1,7 +1,7 @@
 /*
  * pg_controldata
  *
- * reads the data from $PGDATA/global/pg_control
+ * reads the data from the control file located at $PGDATA/XLOG_CONTROL_FILE.
  *
  * copyright (c) Oliver Elphick <olly@lfix.co.uk>, 2001;
  * license: BSD
@@ -32,7 +32,7 @@
 static void
 usage(const char *progname)
 {
-	printf(_("%s displays control information of a Halo database cluster.\n\n"), progname);
+	printf(_("%s displays control information of a PostgreSQL database cluster.\n\n"), progname);
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION] [DATADIR]\n"), progname);
 	printf(_("\nOptions:\n"));
@@ -81,7 +81,7 @@ wal_level_str(WalLevel wal_level)
 		case WAL_LEVEL_LOGICAL:
 			return "logical";
 	}
-	return _("unrecognized wal_level");
+	return _("unrecognized \"wal_level\"");
 }
 
 
@@ -121,7 +121,7 @@ main(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_controldata (Halo) " PG_VERSION_PREFIX PG_VERSION);
+			puts("pg_controldata (PostgreSQL) " PG_VERSION);
 			exit(0);
 		}
 	}
@@ -135,7 +135,8 @@ main(int argc, char *argv[])
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+				/* getopt_long already emitted a complaint */
+				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit(1);
 		}
 	}
@@ -153,39 +154,37 @@ main(int argc, char *argv[])
 	{
 		pg_log_error("too many command-line arguments (first is \"%s\")",
 					 argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
 
 	if (DataDir == NULL)
 	{
 		pg_log_error("no data directory specified");
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
 
 	/* get a copy of the control file */
 	ControlFile = get_controlfile(DataDir, &crc_ok);
 	if (!crc_ok)
-		printf(_("WARNING: Calculated CRC checksum does not match value stored in file.\n"
-				 "Either the file is corrupt, or it has a different layout than this program\n"
-				 "is expecting.  The results below are untrustworthy.\n\n"));
+	{
+		pg_log_warning("calculated CRC checksum does not match value stored in control file");
+		pg_log_warning_detail("Either the control file is corrupt, or it has a different layout than this program "
+							  "is expecting.  The results below are untrustworthy.");
+	}
 
 	/* set wal segment size */
 	WalSegSz = ControlFile->xlog_seg_size;
 
 	if (!IsValidWalSegSize(WalSegSz))
 	{
-		printf(_("WARNING: invalid WAL segment size\n"));
-		printf(ngettext("The WAL segment size stored in the file, %d byte, is not a power of two\n"
-						"between 1 MB and 1 GB.  The file is corrupt and the results below are\n"
-						"untrustworthy.\n\n",
-						"The WAL segment size stored in the file, %d bytes, is not a power of two\n"
-						"between 1 MB and 1 GB.  The file is corrupt and the results below are\n"
-						"untrustworthy.\n\n",
-						WalSegSz),
-			   WalSegSz);
+		pg_log_warning(ngettext("invalid WAL segment size in control file (%d byte)",
+								"invalid WAL segment size in control file (%d bytes)",
+								WalSegSz),
+					   WalSegSz);
+		pg_log_warning_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
+		pg_log_warning_detail("The file is corrupt and the results below are untrustworthy.");
 	}
 
 	/*
@@ -240,8 +239,8 @@ main(int argc, char *argv[])
 		   ControlFile->pg_control_version);
 	printf(_("Catalog version number:               %u\n"),
 		   ControlFile->catalog_version_no);
-	printf(_("Database system identifier:           %llu\n"),
-		   (unsigned long long) ControlFile->system_identifier);
+	printf(_("Database system identifier:           %" PRIu64 "\n"),
+		   ControlFile->system_identifier);
 	printf(_("Database cluster state:               %s\n"),
 		   dbState(ControlFile->state));
 	printf(_("pg_control last modified:             %s\n"),
@@ -337,6 +336,8 @@ main(int argc, char *argv[])
 		   (ControlFile->float8ByVal ? _("by value") : _("by reference")));
 	printf(_("Data page checksum version:           %u\n"),
 		   ControlFile->data_checksum_version);
+	printf(_("Default char data signedness:         %s\n"),
+		   (ControlFile->default_char_signedness ? _("signed") : _("unsigned")));
 	printf(_("Mock authentication nonce:            %s\n"),
 		   mock_auth_nonce_str);
 	return 0;

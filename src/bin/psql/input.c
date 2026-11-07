@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/input.c
  */
@@ -88,8 +88,7 @@ gets_interactive(const char *prompt, PQExpBuffer query_buf)
 		/* Enable SIGINT to longjmp to sigint_interrupt_jmp */
 		sigint_interrupt_enabled = true;
 
-		/* On some platforms, readline is declared as readline(char *) */
-		result = readline((char *) prompt);
+		result = readline(prompt);
 
 		/* Disable SIGINT again */
 		sigint_interrupt_enabled = false;
@@ -158,8 +157,7 @@ pg_send_history(PQExpBuffer history_buf)
 		else
 		{
 			/* Save each previous line for ignoredups processing */
-			if (prev_hist)
-				free(prev_hist);
+			free(prev_hist);
 			prev_hist = pg_strdup(s);
 			/* And send it to readline */
 			add_history(s);
@@ -353,8 +351,15 @@ initializeInput(int flags)
 
 		useReadline = true;
 
-		/* these two things must be done in this order: */
+		/* set appropriate values for Readline's global variables */
 		initialize_readline();
+
+#ifdef HAVE_RL_VARIABLE_BIND
+		/* set comment-begin to a useful value for SQL */
+		(void) rl_variable_bind("comment-begin", "-- ");
+#endif
+
+		/* this reads ~/.inputrc, so do it after rl_variable_bind */
 		rl_initialize();
 
 		useHistory = true;

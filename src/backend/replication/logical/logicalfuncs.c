@@ -6,10 +6,10 @@
  *	   logical replication slots via SQL.
  *
  *
- * Copyright (c) 2012-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *	  src/backend/replication/logicalfuncs.c
+ *	  src/backend/replication/logical/logicalfuncs.c
  *-------------------------------------------------------------------------
  */
 
@@ -17,8 +17,7 @@
 
 #include <unistd.h>
 
-#include "access/xact.h"
-#include "access/xlog_internal.h"
+#include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "catalog/pg_type.h"
 #include "fmgr.h"
@@ -29,17 +28,15 @@
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/message.h"
-#include "storage/fd.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/inval.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/regproc.h"
 #include "utils/resowner.h"
 
-/* private date for writing out data */
+/* Private data for writing out data */
 typedef struct DecodingOutputState
 {
 	Tuplestorestate *tupstore;
@@ -95,15 +92,6 @@ LogicalOutputWrite(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xi
 	p->returned_rows++;
 }
 
-static void
-check_permissions(void)
-{
-	if (!superuser() && !has_rolreplication(GetUserId()))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser or replication role to use replication slots")));
-}
-
 /*
  * Helper function for the various SQL callable logical decoding functions.
  */
@@ -117,6 +105,7 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
 	XLogRecPtr	end_of_wal;
+	XLogRecPtr	wait_for_wal_lsn;
 	LogicalDecodingContext *ctx;
 	ResourceOwner old_resowner = CurrentResourceOwner;
 	ArrayType  *arr;
@@ -124,7 +113,7 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 	List	   *options = NIL;
 	DecodingOutputState *p;
 
-	check_permissions();
+	CheckSlotPermissions();
 
 	CheckLogicalDecodingRequirements();
 
@@ -150,24 +139,10 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 				 errmsg("options array must not be null")));
 	arr = PG_GETARG_ARRAYTYPE_P(3);
 
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
 	/* state to write output to */
 	p = palloc0(sizeof(DecodingOutputState));
 
 	p->binary_output = binary;
-
-	/* Build a tuple descriptor for our result type */
-	if (get_call_result_type(fcinfo, NULL, &p->tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
 
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
@@ -194,8 +169,7 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 
 		Assert(ARR_ELEMTYPE(arr) == TEXTOID);
 
-		deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT,
-						  &datum_opts, NULL, &nelems);
+		deconstruct_array_builtin(arr, TEXTOID, &datum_opts, NULL, &nelems);
 
 		if (nelems % 2 != 0)
 			ereport(ERROR,
@@ -204,28 +178,26 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 
 		for (i = 0; i < nelems; i += 2)
 		{
-			char	   *name = TextDatumGetCString(datum_opts[i]);
+			char	   *optname = TextDatumGetCString(datum_opts[i]);
 			char	   *opt = TextDatumGetCString(datum_opts[i + 1]);
 
-			options = lappend(options, makeDefElem(name, (Node *) makeString(opt), -1));
+			options = lappend(options, makeDefElem(optname, (Node *) makeString(opt), -1));
 		}
 	}
 
-	p->tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = p->tupstore;
-	rsinfo->setDesc = p->tupdesc;
+	InitMaterializedSRF(fcinfo, 0);
+	p->tupstore = rsinfo->setResult;
+	p->tupdesc = rsinfo->setDesc;
 
 	/*
-	 * Compute the current end-of-wal and maintain ThisTimeLineID.
-	 * RecoveryInProgress() will update ThisTimeLineID on promotion.
+	 * Compute the current end-of-wal.
 	 */
 	if (!RecoveryInProgress())
-		end_of_wal = GetFlushRecPtr();
+		end_of_wal = GetFlushRecPtr(NULL);
 	else
-		end_of_wal = GetXLogReplayRecPtr(&ThisTimeLineID);
+		end_of_wal = GetXLogReplayRecPtr(NULL);
 
-	ReplicationSlotAcquire(NameStr(*name), true);
+	ReplicationSlotAcquire(NameStr(*name), true, true);
 
 	PG_TRY();
 	{
@@ -238,19 +210,6 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 											   .segment_close = wal_segment_close),
 									LogicalOutputPrepareWrite,
 									LogicalOutputWrite, NULL);
-
-		/*
-		 * After the sanity checks in CreateDecodingContext, make sure the
-		 * restart_lsn is valid.  Avoid "cannot get changes" wording in this
-		 * errmsg because that'd be confusingly ambiguous about no changes
-		 * being available.
-		 */
-		if (XLogRecPtrIsInvalid(MyReplicationSlot->data.restart_lsn))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("can no longer get changes from replication slot \"%s\"",
-							NameStr(*name)),
-					 errdetail("This slot has never previously reserved WAL, or it has been invalidated.")));
 
 		MemoryContextSwitchTo(oldcontext);
 
@@ -265,6 +224,17 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 					 errmsg("logical decoding output plugin \"%s\" produces binary output, but function \"%s\" expects textual data",
 							NameStr(MyReplicationSlot->data.plugin),
 							format_procedure(fcinfo->flinfo->fn_oid))));
+
+		/*
+		 * Wait for specified streaming replication standby servers (if any)
+		 * to confirm receipt of WAL up to wait_for_wal_lsn.
+		 */
+		if (XLogRecPtrIsInvalid(upto_lsn))
+			wait_for_wal_lsn = end_of_wal;
+		else
+			wait_for_wal_lsn = Min(upto_lsn, end_of_wal);
+
+		WaitForStandbyConfirmation(wait_for_wal_lsn);
 
 		ctx->output_writer_private = p;
 
@@ -286,7 +256,7 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 
 			record = XLogReadRecord(ctx->reader, &errm);
 			if (errm)
-				elog(ERROR, "%s", errm);
+				elog(ERROR, "could not find record for logical decoding: %s", errm);
 
 			/*
 			 * The {begin_txn,change,commit_txn}_wrapper callbacks above will
@@ -304,8 +274,6 @@ pg_logical_slot_get_changes_guts(FunctionCallInfo fcinfo, bool confirm, bool bin
 				break;
 			CHECK_FOR_INTERRUPTS();
 		}
-
-		tuplestore_donestoring(tupstore);
 
 		/*
 		 * Logical decoding could have clobbered CurrentResourceOwner during
@@ -402,10 +370,11 @@ pg_logical_emit_message_bytea(PG_FUNCTION_ARGS)
 	bool		transactional = PG_GETARG_BOOL(0);
 	char	   *prefix = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	bytea	   *data = PG_GETARG_BYTEA_PP(2);
+	bool		flush = PG_GETARG_BOOL(3);
 	XLogRecPtr	lsn;
 
 	lsn = LogLogicalMessage(prefix, VARDATA_ANY(data), VARSIZE_ANY_EXHDR(data),
-							transactional);
+							transactional, flush);
 	PG_RETURN_LSN(lsn);
 }
 

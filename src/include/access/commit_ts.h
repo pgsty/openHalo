@@ -3,7 +3,7 @@
  *
  * PostgreSQL commit timestamp manager
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/commit_ts.h
@@ -15,13 +15,9 @@
 #include "datatype/timestamp.h"
 #include "replication/origin.h"
 #include "storage/sync.h"
-#include "utils/guc.h"
 
 
 extern PGDLLIMPORT bool track_commit_timestamp;
-
-extern bool check_track_commit_timestamp(bool *newval, void **extra,
-										 GucSource source);
 
 extern void TransactionTreeSetCommitTsData(TransactionId xid, int nsubxids,
 										   TransactionId *subxids, TimestampTz timestamp,
@@ -31,7 +27,6 @@ extern bool TransactionIdGetCommitTsData(TransactionId xid,
 extern TransactionId GetLatestCommitTsData(TimestampTz *ts,
 										   RepOriginId *nodeid);
 
-extern Size CommitTsShmemBuffers(void);
 extern Size CommitTsShmemSize(void);
 extern void CommitTsShmemInit(void);
 extern void BootStrapCommitTs(void);
@@ -64,7 +59,7 @@ typedef struct xl_commit_ts_set
 
 typedef struct xl_commit_ts_truncate
 {
-	int			pageno;
+	int64		pageno;
 	TransactionId oldestXid;
 } xl_commit_ts_truncate;
 

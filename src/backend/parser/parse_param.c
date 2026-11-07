@@ -12,7 +12,7 @@
  * Note that other approaches to parameters are possible using the parser
  * hooks defined in ParseState.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,13 +31,12 @@
 #include "parser/parse_param.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include "miscadmin.h"
-#include "adapter/mysql/adapter.h"
+#include "utils/memutils.h"
 
 
 typedef struct FixedParamState
 {
-	Oid		   *paramTypes;		/* array of parameter type OIDs */
+	const Oid  *paramTypes;		/* array of parameter type OIDs */
 	int			numParams;		/* number of array entries */
 } FixedParamState;
 
@@ -66,14 +65,14 @@ static bool query_contains_extern_params_walker(Node *node, void *context);
  * Set up to process a query containing references to fixed parameters.
  */
 void
-parse_fixed_parameters(ParseState *pstate,
-					   Oid *paramTypes, int numParams)
+setup_parse_fixed_parameters(ParseState *pstate,
+							 const Oid *paramTypes, int numParams)
 {
 	FixedParamState *parstate = palloc(sizeof(FixedParamState));
 
 	parstate->paramTypes = paramTypes;
 	parstate->numParams = numParams;
-	pstate->p_ref_hook_state = (void *) parstate;
+	pstate->p_ref_hook_state = parstate;
 	pstate->p_paramref_hook = fixed_paramref_hook;
 	/* no need to use p_coerce_param_hook */
 }
@@ -82,14 +81,14 @@ parse_fixed_parameters(ParseState *pstate,
  * Set up to process a query containing references to variable parameters.
  */
 void
-parse_variable_parameters(ParseState *pstate,
-						  Oid **paramTypes, int *numParams)
+setup_parse_variable_parameters(ParseState *pstate,
+								Oid **paramTypes, int *numParams)
 {
 	VarParamState *parstate = palloc(sizeof(VarParamState));
 
 	parstate->paramTypes = paramTypes;
 	parstate->numParams = numParams;
-	pstate->p_ref_hook_state = (void *) parstate;
+	pstate->p_ref_hook_state = parstate;
 	pstate->p_paramref_hook = variable_paramref_hook;
 	pstate->p_coerce_param_hook = variable_coerce_param_hook;
 }
@@ -138,7 +137,7 @@ variable_paramref_hook(ParseState *pstate, ParamRef *pref)
 	Param	   *param;
 
 	/* Check parameter number is in range */
-	if (paramno <= 0 || paramno > INT_MAX / sizeof(Oid))
+	if (paramno <= 0 || paramno > MaxAllocSize / sizeof(Oid))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_PARAMETER),
 				 errmsg("there is no parameter $%d", paramno),
@@ -147,14 +146,10 @@ variable_paramref_hook(ParseState *pstate, ParamRef *pref)
 	{
 		/* Need to enlarge param array */
 		if (*parstate->paramTypes)
-			*parstate->paramTypes = (Oid *) repalloc(*parstate->paramTypes,
-													 paramno * sizeof(Oid));
+			*parstate->paramTypes = repalloc0_array(*parstate->paramTypes, Oid,
+													*parstate->numParams, paramno);
 		else
-			*parstate->paramTypes = (Oid *) palloc(paramno * sizeof(Oid));
-		/* Zero out the previously-unreferenced slots */
-		MemSet(*parstate->paramTypes + *parstate->numParams,
-			   0,
-			   (paramno - *parstate->numParams) * sizeof(Oid));
+			*parstate->paramTypes = palloc0_array(Oid, paramno);
 		*parstate->numParams = paramno;
 	}
 
@@ -163,24 +158,7 @@ variable_paramref_hook(ParseState *pstate, ParamRef *pref)
 
 	/* If not seen before, initialize to UNKNOWN type */
 	if (*pptype == InvalidOid)
-    {
-        if ((MyProcPort != NULL) && 
-            (nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol))
-        {
-            if (isExtendPreStmt)
-            {
-                *pptype = UNKNOWNOID;
-            }
-            else 
-            {
-                *pptype = BYTEAOID;
-            }
-        }
-        else
-        {
-            *pptype = UNKNOWNOID;
-        }
-    }
+		*pptype = UNKNOWNOID;
 
 	/*
 	 * If the argument is of type void and it's procedure call, interpret it
@@ -296,7 +274,7 @@ check_variable_parameters(ParseState *pstate, Query *query)
 	if (*parstate->numParams > 0)
 		(void) query_tree_walker(query,
 								 check_parameter_resolution_walker,
-								 (void *) pstate, 0);
+								 pstate, 0);
 }
 
 /*
@@ -340,10 +318,10 @@ check_parameter_resolution_walker(Node *node, ParseState *pstate)
 		/* Recurse into RTE subquery or not-yet-planned sublink subquery */
 		return query_tree_walker((Query *) node,
 								 check_parameter_resolution_walker,
-								 (void *) pstate, 0);
+								 pstate, 0);
 	}
 	return expression_tree_walker(node, check_parameter_resolution_walker,
-								  (void *) pstate);
+								  pstate);
 }
 
 /*

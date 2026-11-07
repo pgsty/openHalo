@@ -3,7 +3,7 @@
  * spi.h
  *				Server Programming Interface public declarations
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/spi.h
@@ -96,18 +96,10 @@ typedef struct _SPI_plan *SPIPlanPtr;
 #define SPI_OK_REL_REGISTER		15
 #define SPI_OK_REL_UNREGISTER	16
 #define SPI_OK_TD_REGISTER		17
-
 #define SPI_OK_MERGE			18
-
+#define SPI_OK_MERGE_RETURNING	19
 
 #define SPI_OPT_NONATOMIC		(1 << 0)
-
-/* These used to be functions, now just no-ops for backwards compatibility */
-#define SPI_push()	((void) 0)
-#define SPI_pop()	((void) 0)
-#define SPI_push_conditional()	false
-#define SPI_pop_conditional(pushed) ((void) 0)
-#define SPI_restore_connection()	((void) 0)
 
 extern PGDLLIMPORT uint64 SPI_processed;
 extern PGDLLIMPORT SPITupleTable *SPI_tuptable;
@@ -176,7 +168,7 @@ extern void *SPI_palloc(Size size);
 extern void *SPI_repalloc(void *pointer, Size size);
 extern void SPI_pfree(void *pointer);
 extern Datum SPI_datumTransfer(Datum value, bool typByVal, int typLen);
-extern void SPI_freetuple(HeapTuple pointer);
+extern void SPI_freetuple(HeapTuple tuple);
 extern void SPI_freetuptable(SPITupleTable *tuptable);
 
 extern Portal SPI_cursor_open(const char *name, SPIPlanPtr plan,
@@ -208,8 +200,8 @@ extern void SPI_commit_and_chain(void);
 extern void SPI_rollback(void);
 extern void SPI_rollback_and_chain(void);
 
-extern void SPICleanup(void);
 extern void AtEOXact_SPI(bool isCommit);
 extern void AtEOSubXact_SPI(bool isCommit, SubTransactionId mySubid);
 extern bool SPI_inside_nonatomic_context(void);
+
 #endif							/* SPI_H */

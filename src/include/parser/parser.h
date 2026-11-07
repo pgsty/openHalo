@@ -5,7 +5,7 @@
  *
  * This is the external API for the raw lexing/parsing functions.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parser.h
@@ -16,9 +16,6 @@
 #define PARSER_H
 
 #include "nodes/parsenodes.h"
-
-#include "parser/parserapi.h"
-
 
 
 /*
@@ -36,40 +33,33 @@
  * RAW_PARSE_PLPGSQL_ASSIGNn: parse a PL/pgSQL assignment statement,
  * and return a one-element List containing a RawStmt node.  "n"
  * gives the number of dotted names comprising the target ColumnRef.
- *
- * 定义移至parsereng.h
- * typedef enum
- * {
- * 	RAW_PARSE_DEFAULT = 0,
- * 	RAW_PARSE_TYPE_NAME,
- * 	RAW_PARSE_PLPGSQL_EXPR,
- * 	RAW_PARSE_PLPGSQL_ASSIGN1,
- * 	RAW_PARSE_PLPGSQL_ASSIGN2,
- * 	RAW_PARSE_PLPGSQL_ASSIGN3
- * } RawParseMode;
-*/
-
+ */
+typedef enum
+{
+	RAW_PARSE_DEFAULT = 0,
+	RAW_PARSE_TYPE_NAME,
+	RAW_PARSE_PLPGSQL_EXPR,
+	RAW_PARSE_PLPGSQL_ASSIGN1,
+	RAW_PARSE_PLPGSQL_ASSIGN2,
+	RAW_PARSE_PLPGSQL_ASSIGN3,
+} RawParseMode;
 
 /* Values for the backslash_quote GUC */
 typedef enum
 {
 	BACKSLASH_QUOTE_OFF,
 	BACKSLASH_QUOTE_ON,
-	BACKSLASH_QUOTE_SAFE_ENCODING
+	BACKSLASH_QUOTE_SAFE_ENCODING,
 }			BackslashQuoteType;
 
 /* GUC variables in scan.l (every one of these is a bad idea :-() */
-extern int	backslash_quote;
-extern bool escape_string_warning;
+extern PGDLLIMPORT int backslash_quote;
+extern PGDLLIMPORT bool escape_string_warning;
 extern PGDLLIMPORT bool standard_conforming_strings;
+
 
 /* Primary entry point for the raw parsing functions */
 extern List *raw_parser(const char *str, RawParseMode mode);
-
-
-/* Standard Raw Parser */
-extern const ParserRoutine *GetStandardParserEngine(void);
-
 
 /* Utility functions exported by gram.y (perhaps these should be elsewhere) */
 extern List *SystemFuncName(char *name);

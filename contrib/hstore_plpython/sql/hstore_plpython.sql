@@ -1,9 +1,9 @@
-CREATE EXTENSION hstore_plpython2u CASCADE;
+CREATE EXTENSION hstore_plpython3u CASCADE;
 
 
 -- test hstore -> python
 CREATE FUNCTION test1(val hstore) RETURNS int
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 assert isinstance(val, dict)
@@ -16,7 +16,7 @@ SELECT test1('aa=>bb, cc=>NULL'::hstore);
 
 -- the same with the versioned language name
 CREATE FUNCTION test1n(val hstore) RETURNS int
-LANGUAGE plpython2u
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 assert isinstance(val, dict)
@@ -29,7 +29,7 @@ SELECT test1n('aa=>bb, cc=>NULL'::hstore);
 
 -- test that a non-mapping result is correctly rejected
 CREATE FUNCTION test1bad() RETURNS hstore
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 return "foo"
@@ -38,9 +38,74 @@ $$;
 SELECT test1bad();
 
 
+-- A mapping whose items() raises should be reported as an error, not crash
+-- the backend
+CREATE FUNCTION test1broken() RETURNS hstore
+LANGUAGE plpython3u
+TRANSFORM FOR TYPE hstore
+AS $$
+class C(dict):
+    def items(self):
+        raise ValueError('items failed')
+d = C()
+d['x'] = 1
+return d
+$$;
+
+SELECT test1broken();
+
+
+-- Likewise for a mapping whose items() does not return key/value pairs
+CREATE FUNCTION test1malformed() RETURNS hstore
+LANGUAGE plpython3u
+TRANSFORM FOR TYPE hstore
+AS $$
+class C(dict):
+    def items(self):
+        return [42]
+d = C()
+d['x'] = 1
+return d
+$$;
+
+SELECT test1malformed();
+
+
+-- Likewise for a mapping whose items() yields fewer pairs than its length
+CREATE FUNCTION test1short() RETURNS hstore
+LANGUAGE plpython3u
+TRANSFORM FOR TYPE hstore
+AS $$
+class C(dict):
+    def items(self):
+        return []
+d = C()
+d['x'] = 1
+return d
+$$;
+
+SELECT test1short();
+
+
+-- Likewise for a mapping whose __len__() raises
+CREATE FUNCTION test1brokenlen() RETURNS hstore
+LANGUAGE plpython3u
+TRANSFORM FOR TYPE hstore
+AS $$
+class C(dict):
+    def __len__(self):
+        raise ValueError('len failed')
+d = C()
+d['x'] = 1
+return d
+$$;
+
+SELECT test1brokenlen();
+
+
 -- test hstore[] -> python
 CREATE FUNCTION test1arr(val hstore[]) RETURNS int
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 assert(val == [{'aa': 'bb', 'cc': None}, {'dd': 'ee'}])
@@ -52,7 +117,7 @@ SELECT test1arr(array['aa=>bb, cc=>NULL'::hstore, 'dd=>ee']);
 
 -- test python -> hstore
 CREATE FUNCTION test2(a int, b text) RETURNS hstore
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 val = {'a': a, 'b': b, 'c': None}
@@ -67,7 +132,7 @@ SELECT test2(1, 'boo');
 
 -- test python -> hstore[]
 CREATE FUNCTION test2arr() RETURNS hstore[]
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 val = [{'a': 1, 'b': 'boo', 'c': None}, {'d': 2}]
@@ -81,7 +146,7 @@ SELECT test2arr();
 CREATE DOMAIN hstore_foo AS hstore CHECK(VALUE ? 'foo');
 
 CREATE FUNCTION test2dom(fn text) RETURNS hstore_foo
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 return {'a': 1, fn: 'boo', 'c': None}
@@ -93,7 +158,7 @@ SELECT test2dom('bar');  -- fail
 
 -- test as part of prepare/execute
 CREATE FUNCTION test3() RETURNS void
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 rv = plpy.execute("SELECT 'aa=>bb, cc=>NULL'::hstore AS col1")
@@ -114,7 +179,7 @@ INSERT INTO test1 VALUES (1, 'aa=>bb, cc=>NULL');
 SELECT * FROM test1;
 
 CREATE FUNCTION test4() RETURNS trigger
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 TRANSFORM FOR TYPE hstore
 AS $$
 assert(TD["new"] == {'a': 1, 'b': {'aa': 'bb', 'cc': None}})

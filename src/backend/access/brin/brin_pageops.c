@@ -2,7 +2,7 @@
  * brin_pageops.c
  *		Page-handling routines for BRIN indexes
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,7 +19,6 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
-#include "storage/smgr.h"
 #include "utils/rel.h"
 
 /*
@@ -191,10 +190,10 @@ brin_doupdate(Relation idxrel, BlockNumber pagesPerRange,
 			xlrec.offnum = oldoff;
 
 			XLogBeginInsert();
-			XLogRegisterData((char *) &xlrec, SizeOfBrinSamepageUpdate);
+			XLogRegisterData(&xlrec, SizeOfBrinSamepageUpdate);
 
 			XLogRegisterBuffer(0, oldbuf, REGBUF_STANDARD);
-			XLogRegisterBufData(0, (char *) unconstify(BrinTuple *, newtup), newsz);
+			XLogRegisterBufData(0, newtup, newsz);
 
 			recptr = XLogInsert(RM_BRIN_ID, info);
 
@@ -283,10 +282,10 @@ brin_doupdate(Relation idxrel, BlockNumber pagesPerRange,
 			XLogBeginInsert();
 
 			/* new page */
-			XLogRegisterData((char *) &xlrec, SizeOfBrinUpdate);
+			XLogRegisterData(&xlrec, SizeOfBrinUpdate);
 
 			XLogRegisterBuffer(0, newbuf, REGBUF_STANDARD | (extended ? REGBUF_WILL_INIT : 0));
-			XLogRegisterBufData(0, (char *) unconstify(BrinTuple *, newtup), newsz);
+			XLogRegisterBufData(0, newtup, newsz);
 
 			/* revmap page */
 			XLogRegisterBuffer(1, revmapbuf, 0);
@@ -436,10 +435,10 @@ brin_doinsert(Relation idxrel, BlockNumber pagesPerRange,
 		xlrec.offnum = off;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, SizeOfBrinInsert);
+		XLogRegisterData(&xlrec, SizeOfBrinInsert);
 
 		XLogRegisterBuffer(0, *buffer, REGBUF_STANDARD | (extended ? REGBUF_WILL_INIT : 0));
-		XLogRegisterBufData(0, (char *) tup, itemsz);
+		XLogRegisterBufData(0, tup, itemsz);
 
 		XLogRegisterBuffer(1, revmapbuf, 0);
 
@@ -730,6 +729,10 @@ brin_getinsertbuffer(Relation irel, Buffer oldbuf, Size itemsz,
 			 * There's not enough free space in any existing index page,
 			 * according to the FSM: extend the relation to obtain a shiny new
 			 * page.
+			 *
+			 * XXX: It's likely possible to use RBM_ZERO_AND_LOCK here,
+			 * which'd avoid the need to hold the extension lock during buffer
+			 * reclaim.
 			 */
 			if (!RELATION_IS_LOCAL(irel))
 			{
@@ -890,7 +893,11 @@ brin_initialize_empty_new_buffer(Relation idxrel, Buffer buffer)
 	page = BufferGetPage(buffer);
 	brin_page_init(page, BRIN_PAGETYPE_REGULAR);
 	MarkBufferDirty(buffer);
-	log_newpage_buffer(buffer, true);
+
+	/* XLOG stuff */
+	if (RelationNeedsWAL(idxrel))
+		log_newpage_buffer(buffer, true);
+
 	END_CRIT_SECTION();
 
 	/*

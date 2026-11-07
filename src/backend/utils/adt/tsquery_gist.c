@@ -3,7 +3,7 @@
  * tsquery_gist.c
  *	  GiST index support for tsquery
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -16,8 +16,9 @@
 
 #include "access/gist.h"
 #include "access/stratnum.h"
+#include "common/int.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 
 #define GETENTRY(vec,pos) DatumGetTSQuerySign((vec)->vector[pos].key)
 
@@ -109,7 +110,7 @@ gtsquery_same(PG_FUNCTION_ARGS)
 	TSQuerySign b = PG_GETARG_TSQUERYSIGN(1);
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
 
-	*result = (a == b) ? true : false;
+	*result = (a == b);
 
 	PG_RETURN_POINTER(result);
 }
@@ -156,10 +157,8 @@ typedef struct
 static int
 comparecost(const void *a, const void *b)
 {
-	if (((const SPLITCOST *) a)->cost == ((const SPLITCOST *) b)->cost)
-		return 0;
-	else
-		return (((const SPLITCOST *) a)->cost > ((const SPLITCOST *) b)->cost) ? 1 : -1;
+	return pg_cmp_s32(((const SPLITCOST *) a)->cost,
+					  ((const SPLITCOST *) b)->cost);
 }
 
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
@@ -222,7 +221,7 @@ gtsquery_picksplit(PG_FUNCTION_ARGS)
 		size_beta = hemdist(GETENTRY(entryvec, seed_2), GETENTRY(entryvec, j));
 		costvector[j - 1].cost = abs(size_alpha - size_beta);
 	}
-	qsort((void *) costvector, maxoff, sizeof(SPLITCOST), comparecost);
+	qsort(costvector, maxoff, sizeof(SPLITCOST), comparecost);
 
 	for (k = 0; k < maxoff; k++)
 	{

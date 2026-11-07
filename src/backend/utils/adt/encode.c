@@ -3,7 +3,7 @@
  * encode.c
  *	  Various data encoding/decoding things.
  *
- * Copyright (c) 2001-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 
 /*
@@ -144,7 +145,26 @@ binary_decode(PG_FUNCTION_ARGS)
  * HEX
  */
 
-static const char hextbl[] = "0123456789abcdef";
+/*
+ * The hex expansion of each possible byte value (two chars per value).
+ */
+static const char hextbl[512] =
+"000102030405060708090a0b0c0d0e0f"
+"101112131415161718191a1b1c1d1e1f"
+"202122232425262728292a2b2c2d2e2f"
+"303132333435363738393a3b3c3d3e3f"
+"404142434445464748494a4b4c4d4e4f"
+"505152535455565758595a5b5c5d5e5f"
+"606162636465666768696a6b6c6d6e6f"
+"707172737475767778797a7b7c7d7e7f"
+"808182838485868788898a8b8c8d8e8f"
+"909192939495969798999a9b9c9d9e9f"
+"a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+"b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+"c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+"d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+"e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+"f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
 
 static const int8 hexlookup[128] = {
 	-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -164,15 +184,17 @@ hex_encode(const char *src, size_t len, char *dst)
 
 	while (src < end)
 	{
-		*dst++ = hextbl[(*src >> 4) & 0xF];
-		*dst++ = hextbl[*src & 0xF];
+		unsigned char usrc = *((const unsigned char *) src);
+
+		memcpy(dst, &hextbl[2 * usrc], 2);
 		src++;
+		dst += 2;
 	}
 	return (uint64) len * 2;
 }
 
-static inline char
-get_hex(const char *cp)
+static inline bool
+get_hex(const char *cp, char *out)
 {
 	unsigned char c = (unsigned char) *cp;
 	int			res = -1;
@@ -180,17 +202,19 @@ get_hex(const char *cp)
 	if (c < 127)
 		res = hexlookup[c];
 
-	if (res < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid hexadecimal digit: \"%.*s\"",
-						pg_mblen(cp), cp)));
+	*out = (char) res;
 
-	return (char) res;
+	return (res >= 0);
 }
 
 uint64
 hex_decode(const char *src, size_t len, char *dst)
+{
+	return hex_decode_safe(src, len, dst, NULL);
+}
+
+uint64
+hex_decode_safe(const char *src, size_t len, char *dst, Node *escontext)
 {
 	const char *s,
 			   *srcend;
@@ -208,16 +232,23 @@ hex_decode(const char *src, size_t len, char *dst)
 			s++;
 			continue;
 		}
-		v1 = get_hex(s) << 4;
+		if (!get_hex(s, &v1))
+			ereturn(escontext, 0,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid hexadecimal digit: \"%.*s\"",
+							pg_mblen_range(s, srcend), s)));
 		s++;
 		if (s >= srcend)
-			ereport(ERROR,
+			ereturn(escontext, 0,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("invalid hexadecimal data: odd number of digits")));
-
-		v2 = get_hex(s);
+		if (!get_hex(s, &v2))
+			ereturn(escontext, 0,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid hexadecimal digit: \"%.*s\"",
+							pg_mblen_range(s, srcend), s)));
 		s++;
-		*p++ = v1 | v2;
+		*p++ = (v1 << 4) | v2;
 	}
 
 	return p - dst;
@@ -344,7 +375,7 @@ pg_base64_decode(const char *src, size_t len, char *dst)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("invalid symbol \"%.*s\" found while decoding base64 sequence",
-								pg_mblen(s - 1), s - 1)));
+								pg_mblen_range(s - 1, srcend), s - 1)));
 		}
 		/* add it to buffer */
 		buf = (buf << 6) + b;
@@ -375,7 +406,7 @@ static uint64
 pg_base64_enc_len(const char *src, size_t srclen)
 {
 	/* 3 bytes will be converted to 4, linefeed after 76 chars */
-	return ((uint64) srclen + 2) * 4 / 3 + (uint64) srclen / (76 * 3 / 4);
+	return ((uint64) srclen + 2) / 3 * 4 + (uint64) srclen / (76 * 3 / 4);
 }
 
 static uint64

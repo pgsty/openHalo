@@ -4,7 +4,7 @@
  *	  definition of the "type" system catalog (pg_type)
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_type.h
@@ -20,7 +20,7 @@
 
 #include "catalog/genbki.h"
 #include "catalog/objectaddress.h"
-#include "catalog/pg_type_d.h"
+#include "catalog/pg_type_d.h"	/* IWYU pragma: export */
 #include "nodes/nodes.h"
 
 /* ----------------
@@ -227,9 +227,6 @@ CATALOG(pg_type,1247,TypeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(71,TypeRelati
 	 */
 	Oid			typcollation BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_collation);
 
-	/* package type's access modifier */
-	char		typaccess BKI_DEFAULT(n);
-
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 
 	/*
@@ -265,10 +262,11 @@ typedef FormData_pg_type *Form_pg_type;
 
 DECLARE_TOAST(pg_type, 4171, 4172);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_type_oid_index, 2703, on pg_type using btree(oid oid_ops));
-#define TypeOidIndexId	2703
-DECLARE_UNIQUE_INDEX(pg_type_typname_nsp_index, 2704, on pg_type using btree(typname name_ops, typnamespace oid_ops));
-#define TypeNameNspIndexId	2704
+DECLARE_UNIQUE_INDEX_PKEY(pg_type_oid_index, 2703, TypeOidIndexId, pg_type, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_type_typname_nsp_index, 2704, TypeNameNspIndexId, pg_type, btree(typname name_ops, typnamespace oid_ops));
+
+MAKE_SYSCACHE(TYPEOID, pg_type_oid_index, 64);
+MAKE_SYSCACHE(TYPENAMENSP, pg_type_typname_nsp_index, 64);
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 
@@ -299,9 +297,7 @@ DECLARE_UNIQUE_INDEX(pg_type_typname_nsp_index, 2704, on pg_type using btree(typ
 #define  TYPCATEGORY_USER		'U'
 #define  TYPCATEGORY_BITSTRING	'V' /* er ... "varbit"? */
 #define  TYPCATEGORY_UNKNOWN	'X'
-#define  TYPCATEGORY_P_VARRAY	'J'	/* is varray of */
-#define  TYPCATEGORY_P_TABLE	'K'	/* is table of */
-#define  TYPCATEGORY_P_INDEX	'L' /* index by */
+#define  TYPCATEGORY_INTERNAL	'Z'
 
 #define  TYPALIGN_CHAR			'c' /* char alignment (i.e. unaligned) */
 #define  TYPALIGN_SHORT			's' /* short alignment (typically 2 bytes) */
@@ -347,7 +343,6 @@ DECLARE_UNIQUE_INDEX(pg_type_typname_nsp_index, 2704, on pg_type using btree(typ
 #define LSNOID	PG_LSNOID
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
-#define NON_PACKAGE_MEMBER		'n'
 
 
 extern ObjectAddress TypeShellMake(const char *typeName,
@@ -385,8 +380,7 @@ extern ObjectAddress TypeCreate(Oid newTypeOid,
 								int32 typeMod,
 								int32 typNDims,
 								bool typeNotNull,
-								Oid typeCollation,
-								char typeaccess);
+								Oid typeCollation);
 
 extern void GenerateTypeDependencies(HeapTuple typeTuple,
 									 Relation typeCatalog,
@@ -409,4 +403,5 @@ extern bool moveArrayTypeName(Oid typeOid, const char *typeName,
 
 extern char *makeMultirangeTypeName(const char *rangeTypeName,
 									Oid typeNamespace);
+
 #endif							/* PG_TYPE_H */

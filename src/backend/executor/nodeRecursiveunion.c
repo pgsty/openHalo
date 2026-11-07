@@ -7,7 +7,7 @@
  * already seen.  The hash key is computed from the grouping columns.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,10 +18,12 @@
  */
 #include "postgres.h"
 
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeRecursiveunion.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
+
+
 
 /*
  * Initialize the hash table to empty.
@@ -35,19 +37,25 @@ build_hash_table(RecursiveUnionState *rustate)
 	Assert(node->numCols > 0);
 	Assert(node->numGroups > 0);
 
-	rustate->hashtable = BuildTupleHashTableExt(&rustate->ps,
-												desc,
-												node->numCols,
-												node->dupColIdx,
-												rustate->eqfuncoids,
-												rustate->hashfunctions,
-												node->dupCollations,
-												node->numGroups,
-												0,
-												rustate->ps.state->es_query_cxt,
-												rustate->tableContext,
-												rustate->tempContext,
-												false);
+	/*
+	 * If both child plans deliver the same fixed tuple slot type, we can tell
+	 * BuildTupleHashTable to expect that slot type as input.  Otherwise,
+	 * we'll pass NULL denoting that any slot type is possible.
+	 */
+	rustate->hashtable = BuildTupleHashTable(&rustate->ps,
+											 desc,
+											 ExecGetCommonChildSlotOps(&rustate->ps),
+											 node->numCols,
+											 node->dupColIdx,
+											 rustate->eqfuncoids,
+											 rustate->hashfunctions,
+											 node->dupCollations,
+											 node->numGroups,
+											 0,
+											 rustate->ps.state->es_query_cxt,
+											 rustate->tableContext,
+											 rustate->tempContext,
+											 false);
 }
 
 
@@ -113,19 +121,26 @@ ExecRecursiveUnion(PlanState *pstate)
 		slot = ExecProcNode(innerPlan);
 		if (TupIsNull(slot))
 		{
+			Tuplestorestate *swaptemp;
+
 			/* Done if there's nothing in the intermediate table */
 			if (node->intermediate_empty)
 				break;
 
-			/* done with old working table ... */
-			tuplestore_end(node->working_table);
+			/*
+			 * Now we let the intermediate table become the work table.  We
+			 * need a fresh intermediate table, so delete the tuples from the
+			 * current working table and use that as the new intermediate
+			 * table.  This saves a round of free/malloc from creating a new
+			 * tuple store.
+			 */
+			tuplestore_clear(node->working_table);
 
-			/* intermediate table becomes working table */
+			swaptemp = node->working_table;
 			node->working_table = node->intermediate_table;
+			node->intermediate_table = swaptemp;
 
-			/* create new empty intermediate table */
-			node->intermediate_table = tuplestore_begin_heap(false, false,
-															 work_mem);
+			/* mark the intermediate table as empty */
 			node->intermediate_empty = true;
 
 			/* reset the recursive term */
@@ -177,6 +192,7 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	rustate->ps.plan = (Plan *) node;
 	rustate->ps.state = estate;
 	rustate->ps.ExecProcNode = ExecRecursiveUnion;
+
 	rustate->eqfuncoids = NULL;
 	rustate->hashfunctions = NULL;
 	rustate->hashtable = NULL;
@@ -314,7 +330,7 @@ ExecReScanRecursiveUnion(RecursiveUnionState *node)
 
 	/* Release any hashtable storage */
 	if (node->tableContext)
-		MemoryContextResetAndDeleteChildren(node->tableContext);
+		MemoryContextReset(node->tableContext);
 
 	/* Empty hashtable if needed */
 	if (plan->numCols > 0)

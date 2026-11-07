@@ -1,15 +1,15 @@
 #!/usr/bin/perl
 
-# Check that the keyword lists $gram_filename and $kwlist_filename are sane.
+# Check that the keyword lists in gram.y and kwlist.h are sane.
 # Usage: check_keywords.pl gram.y kwlist.h
 
 # src/backend/parser/check_keywords.pl
-# Copyright (c) 2009-2021, PostgreSQL Global Development Group
+# Copyright (c) 2009-2025, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
-my $gram_filename   = $ARGV[0];
+my $gram_filename = $ARGV[0];
 my $kwlist_filename = $ARGV[1];
 
 my $errors = 0;
@@ -47,10 +47,10 @@ $, = ' ';     # set output field separator
 $\ = "\n";    # set output record separator
 
 my %keyword_categories;
-$keyword_categories{'unreserved_keyword'}     = 'UNRESERVED_KEYWORD';
-$keyword_categories{'col_name_keyword'}       = 'COL_NAME_KEYWORD';
+$keyword_categories{'unreserved_keyword'} = 'UNRESERVED_KEYWORD';
+$keyword_categories{'col_name_keyword'} = 'COL_NAME_KEYWORD';
 $keyword_categories{'type_func_name_keyword'} = 'TYPE_FUNC_NAME_KEYWORD';
-$keyword_categories{'reserved_keyword'}       = 'RESERVED_KEYWORD';
+$keyword_categories{'reserved_keyword'} = 'RESERVED_KEYWORD';
 
 open(my $gram, '<', $gram_filename) || die("Could not open : $gram_filename");
 
@@ -168,7 +168,7 @@ while (my ($kcat, $kcat_id) = each(%keyword_categories))
 }
 my %bare_label_keywords = map { $_ => 1 } @bare_label_keywords;
 
-# Now read in $kwlist_filename
+# Now read in kwlist.h
 
 open(my $kwlist, '<', $kwlist_filename)
   || die("Could not open : $kwlist_filename");
@@ -183,7 +183,7 @@ kwlist_line: while (<$kwlist>)
 	if ($line =~ /^PG_KEYWORD\(\"(.*)\", (.*), (.*), (.*)\)/)
 	{
 		my ($kwstring) = $1;
-		my ($kwname)   = $2;
+		my ($kwname) = $2;
 		my ($kwcat_id) = $3;
 		my ($collabel) = $4;
 
@@ -191,7 +191,7 @@ kwlist_line: while (<$kwlist>)
 		if ($kwstring le $prevkwstring)
 		{
 			error
-			  "'$kwstring' after '$prevkwstring' in $kwlist_filename is misplaced";
+			  "'$kwstring' after '$prevkwstring' in kwlist.h is misplaced";
 		}
 		$prevkwstring = $kwstring;
 
@@ -229,25 +229,25 @@ kwlist_line: while (<$kwlist>)
 		{
 			if (!($kwhash{$kwname}))
 			{
-				error "'$kwname' not present in $kwcat_id section of $gram_filename";
+				error "'$kwname' not present in $kwcat_id section of gram.y";
 			}
 			else
 			{
 
 				# Remove it from the hash, so that we can
 				# complain at the end if there's keywords left
-				# that were not found in $kwlist_filename
+				# that were not found in kwlist.h
 				delete $kwhashes{$kwcat_id}->{$kwname};
 			}
 		}
 
-		# Check that the keyword's collabel property matches $gram_filename
+		# Check that the keyword's collabel property matches gram.y
 		if ($collabel eq 'BARE_LABEL')
 		{
 			unless ($bare_label_keywords{$kwname})
 			{
 				error
-				  "'$kwname' is marked as BARE_LABEL in $kwlist_filename, but it is missing from $gram_filename's bare_label_keyword rule";
+				  "'$kwname' is marked as BARE_LABEL in kwlist.h, but it is missing from gram.y's bare_label_keyword rule";
 			}
 		}
 		elsif ($collabel eq 'AS_LABEL')
@@ -255,26 +255,26 @@ kwlist_line: while (<$kwlist>)
 			if ($bare_label_keywords{$kwname})
 			{
 				error
-				  "'$kwname' is marked as AS_LABEL in $kwlist_filename, but it is listed in $gram_filename's bare_label_keyword rule";
+				  "'$kwname' is marked as AS_LABEL in kwlist.h, but it is listed in gram.y's bare_label_keyword rule";
 			}
 		}
 		else
 		{
 			error
-			  "'$collabel' not recognized in $kwlist_filename.  Expected either 'BARE_LABEL' or 'AS_LABEL'";
+			  "'$collabel' not recognized in kwlist.h.  Expected either 'BARE_LABEL' or 'AS_LABEL'";
 		}
 	}
 }
 close $kwlist;
 
-# Check that we've paired up all keywords from $gram_filename with lines in $kwlist_filename
+# Check that we've paired up all keywords from gram.y with lines in kwlist.h
 while (my ($kwcat, $kwcat_id) = each(%keyword_categories))
 {
 	%kwhash = %{ $kwhashes{$kwcat_id} };
 
 	for my $kw (keys %kwhash)
 	{
-		error "'$kw' found in $gram_filename $kwcat category, but not in $kwlist_filename";
+		error "'$kw' found in gram.y $kwcat category, but not in kwlist.h";
 	}
 }
 

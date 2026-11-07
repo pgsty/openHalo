@@ -6,7 +6,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/regress.c
@@ -21,13 +21,13 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
-#include "access/transam.h"
-#include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
+#include "common/pg_lzcompress.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -38,6 +38,7 @@
 #include "optimizer/plancat.h"
 #include "parser/parse_coerce.h"
 #include "port/atomics.h"
+#include "postmaster/postmaster.h"	/* for MAX_BACKENDS */
 #include "storage/spin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -56,22 +57,22 @@
 
 #define EXPECT_EQ_U32(result_expr, expected_expr)	\
 	do { \
-		uint32		result = (result_expr); \
-		uint32		expected = (expected_expr); \
-		if (result != expected) \
+		uint32		actual_result = (result_expr); \
+		uint32		expected_result = (expected_expr); \
+		if (actual_result != expected_result) \
 			elog(ERROR, \
 				 "%s yielded %u, expected %s in file \"%s\" line %u", \
-				 #result_expr, result, #expected_expr, __FILE__, __LINE__); \
+				 #result_expr, actual_result, #expected_expr, __FILE__, __LINE__); \
 	} while (0)
 
 #define EXPECT_EQ_U64(result_expr, expected_expr)	\
 	do { \
-		uint64		result = (result_expr); \
-		uint64		expected = (expected_expr); \
-		if (result != expected) \
+		uint64		actual_result = (result_expr); \
+		uint64		expected_result = (expected_expr); \
+		if (actual_result != expected_result) \
 			elog(ERROR, \
 				 "%s yielded " UINT64_FORMAT ", expected %s in file \"%s\" line %u", \
-				 #result_expr, result, #expected_expr, __FILE__, __LINE__); \
+				 #result_expr, actual_result, #expected_expr, __FILE__, __LINE__); \
 	} while (0)
 
 #define LDELIM			'('
@@ -80,7 +81,10 @@
 
 static void regress_lseg_construct(LSEG *lseg, Point *pt1, Point *pt2);
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "regress",
+					.version = PG_VERSION
+);
 
 
 /* return the point where two paths intersect, or NULL if no intersection. */
@@ -182,6 +186,11 @@ widget_in(PG_FUNCTION_ARGS)
 			coord[i++] = p + 1;
 	}
 
+	/*
+	 * Note: DON'T convert this error to "soft" style (errsave/ereturn).  We
+	 * want this data type to stay permanently in the hard-error world so that
+	 * it can be used for testing that such cases still work reasonably.
+	 */
 	if (i < NARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
@@ -259,227 +268,6 @@ trigger_return_old(PG_FUNCTION_ARGS)
 	return PointerGetDatum(tuple);
 }
 
-#define TTDUMMY_INFINITY	999999
-
-static SPIPlanPtr splan = NULL;
-static bool ttoff = false;
-
-PG_FUNCTION_INFO_V1(ttdummy);
-
-Datum
-ttdummy(PG_FUNCTION_ARGS)
-{
-	TriggerData *trigdata = (TriggerData *) fcinfo->context;
-	Trigger    *trigger;		/* to get trigger name */
-	char	  **args;			/* arguments */
-	int			attnum[2];		/* fnumbers of start/stop columns */
-	Datum		oldon,
-				oldoff;
-	Datum		newon,
-				newoff;
-	Datum	   *cvals;			/* column values */
-	char	   *cnulls;			/* column nulls */
-	char	   *relname;		/* triggered relation name */
-	Relation	rel;			/* triggered relation */
-	HeapTuple	trigtuple;
-	HeapTuple	newtuple = NULL;
-	HeapTuple	rettuple;
-	TupleDesc	tupdesc;		/* tuple description */
-	int			natts;			/* # of attributes */
-	bool		isnull;			/* to know is some column NULL or not */
-	int			ret;
-	int			i;
-
-	if (!CALLED_AS_TRIGGER(fcinfo))
-		elog(ERROR, "ttdummy: not fired by trigger manager");
-	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
-		elog(ERROR, "ttdummy: must be fired for row");
-	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
-		elog(ERROR, "ttdummy: must be fired before event");
-	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-		elog(ERROR, "ttdummy: cannot process INSERT event");
-	if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-		newtuple = trigdata->tg_newtuple;
-
-	trigtuple = trigdata->tg_trigtuple;
-
-	rel = trigdata->tg_relation;
-	relname = SPI_getrelname(rel);
-
-	/* check if TT is OFF for this relation */
-	if (ttoff)					/* OFF - nothing to do */
-	{
-		pfree(relname);
-		return PointerGetDatum((newtuple != NULL) ? newtuple : trigtuple);
-	}
-
-	trigger = trigdata->tg_trigger;
-
-	if (trigger->tgnargs != 2)
-		elog(ERROR, "ttdummy (%s): invalid (!= 2) number of arguments %d",
-			 relname, trigger->tgnargs);
-
-	args = trigger->tgargs;
-	tupdesc = rel->rd_att;
-	natts = tupdesc->natts;
-
-	for (i = 0; i < 2; i++)
-	{
-		attnum[i] = SPI_fnumber(tupdesc, args[i]);
-		if (attnum[i] <= 0)
-			elog(ERROR, "ttdummy (%s): there is no attribute %s",
-				 relname, args[i]);
-		if (SPI_gettypeid(tupdesc, attnum[i]) != INT4OID)
-			elog(ERROR, "ttdummy (%s): attribute %s must be of integer type",
-				 relname, args[i]);
-	}
-
-	oldon = SPI_getbinval(trigtuple, tupdesc, attnum[0], &isnull);
-	if (isnull)
-		elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[0]);
-
-	oldoff = SPI_getbinval(trigtuple, tupdesc, attnum[1], &isnull);
-	if (isnull)
-		elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[1]);
-
-	if (newtuple != NULL)		/* UPDATE */
-	{
-		newon = SPI_getbinval(newtuple, tupdesc, attnum[0], &isnull);
-		if (isnull)
-			elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[0]);
-		newoff = SPI_getbinval(newtuple, tupdesc, attnum[1], &isnull);
-		if (isnull)
-			elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[1]);
-
-		if (oldon != newon || oldoff != newoff)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("ttdummy (%s): you cannot change %s and/or %s columns (use set_ttdummy)",
-							relname, args[0], args[1])));
-
-		if (newoff != TTDUMMY_INFINITY)
-		{
-			pfree(relname);		/* allocated in upper executor context */
-			return PointerGetDatum(NULL);
-		}
-	}
-	else if (oldoff != TTDUMMY_INFINITY)	/* DELETE */
-	{
-		pfree(relname);
-		return PointerGetDatum(NULL);
-	}
-
-	newoff = DirectFunctionCall1(nextval, CStringGetTextDatum("ttdummy_seq"));
-	/* nextval now returns int64; coerce down to int32 */
-	newoff = Int32GetDatum((int32) DatumGetInt64(newoff));
-
-	/* Connect to SPI manager */
-	if ((ret = SPI_connect()) < 0)
-		elog(ERROR, "ttdummy (%s): SPI_connect returned %d", relname, ret);
-
-	/* Fetch tuple values and nulls */
-	cvals = (Datum *) palloc(natts * sizeof(Datum));
-	cnulls = (char *) palloc(natts * sizeof(char));
-	for (i = 0; i < natts; i++)
-	{
-		cvals[i] = SPI_getbinval((newtuple != NULL) ? newtuple : trigtuple,
-								 tupdesc, i + 1, &isnull);
-		cnulls[i] = (isnull) ? 'n' : ' ';
-	}
-
-	/* change date column(s) */
-	if (newtuple)				/* UPDATE */
-	{
-		cvals[attnum[0] - 1] = newoff;	/* start_date eq current date */
-		cnulls[attnum[0] - 1] = ' ';
-		cvals[attnum[1] - 1] = TTDUMMY_INFINITY;	/* stop_date eq INFINITY */
-		cnulls[attnum[1] - 1] = ' ';
-	}
-	else
-		/* DELETE */
-	{
-		cvals[attnum[1] - 1] = newoff;	/* stop_date eq current date */
-		cnulls[attnum[1] - 1] = ' ';
-	}
-
-	/* if there is no plan ... */
-	if (splan == NULL)
-	{
-		SPIPlanPtr	pplan;
-		Oid		   *ctypes;
-		char	   *query;
-
-		/* allocate space in preparation */
-		ctypes = (Oid *) palloc(natts * sizeof(Oid));
-		query = (char *) palloc(100 + 16 * natts);
-
-		/*
-		 * Construct query: INSERT INTO _relation_ VALUES ($1, ...)
-		 */
-		sprintf(query, "INSERT INTO %s VALUES (", relname);
-		for (i = 1; i <= natts; i++)
-		{
-			sprintf(query + strlen(query), "$%d%s",
-					i, (i < natts) ? ", " : ")");
-			ctypes[i - 1] = SPI_gettypeid(tupdesc, i);
-		}
-
-		/* Prepare plan for query */
-		pplan = SPI_prepare(query, natts, ctypes);
-		if (pplan == NULL)
-			elog(ERROR, "ttdummy (%s): SPI_prepare returned %s", relname, SPI_result_code_string(SPI_result));
-
-		if (SPI_keepplan(pplan))
-			elog(ERROR, "ttdummy (%s): SPI_keepplan failed", relname);
-
-		splan = pplan;
-	}
-
-	ret = SPI_execp(splan, cvals, cnulls, 0);
-
-	if (ret < 0)
-		elog(ERROR, "ttdummy (%s): SPI_execp returned %d", relname, ret);
-
-	/* Tuple to return to upper Executor ... */
-	if (newtuple)				/* UPDATE */
-		rettuple = SPI_modifytuple(rel, trigtuple, 1, &(attnum[1]), &newoff, NULL);
-	else						/* DELETE */
-		rettuple = trigtuple;
-
-	SPI_finish();				/* don't forget say Bye to SPI mgr */
-
-	pfree(relname);
-
-	return PointerGetDatum(rettuple);
-}
-
-PG_FUNCTION_INFO_V1(set_ttdummy);
-
-Datum
-set_ttdummy(PG_FUNCTION_ARGS)
-{
-	int32		on = PG_GETARG_INT32(0);
-
-	if (ttoff)					/* OFF currently */
-	{
-		if (on == 0)
-			PG_RETURN_INT32(0);
-
-		/* turn ON */
-		ttoff = false;
-		PG_RETURN_INT32(0);
-	}
-
-	/* ON currently */
-	if (on != 0)
-		PG_RETURN_INT32(1);
-
-	/* turn OFF */
-	ttoff = true;
-
-	PG_RETURN_INT32(1);
-}
-
 
 /*
  * Type int44 has no real-world use, but the regression tests use it
@@ -532,6 +320,16 @@ int44out(PG_FUNCTION_ARGS)
 	PG_RETURN_CSTRING(result);
 }
 
+PG_FUNCTION_INFO_V1(test_canonicalize_path);
+Datum
+test_canonicalize_path(PG_FUNCTION_ARGS)
+{
+	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+
+	canonicalize_path(path);
+	PG_RETURN_TEXT_P(cstring_to_text(path));
+}
+
 PG_FUNCTION_INFO_V1(make_tuple_indirect);
 Datum
 make_tuple_indirect(PG_FUNCTION_ARGS)
@@ -580,7 +378,8 @@ make_tuple_indirect(PG_FUNCTION_ARGS)
 		/* only work on existing, not-null varlenas */
 		if (TupleDescAttr(tupdesc, i)->attisdropped ||
 			nulls[i] ||
-			TupleDescAttr(tupdesc, i)->attlen != -1)
+			TupleDescAttr(tupdesc, i)->attlen != -1 ||
+			TupleDescAttr(tupdesc, i)->attstorage == TYPSTORAGE_PLAIN)
 			continue;
 
 		attr = (struct varlena *) DatumGetPointer(values[i]);
@@ -634,7 +433,9 @@ PG_FUNCTION_INFO_V1(get_environ);
 Datum
 get_environ(PG_FUNCTION_ARGS)
 {
+#if !defined(WIN32) || defined(_MSC_VER)
 	extern char **environ;
+#endif
 	int			nvals = 0;
 	ArrayType  *result;
 	Datum	   *env;
@@ -647,7 +448,7 @@ get_environ(PG_FUNCTION_ARGS)
 	for (int i = 0; i < nvals; i++)
 		env[i] = CStringGetTextDatum(environ[i]);
 
-	result = construct_array(env, nvals, TEXTOID, -1, false, TYPALIGN_INT);
+	result = construct_array_builtin(env, nvals, TEXTOID);
 
 	PG_RETURN_POINTER(result);
 }
@@ -894,91 +695,7 @@ test_spinlock(void)
 		if (memcmp(struct_w_lock.data_after, "ef12", 4) != 0)
 			elog(ERROR, "padding after spinlock modified");
 	}
-
-	/*
-	 * Ensure that allocating more than INT32_MAX emulated spinlocks works.
-	 * That's interesting because the spinlock emulation uses a 32bit integer
-	 * to map spinlocks onto semaphores. There've been bugs...
-	 */
-#ifndef HAVE_SPINLOCKS
-	{
-		/*
-		 * Initialize enough spinlocks to advance counter close to wraparound.
-		 * It's too expensive to perform acquire/release for each, as those
-		 * may be syscalls when the spinlock emulation is used (and even just
-		 * atomic TAS would be expensive).
-		 */
-		for (uint32 i = 0; i < INT32_MAX - 100000; i++)
-		{
-			slock_t		lock;
-
-			SpinLockInit(&lock);
-		}
-
-		for (uint32 i = 0; i < 200000; i++)
-		{
-			slock_t		lock;
-
-			SpinLockInit(&lock);
-
-			SpinLockAcquire(&lock);
-			SpinLockRelease(&lock);
-			SpinLockAcquire(&lock);
-			SpinLockRelease(&lock);
-		}
-	}
-#endif
 }
-
-/*
- * Verify that performing atomic ops inside a spinlock isn't a
- * problem. Realistically that's only going to be a problem when both
- * --disable-spinlocks and --disable-atomics are used, but it's cheap enough
- * to just always test.
- *
- * The test works by initializing enough atomics that we'd conflict if there
- * were an overlap between a spinlock and an atomic by holding a spinlock
- * while manipulating more than NUM_SPINLOCK_SEMAPHORES atomics.
- *
- * NUM_TEST_ATOMICS doesn't really need to be more than
- * NUM_SPINLOCK_SEMAPHORES, but it seems better to test a bit more
- * extensively.
- */
-static void
-test_atomic_spin_nest(void)
-{
-	slock_t		lock;
-#define NUM_TEST_ATOMICS (NUM_SPINLOCK_SEMAPHORES + NUM_ATOMICS_SEMAPHORES + 27)
-	pg_atomic_uint32 atomics32[NUM_TEST_ATOMICS];
-	pg_atomic_uint64 atomics64[NUM_TEST_ATOMICS];
-
-	SpinLockInit(&lock);
-
-	for (int i = 0; i < NUM_TEST_ATOMICS; i++)
-	{
-		pg_atomic_init_u32(&atomics32[i], 0);
-		pg_atomic_init_u64(&atomics64[i], 0);
-	}
-
-	/* just so it's not all zeroes */
-	for (int i = 0; i < NUM_TEST_ATOMICS; i++)
-	{
-		EXPECT_EQ_U32(pg_atomic_fetch_add_u32(&atomics32[i], i), 0);
-		EXPECT_EQ_U64(pg_atomic_fetch_add_u64(&atomics64[i], i), 0);
-	}
-
-	/* test whether we can do atomic op with lock held */
-	SpinLockAcquire(&lock);
-	for (int i = 0; i < NUM_TEST_ATOMICS; i++)
-	{
-		EXPECT_EQ_U32(pg_atomic_fetch_sub_u32(&atomics32[i], i), i);
-		EXPECT_EQ_U32(pg_atomic_read_u32(&atomics32[i]), 0);
-		EXPECT_EQ_U64(pg_atomic_fetch_sub_u64(&atomics64[i], i), i);
-		EXPECT_EQ_U64(pg_atomic_read_u64(&atomics64[i]), 0);
-	}
-	SpinLockRelease(&lock);
-}
-#undef NUM_TEST_ATOMICS
 
 PG_FUNCTION_INFO_V1(test_atomic_ops);
 Datum
@@ -996,8 +713,6 @@ test_atomic_ops(PG_FUNCTION_ARGS)
 	 */
 	test_spinlock();
 
-	test_atomic_spin_nest();
-
 	PG_RETURN_BOOL(true);
 }
 
@@ -1007,6 +722,13 @@ test_fdw_handler(PG_FUNCTION_ARGS)
 {
 	elog(ERROR, "test_fdw_handler is not implemented");
 	PG_RETURN_NULL();
+}
+
+PG_FUNCTION_INFO_V1(is_catalog_text_unique_index_oid);
+Datum
+is_catalog_text_unique_index_oid(PG_FUNCTION_ARGS)
+{
+	return IsCatalogTextUniqueIndexOid(PG_GETARG_OID(0));
 }
 
 PG_FUNCTION_INFO_V1(test_support_func);
@@ -1173,7 +895,7 @@ test_enc_conversion(PG_FUNCTION_ARGS)
 	int			convertedbytes;
 	int			dstlen;
 	Datum		values[2];
-	bool		nulls[2];
+	bool		nulls[2] = {0};
 	HeapTuple	tuple;
 
 	if (src_encoding < 0)
@@ -1262,12 +984,150 @@ test_enc_conversion(PG_FUNCTION_ARGS)
 		pfree(dst);
 	}
 
-	MemSet(nulls, 0, sizeof(nulls));
 	values[0] = Int32GetDatum(convertedbytes);
 	values[1] = PointerGetDatum(retval);
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/* Convert bytea to text without validation for corruption tests from SQL. */
+PG_FUNCTION_INFO_V1(test_bytea_to_text);
+Datum
+test_bytea_to_text(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(PG_GETARG_BYTEA_PP(0));
+}
+
+/* And the reverse. */
+PG_FUNCTION_INFO_V1(test_text_to_bytea);
+Datum
+test_text_to_bytea(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BYTEA_P(PG_GETARG_TEXT_PP(0));
+}
+
+/* Corruption tests in C. */
+PG_FUNCTION_INFO_V1(test_mblen_func);
+Datum
+test_mblen_func(PG_FUNCTION_ARGS)
+{
+	const char *func = text_to_cstring(PG_GETARG_BYTEA_PP(0));
+	const char *encoding = text_to_cstring(PG_GETARG_BYTEA_PP(1));
+	text	   *string = PG_GETARG_BYTEA_PP(2);
+	int			offset = PG_GETARG_INT32(3);
+	const char *data = VARDATA_ANY(string);
+	size_t		size = VARSIZE_ANY_EXHDR(string);
+	int			result = 0;
+
+	if (strcmp(func, "pg_mblen_unbounded") == 0)
+		result = pg_mblen_unbounded(data + offset);
+	else if (strcmp(func, "pg_mblen_cstr") == 0)
+		result = pg_mblen_cstr(data + offset);
+	else if (strcmp(func, "pg_mblen_with_len") == 0)
+		result = pg_mblen_with_len(data + offset, size - offset);
+	else if (strcmp(func, "pg_mblen_range") == 0)
+		result = pg_mblen_range(data + offset, data + size);
+	else if (strcmp(func, "pg_encoding_mblen") == 0)
+		result = pg_encoding_mblen(pg_char_to_encoding(encoding), data + offset);
+	else
+		elog(ERROR, "unknown function");
+
+	PG_RETURN_INT32(result);
+}
+
+PG_FUNCTION_INFO_V1(test_text_to_wchars);
+Datum
+test_text_to_wchars(PG_FUNCTION_ARGS)
+{
+	const char *encoding_name = text_to_cstring(PG_GETARG_BYTEA_PP(0));
+	text	   *string = PG_GETARG_TEXT_PP(1);
+	const char *data = VARDATA_ANY(string);
+	size_t		size = VARSIZE_ANY_EXHDR(string);
+	pg_wchar   *wchars = palloc(sizeof(pg_wchar) * (size + 1));
+	Datum	   *datums;
+	int			wlen;
+	int			encoding;
+
+	encoding = pg_char_to_encoding(encoding_name);
+	if (encoding < 0)
+		elog(ERROR, "unknown encoding name: %s", encoding_name);
+
+	if (size > 0)
+	{
+		datums = palloc(sizeof(Datum) * size);
+		wlen = pg_encoding_mb2wchar_with_len(encoding,
+											 data,
+											 wchars,
+											 size);
+		Assert(wlen >= 0);
+		Assert(wlen <= size);
+		Assert(wchars[wlen] == 0);
+
+		for (int i = 0; i < wlen; ++i)
+			datums[i] = UInt32GetDatum(wchars[i]);
+	}
+	else
+	{
+		datums = NULL;
+		wlen = 0;
+	}
+
+	PG_RETURN_ARRAYTYPE_P(construct_array_builtin(datums, wlen, INT4OID));
+}
+
+PG_FUNCTION_INFO_V1(test_wchars_to_text);
+Datum
+test_wchars_to_text(PG_FUNCTION_ARGS)
+{
+	const char *encoding_name = text_to_cstring(PG_GETARG_BYTEA_PP(0));
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(1);
+	Datum	   *datums;
+	bool	   *nulls;
+	char	   *mb;
+	text	   *result;
+	int			wlen;
+	int			bytes;
+	int			encoding;
+
+	encoding = pg_char_to_encoding(encoding_name);
+	if (encoding < 0)
+		elog(ERROR, "unknown encoding name: %s", encoding_name);
+
+	deconstruct_array_builtin(array, INT4OID, &datums, &nulls, &wlen);
+
+	if (wlen > 0)
+	{
+		pg_wchar   *wchars = palloc(sizeof(pg_wchar) * wlen);
+
+		for (int i = 0; i < wlen; ++i)
+		{
+			if (nulls[i])
+				elog(ERROR, "unexpected NULL in array");
+			wchars[i] = DatumGetInt32(datums[i]);
+		}
+
+		mb = palloc(pg_encoding_max_length(encoding) * wlen + 1);
+		bytes = pg_encoding_wchar2mb_with_len(encoding, wchars, mb, wlen);
+	}
+	else
+	{
+		mb = "";
+		bytes = 0;
+	}
+
+	result = palloc(bytes + VARHDRSZ);
+	SET_VARSIZE(result, bytes + VARHDRSZ);
+	memcpy(VARDATA(result), mb, bytes);
+
+	PG_RETURN_TEXT_P(result);
+}
+
+PG_FUNCTION_INFO_V1(test_valid_server_encoding);
+Datum
+test_valid_server_encoding(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(pg_valid_server_encoding(text_to_cstring(PG_GETARG_TEXT_PP(0))) >= 0);
 }
 
 /* Provide SQL access to IsBinaryCoercible() */
@@ -1279,4 +1139,97 @@ binary_coercible(PG_FUNCTION_ARGS)
 	Oid			targettype = PG_GETARG_OID(1);
 
 	PG_RETURN_BOOL(IsBinaryCoercible(srctype, targettype));
+}
+
+/*
+ * Sanity checks for functions in relpath.h
+ */
+PG_FUNCTION_INFO_V1(test_relpath);
+Datum
+test_relpath(PG_FUNCTION_ARGS)
+{
+	RelPathStr	rpath;
+
+	/*
+	 * Verify that PROCNUMBER_CHARS and MAX_BACKENDS stay in sync.
+	 * Unfortunately I don't know how to express that in a way suitable for a
+	 * static assert.
+	 */
+	if ((int) ceil(log10(MAX_BACKENDS)) != PROCNUMBER_CHARS)
+		elog(WARNING, "mismatch between MAX_BACKENDS and PROCNUMBER_CHARS");
+
+	/* verify that the max-length relpath is generated ok */
+	rpath = GetRelationPath(OID_MAX, OID_MAX, OID_MAX, MAX_BACKENDS - 1,
+							INIT_FORKNUM);
+
+	if (strlen(rpath.str) != REL_PATH_STR_MAXLEN)
+		elog(WARNING, "maximum length relpath is if length %zu instead of %zu",
+			 strlen(rpath.str), REL_PATH_STR_MAXLEN);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * test_pglz_compress
+ *
+ * Compress the input using pglz_compress().  Only the "always" strategy is
+ * currently supported.
+ *
+ * Returns the compressed data, or NULL if compression fails.
+ */
+PG_FUNCTION_INFO_V1(test_pglz_compress);
+Datum
+test_pglz_compress(PG_FUNCTION_ARGS)
+{
+	bytea	   *input = PG_GETARG_BYTEA_PP(0);
+	char	   *source = VARDATA_ANY(input);
+	int32		slen = VARSIZE_ANY_EXHDR(input);
+	int32		maxout = PGLZ_MAX_OUTPUT(slen);
+	bytea	   *result;
+	int32		clen;
+
+	result = (bytea *) palloc(maxout + VARHDRSZ);
+	clen = pglz_compress(source, slen, VARDATA(result),
+						 PGLZ_strategy_always);
+	if (clen < 0)
+		PG_RETURN_NULL();
+
+	SET_VARSIZE(result, clen + VARHDRSZ);
+	PG_RETURN_BYTEA_P(result);
+}
+
+/*
+ * test_pglz_decompress
+ *
+ * Decompress the input using pglz_decompress().
+ *
+ * The second argument is the expected uncompressed data size.  The third
+ * argument is here for the check_complete flag.
+ *
+ * Returns the decompressed data, or raises an error if decompression fails.
+ */
+PG_FUNCTION_INFO_V1(test_pglz_decompress);
+Datum
+test_pglz_decompress(PG_FUNCTION_ARGS)
+{
+	bytea	   *input = PG_GETARG_BYTEA_PP(0);
+	int32		rawsize = PG_GETARG_INT32(1);
+	bool		check_complete = PG_GETARG_BOOL(2);
+	char	   *source = VARDATA_ANY(input);
+	int32		slen = VARSIZE_ANY_EXHDR(input);
+	bytea	   *result;
+	int32		dlen;
+
+	if (rawsize < 0)
+		elog(ERROR, "rawsize must not be negative");
+
+	result = (bytea *) palloc(rawsize + VARHDRSZ);
+
+	dlen = pglz_decompress(source, slen, VARDATA(result),
+						   rawsize, check_complete);
+	if (dlen < 0)
+		elog(ERROR, "pglz_decompress failed");
+
+	SET_VARSIZE(result, dlen + VARHDRSZ);
+	PG_RETURN_BYTEA_P(result);
 }

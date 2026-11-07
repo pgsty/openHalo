@@ -3,7 +3,7 @@
  * scansup.c
  *	  scanner support routines used by the core lexer
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,9 +18,6 @@
 
 #include "mb/pg_wchar.h"
 #include "parser/scansup.h"
-#include "miscadmin.h"
-#include "utils/elog.h"
-#include "libpq/libpq-be.h"
 
 
 /*
@@ -68,12 +65,12 @@ downcase_identifier(const char *ident, int len, bool warn, bool truncate)
 	{
 		unsigned char ch = (unsigned char) ident[i];
 
-        if (ch >= 'A' && ch <= 'Z')
-            ch += 'a' - 'A';
-        else if (enc_is_single_byte && IS_HIGHBIT_SET(ch) && isupper(ch))
-            ch = tolower(ch);
-        result[i] = (char) ch;
-    }
+		if (ch >= 'A' && ch <= 'Z')
+			ch += 'a' - 'A';
+		else if (enc_is_single_byte && IS_HIGHBIT_SET(ch) && isupper(ch))
+			ch = tolower(ch);
+		result[i] = (char) ch;
+	}
 	result[i] = '\0';
 
 	if (i >= NAMEDATALEN && truncate)
@@ -124,6 +121,7 @@ scanner_isspace(char ch)
 		ch == '\t' ||
 		ch == '\n' ||
 		ch == '\r' ||
+		ch == '\v' ||
 		ch == '\f')
 		return true;
 	return false;

@@ -10,8 +10,7 @@
  * analyze.c and related files.
  *
  *
- * Portions Copyright (c) 2021, Halo Tech Co.,Ltd. 
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,80 +21,25 @@
 
 #include "postgres.h"
 
+#include "gramparse.h"
 #include "mb/pg_wchar.h"
-#include "parser/gramparse.h"
 #include "parser/parser.h"
-
-#include "parser/parsereng.h"
-
 #include "parser/scansup.h"
-
-
-const ParserRoutine *GetStandardParserEngine(void);	/* Get Standard Parser Engine */
-
 
 static bool check_uescapechar(unsigned char escape);
 static char *str_udeescape(const char *str, char escape,
 						   int position, core_yyscan_t yyscanner);
 
-static List *standard_raw_parser(const char *str, RawParseMode mode);
-static const ParserRoutine standard_parser_engine;
-
-
 
 /*
  * raw_parser
- *		Do lexical and grammatical analysis.
- *
- * Returns a list of raw (un-analyzed) parse trees.
- */
-List *
-raw_parser(const char *str, RawParseMode mode)
-{
-	List *raw_parsetree = NIL;
-	MemoryContext	oldctx = CurrentMemoryContext;
-
-	if (parserengine == NULL)
-		parserengine = GetStandardParserEngine();
-
-	Assert(parserengine != NULL);
-	Assert(parserengine->raw_parser != NULL);
-
-	PG_TRY();
-	{
-		raw_parsetree = parserengine->raw_parser(str, mode);
-	}
-	PG_CATCH();
-	{
-		if (raw_parsetree == NIL && parserengine->is_standard_parser == false
-			&& (standard_parserengine_auxiliary == STANDARDARD_PARSERENGINE_AUXILIARY_ON 
-				&& parserengine->need_standard_parser == true))
-		{
-			MemoryContextSwitchTo(oldctx);
-			FlushErrorState();
-			MemoryContextSwitchTo(oldctx);
-
-			raw_parsetree = GetStandardParserEngine()->raw_parser(str, mode);
-		}
-		else
-			PG_RE_THROW();
-	}
-	PG_END_TRY();
-	return raw_parsetree;
-}
-
-
-/*
- * standard_raw_parser
  *		Given a query in string form, do lexical and grammatical analysis.
  *
  * Returns a list of raw (un-analyzed) parse trees.  The contents of the
  * list have the form required by the specified RawParseMode.
  */
-
-static List *
-standard_raw_parser(const char *str, RawParseMode mode)
-
+List *
+raw_parser(const char *str, RawParseMode mode)
 {
 	core_yyscan_t yyscanner;
 	base_yy_extra_type yyextra;
@@ -112,12 +56,12 @@ standard_raw_parser(const char *str, RawParseMode mode)
 	{
 		/* this array is indexed by RawParseMode enum */
 		static const int mode_token[] = {
-			0,					/* RAW_PARSE_DEFAULT */
-			MODE_TYPE_NAME,		/* RAW_PARSE_TYPE_NAME */
-			MODE_PLPGSQL_EXPR,	/* RAW_PARSE_PLPGSQL_EXPR */
-			MODE_PLPGSQL_ASSIGN1,	/* RAW_PARSE_PLPGSQL_ASSIGN1 */
-			MODE_PLPGSQL_ASSIGN2,	/* RAW_PARSE_PLPGSQL_ASSIGN2 */
-			MODE_PLPGSQL_ASSIGN3	/* RAW_PARSE_PLPGSQL_ASSIGN3 */
+			[RAW_PARSE_DEFAULT] = 0,
+			[RAW_PARSE_TYPE_NAME] = MODE_TYPE_NAME,
+			[RAW_PARSE_PLPGSQL_EXPR] = MODE_PLPGSQL_EXPR,
+			[RAW_PARSE_PLPGSQL_ASSIGN1] = MODE_PLPGSQL_ASSIGN1,
+			[RAW_PARSE_PLPGSQL_ASSIGN2] = MODE_PLPGSQL_ASSIGN2,
+			[RAW_PARSE_PLPGSQL_ASSIGN3] = MODE_PLPGSQL_ASSIGN3,
 		};
 
 		yyextra.have_lookahead = true;
@@ -193,6 +137,9 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 	 */
 	switch (cur_token)
 	{
+		case FORMAT:
+			cur_token_length = 6;
+			break;
 		case NOT:
 			cur_token_length = 3;
 			break;
@@ -205,6 +152,9 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 		case UIDENT:
 		case USCONST:
 			cur_token_length = strlen(yyextra->core_yy_extra.scanbuf + *llocp);
+			break;
+		case WITHOUT:
+			cur_token_length = 7;
 			break;
 		default:
 			return cur_token;
@@ -244,6 +194,16 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 	/* Replace cur_token if needed, based on lookahead */
 	switch (cur_token)
 	{
+		case FORMAT:
+			/* Replace FORMAT by FORMAT_LA if it's followed by JSON */
+			switch (next_token)
+			{
+				case JSON:
+					cur_token = FORMAT_LA;
+					break;
+			}
+			break;
+
 		case NOT:
 			/* Replace NOT by NOT_LA if it's followed by BETWEEN, IN, etc */
 			switch (next_token)
@@ -276,6 +236,16 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 				case TIME:
 				case ORDINALITY:
 					cur_token = WITH_LA;
+					break;
+			}
+			break;
+
+		case WITHOUT:
+			/* Replace WITHOUT by WITHOUT_LA if it's followed by TIME */
+			switch (next_token)
+			{
+				case TIME:
+					cur_token = WITHOUT_LA;
 					break;
 			}
 			break;
@@ -352,44 +322,6 @@ base_yylex(YYSTYPE *lvalp, YYLTYPE *llocp, core_yyscan_t yyscanner)
 
 	return cur_token;
 }
-
-
-/*
- * 定义Standard Parser Engine
- */
-static const ParserRoutine standard_parser_engine = {
-	.type = T_ParserRoutine,
-	.is_standard_parser = true,
-	.need_standard_parser = false,
-
-	.keywordlist = &ScanKeywords,
-	.keyword_tokens = ScanKeywordTokens,
-	.keyword_categories = ScanKeywordCategories,
-
-	.raw_parser = standard_raw_parser,
-	.transformStmt = NULL,
-	.transformSelectStmt = NULL,
-	.transformInsertStmt = NULL,
-	.transformDeleteStmt = NULL,
-	.transformUpdateStmt = NULL,
-	.transformSetOperationStmt = NULL,
-	.transformCallStmt = NULL,
-	.transformOptionalSelectInto = NULL,
-	.transformSetOperationTree = NULL,
-	.transformGroupClause = NULL,
-	.transformDistinctClause = NULL,
-	.transformOnConflictArbiter = NULL,
-	.transformExpr = NULL,
-	.transformCreateStmt = NULL,
-	.transformAlterTableStmt = NULL
-};
-
-const ParserRoutine *
-GetStandardParserEngine(void)
-{
-	return &standard_parser_engine;
-}
-
 
 /* convert hex digit (caller should have verified that) to value */
 static unsigned int

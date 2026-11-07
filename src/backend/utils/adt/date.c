@@ -3,7 +3,7 @@
  * date.c
  *	  implements DATE and TIME data types specified in SQL standard
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
@@ -22,21 +22,19 @@
 #include <time.h>
 
 #include "access/xact.h"
+#include "catalog/pg_type.h"
 #include "common/hashfn.h"
+#include "common/int.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/supportnodes.h"
 #include "parser/scansup.h"
-
-#include "libpq/libpq-be.h"
-#include "parser/parsereng.h"
-#include "utils/adtext.h"
-
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/numeric.h"
+#include "utils/skipsupport.h"
 #include "utils/sortsupport.h"
 
 /*
@@ -100,7 +98,7 @@ anytime_typmodout(bool istz, int32 typmod)
 	if (typmod >= 0)
 		return psprintf("(%d)%s", (int) typmod, tz);
 	else
-		return psprintf("%s", tz);
+		return pstrdup(tz);
 }
 
 
@@ -116,6 +114,7 @@ Datum
 date_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
+	Node	   *escontext = fcinfo->context;
 	DateADT		date;
 	fsec_t		fsec;
 	struct pg_tm tt,
@@ -127,21 +126,18 @@ date_in(PG_FUNCTION_ARGS)
 	char	   *field[MAXDATEFIELDS];
 	int			ftype[MAXDATEFIELDS];
 	char		workbuf[MAXDATELEN + 1];
-
-    if (adtext != NULL)
-    {
-		if (adtext->date_in != NULL)
-		{
-			return adtext->date_in(fcinfo);
-		}
-    }
+	DateTimeErrorExtra extra;
 
 	dterr = ParseDateTime(str, workbuf, sizeof(workbuf),
 						  field, ftype, MAXDATEFIELDS, &nf);
 	if (dterr == 0)
-		dterr = DecodeDateTime(field, ftype, nf, &dtype, tm, &fsec, &tzp);
+		dterr = DecodeDateTime(field, ftype, nf,
+							   &dtype, tm, &fsec, &tzp, &extra);
 	if (dterr != 0)
-		DateTimeParseError(dterr, str, "date");
+	{
+		DateTimeParseError(dterr, &extra, str, "date", escontext);
+		PG_RETURN_NULL();
+	}
 
 	switch (dtype)
 	{
@@ -161,13 +157,13 @@ date_in(PG_FUNCTION_ARGS)
 			PG_RETURN_DATEADT(date);
 
 		default:
-			DateTimeParseError(DTERR_BAD_FORMAT, str, "date");
-			break;
+			DateTimeParseError(DTERR_BAD_FORMAT, &extra, str, "date", escontext);
+			PG_RETURN_NULL();
 	}
 
 	/* Prevent overflow in Julian-day routines */
 	if (!IS_VALID_JULIAN(tm->tm_year, tm->tm_mon, tm->tm_mday))
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("date out of range: \"%s\"", str)));
 
@@ -175,7 +171,7 @@ date_in(PG_FUNCTION_ARGS)
 
 	/* Now check for just-out-of-range dates */
 	if (!IS_VALID_DATE(date))
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
 				 errmsg("date out of range: \"%s\"", str)));
 
@@ -261,8 +257,15 @@ make_date(PG_FUNCTION_ARGS)
 	/* Handle negative years as BC */
 	if (tm.tm_year < 0)
 	{
+		int			year = tm.tm_year;
+
 		bc = true;
-		tm.tm_year = -tm.tm_year;
+		if (pg_neg_s32_overflow(year, &year))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_FIELD_OVERFLOW),
+					 errmsg("date field value out of range: %d-%02d-%02d",
+							tm.tm_year, tm.tm_mon, tm.tm_mday)));
+		tm.tm_year = year;
 	}
 
 	dterr = ValidateDate(DTK_DATE_M, false, false, bc, &tm);
@@ -360,29 +363,6 @@ GetSQLCurrentTime(int32 typmod)
 	return result;
 }
 
-
-/*
- * GetSQLCurrentTimeZone -- implements CURRENT_TIME
- */
-TimeTzADT *
-GetSQLCurrentTimeZone(int32 typmod)
-{
-	TimeTzADT  *result;
-	struct pg_tm tt,
-			   *tm = &tt;
-	fsec_t		fsec;
-	int			tz;
-
-	GetCurrentTimeUsec(tm, &fsec, &tz);
-
-	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
-	result->time = -1;/*As an identifier of "timezone" type*/
-	result->zone = tz;
-	AdjustTimeForTypmod(&(result->time), typmod);
-	return result;
-}
-
-
 /*
  * GetSQLLocalTime -- implements LOCALTIME, LOCALTIME(n)
  */
@@ -474,26 +454,70 @@ date_cmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(0);
 }
 
-static int
-date_fastcmp(Datum x, Datum y, SortSupport ssup)
-{
-	DateADT		a = DatumGetDateADT(x);
-	DateADT		b = DatumGetDateADT(y);
-
-	if (a < b)
-		return -1;
-	else if (a > b)
-		return 1;
-	return 0;
-}
-
 Datum
 date_sortsupport(PG_FUNCTION_ARGS)
 {
 	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = date_fastcmp;
+	ssup->comparator = ssup_datum_int32_cmp;
 	PG_RETURN_VOID();
+}
+
+static Datum
+date_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	DateADT		dexisting = DatumGetDateADT(existing);
+
+	if (dexisting == DATEVAL_NOBEGIN)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return DateADTGetDatum(dexisting - 1);
+}
+
+static Datum
+date_increment(Relation rel, Datum existing, bool *overflow)
+{
+	DateADT		dexisting = DatumGetDateADT(existing);
+
+	if (dexisting == DATEVAL_NOEND)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return DateADTGetDatum(dexisting + 1);
+}
+
+Datum
+date_skipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = date_decrement;
+	sksup->increment = date_increment;
+	sksup->low_elem = DateADTGetDatum(DATEVAL_NOBEGIN);
+	sksup->high_elem = DateADTGetDatum(DATEVAL_NOEND);
+
+	PG_RETURN_VOID();
+}
+
+Datum
+hashdate(PG_FUNCTION_ARGS)
+{
+	return hash_uint32(PG_GETARG_DATEADT(0));
+}
+
+Datum
+hashdateextended(PG_FUNCTION_ARGS)
+{
+	return hash_uint32_extended(PG_GETARG_DATEADT(0), PG_GETARG_INT64(1));
 }
 
 Datum
@@ -1160,8 +1184,8 @@ extract_date(PG_FUNCTION_ARGS)
 			default:
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("date units \"%s\" not supported",
-								lowunits)));
+						 errmsg("unit \"%s\" not supported for type %s",
+								lowunits, format_type_be(DATEOID))));
 		}
 	}
 	else if (type == UNITS)
@@ -1243,8 +1267,8 @@ extract_date(PG_FUNCTION_ARGS)
 			default:
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("date units \"%s\" not supported",
-								lowunits)));
+						 errmsg("unit \"%s\" not supported for type %s",
+								lowunits, format_type_be(DATEOID))));
 				intresult = 0;
 		}
 	}
@@ -1259,8 +1283,8 @@ extract_date(PG_FUNCTION_ARGS)
 			default:
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("date units \"%s\" not supported",
-								lowunits)));
+						 errmsg("unit \"%s\" not supported for type %s",
+								lowunits, format_type_be(DATEOID))));
 				intresult = 0;
 		}
 	}
@@ -1268,7 +1292,8 @@ extract_date(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("date units \"%s\" not recognized", lowunits)));
+				 errmsg("unit \"%s\" not recognized for type %s",
+						lowunits, format_type_be(DATEOID))));
 		intresult = 0;
 	}
 
@@ -1410,15 +1435,15 @@ timestamptz_date(PG_FUNCTION_ARGS)
  *	 Time ADT
  *****************************************************************************/
 
-static TimeADT
-standard_pre_time_in(PG_FUNCTION_ARGS)
+Datum
+time_in(PG_FUNCTION_ARGS)
 {
-    char	   *str = PG_GETARG_CSTRING(0);
-
+	char	   *str = PG_GETARG_CSTRING(0);
 #ifdef NOT_USED
 	Oid			typelem = PG_GETARG_OID(1);
 #endif
 	int32		typmod = PG_GETARG_INT32(2);
+	Node	   *escontext = fcinfo->context;
 	TimeADT		result;
 	fsec_t		fsec;
 	struct pg_tm tt,
@@ -1430,41 +1455,21 @@ standard_pre_time_in(PG_FUNCTION_ARGS)
 	char	   *field[MAXDATEFIELDS];
 	int			dtype;
 	int			ftype[MAXDATEFIELDS];
+	DateTimeErrorExtra extra;
 
 	dterr = ParseDateTime(str, workbuf, sizeof(workbuf),
 						  field, ftype, MAXDATEFIELDS, &nf);
 	if (dterr == 0)
-		dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, &fsec, &tz);
+		dterr = DecodeTimeOnly(field, ftype, nf,
+							   &dtype, tm, &fsec, &tz, &extra);
 	if (dterr != 0)
-		DateTimeParseError(dterr, str, "time");
+	{
+		DateTimeParseError(dterr, &extra, str, "time", escontext);
+		PG_RETURN_NULL();
+	}
 
 	tm2time(tm, fsec, &result);
 	AdjustTimeForTypmod(&result, typmod);
-
-    return result;
-}
-
-
-Datum
-time_in(PG_FUNCTION_ARGS)
-{
-    TimeADT result;
-
-    if (adtext != NULL)
-    {
-        if (adtext->pre_time_in != NULL)
-        {
-            result = adtext->pre_time_in(fcinfo);
-        }
-        else 
-        {
-            result = standard_pre_time_in(fcinfo);
-        }
-    }
-    else
-    {
-        result = standard_pre_time_in(fcinfo);
-    }
 
 	PG_RETURN_TIMEADT(result);
 }
@@ -1486,19 +1491,6 @@ tm2time(struct pg_tm *tm, fsec_t fsec, TimeADT *result)
 bool
 time_overflows(int hour, int min, int sec, fsec_t fsec)
 {
-    
-    if ((MyProcPort != NULL) && 
-        (nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol))
-    {
-        /* mys_adtext->mys_pre_time_in已经做过检查 */
-        return false;
-    }
-    else
-    {
-        /* Nothing to do */
-    }
-    
-
 	/* Range-check the fields individually. */
 	if (hour < 0 || hour > HOURS_PER_DAY ||
 		min < 0 || min >= MINS_PER_HOUR ||
@@ -1555,9 +1547,7 @@ float_time_overflows(int hour, int min, double sec)
 /* time2tm()
  * Convert time data type to POSIX time structure.
  *
- * For dates within the range of pg_time_t, convert to the local time zone.
- * If out of this range, leave as UTC (in practice that could only happen
- * if pg_time_t is just 32 bits) - thomas 97/05/27
+ * Note that only the hour/min/sec/fractional-sec fields are filled in.
  */
 int
 time2tm(TimeADT time, struct pg_tm *tm, fsec_t *fsec)
@@ -1572,11 +1562,10 @@ time2tm(TimeADT time, struct pg_tm *tm, fsec_t *fsec)
 	return 0;
 }
 
-
-static char *
-standard_post_time_out(PG_FUNCTION_ARGS)
+Datum
+time_out(PG_FUNCTION_ARGS)
 {
-    TimeADT		time = PG_GETARG_TIMEADT(0);
+	TimeADT		time = PG_GETARG_TIMEADT(0);
 	char	   *result;
 	struct pg_tm tt,
 			   *tm = &tt;
@@ -1587,32 +1576,6 @@ standard_post_time_out(PG_FUNCTION_ARGS)
 	EncodeTimeOnly(tm, fsec, false, 0, DateStyle, buf);
 
 	result = pstrdup(buf);
-
-    return result;
-}
-
-
-Datum
-time_out(PG_FUNCTION_ARGS)
-{
-	char *result;
-
-    if (adtext != NULL)
-    {
-        if (adtext->post_time_out != NULL)
-        {
-            result = adtext->post_time_out(fcinfo);
-        }
-        else
-        {
-            result = standard_post_time_out(fcinfo);
-        }
-    }
-    else
-    {
-        result = standard_post_time_out(fcinfo);
-    }
-
 	PG_RETURN_CSTRING(result);
 }
 
@@ -2115,19 +2078,15 @@ interval_time(PG_FUNCTION_ARGS)
 {
 	Interval   *span = PG_GETARG_INTERVAL_P(0);
 	TimeADT		result;
-	int64		days;
 
-	result = span->time;
-	if (result >= USECS_PER_DAY)
-	{
-		days = result / USECS_PER_DAY;
-		result -= days * USECS_PER_DAY;
-	}
-	else if (result < 0)
-	{
-		days = (-result + USECS_PER_DAY - 1) / USECS_PER_DAY;
-		result += days * USECS_PER_DAY;
-	}
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot convert infinite interval to time")));
+
+	result = span->time % USECS_PER_DAY;
+	if (result < 0)
+		result += USECS_PER_DAY;
 
 	PG_RETURN_TIMEADT(result);
 }
@@ -2161,6 +2120,11 @@ time_pl_interval(PG_FUNCTION_ARGS)
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeADT		result;
 
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot add infinite interval to time")));
+
 	result = time + span->time;
 	result -= result / USECS_PER_DAY * USECS_PER_DAY;
 	if (result < INT64CONST(0))
@@ -2178,6 +2142,11 @@ time_mi_interval(PG_FUNCTION_ARGS)
 	TimeADT		time = PG_GETARG_TIMEADT(0);
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeADT		result;
+
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot subtract infinite interval from time")));
 
 	result = time - span->time;
 	result -= result / USECS_PER_DAY * USECS_PER_DAY;
@@ -2202,7 +2171,8 @@ in_range_time_interval(PG_FUNCTION_ARGS)
 
 	/*
 	 * Like time_pl_interval/time_mi_interval, we disregard the month and day
-	 * fields of the offset.  So our test for negative should too.
+	 * fields of the offset.  So our test for negative should too.  This also
+	 * catches -infinity, so we only need worry about +infinity below.
 	 */
 	if (offset->time < 0)
 		ereport(ERROR,
@@ -2212,13 +2182,14 @@ in_range_time_interval(PG_FUNCTION_ARGS)
 	/*
 	 * We can't use time_pl_interval/time_mi_interval here, because their
 	 * wraparound behavior would give wrong (or at least undesirable) answers.
-	 * Fortunately the equivalent non-wrapping behavior is trivial, especially
-	 * since we don't worry about integer overflow.
+	 * Fortunately the equivalent non-wrapping behavior is trivial, except
+	 * that adding an infinite (or very large) interval might cause integer
+	 * overflow.  Subtraction cannot overflow here.
 	 */
 	if (sub)
 		sum = base - offset->time;
-	else
-		sum = base + offset->time;
+	else if (pg_add_s64_overflow(base, offset->time, &sum))
+		PG_RETURN_BOOL(less);
 
 	if (less)
 		PG_RETURN_BOOL(val <= sum);
@@ -2305,9 +2276,9 @@ time_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 			case DTK_ISOYEAR:
 			default:
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("\"time\" units \"%s\" not recognized",
-								lowunits)));
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("unit \"%s\" not supported for type %s",
+								lowunits, format_type_be(TIMEOID))));
 				intresult = 0;
 		}
 	}
@@ -2322,8 +2293,8 @@ time_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"time\" units \"%s\" not recognized",
-						lowunits)));
+				 errmsg("unit \"%s\" not recognized for type %s",
+						lowunits, format_type_be(TIMEOID))));
 		intresult = 0;
 	}
 
@@ -2367,11 +2338,11 @@ Datum
 timetz_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-
 #ifdef NOT_USED
 	Oid			typelem = PG_GETARG_OID(1);
 #endif
 	int32		typmod = PG_GETARG_INT32(2);
+	Node	   *escontext = fcinfo->context;
 	TimeTzADT  *result;
 	fsec_t		fsec;
 	struct pg_tm tt,
@@ -2383,19 +2354,19 @@ timetz_in(PG_FUNCTION_ARGS)
 	char	   *field[MAXDATEFIELDS];
 	int			dtype;
 	int			ftype[MAXDATEFIELDS];
-
-	
-	Assert(adtext != NULL);
-	if (adtext->pre_timetz_in != NULL)
-		str = adtext->pre_timetz_in(str);
-	
+	DateTimeErrorExtra extra;
 
 	dterr = ParseDateTime(str, workbuf, sizeof(workbuf),
 						  field, ftype, MAXDATEFIELDS, &nf);
 	if (dterr == 0)
-		dterr = DecodeTimeOnly(field, ftype, nf, &dtype, tm, &fsec, &tz);
+		dterr = DecodeTimeOnly(field, ftype, nf,
+							   &dtype, tm, &fsec, &tz, &extra);
 	if (dterr != 0)
-		DateTimeParseError(dterr, str, "time with time zone");
+	{
+		DateTimeParseError(dterr, &extra, str, "time with time zone",
+						   escontext);
+		PG_RETURN_NULL();
+	}
 
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 	tm2timetz(tm, fsec, tz, result);
@@ -2404,9 +2375,10 @@ timetz_in(PG_FUNCTION_ARGS)
 	PG_RETURN_TIMETZADT_P(result);
 }
 
-static char *
-standard_post_timetz_out(void  *time)
+Datum
+timetz_out(PG_FUNCTION_ARGS)
 {
+	TimeTzADT  *time = PG_GETARG_TIMETZADT_P(0);
 	char	   *result;
 	struct pg_tm tt,
 			   *tm = &tt;
@@ -2414,26 +2386,10 @@ standard_post_timetz_out(void  *time)
 	int			tz;
 	char		buf[MAXDATELEN + 1];
 
-	timetz2tm((TimeTzADT*)time, tm, &fsec, &tz);
+	timetz2tm(time, tm, &fsec, &tz);
 	EncodeTimeOnly(tm, fsec, true, tz, DateStyle, buf);
+
 	result = pstrdup(buf);
-	return result;
-}
-
-Datum
-timetz_out(PG_FUNCTION_ARGS)
-{
-	TimeTzADT  *time = PG_GETARG_TIMETZADT_P(0);
-	char	   *result;
-
-	
-	Assert(adtext != NULL);
-	if (adtext->post_timetz_out != NULL)
-		result = adtext->post_timetz_out(time);
-	else
-		result = standard_post_timetz_out(time);
-
-	
 	PG_RETURN_CSTRING(result);
 }
 
@@ -2708,6 +2664,11 @@ timetz_pl_interval(PG_FUNCTION_ARGS)
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeTzADT  *result;
 
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot add infinite interval to time")));
+
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 
 	result->time = time->time + span->time;
@@ -2729,6 +2690,11 @@ timetz_mi_interval(PG_FUNCTION_ARGS)
 	TimeTzADT  *time = PG_GETARG_TIMETZADT_P(0);
 	Interval   *span = PG_GETARG_INTERVAL_P(1);
 	TimeTzADT  *result;
+
+	if (INTERVAL_NOT_FINITE(span))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot subtract infinite interval from time")));
 
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
 
@@ -2757,7 +2723,8 @@ in_range_timetz_interval(PG_FUNCTION_ARGS)
 
 	/*
 	 * Like timetz_pl_interval/timetz_mi_interval, we disregard the month and
-	 * day fields of the offset.  So our test for negative should too.
+	 * day fields of the offset.  So our test for negative should too. This
+	 * also catches -infinity, so we only need worry about +infinity below.
 	 */
 	if (offset->time < 0)
 		ereport(ERROR,
@@ -2767,13 +2734,14 @@ in_range_timetz_interval(PG_FUNCTION_ARGS)
 	/*
 	 * We can't use timetz_pl_interval/timetz_mi_interval here, because their
 	 * wraparound behavior would give wrong (or at least undesirable) answers.
-	 * Fortunately the equivalent non-wrapping behavior is trivial, especially
-	 * since we don't worry about integer overflow.
+	 * Fortunately the equivalent non-wrapping behavior is trivial, except
+	 * that adding an infinite (or very large) interval might cause integer
+	 * overflow.  Subtraction cannot overflow here.
 	 */
 	if (sub)
 		sum.time = base->time - offset->time;
-	else
-		sum.time = base->time + offset->time;
+	else if (pg_add_s64_overflow(base->time, offset->time, &sum.time))
+		PG_RETURN_BOOL(less);
 	sum.zone = base->zone;
 
 	if (less)
@@ -3104,9 +3072,9 @@ timetz_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 			case DTK_MILLENNIUM:
 			default:
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("\"time with time zone\" units \"%s\" not recognized",
-								lowunits)));
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("unit \"%s\" not supported for type %s",
+								lowunits, format_type_be(TIMETZOID))));
 				intresult = 0;
 		}
 	}
@@ -3125,8 +3093,8 @@ timetz_part_common(PG_FUNCTION_ARGS, bool retnumeric)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"time with time zone\" units \"%s\" not recognized",
-						lowunits)));
+				 errmsg("unit \"%s\" not recognized for type %s",
+						lowunits, format_type_be(TIMETZOID))));
 		intresult = 0;
 	}
 
@@ -3151,7 +3119,7 @@ extract_timetz(PG_FUNCTION_ARGS)
 
 /* timetz_zone()
  * Encode time with time zone type with specified time zone.
- * Applies DST rules as of the current date.
+ * Applies DST rules as of the transaction start time.
  */
 Datum
 timetz_zone(PG_FUNCTION_ARGS)
@@ -3161,64 +3129,41 @@ timetz_zone(PG_FUNCTION_ARGS)
 	TimeTzADT  *result;
 	int			tz;
 	char		tzname[TZ_STRLEN_MAX + 1];
-	char	   *lowzone;
 	int			type,
 				val;
 	pg_tz	   *tzp;
 
 	/*
-	 * Look up the requested timezone.  First we look in the timezone
-	 * abbreviation table (to handle cases like "EST"), and if that fails, we
-	 * look in the timezone database (to handle cases like
-	 * "America/New_York").  (This matches the order in which timestamp input
-	 * checks the cases; it's important because the timezone database unwisely
-	 * uses a few zone names that are identical to offset abbreviations.)
+	 * Look up the requested timezone.
 	 */
 	text_to_cstring_buffer(zone, tzname, sizeof(tzname));
 
-	/* DecodeTimezoneAbbrev requires lowercase input */
-	lowzone = downcase_truncate_identifier(tzname,
-										   strlen(tzname),
-										   false);
+	type = DecodeTimezoneName(tzname, &val, &tzp);
 
-	type = DecodeTimezoneAbbrev(0, lowzone, &val, &tzp);
-
-	if (type == TZ || type == DTZ)
+	if (type == TZNAME_FIXED_OFFSET)
 	{
 		/* fixed-offset abbreviation */
 		tz = -val;
 	}
-	else if (type == DYNTZ)
+	else if (type == TZNAME_DYNTZ)
 	{
-		/* dynamic-offset abbreviation, resolve using current time */
-		pg_time_t	now = (pg_time_t) time(NULL);
-		struct pg_tm *tm;
+		/* dynamic-offset abbreviation, resolve using transaction start time */
+		TimestampTz now = GetCurrentTransactionStartTimestamp();
+		int			isdst;
 
-		tm = pg_localtime(&now, tzp);
-		tm->tm_year += 1900;	/* adjust to PG conventions */
-		tm->tm_mon += 1;
-		tz = DetermineTimeZoneAbbrevOffset(tm, tzname, tzp);
+		tz = DetermineTimeZoneAbbrevOffsetTS(now, tzname, tzp, &isdst);
 	}
 	else
 	{
-		/* try it as a full zone name */
-		tzp = pg_tzset(tzname);
-		if (tzp)
-		{
-			/* Get the offset-from-GMT that is valid today for the zone */
-			pg_time_t	now = (pg_time_t) time(NULL);
-			struct pg_tm *tm;
+		/* Get the offset-from-GMT that is valid now for the zone name */
+		TimestampTz now = GetCurrentTransactionStartTimestamp();
+		struct pg_tm tm;
+		fsec_t		fsec;
 
-			tm = pg_localtime(&now, tzp);
-			tz = -tm->tm_gmtoff;
-		}
-		else
-		{
+		if (timestamp2tm(now, &tz, &tm, &fsec, NULL, tzp) != 0)
 			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("time zone \"%s\" not recognized", tzname)));
-			tz = 0;				/* keep compiler quiet */
-		}
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
 	}
 
 	result = (TimeTzADT *) palloc(sizeof(TimeTzADT));
@@ -3246,6 +3191,13 @@ timetz_izone(PG_FUNCTION_ARGS)
 	TimeTzADT  *result;
 	int			tz;
 
+	if (INTERVAL_NOT_FINITE(zone))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("interval time zone \"%s\" must be finite",
+						DatumGetCString(DirectFunctionCall1(interval_out,
+															PointerGetDatum(zone))))));
+
 	if (zone->month != 0 || zone->day != 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -3267,4 +3219,19 @@ timetz_izone(PG_FUNCTION_ARGS)
 	result->zone = tz;
 
 	PG_RETURN_TIMETZADT_P(result);
+}
+
+/* timetz_at_local()
+ *
+ * Unlike for timestamp[tz]_at_local, the type for timetz does not flip between
+ * time with/without time zone, so we cannot just call the conversion function.
+ */
+Datum
+timetz_at_local(PG_FUNCTION_ARGS)
+{
+	Datum		time = PG_GETARG_DATUM(0);
+	const char *tzn = pg_get_timezone_name(session_timezone);
+	Datum		zone = PointerGetDatum(cstring_to_text(tzn));
+
+	return DirectFunctionCall2(timetz_zone, zone, time);
 }

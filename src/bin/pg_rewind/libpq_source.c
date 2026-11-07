@@ -3,7 +3,7 @@
  * libpq_source.c
  *	  Functions for fetching files from a remote server via libpq.
  *
- * Copyright (c) 2013-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2025, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -11,7 +11,6 @@
 
 #include "catalog/pg_type_d.h"
 #include "common/connect.h"
-#include "datapagemap.h"
 #include "file_ops.h"
 #include "filemap.h"
 #include "lib/stringinfo.h"
@@ -63,6 +62,7 @@ static void process_queued_fetch_requests(libpq_source *src);
 /* public interface functions */
 static void libpq_traverse_files(rewind_source *source,
 								 process_file_callback_t callback);
+static void libpq_queue_fetch_file(rewind_source *source, const char *path, size_t len);
 static void libpq_queue_fetch_range(rewind_source *source, const char *path,
 									off_t off, size_t len);
 static void libpq_finish_fetch(rewind_source *source);
@@ -88,6 +88,7 @@ init_libpq_source(PGconn *conn)
 
 	src->common.traverse_files = libpq_traverse_files;
 	src->common.fetch_file = libpq_fetch_file;
+	src->common.queue_fetch_file = libpq_queue_fetch_file;
 	src->common.queue_fetch_range = libpq_queue_fetch_range;
 	src->common.finish_fetch = libpq_finish_fetch;
 	src->common.get_current_wal_insert_lsn = libpq_get_current_wal_insert_lsn;
@@ -115,6 +116,7 @@ init_libpq_conn(PGconn *conn)
 	run_simple_command(conn, "SET statement_timeout = 0");
 	run_simple_command(conn, "SET lock_timeout = 0");
 	run_simple_command(conn, "SET idle_in_transaction_session_timeout = 0");
+	run_simple_command(conn, "SET transaction_timeout = 0");
 
 	/*
 	 * we don't intend to do any updates, put the connection in read-only mode
@@ -125,7 +127,7 @@ init_libpq_conn(PGconn *conn)
 	/* secure search_path */
 	res = PQexec(conn, ALWAYS_SECURE_SEARCH_PATH_SQL);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		pg_fatal("could not clear search_path: %s",
+		pg_fatal("could not clear \"search_path\": %s",
 				 PQresultErrorMessage(res));
 	PQclear(res);
 
@@ -136,7 +138,7 @@ init_libpq_conn(PGconn *conn)
 	 */
 	str = run_simple_query(conn, "SHOW full_page_writes");
 	if (strcmp(str, "on") != 0)
-		pg_fatal("full_page_writes must be enabled in the source server");
+		pg_fatal("\"full_page_writes\" must be enabled in the source server");
 	pg_free(str);
 
 	/* Prepare a statement we'll use to fetch files */
@@ -291,20 +293,59 @@ libpq_traverse_files(rewind_source *source, process_file_callback_t callback)
 		}
 
 		path = PQgetvalue(res, i, 0);
-		filesize = atol(PQgetvalue(res, i, 1));
+		filesize = atoll(PQgetvalue(res, i, 1));
 		isdir = (strcmp(PQgetvalue(res, i, 2), "t") == 0);
 		link_target = PQgetvalue(res, i, 3);
 
 		if (link_target[0])
-			type = FILE_TYPE_SYMLINK;
+		{
+			/*
+			 * In-place tablespaces are directories located in pg_tblspc/ with
+			 * relative paths.
+			 */
+			if (is_absolute_path(link_target))
+				type = FILE_TYPE_SYMLINK;
+			else
+				type = FILE_TYPE_DIRECTORY;
+		}
 		else if (isdir)
 			type = FILE_TYPE_DIRECTORY;
 		else
 			type = FILE_TYPE_REGULAR;
 
-		process_source_file(path, type, filesize, link_target);
+		callback(path, type, filesize, link_target);
 	}
 	PQclear(res);
+}
+
+/*
+ * Queue up a request to fetch a file from remote system.
+ */
+static void
+libpq_queue_fetch_file(rewind_source *source, const char *path, size_t len)
+{
+	/*
+	 * Truncate the target file immediately, and queue a request to fetch it
+	 * from the source. If the file is small, smaller than MAX_CHUNK_SIZE,
+	 * request fetching a full-sized chunk anyway, so that if the file has
+	 * become larger in the source system, after we scanned the source
+	 * directory, we still fetch the whole file. This only works for files up
+	 * to MAX_CHUNK_SIZE, but that's good enough for small configuration files
+	 * and such that are changed every now and then, but not WAL-logged. For
+	 * larger files, we fetch up to the original size.
+	 *
+	 * Even with that mechanism, there is an inherent race condition if the
+	 * file is modified at the same instant that we're copying it, so that we
+	 * might copy a torn version of the file with one half from the old
+	 * version and another half from the new. But pg_basebackup has the same
+	 * problem, and it hasn't been a problem in practice.
+	 *
+	 * It might seem more natural to truncate the file later, when we receive
+	 * it from the source server, but then we'd need to track which
+	 * fetch-requests are for a whole file.
+	 */
+	open_target_file(path, true);
+	libpq_queue_fetch_range(source, path, 0, Max(len, MAX_CHUNK_SIZE));
 }
 
 /*
@@ -526,8 +567,8 @@ process_queued_fetch_requests(libpq_source *src)
 		}
 		else
 		{
-			pg_log_debug("received chunk for file \"%s\", offset %lld, size %d",
-						 filename, (long long int) chunkoff, chunksize);
+			pg_log_debug("received chunk for file \"%s\", offset %" PRId64 ", size %d",
+						 filename, chunkoff, chunksize);
 
 			if (strcmp(filename, rq->path) != 0)
 			{
@@ -535,8 +576,8 @@ process_queued_fetch_requests(libpq_source *src)
 						 filename, rq->path);
 			}
 			if (chunkoff != rq->offset)
-				pg_fatal("received data at offset %lld of file \"%s\", when requested for offset %lld",
-						 (long long int) chunkoff, rq->path, (long long int) rq->offset);
+				pg_fatal("received data at offset %" PRId64 " of file \"%s\", when requested for offset %lld",
+						 chunkoff, rq->path, (long long int) rq->offset);
 
 			/*
 			 * We should not receive more data than we requested, or

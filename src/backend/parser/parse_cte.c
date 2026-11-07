@@ -3,7 +3,7 @@
  * parse_cte.c
  *	  handle CTEs (common table expressions) in parser
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,7 +35,7 @@ typedef enum
 	RECURSION_SUBLINK,			/* inside a sublink */
 	RECURSION_OUTERJOIN,		/* inside nullable side of an outer join */
 	RECURSION_INTERSECT,		/* underneath INTERSECT (ALL) */
-	RECURSION_EXCEPT			/* underneath EXCEPT (ALL) */
+	RECURSION_EXCEPT,			/* underneath EXCEPT (ALL) */
 } RecursionContext;
 
 /* Associated error messages --- each must have one %s for CTE name */
@@ -98,7 +98,7 @@ static void checkWellFormedSelectStmt(SelectStmt *stmt, CteState *cstate);
 
 
 /*
- * standard_transformWithClause -
+ * transformWithClause -
  *	  Transform the list of WITH clause "common table expressions" into
  *	  Query nodes.
  *
@@ -107,7 +107,7 @@ static void checkWellFormedSelectStmt(SelectStmt *stmt, CteState *cstate);
  * but it seems cleaner to not expose that in the function's API.)
  */
 List *
-standard_transformWithClause(ParseState *pstate, WithClause *withClause)
+transformWithClause(ParseState *pstate, WithClause *withClause)
 {
 	ListCell   *lc;
 
@@ -147,11 +147,11 @@ standard_transformWithClause(ParseState *pstate, WithClause *withClause)
 			/* must be a data-modifying statement */
 			Assert(IsA(cte->ctequery, InsertStmt) ||
 				   IsA(cte->ctequery, UpdateStmt) ||
-				   IsA(cte->ctequery, DeleteStmt));
+				   IsA(cte->ctequery, DeleteStmt) ||
+				   IsA(cte->ctequery, MergeStmt));
 
 			pstate->p_hasModifyingCTE = true;
 		}
-
 	}
 
 	if (withClause->recursive)
@@ -232,6 +232,7 @@ standard_transformWithClause(ParseState *pstate, WithClause *withClause)
 
 	return pstate->p_ctenamespace;
 }
+
 
 /*
  * Perform the actual parse analysis transformation of one CTE.  All
@@ -463,7 +464,7 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
 
 		foreach(lc, search_clause->search_col_list)
 		{
-			Value	   *colname = lfirst(lc);
+			String	   *colname = lfirst_node(String, lc);
 
 			if (!list_member(cte->ctecolnames, colname))
 				ereport(ERROR,
@@ -496,7 +497,7 @@ analyzeCTE(ParseState *pstate, CommonTableExpr *cte)
 
 		foreach(lc, cycle_clause->cycle_col_list)
 		{
-			Value	   *colname = lfirst(lc);
+			String	   *colname = lfirst_node(String, lc);
 
 			if (!list_member(cte->ctecolnames, colname))
 				ereport(ERROR,
@@ -774,6 +775,19 @@ makeDependencyGraphWalker(Node *node, CteState *cstate)
 		}
 		/* if no WITH clause, just fall through for normal processing */
 	}
+	else if (IsA(node, MergeStmt))
+	{
+		MergeStmt  *stmt = (MergeStmt *) node;
+
+		if (stmt->withClause)
+		{
+			/* Examine the WITH clause and the MergeStmt */
+			WalkInnerWith(node, stmt->withClause, cstate);
+			/* We're done examining the MergeStmt */
+			return false;
+		}
+		/* if no WITH clause, just fall through for normal processing */
+	}
 	else if (IsA(node, WithClause))
 	{
 		/*
@@ -785,7 +799,7 @@ makeDependencyGraphWalker(Node *node, CteState *cstate)
 	}
 	return raw_expression_tree_walker(node,
 									  makeDependencyGraphWalker,
-									  (void *) cstate);
+									  cstate);
 }
 
 /*
@@ -815,7 +829,7 @@ WalkInnerWith(Node *stmt, WithClause *withClause, CteState *cstate)
 		}
 		(void) raw_expression_tree_walker(stmt,
 										  makeDependencyGraphWalker,
-										  (void *) cstate);
+										  cstate);
 		cstate->innerwiths = list_delete_first(cstate->innerwiths);
 	}
 	else
@@ -837,7 +851,7 @@ WalkInnerWith(Node *stmt, WithClause *withClause, CteState *cstate)
 		}
 		(void) raw_expression_tree_walker(stmt,
 										  makeDependencyGraphWalker,
-										  (void *) cstate);
+										  cstate);
 		cstate->innerwiths = list_delete_first(cstate->innerwiths);
 	}
 }
@@ -1182,7 +1196,7 @@ checkWellFormedRecursionWalker(Node *node, CteState *cstate)
 	}
 	return raw_expression_tree_walker(node,
 									  checkWellFormedRecursionWalker,
-									  (void *) cstate);
+									  cstate);
 }
 
 /*
@@ -1199,7 +1213,7 @@ checkWellFormedSelectStmt(SelectStmt *stmt, CteState *cstate)
 		/* just recurse without changing state */
 		raw_expression_tree_walker((Node *) stmt,
 								   checkWellFormedRecursionWalker,
-								   (void *) cstate);
+								   cstate);
 	}
 	else
 	{
@@ -1209,7 +1223,7 @@ checkWellFormedSelectStmt(SelectStmt *stmt, CteState *cstate)
 			case SETOP_UNION:
 				raw_expression_tree_walker((Node *) stmt,
 										   checkWellFormedRecursionWalker,
-										   (void *) cstate);
+										   cstate);
 				break;
 			case SETOP_INTERSECT:
 				if (stmt->all)

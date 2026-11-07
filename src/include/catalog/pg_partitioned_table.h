@@ -5,7 +5,7 @@
  *	  (pg_partitioned_table)
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_partitioned_table.h
@@ -20,7 +20,7 @@
 #define PG_PARTITIONED_TABLE_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_partitioned_table_d.h"
+#include "catalog/pg_partitioned_table_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_partitioned_table definition.  cpp turns this into
@@ -66,8 +66,9 @@ typedef FormData_pg_partitioned_table *Form_pg_partitioned_table;
 
 DECLARE_TOAST(pg_partitioned_table, 4165, 4166);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_partitioned_table_partrelid_index, 3351, on pg_partitioned_table using btree(partrelid oid_ops));
-#define PartitionedRelidIndexId			 3351
+DECLARE_UNIQUE_INDEX_PKEY(pg_partitioned_table_partrelid_index, 3351, PartitionedRelidIndexId, pg_partitioned_table, btree(partrelid oid_ops));
+
+MAKE_SYSCACHE(PARTRELID, pg_partitioned_table_partrelid_index, 32);
 
 /* partattrs can contain zero (InvalidAttrNumber) to represent expressions */
 DECLARE_ARRAY_FOREIGN_KEY_OPT((partrelid, partattrs), pg_attribute, (attrelid, attnum));

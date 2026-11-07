@@ -4,7 +4,7 @@
  *	  prototypes for utility.c.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/tcop/utility.h
@@ -23,7 +23,7 @@ typedef enum
 	PROCESS_UTILITY_QUERY,		/* a complete query, but not toplevel */
 	PROCESS_UTILITY_QUERY_NONATOMIC,	/* a complete query, nonatomic
 										 * execution context */
-	PROCESS_UTILITY_SUBCOMMAND	/* a portion of a query */
+	PROCESS_UTILITY_SUBCOMMAND, /* a portion of a query */
 } ProcessUtilityContext;
 
 /* Info needed when recursing from ALTER TABLE */
@@ -108,13 +108,5 @@ CreateCommandName(Node *parsetree)
 extern LogStmtLevel GetCommandLogLevel(Node *parsetree);
 
 extern bool CommandIsReadOnly(PlannedStmt *pstmt);
-
-/* mysql mode */
-/* src/backend/tcop/mysql/mys_utility.c */
-extern void mys_standard_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
-                                        bool readOnlyTree,
-                                        ProcessUtilityContext context, ParamListInfo params,
-                                        QueryEnvironment *queryEnv,
-                                        DestReceiver *dest, QueryCompletion *qc);
 
 #endif							/* UTILITY_H */

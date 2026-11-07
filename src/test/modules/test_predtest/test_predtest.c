@@ -3,7 +3,7 @@
  * test_predtest.c
  *		Test correctness of optimizer's predicate proof logic.
  *
- * Copyright (c) 2018-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2018-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_predtest/test_predtest.c
@@ -50,12 +50,11 @@ test_predtest(PG_FUNCTION_ARGS)
 				strong_refuted_by,
 				weak_refuted_by;
 	Datum		values[8];
-	bool		nulls[8];
+	bool		nulls[8] = {0};
 	int			i;
 
 	/* We use SPI to parse, plan, and execute the test query */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	SPI_connect();
 
 	/*
 	 * First, plan and execute the query, and inspect the results.  To the
@@ -119,6 +118,22 @@ test_predtest(PG_FUNCTION_ARGS)
 	}
 
 	/*
+	 * Strong refutation implies weak refutation, so we should never observe
+	 * s_r_holds = true with w_r_holds = false.
+	 *
+	 * We can't make a comparable assertion for implication since moving from
+	 * strong to weak implication expands the allowed values of "A" from true
+	 * to either true or NULL.
+	 *
+	 * If this fails it constitutes a bug not with the proofs but with either
+	 * this test module or a more core part of expression evaluation since we
+	 * are validating the logical correctness of the observed result rather
+	 * than the proof.
+	 */
+	if (s_r_holds && !w_r_holds)
+		elog(WARNING, "s_r_holds was true; w_r_holds must not be false");
+
+	/*
 	 * Now, dig the clause querytrees out of the plan, and see what predtest.c
 	 * does with them.
 	 */
@@ -131,8 +146,8 @@ test_predtest(PG_FUNCTION_ARGS)
 		elog(ERROR, "test_predtest query must be a SELECT");
 	plan = stmt->planTree;
 	Assert(list_length(plan->targetlist) >= 2);
-	clause1 = castNode(TargetEntry, linitial(plan->targetlist))->expr;
-	clause2 = castNode(TargetEntry, lsecond(plan->targetlist))->expr;
+	clause1 = linitial_node(TargetEntry, plan->targetlist)->expr;
+	clause2 = lsecond_node(TargetEntry, plan->targetlist)->expr;
 
 	/*
 	 * Because the clauses are in the SELECT list, preprocess_expression did
@@ -180,6 +195,19 @@ test_predtest(PG_FUNCTION_ARGS)
 		elog(WARNING, "weak_refuted_by result is incorrect");
 
 	/*
+	 * As with our earlier check of the logical consistency of whether strong
+	 * and weak refutation hold, we ought never prove strong refutation
+	 * without also proving weak refutation.
+	 *
+	 * Also as earlier we cannot make the same guarantee about implication
+	 * proofs.
+	 *
+	 * A warning here suggests a bug in the proof code.
+	 */
+	if (strong_refuted_by && !weak_refuted_by)
+		elog(WARNING, "strong_refuted_by was proven; weak_refuted_by should also be proven");
+
+	/*
 	 * Clean up and return a record of the results.
 	 */
 	if (SPI_finish() != SPI_OK_FINISH)
@@ -204,7 +232,6 @@ test_predtest(PG_FUNCTION_ARGS)
 					   "w_r_holds", BOOLOID, -1, 0);
 	tupdesc = BlessTupleDesc(tupdesc);
 
-	MemSet(nulls, 0, sizeof(nulls));
 	values[0] = BoolGetDatum(strong_implied_by);
 	values[1] = BoolGetDatum(weak_implied_by);
 	values[2] = BoolGetDatum(strong_refuted_by);

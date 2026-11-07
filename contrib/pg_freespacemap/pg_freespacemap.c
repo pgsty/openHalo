@@ -9,11 +9,14 @@
 #include "postgres.h"
 
 #include "access/relation.h"
-#include "funcapi.h"
+#include "fmgr.h"
 #include "storage/freespace.h"
 #include "utils/rel.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pg_freespacemap",
+					.version = PG_VERSION
+);
 
 /*
  * Returns the amount of free space on a given page, according to the
@@ -35,8 +38,9 @@ pg_freespace(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" does not have storage",
-						RelationGetRelationName(rel))));
-						
+						RelationGetRelationName(rel)),
+				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
+
 	if (blkno < 0 || blkno > MaxBlockNumber)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

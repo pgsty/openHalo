@@ -97,12 +97,13 @@ PostgreSQL documentation
    <application>pg_rewind</application> requires that the target server either has
    the <xref linkend="guc-wal-log-hints"/> option enabled
    in <filename>postgresql.conf</filename> or data checksums enabled when
-   the cluster was initialized with <application>initdb</application>.  Neither of these
-   are currently on by default.  <xref linkend="guc-full-page-writes"/>
-   must also be set to <literal>on</literal>, but is enabled by default.
+   the cluster was initialized with <application>initdb</application> (the
+   default).  <xref linkend="guc-full-page-writes"/> must also be set to
+   <literal>on</literal>, but is enabled by default.
   </para>
 
   <warning>
+   <title>Warning: Failures While Rewinding</title>
    <para>
     If <application>pg_rewind</application> fails while processing, then
     the data folder of the target is likely not in a state that can be
@@ -185,8 +186,10 @@ PostgreSQL documentation
        <para>
         Create <filename>standby.signal</filename> and append connection
         settings to <filename>postgresql.auto.conf</filename> in the output
-        directory.  <literal>--source-server</literal> is mandatory with
-        this option.
+        directory.  The dbname will be recorded only if the dbname was
+        specified explicitly in the connection string or <link linkend="libpq-envars">
+        environment variable</link>. <literal>--source-server</literal> is
+        mandatory with this option.
        </para>
       </listitem>
      </varlistentry>
@@ -242,6 +245,21 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--config-file=<replaceable class="parameter">filename</replaceable></option></term>
+      <listitem>
+       <para>
+        Use the specified main server configuration file for the target
+        cluster. This affects <application>pg_rewind</application> when
+        it uses internally the <application>postgres</application> command
+        for the rewind operation on this cluster (when retrieving
+        <varname>restore_command</varname> with the option
+        <option>-c/--restore-target-wal</option> and when forcing a
+        completion of crash recovery).
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--debug</option></term>
       <listitem>
        <para>
@@ -264,6 +282,28 @@ PostgreSQL documentation
         this and errors out immediately if the server is not cleanly shut
         down. Users are expected to handle the situation themselves in that
         case.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--sync-method=<replaceable class="parameter">method</replaceable></option></term>
+      <listitem>
+       <para>
+        When set to <literal>fsync</literal>, which is the default,
+        <command>pg_rewind</command> will recursively open and synchronize all
+        files in the data directory.  The search for files will follow symbolic
+        links for the WAL directory and each configured tablespace.
+       </para>
+       <para>
+        On Linux, <literal>syncfs</literal> may be used instead to ask the
+        operating system to synchronize the whole file systems that contain the
+        data directory, the WAL files, and each tablespace.  See
+        <xref linkend="guc-recovery-init-sync-method"/> for information about
+        the caveats to be aware of when using <literal>syncfs</literal>.
+       </para>
+       <para>
+        This option has no effect when <option>--no-sync</option> is used.
        </para>
       </listitem>
      </varlistentry>
@@ -319,15 +359,6 @@ GRANT EXECUTE ON function pg_catalog.pg_read_binary_file(text, bigint, bigint, b
 </programlisting>
   </para>
 
-  <para>
-   When executing <application>pg_rewind</application> using an online
-   cluster as source which has been recently promoted, it is necessary
-   to execute a <command>CHECKPOINT</command> after promotion such that its
-   control file reflects up-to-date timeline information, which is used by
-   <application>pg_rewind</application> to check if the target cluster
-   can be rewound using the designated source cluster.
-  </para>
-
   <refsect2>
    <title>How It Works</title>
 
@@ -374,8 +405,9 @@ GRANT EXECUTE ON function pg_catalog.pg_read_binary_file(text, bigint, bigint, b
       <filename>backup_label</filename>,
       <filename>tablespace_map</filename>,
       <filename>pg_internal.init</filename>,
-      <filename>postmaster.opts</filename>, and
-      <filename>postmaster.pid</filename>, as well as any file or directory
+      <filename>postmaster.opts</filename>,
+      <filename>postmaster.pid</filename> and
+      <filename>.DS_Store</filename> as well as any file or directory
       beginning with <filename>pgsql_tmp</filename>, are omitted.
      </para>
     </step>

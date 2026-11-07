@@ -19,9 +19,7 @@ OBJS = \
 	planagg.o \
 	planmain.o \
 	planner.o \
-	planner_engine.o \
-	planner_ep.o \
 	setrefs.o \
 	subselect.o
-	
+
 include $(top_srcdir)/src/backend/common.mk

@@ -3,7 +3,7 @@
 # pg_operator.dat
 #    Initial contents of the pg_operator system catalog.
 #
-# Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/include/catalog/pg_operator.dat
@@ -102,7 +102,7 @@
   oprright => 'text', oprresult => 'bool', oprcom => '=(text,text)',
   oprnegate => '<>(text,text)', oprcode => 'texteq', oprrest => 'eqsel',
   oprjoin => 'eqjoinsel' },
-{ oid => '3877', descr => 'starts with',
+{ oid => '3877', oid_symbol => 'TextPrefixOperator', descr => 'starts with',
   oprname => '^@', oprleft => 'text', oprright => 'text', oprresult => 'bool',
   oprcode => 'starts_with', oprrest => 'prefixsel',
   oprjoin => 'prefixjoinsel' },
@@ -1177,9 +1177,6 @@
 { oid => '969', descr => 'center of',
   oprname => '@@', oprkind => 'l', oprleft => '0', oprright => 'lseg',
   oprresult => 'point', oprcode => 'lseg_center' },
-{ oid => '970', descr => 'center of',
-  oprname => '@@', oprkind => 'l', oprleft => '0', oprright => 'path',
-  oprresult => 'point', oprcode => 'path_center' },
 { oid => '971', descr => 'center of',
   oprname => '@@', oprkind => 'l', oprleft => '0', oprright => 'polygon',
   oprresult => 'point', oprcode => 'poly_center' },
@@ -1742,14 +1739,6 @@
   oprresult => 'float8', oprcom => '<->(circle,polygon)',
   oprcode => 'dist_polyc' },
 
-# additional geometric operators - thomas 1997-07-09
-{ oid => '1524', descr => 'distance between',
-  oprname => '<->', oprleft => 'line', oprright => 'box', oprresult => 'float8',
-  oprcom => '<->(box,line)', oprcode => 'dist_lb' },
-{ oid => '1382', descr => 'distance between',
-  oprname => '<->', oprleft => 'box', oprright => 'line', oprresult => 'float8',
-  oprcom => '<->(line,box)', oprcode => 'dist_bl' },
-
 { oid => '1525', descr => 'intersect',
   oprname => '?#', oprleft => 'lseg', oprright => 'lseg', oprresult => 'bool',
   oprcom => '?#(lseg,lseg)', oprcode => 'lseg_intersect' },
@@ -1805,15 +1794,9 @@
   oprname => '##', oprleft => 'point', oprright => 'box', oprresult => 'point',
   oprcode => 'close_pb' },
 
-{ oid => '1566', descr => 'closest point to A on B',
-  oprname => '##', oprleft => 'lseg', oprright => 'line', oprresult => 'point',
-  oprcode => 'close_sl' },
 { oid => '1567', descr => 'closest point to A on B',
   oprname => '##', oprleft => 'lseg', oprright => 'box', oprresult => 'point',
   oprcode => 'close_sb' },
-{ oid => '1568', descr => 'closest point to A on B',
-  oprname => '##', oprleft => 'line', oprright => 'box', oprresult => 'point',
-  oprcode => 'close_lb' },
 { oid => '1577', descr => 'closest point to A on B',
   oprname => '##', oprleft => 'line', oprright => 'lseg', oprresult => 'point',
   oprcode => 'close_ls' },
@@ -3074,7 +3057,7 @@
   oprrest => 'scalargesel', oprjoin => 'scalargejoinsel' },
 
 # generic range type operators
-{ oid => '3882', descr => 'equal',
+{ oid => '3882', oid_symbol => 'RANGE_EQ_OP', descr => 'equal',
   oprname => '=', oprcanmerge => 't', oprcanhash => 't', oprleft => 'anyrange',
   oprright => 'anyrange', oprresult => 'bool', oprcom => '=(anyrange,anyrange)',
   oprnegate => '<>(anyrange,anyrange)', oprcode => 'range_eq',
@@ -3167,7 +3150,8 @@
 { oid => '3899', descr => 'range difference',
   oprname => '-', oprleft => 'anyrange', oprright => 'anyrange',
   oprresult => 'anyrange', oprcode => 'range_minus' },
-{ oid => '3900', descr => 'range intersection',
+{ oid => '3900', oid_symbol => 'OID_RANGE_INTERSECT_RANGE_OP',
+  descr => 'range intersection',
   oprname => '*', oprleft => 'anyrange', oprright => 'anyrange',
   oprresult => 'anyrange', oprcom => '*(anyrange,anyrange)',
   oprcode => 'range_intersect' },
@@ -3279,7 +3263,7 @@
   oprname => '@@', oprleft => 'jsonb', oprright => 'jsonpath',
   oprresult => 'bool', oprcode => 'jsonb_path_match_opr(jsonb,jsonpath)',
   oprrest => 'matchingsel', oprjoin => 'matchingjoinsel' },
-{ oid => '2860', descr => 'equal',
+{ oid => '2860', oid_symbol => 'MULTIRANGE_EQ_OP', descr => 'equal',
   oprname => '=', oprcanmerge => 't', oprcanhash => 't',
   oprleft => 'anymultirange', oprright => 'anymultirange', oprresult => 'bool',
   oprcom => '=(anymultirange,anymultirange)',
@@ -3434,7 +3418,8 @@
 { oid => '4393', descr => 'multirange minus',
   oprname => '-', oprleft => 'anymultirange', oprright => 'anymultirange',
   oprresult => 'anymultirange', oprcode => 'multirange_minus' },
-{ oid => '4394', descr => 'multirange intersect',
+{ oid => '4394', oid_symbol => 'OID_MULTIRANGE_INTERSECT_MULTIRANGE_OP',
+  descr => 'multirange intersect',
   oprname => '*', oprleft => 'anymultirange', oprright => 'anymultirange',
   oprresult => 'anymultirange', oprcom => '*(anymultirange,anymultirange)',
   oprcode => 'multirange_intersect' },

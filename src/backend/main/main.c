@@ -9,7 +9,7 @@
  * proper FooMain() routine for the incarnation.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -22,21 +22,18 @@
 
 #include <unistd.h>
 
-#if defined(__NetBSD__)
-#include <sys/param.h>
+#if defined(WIN32)
+#include <crtdbg.h>
 #endif
 
-#if defined(_M_AMD64) && _MSC_VER == 1800
-#include <math.h>
-#include <versionhelpers.h>
+#if defined(__NetBSD__)
+#include <sys/param.h>
 #endif
 
 #include "bootstrap/bootstrap.h"
 #include "common/username.h"
 #include "miscadmin.h"
-#include "port/atomics.h"
 #include "postmaster/postmaster.h"
-#include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/help_config.h"
 #include "utils/memutils.h"
@@ -45,7 +42,21 @@
 
 
 const char *progname;
+static bool reached_main = false;
 
+/* names of special must-be-first options for dispatching to subprograms */
+static const char *const DispatchOptionNames[] =
+{
+	[DISPATCH_CHECK] = "check",
+	[DISPATCH_BOOT] = "boot",
+	[DISPATCH_FORKCHILD] = "forkchild",
+	[DISPATCH_DESCRIBE_CONFIG] = "describe-config",
+	[DISPATCH_SINGLE] = "single",
+	/* DISPATCH_POSTMASTER has no name */
+};
+
+StaticAssertDecl(lengthof(DispatchOptionNames) == DISPATCH_POSTMASTER,
+				 "array length mismatch");
 
 static void startup_hacks(const char *progname);
 static void init_locale(const char *categoryname, int category, const char *locale);
@@ -60,12 +71,15 @@ int
 main(int argc, char *argv[])
 {
 	bool		do_check_root = true;
+	DispatchOption dispatch_option = DISPATCH_POSTMASTER;
+
+	reached_main = true;
 
 	/*
 	 * If supported on the current platform, set up a handler to be called if
 	 * the backend/postmaster crashes with a fatal signal or exception.
 	 */
-#if defined(WIN32) && defined(HAVE_MINIDUMP_TYPE)
+#if defined(WIN32)
 	pgwin32_install_crashdump_handler();
 #endif
 
@@ -100,6 +114,12 @@ main(int argc, char *argv[])
 	MemoryContextInit();
 
 	/*
+	 * Set reference point for stack-depth checking.  (There's no point in
+	 * enabling this before error reporting works.)
+	 */
+	(void) set_stack_base();
+
+	/*
 	 * Set up locale information
 	 */
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("postgres"));
@@ -122,10 +142,7 @@ main(int argc, char *argv[])
 	init_locale("LC_MESSAGES", LC_MESSAGES, "");
 #endif
 
-	/*
-	 * We keep these set to "C" always, except transiently in pg_locale.c; see
-	 * that file for explanations.
-	 */
+	/* We keep these set to "C" always.  See pg_locale.c for explanation. */
 	init_locale("LC_MONETARY", LC_MONETARY, "C");
 	init_locale("LC_NUMERIC", LC_NUMERIC, "C");
 	init_locale("LC_TIME", LC_TIME, "C");
@@ -136,8 +153,6 @@ main(int argc, char *argv[])
 	 * variables installed by pg_perm_setlocale have force.
 	 */
 	unsetenv("LC_ALL");
-
-	check_strxfrm_bug();
 
 	/*
 	 * Catch standard options before doing much else, in particular before we
@@ -183,36 +198,72 @@ main(int argc, char *argv[])
 	 * Dispatch to one of various subprograms depending on first argument.
 	 */
 
+	if (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-')
+		dispatch_option = parse_dispatch_option(&argv[1][2]);
+
+	switch (dispatch_option)
+	{
+		case DISPATCH_CHECK:
+			BootstrapModeMain(argc, argv, true);
+			break;
+		case DISPATCH_BOOT:
+			BootstrapModeMain(argc, argv, false);
+			break;
+		case DISPATCH_FORKCHILD:
 #ifdef EXEC_BACKEND
-	if (argc > 1 && strncmp(argv[1], "--fork", 6) == 0)
-		SubPostmasterMain(argc, argv);	/* does not return */
+			SubPostmasterMain(argc, argv);
+#else
+			Assert(false);		/* should never happen */
 #endif
+			break;
+		case DISPATCH_DESCRIBE_CONFIG:
+			GucInfoMain();
+			break;
+		case DISPATCH_SINGLE:
+			PostgresSingleUserMain(argc, argv,
+								   strdup(get_user_name_or_exit(progname)));
+			break;
+		case DISPATCH_POSTMASTER:
+			PostmasterMain(argc, argv);
+			break;
+	}
 
-#ifdef WIN32
-
-	/*
-	 * Start our win32 signal implementation
-	 *
-	 * SubPostmasterMain() will do this for itself, but the remaining modes
-	 * need it here
-	 */
-	pgwin32_signal_initialize();
-#endif
-
-	if (argc > 1 && strcmp(argv[1], "--boot") == 0)
-		AuxiliaryProcessMain(argc, argv);	/* does not return */
-	else if (argc > 1 && strcmp(argv[1], "--describe-config") == 0)
-		GucInfoMain();			/* does not return */
-	else if (argc > 1 && strcmp(argv[1], "--single") == 0)
-		PostgresMain(argc, argv,
-					 NULL,		/* no dbname */
-					 strdup(get_user_name_or_exit(progname)));	/* does not return */
-	else
-		PostmasterMain(argc, argv); /* does not return */
-	abort();					/* should not get here */
+	/* the functions above should not return */
+	abort();
 }
 
+/*
+ * Returns the matching DispatchOption value for the given option name.  If no
+ * match is found, DISPATCH_POSTMASTER is returned.
+ */
+DispatchOption
+parse_dispatch_option(const char *name)
+{
+	for (int i = 0; i < lengthof(DispatchOptionNames); i++)
+	{
+		/*
+		 * Unlike the other dispatch options, "forkchild" takes an argument,
+		 * so we just look for the prefix for that one.  For non-EXEC_BACKEND
+		 * builds, we never want to return DISPATCH_FORKCHILD, so skip over it
+		 * in that case.
+		 */
+		if (i == DISPATCH_FORKCHILD)
+		{
+#ifdef EXEC_BACKEND
+			if (strncmp(DispatchOptionNames[DISPATCH_FORKCHILD], name,
+						strlen(DispatchOptionNames[DISPATCH_FORKCHILD])) == 0)
+				return DISPATCH_FORKCHILD;
+#endif
+			continue;
+		}
 
+		if (strcmp(DispatchOptionNames[i], name) == 0)
+			return (DispatchOption) i;
+	}
+
+	/* no match means this is a postmaster */
+	return DISPATCH_POSTMASTER;
+}
 
 /*
  * Place platform-specific startup hacks here.  This is the right
@@ -249,33 +300,57 @@ startup_hacks(const char *progname)
 			exit(1);
 		}
 
-		/* In case of general protection fault, don't show GUI popup box */
-		SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-
-#if defined(_M_AMD64) && _MSC_VER == 1800
-
-		/*----------
-		 * Avoid crashing in certain floating-point operations if we were
-		 * compiled for x64 with MS Visual Studio 2013 and are running on
-		 * Windows prior to 7/2008R2 SP1 on an AVX2-capable CPU.
+		/*
+		 * By default abort() only generates a crash-dump in *non* debug
+		 * builds. As our Assert() / ExceptionalCondition() uses abort(),
+		 * leaving the default in place would make debugging harder.
 		 *
-		 * Ref: https://connect.microsoft.com/VisualStudio/feedback/details/811093/visual-studio-2013-rtm-c-x64-code-generation-bug-for-avx2-instructions
-		 *----------
+		 * MINGW's own C runtime doesn't have _set_abort_behavior(). When
+		 * targeting Microsoft's UCRT with mingw, it never links to the debug
+		 * version of the library and thus doesn't need the call to
+		 * _set_abort_behavior() either.
 		 */
-		if (!IsWindows7SP1OrGreater())
-		{
-			_set_FMA3_enable(0);
-		}
-#endif							/* defined(_M_AMD64) && _MSC_VER == 1800 */
+#if !defined(__MINGW32__) && !defined(__MINGW64__)
+		_set_abort_behavior(_CALL_REPORTFAULT | _WRITE_ABORT_MSG,
+							_CALL_REPORTFAULT | _WRITE_ABORT_MSG);
+#endif							/* !defined(__MINGW32__) &&
+								 * !defined(__MINGW64__) */
 
+		/*
+		 * SEM_FAILCRITICALERRORS causes more errors to be reported to
+		 * callers.
+		 *
+		 * We used to also specify SEM_NOGPFAULTERRORBOX, but that prevents
+		 * windows crash reporting from working. Which includes registered
+		 * just-in-time debuggers, making it unnecessarily hard to debug
+		 * problems on windows. Now we try to disable sources of popups
+		 * separately below (note that SEM_NOGPFAULTERRORBOX did not actually
+		 * prevent all sources of such popups).
+		 */
+		SetErrorMode(SEM_FAILCRITICALERRORS);
+
+		/*
+		 * Show errors on stderr instead of popup box (note this doesn't
+		 * affect errors originating in the C runtime, see below).
+		 */
+		_set_error_mode(_OUT_TO_STDERR);
+
+		/*
+		 * In DEBUG builds, errors, including assertions, C runtime errors are
+		 * reported via _CrtDbgReport. By default such errors are displayed
+		 * with a popup (even with NOGPFAULTERRORBOX), preventing forward
+		 * progress. Instead report such errors stderr (and the debugger).
+		 * This is C runtime specific and thus the above incantations aren't
+		 * sufficient to suppress these popups.
+		 */
+		_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+		_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+		_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+		_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+		_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+		_CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
 	}
 #endif							/* WIN32 */
-
-	/*
-	 * Initialize dummy_spinlock, in case we are on a platform where we have
-	 * to use the fallback implementation of pg_memory_barrier().
-	 */
-	SpinLockInit(&dummy_spinlock);
 }
 
 
@@ -308,7 +383,7 @@ init_locale(const char *categoryname, int category, const char *locale)
 static void
 help(const char *progname)
 {
-	printf(_("%s is the Halo server.\n\n"), progname);
+	printf(_("%s is the PostgreSQL server.\n\n"), progname);
 	printf(_("Usage:\n  %s [OPTION]...\n\n"), progname);
 	printf(_("Options:\n"));
 	printf(_("  -B NBUFFERS        number of shared buffers\n"));
@@ -319,7 +394,7 @@ help(const char *progname)
 	printf(_("  -e                 use European date input format (DMY)\n"));
 	printf(_("  -F                 turn fsync off\n"));
 	printf(_("  -h HOSTNAME        host name or IP address to listen on\n"));
-	printf(_("  -i                 enable TCP/IP connections\n"));
+	printf(_("  -i                 enable TCP/IP connections (deprecated)\n"));
 	printf(_("  -k DIRECTORY       Unix-domain socket location\n"));
 #ifdef USE_SSL
 	printf(_("  -l                 enable SSL connections\n"));
@@ -335,11 +410,10 @@ help(const char *progname)
 
 	printf(_("\nDeveloper options:\n"));
 	printf(_("  -f s|i|o|b|t|n|m|h forbid use of some plan types\n"));
-	printf(_("  -n                 do not reinitialize shared memory after abnormal exit\n"));
 	printf(_("  -O                 allow system table structure changes\n"));
 	printf(_("  -P                 disable system indexes\n"));
 	printf(_("  -t pa|pl|ex        show timings after each query\n"));
-	printf(_("  -T                 send SIGSTOP to all backend processes if one dies\n"));
+	printf(_("  -T                 send SIGABRT to all backend processes if one dies\n"));
 	printf(_("  -W NUM             wait NUM seconds to allow attach from a debugger\n"));
 
 	printf(_("\nOptions for single-user mode:\n"));
@@ -352,9 +426,9 @@ help(const char *progname)
 
 	printf(_("\nOptions for bootstrapping mode:\n"));
 	printf(_("  --boot             selects bootstrapping mode (must be first argument)\n"));
+	printf(_("  --check            selects check mode (must be first argument)\n"));
 	printf(_("  DBNAME             database name (mandatory argument in bootstrapping mode)\n"));
 	printf(_("  -r FILENAME        send stdout and stderr to given file\n"));
-	printf(_("  -x NUM             internal use\n"));
 
 	printf(_("\nPlease read the documentation for the complete list of run-time\n"
 			 "configuration settings and how to set them on the command line or in\n"
@@ -403,4 +477,40 @@ check_root(const char *progname)
 		exit(1);
 	}
 #endif							/* WIN32 */
+}
+
+/*
+ * At least on linux, set_ps_display() breaks /proc/$pid/environ. The
+ * sanitizer library uses /proc/$pid/environ to implement getenv() as it wants
+ * to work independent of libc. Depending on which sanitizers are enabled,
+ * the sanitizer library may not get initialized until after we've called
+ * set_ps_display(), preventing the sanitizer from seeing environment-supplied
+ * options.
+ *
+ * We can work around that by defining __ubsan_default_options, a weak symbol
+ * libsanitizer uses to get defaults from the application, and return
+ * getenv("UBSAN_OPTIONS"). But only if main already was reached, so that we
+ * don't end up relying on a not-yet-working getenv().
+ *
+ * On the other hand, with different sanitizers enabled, libsanitizer can
+ * call this so early that it's not fully initialized itself, resulting in
+ * recursion and a core dump within libsanitizer.  To prevent that, ensure
+ * that this function is built without any sanitizer callbacks in it.
+ *
+ * As this function won't get called when not running a sanitizer, it doesn't
+ * seem necessary to only compile it conditionally.
+ */
+const char *__ubsan_default_options(void);
+
+#if __has_attribute(disable_sanitizer_instrumentation)
+__attribute__((disable_sanitizer_instrumentation))
+#endif
+const char *
+__ubsan_default_options(void)
+{
+	/* don't call libc before it's guaranteed to be initialized */
+	if (!reached_main)
+		return "";
+
+	return getenv("UBSAN_OPTIONS");
 }

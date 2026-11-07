@@ -4,7 +4,7 @@
  *	  creator functions for various nodes. The functions here are for the
  *	  most frequently created nodes.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -51,7 +51,7 @@ makeSimpleA_Expr(A_Expr_Kind kind, char *name,
 	A_Expr	   *a = makeNode(A_Expr);
 
 	a->kind = kind;
-	a->name = list_make1(makeString((char *) name));
+	a->name = list_make1(makeString(name));
 	a->lexpr = lexpr;
 	a->rexpr = rexpr;
 	a->location = location;
@@ -63,7 +63,7 @@ makeSimpleA_Expr(A_Expr_Kind kind, char *name,
  *	  creates a Var node
  */
 Var *
-makeVar(Index varno,
+makeVar(int varno,
 		AttrNumber varattno,
 		Oid vartype,
 		int32 vartypmod,
@@ -80,12 +80,16 @@ makeVar(Index varno,
 	var->varlevelsup = varlevelsup;
 
 	/*
-	 * Only a few callers need to make Var nodes with varnosyn/varattnosyn
-	 * different from varno/varattno.  We don't provide separate arguments for
-	 * them, but just initialize them to the given varno/varattno.  This
-	 * reduces code clutter and chance of error for most callers.
+	 * Only a few callers need to make Var nodes with varreturningtype
+	 * different from VAR_RETURNING_DEFAULT, non-null varnullingrels, or with
+	 * varnosyn/varattnosyn different from varno/varattno.  We don't provide
+	 * separate arguments for them, but just initialize them to sensible
+	 * default values.  This reduces code clutter and chance of error for most
+	 * callers.
 	 */
-	var->varnosyn = varno;
+	var->varreturningtype = VAR_RETURNING_DEFAULT;
+	var->varnullingrels = NULL;
+	var->varnosyn = (Index) varno;
 	var->varattnosyn = varattno;
 
 	/* Likewise, we just set location to "unknown" here */
@@ -100,7 +104,7 @@ makeVar(Index varno,
  *		TargetEntry
  */
 Var *
-makeVarFromTargetEntry(Index varno,
+makeVarFromTargetEntry(int varno,
 					   TargetEntry *tle)
 {
 	return makeVar(varno,
@@ -131,7 +135,7 @@ makeVarFromTargetEntry(Index varno,
  */
 Var *
 makeWholeRowVar(RangeTblEntry *rte,
-				Index varno,
+				int varno,
 				Index varlevelsup,
 				bool allowScalar)
 {
@@ -156,7 +160,7 @@ makeWholeRowVar(RangeTblEntry *rte,
 							 InvalidOid,
 							 varlevelsup);
 			break;
-		
+
 		case RTE_SUBQUERY:
 
 			/*
@@ -476,10 +480,33 @@ makeRangeVar(char *schemaname, char *relname, int location)
 	r->inh = true;
 	r->relpersistence = RELPERSISTENCE_PERMANENT;
 	r->alias = NULL;
-	r->partitionfornode = NULL;
 	r->location = location;
 
 	return r;
+}
+
+/*
+ * makeNotNullConstraint -
+ *		creates a Constraint node for NOT NULL constraints
+ */
+Constraint *
+makeNotNullConstraint(String *colname)
+{
+	Constraint *notnull;
+
+	notnull = makeNode(Constraint);
+	notnull->contype = CONSTR_NOTNULL;
+	notnull->conname = NULL;
+	notnull->is_no_inherit = false;
+	notnull->deferrable = false;
+	notnull->initdeferred = false;
+	notnull->location = -1;
+	notnull->keys = list_make1(colname);
+	notnull->is_enforced = true;
+	notnull->skip_validation = false;
+	notnull->initially_valid = true;
+
+	return notnull;
 }
 
 /*
@@ -557,29 +584,6 @@ makeColumnDef(const char *colname, Oid typeOid, int32 typmod, Oid collOid)
 	return n;
 }
 
-ColumnDef *
-mys_makeColumnDef(const char *colname, bool isNotNull, Oid typeOid, int32 typmod, Oid collOid)
-{
-	ColumnDef  *n = makeNode(ColumnDef);
-
-	n->colname = pstrdup(colname);
-	n->typeName = makeTypeNameFromOid(typeOid, typmod);
-	n->inhcount = 0;
-	n->is_local = true;
-	n->is_not_null = isNotNull;
-	n->is_from_type = false;
-	n->storage = 0;
-	n->raw_default = NULL;
-	n->cooked_default = NULL;
-	n->collClause = NULL;
-	n->collOid = collOid;
-	n->constraints = NIL;
-	n->fdwoptions = NIL;
-	n->location = -1;
-
-	return n;
-}
-
 /*
  * makeFuncExpr -
  *	build an expression tree representing a function call.
@@ -604,6 +608,22 @@ makeFuncExpr(Oid funcid, Oid rettype, List *args,
 	funcexpr->location = -1;
 
 	return funcexpr;
+}
+
+/*
+ * makeStringConst -
+ * 	build a A_Const node of type T_String for given string
+ */
+Node *
+makeStringConst(char *str, int location)
+{
+	A_Const    *n = makeNode(A_Const);
+
+	n->val.sval.type = T_String;
+	n->val.sval.sval = str;
+	n->location = location;
+
+	return (Node *) n;
 }
 
 /*
@@ -812,7 +832,9 @@ make_ands_implicit(Expr *clause)
  */
 IndexInfo *
 makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
-			  List *predicates, bool unique, bool isready, bool concurrent)
+			  List *predicates, bool unique, bool nulls_not_distinct,
+			  bool isready, bool concurrent, bool summarizing,
+			  bool withoutoverlaps)
 {
 	IndexInfo  *n = makeNode(IndexInfo);
 
@@ -821,8 +843,16 @@ makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
 	Assert(n->ii_NumIndexKeyAttrs != 0);
 	Assert(n->ii_NumIndexKeyAttrs <= n->ii_NumIndexAttrs);
 	n->ii_Unique = unique;
+	n->ii_NullsNotDistinct = nulls_not_distinct;
 	n->ii_ReadyForInserts = isready;
+	n->ii_CheckedUnchanged = false;
+	n->ii_IndexUnchanged = false;
 	n->ii_Concurrent = concurrent;
+	n->ii_Summarizing = summarizing;
+	n->ii_WithoutOverlaps = withoutoverlaps;
+
+	/* summarizing indexes cannot contain non-key attributes */
+	Assert(!summarizing || (numkeyattrs == numattrs));
 
 	/* expressions */
 	n->ii_Expressions = expressions;
@@ -836,9 +866,6 @@ makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
 	n->ii_ExclusionOps = NULL;
 	n->ii_ExclusionProcs = NULL;
 	n->ii_ExclusionStrats = NULL;
-
-	/* opclass options */
-	n->ii_OpclassOptions = NULL;
 
 	/* speculative inserts */
 	n->ii_UniqueOps = NULL;
@@ -885,4 +912,126 @@ makeVacuumRelation(RangeVar *relation, Oid oid, List *va_cols)
 	v->oid = oid;
 	v->va_cols = va_cols;
 	return v;
+}
+
+/*
+ * makeJsonFormat -
+ *	  creates a JsonFormat node
+ */
+JsonFormat *
+makeJsonFormat(JsonFormatType type, JsonEncoding encoding, int location)
+{
+	JsonFormat *jf = makeNode(JsonFormat);
+
+	jf->format_type = type;
+	jf->encoding = encoding;
+	jf->location = location;
+
+	return jf;
+}
+
+/*
+ * makeJsonValueExpr -
+ *	  creates a JsonValueExpr node
+ */
+JsonValueExpr *
+makeJsonValueExpr(Expr *raw_expr, Expr *formatted_expr,
+				  JsonFormat *format)
+{
+	JsonValueExpr *jve = makeNode(JsonValueExpr);
+
+	jve->raw_expr = raw_expr;
+	jve->formatted_expr = formatted_expr;
+	jve->format = format;
+
+	return jve;
+}
+
+/*
+ * makeJsonBehavior -
+ *	  creates a JsonBehavior node
+ */
+JsonBehavior *
+makeJsonBehavior(JsonBehaviorType btype, Node *expr, int location)
+{
+	JsonBehavior *behavior = makeNode(JsonBehavior);
+
+	behavior->btype = btype;
+	behavior->expr = expr;
+	behavior->location = location;
+
+	return behavior;
+}
+
+/*
+ * makeJsonKeyValue -
+ *	  creates a JsonKeyValue node
+ */
+Node *
+makeJsonKeyValue(Node *key, Node *value)
+{
+	JsonKeyValue *n = makeNode(JsonKeyValue);
+
+	n->key = (Expr *) key;
+	n->value = castNode(JsonValueExpr, value);
+
+	return (Node *) n;
+}
+
+/*
+ * makeJsonIsPredicate -
+ *	  creates a JsonIsPredicate node
+ */
+Node *
+makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
+					bool unique_keys, int location)
+{
+	JsonIsPredicate *n = makeNode(JsonIsPredicate);
+
+	Assert(expr != NULL);
+
+	n->expr = expr;
+	n->format = format;
+	n->item_type = item_type;
+	n->unique_keys = unique_keys;
+	n->location = location;
+
+	return (Node *) n;
+}
+
+/*
+ * makeJsonTablePathSpec -
+ *		Make JsonTablePathSpec node from given path string and name (if any)
+ */
+JsonTablePathSpec *
+makeJsonTablePathSpec(char *string, char *name, int string_location,
+					  int name_location)
+{
+	JsonTablePathSpec *pathspec = makeNode(JsonTablePathSpec);
+
+	Assert(string != NULL);
+	pathspec->string = makeStringConst(string, string_location);
+	if (name != NULL)
+		pathspec->name = pstrdup(name);
+
+	pathspec->name_location = name_location;
+	pathspec->location = string_location;
+
+	return pathspec;
+}
+
+/*
+ * makeJsonTablePath -
+ *		Make JsonTablePath node for given path string and name
+ */
+JsonTablePath *
+makeJsonTablePath(Const *pathvalue, char *pathname)
+{
+	JsonTablePath *path = makeNode(JsonTablePath);
+
+	Assert(IsA(pathvalue, Const));
+	path->value = pathvalue;
+	path->name = pathname;
+
+	return path;
 }

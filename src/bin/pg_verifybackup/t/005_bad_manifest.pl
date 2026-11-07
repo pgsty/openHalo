@@ -1,18 +1,16 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Test the behavior of pg_verifybackup when the backup manifest has
 # problems.
 
 use strict;
-use warnings;
-use Cwd;
-use Config;
-use PostgresNode;
-use TestLib;
-use Test::More tests => 58;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
-my $tempdir = TestLib::tempdir;
+my $tempdir = PostgreSQL::Test::Utils::tempdir;
 
 test_bad_manifest(
 	'input string ended unexpectedly',
@@ -33,8 +31,12 @@ test_parse_error('expected version indicator', <<EOM);
 {"not-expected": 1}
 EOM
 
-test_parse_error('unexpected manifest version', <<EOM);
+test_parse_error('manifest version not an integer', <<EOM);
 {"PostgreSQL-Backup-Manifest-Version": "phooey"}
+EOM
+
+test_parse_error('unexpected manifest version', <<EOM);
+{"PostgreSQL-Backup-Manifest-Version": 9876599}
 EOM
 
 test_parse_error('unexpected scalar', <<EOM);
@@ -192,7 +194,7 @@ sub test_fatal_error
 
 	my ($test_name, $manifest_contents) = @_;
 
-	test_bad_manifest($test_name, qr/fatal: $test_name/, $manifest_contents);
+	test_bad_manifest($test_name, qr/error: $test_name/, $manifest_contents);
 	return;
 }
 
@@ -209,3 +211,5 @@ sub test_bad_manifest
 	command_fails_like([ 'pg_verifybackup', $tempdir ], $regexp, $test_name);
 	return;
 }
+
+done_testing();

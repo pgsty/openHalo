@@ -17,7 +17,7 @@
  * won't visit blocks added after the first scan, but that is fine since
  * such blocks shouldn't contain any visible tuples anyway.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -28,14 +28,16 @@
 
 #include "postgres.h"
 
-#include "access/relscan.h"
 #include "access/tsmapi.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "utils/sampling.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "tsm_system_rows",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(tsm_system_rows_handler);
 
@@ -69,7 +71,7 @@ static BlockNumber system_rows_nextsampleblock(SampleScanState *node, BlockNumbe
 static OffsetNumber system_rows_nextsampletuple(SampleScanState *node,
 												BlockNumber blockno,
 												OffsetNumber maxoffset);
-static uint32 random_relative_prime(uint32 n, SamplerRandomState randstate);
+static uint32 random_relative_prime(uint32 n, pg_prng_state *randstate);
 
 
 /*
@@ -213,25 +215,25 @@ system_rows_nextsampleblock(SampleScanState *node, BlockNumber nblocks)
 		if (sampler->step == 0)
 		{
 			/* Initialize now that we have scan descriptor */
-			SamplerRandomState randstate;
+			pg_prng_state randstate;
 
 			/* If relation is empty, there's nothing to scan */
 			if (nblocks == 0)
 				return InvalidBlockNumber;
 
 			/* We only need an RNG during this setup step */
-			sampler_random_init_state(sampler->seed, randstate);
+			sampler_random_init_state(sampler->seed, &randstate);
 
 			/* Compute nblocks/firstblock/step only once per query */
 			sampler->nblocks = nblocks;
 
 			/* Choose random starting block within the relation */
 			/* (Actually this is the predecessor of the first block visited) */
-			sampler->firstblock = sampler_random_fract(randstate) *
+			sampler->firstblock = sampler_random_fract(&randstate) *
 				sampler->nblocks;
 
 			/* Find relative prime as step size for linear probing */
-			sampler->step = random_relative_prime(sampler->nblocks, randstate);
+			sampler->step = random_relative_prime(sampler->nblocks, &randstate);
 		}
 
 		/* Reinitialize lb */
@@ -317,7 +319,7 @@ gcd(uint32 a, uint32 b)
  * (else return 1).
  */
 static uint32
-random_relative_prime(uint32 n, SamplerRandomState randstate)
+random_relative_prime(uint32 n, pg_prng_state *randstate)
 {
 	uint32		r;
 

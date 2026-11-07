@@ -20,9 +20,6 @@
 
 PG_MODULE_MAGIC;
 
-void		_PG_init(void);
-void		_PG_fini(void);
-
 static char *ssl_passphrase = NULL;
 
 /* callback function */
@@ -48,14 +45,11 @@ _PG_init(void)
 							   NULL,
 							   NULL,
 							   NULL);
+
+	MarkGUCPrefixReserved("ssl_passphrase");
+
 	if (ssl_passphrase)
 		openssl_tls_init_hook = set_rot13;
-}
-
-void
-_PG_fini(void)
-{
-	/* do  nothing yet */
 }
 
 static void
@@ -64,7 +58,7 @@ set_rot13(SSL_CTX *context, bool isServerStart)
 	/* warn if the user has set ssl_passphrase_command */
 	if (ssl_passphrase_command[0])
 		ereport(WARNING,
-				(errmsg("ssl_passphrase_command setting ignored by ssl_passphrase_func module")));
+				(errmsg("\"ssl_passphrase_command\" setting ignored by ssl_passphrase_func module")));
 
 	SSL_CTX_set_default_passwd_cb(context, rot13_passphrase);
 }
@@ -86,5 +80,4 @@ rot13_passphrase(char *buf, int size, int rwflag, void *userdata)
 	}
 
 	return strlen(buf);
-
 }

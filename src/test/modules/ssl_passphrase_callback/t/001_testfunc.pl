@@ -1,26 +1,25 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use File::Copy;
 
-use TestLib;
+use PostgreSQL::Test::Utils;
 use Test::More;
-use PostgresNode;
+use PostgreSQL::Test::Cluster;
 
-unless ($ENV{with_ssl} eq 'openssl')
+unless (($ENV{with_ssl} || "") eq 'openssl')
 {
 	plan skip_all => 'OpenSSL not supported by this build';
 }
 
-my $clearpass = "FooBaR1";
 my $rot13pass = "SbbOnE1";
 
 # see the Makefile for how the certificate and key have been generated
 
-my $node = get_new_node('main');
+my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 $node->append_conf('postgresql.conf',
 	"ssl_passphrase.passphrase = '$rot13pass'");
@@ -33,7 +32,7 @@ my $ddir = $node->data_dir;
 # install certificate and protected key
 copy("server.crt", $ddir);
 copy("server.key", $ddir);
-chmod 0600, "$ddir/server.key";
+chmod 0600, "$ddir/server.key" or die $!;
 
 $node->start;
 
@@ -56,19 +55,22 @@ my $log_contents = slurp_file($log);
 
 like(
 	$log_contents,
-	qr/WARNING.*ssl_passphrase_command setting ignored by ssl_passphrase_func module/,
+	qr/WARNING.*"ssl_passphrase_command" setting ignored by ssl_passphrase_func module/,
 	"ssl_passphrase_command set warning");
 
 # set the wrong passphrase
 $node->append_conf('postgresql.conf', "ssl_passphrase.passphrase = 'blurfl'");
 
 # try to start the server again
-my $ret = TestLib::system_log('pg_ctl', '-D', $node->data_dir, '-l',
-	$node->logfile, 'start');
+my $ret = PostgreSQL::Test::Utils::system_log(
+	'pg_ctl',
+	'--pgdata' => $node->data_dir,
+	'--log' => $node->logfile,
+	'start');
 
 
 # with a bad passphrase the server should not start
-ok($ret,                       "pg_ctl fails with bad passphrase");
+ok($ret, "pg_ctl fails with bad passphrase");
 ok(!-e "$ddir/postmaster.pid", "postgres not started with bad passphrase");
 
 # just in case

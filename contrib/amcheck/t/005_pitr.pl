@@ -1,8 +1,8 @@
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Test integrity of intermediate states by PITR to those states
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -15,23 +15,23 @@ $origin->start;
 $origin->backup('my_backup');
 # Create a table with each of 6 PK values spanning 1/4 of a block.  Delete the
 # first four, so one index leaf is eligible for deletion.  Make a replication
-# slot just so pg_waldump will always have access to later WAL.
+# slot just so pg_walinspect will always have access to later WAL.
 my $setup = <<EOSQL;
 BEGIN;
 CREATE EXTENSION amcheck;
-CREATE TABLE not_leftmost (c text);
-ALTER TABLE not_leftmost ALTER c SET STORAGE PLAIN;
+CREATE EXTENSION pg_walinspect;
+CREATE TABLE not_leftmost (c text STORAGE PLAIN);
 INSERT INTO not_leftmost
   SELECT repeat(n::text, database_block_size / 4)
   FROM generate_series(1,6) t(n), pg_control_init();
 ALTER TABLE not_leftmost ADD CONSTRAINT not_leftmost_pk PRIMARY KEY (c);
 DELETE FROM not_leftmost WHERE c ~ '^[1-4]';
-SELECT pg_create_physical_replication_slot('for_waldump', true, false);
+SELECT pg_create_physical_replication_slot('for_walinspect', true, false);
 COMMIT;
 EOSQL
 $origin->safe_psql('postgres', $setup);
-my $before_vacuum_walfile =
-  $origin->safe_psql('postgres', "SELECT pg_walfile_name(pg_current_wal_lsn())");
+my $before_vacuum_lsn =
+  $origin->safe_psql('postgres', "SELECT pg_current_wal_lsn()");
 # VACUUM to delete the aforementioned leaf page.  Force an XLogFlush() by
 # dropping a permanent table.  That way, the XLogReader infrastructure can
 # always see VACUUM's records, even under synchronous_commit=off.  Finally,
@@ -41,19 +41,12 @@ SET synchronous_commit = off;
 VACUUM (VERBOSE, INDEX_CLEANUP ON) not_leftmost;
 CREATE TABLE XLogFlush ();
 DROP TABLE XLogFlush;
-SELECT pg_walfile_name(pg_current_wal_flush_lsn());
+SELECT max(start_lsn)
+  FROM pg_get_wal_records_info('$before_vacuum_lsn', 'FFFFFFFF/FFFFFFFF')
+  WHERE resource_manager = 'Btree' AND record_type = 'UNLINK_PAGE';
 EOSQL
-my $after_unlink_walfile = $origin->safe_psql('postgres', $vacuum);
+my $unlink_lsn = $origin->safe_psql('postgres', $vacuum);
 $origin->stop;
-my $unlink_lsn = do {
-	local %ENV = $origin->_get_env();
-	my $stdout;
-	run_log(['pg_waldump', '-p', $origin->data_dir . '/pg_wal',
-			 $before_vacuum_walfile, $after_unlink_walfile],
-			'>', \$stdout);
-	$stdout =~ m|^rmgr: Btree .*, lsn: ([/0-9A-F]+), .*, desc: UNLINK_PAGE left|m;
-	$1;
-};
 die "did not find UNLINK_PAGE record" unless $unlink_lsn;
 
 # replica node: amcheck at notable points in the WAL stream

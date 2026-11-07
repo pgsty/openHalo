@@ -5,7 +5,7 @@
  *	  (pg_ts_config)
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_ts_config.h
@@ -20,7 +20,7 @@
 #define PG_TS_CONFIG_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_ts_config_d.h"
+#include "catalog/pg_ts_config_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_ts_config definition.  cpp turns this into
@@ -47,9 +47,10 @@ CATALOG(pg_ts_config,3602,TSConfigRelationId)
 
 typedef FormData_pg_ts_config *Form_pg_ts_config;
 
-DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608, on pg_ts_config using btree(cfgname name_ops, cfgnamespace oid_ops));
-#define TSConfigNameNspIndexId	3608
-DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_oid_index, 3712, on pg_ts_config using btree(oid oid_ops));
-#define TSConfigOidIndexId	3712
+DECLARE_UNIQUE_INDEX(pg_ts_config_cfgname_index, 3608, TSConfigNameNspIndexId, pg_ts_config, btree(cfgname name_ops, cfgnamespace oid_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_ts_config_oid_index, 3712, TSConfigOidIndexId, pg_ts_config, btree(oid oid_ops));
+
+MAKE_SYSCACHE(TSCONFIGNAMENSP, pg_ts_config_cfgname_index, 2);
+MAKE_SYSCACHE(TSCONFIGOID, pg_ts_config_oid_index, 2);
 
 #endif							/* PG_TS_CONFIG_H */

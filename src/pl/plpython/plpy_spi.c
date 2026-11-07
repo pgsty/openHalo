@@ -8,7 +8,6 @@
 
 #include <limits.h>
 
-#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
@@ -18,12 +17,10 @@
 #include "plpy_main.h"
 #include "plpy_planobject.h"
 #include "plpy_plpymodule.h"
-#include "plpy_procedure.h"
 #include "plpy_resultobject.h"
 #include "plpy_spi.h"
-#include "plpython.h"
+#include "plpy_util.h"
 #include "utils/memutils.h"
-#include "utils/syscache.h"
 
 static PyObject *PLy_spi_execute_query(char *query, long limit);
 static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable,
@@ -69,7 +66,6 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 
 	plan->nargs = nargs;
 	plan->types = nargs ? palloc0(sizeof(Oid) * nargs) : NULL;
-	plan->values = nargs ? palloc0(sizeof(Datum) * nargs) : NULL;
 	plan->args = nargs ? palloc0(sizeof(PLyObToDatum) * nargs) : NULL;
 
 	MemoryContextSwitchTo(oldcontext);
@@ -90,9 +86,12 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			int32		typmod;
 
 			optr = PySequence_GetItem(list, i);
-			if (PyString_Check(optr))
-				sptr = PyString_AsString(optr);
-			else if (PyUnicode_Check(optr))
+
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (optr == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", i);
+
+			if (PyUnicode_Check(optr))
 				sptr = PLyUnicode_AsString(optr);
 			else
 			{
@@ -107,7 +106,7 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			 *information for input conversion.
 			 ********************************************************/
 
-			parseTypeString(sptr, &typeId, &typmod, false);
+			(void) parseTypeString(sptr, &typeId, &typmod, NULL);
 
 			Py_DECREF(optr);
 
@@ -185,7 +184,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 
 	if (list != NULL)
 	{
-		if (!PySequence_Check(list) || PyString_Check(list) || PyUnicode_Check(list))
+		if (!PySequence_Check(list) || PyUnicode_Check(list))
 		{
 			PLy_exception_set(PyExc_TypeError, "plpy.execute takes a sequence as its second argument");
 			return NULL;
@@ -204,7 +203,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 
 		if (!so)
 			PLy_elog(ERROR, "could not execute plan");
-		sv = PyString_AsString(so);
+		sv = PLyUnicode_AsString(so);
 		PLy_exception_set_plural(PyExc_TypeError,
 								 "Expected sequence of %d argument, got %d: %s",
 								 "Expected sequence of %d arguments, got %d: %s",
@@ -254,18 +253,23 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 			PyObject   *elem;
 
 			elem = PySequence_GetItem(list, j);
-			PG_TRY();
+
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (elem == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", j);
+
+			PG_TRY(2);
 			{
 				bool		isnull;
 
 				values[j] = PLy_output_convert(arg, elem, &isnull);
 				nulls[j] = isnull ? 'n' : ' ';
 			}
-			PG_FINALLY();
+			PG_FINALLY(2);
 			{
 				Py_DECREF(elem);
 			}
-			PG_END_TRY();
+			PG_END_TRY(2);
 		}
 
 		MemoryContextSwitchTo(oldcontext);
@@ -352,7 +356,7 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, uint64 rows, int status)
 		return NULL;
 	}
 	Py_DECREF(result->status);
-	result->status = PyInt_FromLong(status);
+	result->status = PyLong_FromLong(status);
 
 	if (status > 0 && tuptable == NULL)
 	{

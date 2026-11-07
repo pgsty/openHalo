@@ -2,106 +2,17 @@
 -- TRIGGERS
 --
 
-create table pkeys (pkey1 int4 not null, pkey2 text not null);
-create table fkeys (fkey1 int4, fkey2 text, fkey3 int);
-create table fkeys2 (fkey21 int4, fkey22 text, pkey23 int not null);
+-- directory paths and dlsuffix are passed to us in environment variables
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
 
-create index fkeys_i on fkeys (fkey1, fkey2);
-create index fkeys2_i on fkeys2 (fkey21, fkey22);
-create index fkeys2p_i on fkeys2 (pkey23);
+\set regresslib :libdir '/regress' :dlsuffix
 
-insert into pkeys values (10, '1');
-insert into pkeys values (20, '2');
-insert into pkeys values (30, '3');
-insert into pkeys values (40, '4');
-insert into pkeys values (50, '5');
-insert into pkeys values (60, '6');
-create unique index pkeys_i on pkeys (pkey1, pkey2);
+CREATE FUNCTION trigger_return_old ()
+        RETURNS trigger
+        AS :'regresslib'
+        LANGUAGE C;
 
---
--- For fkeys:
--- 	(fkey1, fkey2)	--> pkeys (pkey1, pkey2)
--- 	(fkey3)		--> fkeys2 (pkey23)
---
-create trigger check_fkeys_pkey_exist
-	before insert or update on fkeys
-	for each row
-	execute function
-	check_primary_key ('fkey1', 'fkey2', 'pkeys', 'pkey1', 'pkey2');
-
-create trigger check_fkeys_pkey2_exist
-	before insert or update on fkeys
-	for each row
-	execute function check_primary_key ('fkey3', 'fkeys2', 'pkey23');
-
---
--- For fkeys2:
--- 	(fkey21, fkey22)	--> pkeys (pkey1, pkey2)
---
-create trigger check_fkeys2_pkey_exist
-	before insert or update on fkeys2
-	for each row
-	execute procedure
-	check_primary_key ('fkey21', 'fkey22', 'pkeys', 'pkey1', 'pkey2');
-
--- Test comments
-COMMENT ON TRIGGER check_fkeys2_pkey_bad ON fkeys2 IS 'wrong';
-COMMENT ON TRIGGER check_fkeys2_pkey_exist ON fkeys2 IS 'right';
-COMMENT ON TRIGGER check_fkeys2_pkey_exist ON fkeys2 IS NULL;
-
---
--- For pkeys:
--- 	ON DELETE/UPDATE (pkey1, pkey2) CASCADE:
--- 		fkeys (fkey1, fkey2) and fkeys2 (fkey21, fkey22)
---
-create trigger check_pkeys_fkey_cascade
-	before delete or update on pkeys
-	for each row
-	execute procedure
-	check_foreign_key (2, 'cascade', 'pkey1', 'pkey2',
-	'fkeys', 'fkey1', 'fkey2', 'fkeys2', 'fkey21', 'fkey22');
-
---
--- For fkeys2:
--- 	ON DELETE/UPDATE (pkey23) RESTRICT:
--- 		fkeys (fkey3)
---
-create trigger check_fkeys2_fkey_restrict
-	before delete or update on fkeys2
-	for each row
-	execute procedure check_foreign_key (1, 'restrict', 'pkey23', 'fkeys', 'fkey3');
-
-insert into fkeys2 values (10, '1', 1);
-insert into fkeys2 values (30, '3', 2);
-insert into fkeys2 values (40, '4', 5);
-insert into fkeys2 values (50, '5', 3);
--- no key in pkeys
-insert into fkeys2 values (70, '5', 3);
-
-insert into fkeys values (10, '1', 2);
-insert into fkeys values (30, '3', 3);
-insert into fkeys values (40, '4', 2);
-insert into fkeys values (50, '5', 2);
--- no key in pkeys
-insert into fkeys values (70, '5', 1);
--- no key in fkeys2
-insert into fkeys values (60, '6', 4);
-
-delete from pkeys where pkey1 = 30 and pkey2 = '3';
-delete from pkeys where pkey1 = 40 and pkey2 = '4';
-update pkeys set pkey1 = 7, pkey2 = '70' where pkey1 = 50 and pkey2 = '5';
-update pkeys set pkey1 = 7, pkey2 = '70' where pkey1 = 10 and pkey2 = '1';
-
-SELECT trigger_name, event_manipulation, event_object_schema, event_object_table,
-       action_order, action_condition, action_orientation, action_timing,
-       action_reference_old_table, action_reference_new_table
-  FROM information_schema.triggers
-  WHERE event_object_table in ('pkeys', 'fkeys', 'fkeys2')
-  ORDER BY trigger_name COLLATE "C", 2;
-
-DROP TABLE pkeys;
-DROP TABLE fkeys;
-DROP TABLE fkeys2;
 
 -- Check behavior when trigger returns unmodified trigtuple
 create table trigtest (f1 int, f2 text);
@@ -181,77 +92,6 @@ select * from trigtest;
 
 drop table trigtest;
 
-create sequence ttdummy_seq increment 10 start 0 minvalue 0;
-
-create table tttest (
-	price_id	int4,
-	price_val	int4,
-	price_on	int4,
-	price_off	int4 default 999999
-);
-
-create trigger ttdummy
-	before delete or update on tttest
-	for each row
-	execute procedure
-	ttdummy (price_on, price_off);
-
-create trigger ttserial
-	before insert or update on tttest
-	for each row
-	execute procedure
-	autoinc (price_on, ttdummy_seq);
-
-insert into tttest values (1, 1, null);
-insert into tttest values (2, 2, null);
-insert into tttest values (3, 3, 0);
-
-select * from tttest;
-delete from tttest where price_id = 2;
-select * from tttest;
--- what do we see ?
-
--- get current prices
-select * from tttest where price_off = 999999;
-
--- change price for price_id == 3
-update tttest set price_val = 30 where price_id = 3;
-select * from tttest;
-
--- now we want to change pric_id in ALL tuples
--- this gets us not what we need
-update tttest set price_id = 5 where price_id = 3;
-select * from tttest;
-
--- restore data as before last update:
-select set_ttdummy(0);
-delete from tttest where price_id = 5;
-update tttest set price_off = 999999 where price_val = 30;
-select * from tttest;
-
--- and try change price_id now!
-update tttest set price_id = 5 where price_id = 3;
-select * from tttest;
--- isn't it what we need ?
-
-select set_ttdummy(1);
-
--- we want to correct some "date"
-update tttest set price_on = -1 where price_id = 1;
--- but this doesn't work
-
--- try in this way
-select set_ttdummy(0);
-update tttest set price_on = -1 where price_id = 1;
-select * from tttest;
--- isn't it what we need ?
-
--- get price for price_id == 5 as it was @ "date" 35
-select * from tttest where price_on <= 35 and price_off > 35 and price_id = 5;
-
-drop table tttest;
-drop sequence ttdummy_seq;
-
 --
 -- tests for per-statement triggers
 --
@@ -312,6 +152,11 @@ COPY main_table (a, b) FROM stdin;
 \.
 
 SELECT * FROM main_table ORDER BY a, b;
+
+-- Test comments
+COMMENT ON TRIGGER no_such_trigger ON main_table IS 'wrong';
+COMMENT ON TRIGGER before_ins_stmt_trig ON main_table IS 'right';
+COMMENT ON TRIGGER before_ins_stmt_trig ON main_table IS NULL;
 
 --
 -- test triggers with WHEN clause
@@ -1153,9 +998,13 @@ insert into child values (10, 1, 'b');
 select * from parent; select * from child;
 
 update parent set val1 = 'b' where aid = 1; -- should fail
+merge into parent p using (values (1)) as v(id) on p.aid = v.id
+  when matched then update set val1 = 'b'; -- should fail
 select * from parent; select * from child;
 
 delete from parent where aid = 1; -- should fail
+merge into parent p using (values (1)) as v(id) on p.aid = v.id
+  when matched then delete; -- should fail
 select * from parent; select * from child;
 
 -- replace the trigger function with one that restarts the deletion after
@@ -1550,6 +1399,42 @@ create trigger qqq after insert on parted_trig_1_1 for each row execute procedur
 insert into parted_trig values (50), (1500);
 drop table parted_trig;
 
+-- Verify that the correct triggers fire for cross-partition updates
+create table parted_trig (a int) partition by list (a);
+create table parted_trig1 partition of parted_trig for values in (1);
+create table parted_trig2 partition of parted_trig for values in (2);
+insert into parted_trig values (1);
+
+create or replace function trigger_notice() returns trigger as $$
+  begin
+    raise notice 'trigger % on % % % for %', TG_NAME, TG_TABLE_NAME, TG_WHEN, TG_OP, TG_LEVEL;
+    if TG_LEVEL = 'ROW' then
+      if TG_OP = 'DELETE' then
+        return OLD;
+      else
+        return NEW;
+      end if;
+    end if;
+    return null;
+  end;
+  $$ language plpgsql;
+create trigger parted_trig_before_stmt before insert or update or delete on parted_trig
+   for each statement execute procedure trigger_notice();
+create trigger parted_trig_before_row before insert or update or delete on parted_trig
+   for each row execute procedure trigger_notice();
+create trigger parted_trig_after_row after insert or update or delete on parted_trig
+   for each row execute procedure trigger_notice();
+create trigger parted_trig_after_stmt after insert or update or delete on parted_trig
+   for each statement execute procedure trigger_notice();
+
+update parted_trig set a = 2 where a = 1;
+
+-- update action in merge should behave the same
+merge into parted_trig using (select 1) as ss on true
+  when matched and a = 2 then update set a = 1;
+
+drop table parted_trig;
+
 -- Verify propagation of trigger arguments to partitions
 create table parted_trig (a int) partition by list (a);
 create table parted_trig1 partition of parted_trig for values in (1);
@@ -1863,7 +1748,6 @@ select tgrelid::regclass, rtrim(tgname, '0123456789') as tgname,
   tgfoid::regproc, tgenabled
   from pg_trigger where tgrelid in ('parent'::regclass, 'child1'::regclass)
   order by tgrelid::regclass::text, tgfoid;
--- Before v15, this has no effect because parent has no triggers:
 alter table parent disable trigger all;
 select tgrelid::regclass, rtrim(tgname, '0123456789') as tgname,
   tgfoid::regproc, tgenabled
@@ -2037,6 +1921,11 @@ AAA	42
 BBB	42
 CCC	42
 \.
+
+-- check detach/reattach behavior; statement triggers with transition tables
+-- should not prevent a table from becoming a partition again
+alter table parent detach partition child1;
+alter table parent attach partition child1 for values in ('AAA');
 
 -- DML affecting parent sees tuples collected from children even if
 -- there is no transition table trigger on the children
@@ -2257,6 +2146,11 @@ copy parent (a, b) from stdin;
 DDD	42
 \.
 
+-- check disinherit/reinherit behavior; statement triggers with transition
+-- tables should not prevent a table from becoming an inheritance child again
+alter table child1 no inherit parent;
+alter table child1 inherit parent;
+
 -- DML affecting parent sees tuples collected from children even if
 -- there is no transition table trigger on the children
 drop trigger child1_insert_trig on child1;
@@ -2320,6 +2214,10 @@ with wcte as (insert into table1 values (42))
 
 with wcte as (insert into table1 values (43))
   insert into table1 values (44);
+
+with wcte as (insert into table1 values (45))
+  merge into table1 using (values (46)) as v(a) on table1.a = v.a
+    when not matched then insert values (v.a);
 
 select * from table1;
 select * from table2;
@@ -2409,6 +2307,25 @@ create trigger my_table_col_update_trig
 drop table my_table;
 
 --
+-- Verify that transition tables can't be used in, eg, a view.
+--
+
+create table my_table (a int);
+create function make_bogus_matview() returns trigger as
+$$ begin
+  create materialized view transition_test_mv as select * from new_table;
+  return new;
+end $$
+language plpgsql;
+create trigger make_bogus_matview
+  after insert on my_table
+  referencing new table as new_table
+  for each statement execute function make_bogus_matview();
+insert into my_table values (42);  -- error
+drop table my_table;
+drop function make_bogus_matview();
+
+--
 -- Test firing of triggers with transition tables by foreign key cascades
 --
 
@@ -2495,6 +2412,53 @@ insert into self_ref values (1, null), (2, 1), (3, 2), (4, 3);
 delete from self_ref where a = 1;
 
 drop table self_ref;
+
+--
+-- test transition tables with MERGE
+--
+create table merge_target_table (a int primary key, b text);
+create trigger merge_target_table_insert_trig
+  after insert on merge_target_table referencing new table as new_table
+  for each statement execute procedure dump_insert();
+create trigger merge_target_table_update_trig
+  after update on merge_target_table referencing old table as old_table new table as new_table
+  for each statement execute procedure dump_update();
+create trigger merge_target_table_delete_trig
+  after delete on merge_target_table referencing old table as old_table
+  for each statement execute procedure dump_delete();
+
+create table merge_source_table (a int, b text);
+insert into merge_source_table
+  values (1, 'initial1'), (2, 'initial2'),
+		 (3, 'initial3'), (4, 'initial4');
+
+merge into merge_target_table t
+using merge_source_table s
+on t.a = s.a
+when not matched then
+  insert values (a, b);
+
+merge into merge_target_table t
+using merge_source_table s
+on t.a = s.a
+when matched and s.a <= 2 then
+	update set b = t.b || ' updated by merge'
+when matched and s.a > 2 then
+	delete
+when not matched then
+  insert values (a, b);
+
+merge into merge_target_table t
+using merge_source_table s
+on t.a = s.a
+when matched and s.a <= 2 then
+	update set b = t.b || ' updated again by merge'
+when matched and s.a > 2 then
+	delete
+when not matched then
+  insert values (a, b);
+
+drop table merge_source_table, merge_target_table;
 
 -- cleanup
 drop function dump_insert();
@@ -2700,3 +2664,113 @@ rollback;
 
 drop table convslot_test_parent;
 drop function convslot_trig4();
+
+-- Test trigger renaming on partitioned tables
+create table grandparent (id int, primary key (id)) partition by range (id);
+create table middle partition of grandparent for values from (1) to (10)
+partition by range (id);
+create table chi partition of middle for values from (1) to (5);
+create table cho partition of middle for values from (6) to (10);
+create function f () returns trigger as
+$$ begin return new; end; $$
+language plpgsql;
+create trigger a after insert on grandparent
+for each row execute procedure f();
+
+alter trigger a on grandparent rename to b;
+select tgrelid::regclass, tgname,
+(select tgname from pg_trigger tr where tr.oid = pg_trigger.tgparentid) parent_tgname
+from pg_trigger where tgrelid in (select relid from pg_partition_tree('grandparent'))
+order by tgname, tgrelid::regclass::text COLLATE "C";
+alter trigger a on only grandparent rename to b;	-- ONLY not supported
+alter trigger b on middle rename to c;	-- can't rename trigger on partition
+create trigger c after insert on middle
+for each row execute procedure f();
+alter trigger b on grandparent rename to c;
+
+-- Rename cascading does not affect statement triggers
+create trigger p after insert on grandparent for each statement execute function f();
+create trigger p after insert on middle for each statement execute function f();
+alter trigger p on grandparent rename to q;
+select tgrelid::regclass, tgname,
+(select tgname from pg_trigger tr where tr.oid = pg_trigger.tgparentid) parent_tgname
+from pg_trigger where tgrelid in (select relid from pg_partition_tree('grandparent'))
+order by tgname, tgrelid::regclass::text COLLATE "C";
+
+drop table grandparent;
+
+-- Trigger renaming does not recurse on legacy inheritance
+create table parent (a int);
+create table child () inherits (parent);
+create trigger parenttrig after insert on parent
+for each row execute procedure f();
+create trigger parenttrig after insert on child
+for each row execute procedure f();
+alter trigger parenttrig on parent rename to anothertrig;
+\d+ child
+
+drop table parent, child;
+drop function f();
+
+-- Test who runs deferred trigger functions
+
+-- setup
+create role regress_caller;
+create role regress_fn_owner;
+create function whoami() returns trigger language plpgsql
+as $$
+begin
+  raise notice 'I am %', current_user;
+  return null;
+end;
+$$;
+alter function whoami() owner to regress_fn_owner;
+
+create table defer_trig (id integer);
+grant insert on defer_trig to public;
+create constraint trigger whoami after insert on defer_trig
+  deferrable initially deferred
+  for each row
+  execute function whoami();
+
+-- deferred triggers must run as the user that queued the trigger
+begin;
+set role regress_caller;
+insert into defer_trig values (1);
+reset role;
+set role regress_fn_owner;
+insert into defer_trig values (2);
+reset role;
+commit;
+
+-- security definer functions override the user who queued the trigger
+alter function whoami() security definer;
+begin;
+set role regress_caller;
+insert into defer_trig values (3);
+reset role;
+commit;
+alter function whoami() security invoker;
+
+-- make sure the current user is restored after error
+create or replace function whoami() returns trigger language plpgsql
+as $$
+begin
+  raise notice 'I am %', current_user;
+  perform 1 / 0;
+  return null;
+end;
+$$;
+
+begin;
+set role regress_caller;
+insert into defer_trig values (4);
+reset role;
+commit;  -- error expected
+select current_user = session_user;
+
+-- clean up
+drop table defer_trig;
+drop function whoami();
+drop role regress_fn_owner;
+drop role regress_caller;

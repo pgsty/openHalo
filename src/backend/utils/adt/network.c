@@ -53,7 +53,6 @@ typedef struct
 
 static int32 network_cmp_internal(inet *a1, inet *a2);
 static int	network_fast_cmp(Datum x, Datum y, SortSupport ssup);
-static int	network_cmp_abbrev(Datum x, Datum y, SortSupport ssup);
 static bool network_abbrev_abort(int memtupcount, SortSupport ssup);
 static Datum network_abbrev_convert(Datum original, SortSupport ssup);
 static List *match_network_function(Node *leftop,
@@ -73,7 +72,7 @@ static inet *internal_inetpl(inet *ip, int64 addend);
  * Common INET/CIDR input routine
  */
 static inet *
-network_in(char *src, bool is_cidr)
+network_in(char *src, bool is_cidr, Node *escontext)
 {
 	int			bits;
 	inet	   *dst;
@@ -94,7 +93,7 @@ network_in(char *src, bool is_cidr)
 	bits = pg_inet_net_pton(ip_family(dst), src, ip_addr(dst),
 							is_cidr ? ip_addrsize(dst) : -1);
 	if ((bits < 0) || (bits > ip_maxbits(dst)))
-		ereport(ERROR,
+		ereturn(escontext, NULL,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 		/* translator: first %s is inet or cidr */
 				 errmsg("invalid input syntax for type %s: \"%s\"",
@@ -106,7 +105,7 @@ network_in(char *src, bool is_cidr)
 	if (is_cidr)
 	{
 		if (!addressOK(ip_addr(dst), bits, ip_family(dst)))
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid cidr value: \"%s\"", src),
 					 errdetail("Value has bits set to right of mask.")));
@@ -123,7 +122,7 @@ inet_in(PG_FUNCTION_ARGS)
 {
 	char	   *src = PG_GETARG_CSTRING(0);
 
-	PG_RETURN_INET_P(network_in(src, false));
+	PG_RETURN_INET_P(network_in(src, false, fcinfo->context));
 }
 
 Datum
@@ -131,7 +130,7 @@ cidr_in(PG_FUNCTION_ARGS)
 {
 	char	   *src = PG_GETARG_CSTRING(0);
 
-	PG_RETURN_INET_P(network_in(src, true));
+	PG_RETURN_INET_P(network_in(src, true, fcinfo->context));
 }
 
 
@@ -280,8 +279,6 @@ network_send(inet *addr, bool is_cidr)
 	pq_sendbyte(&buf, ip_bits(addr));
 	pq_sendbyte(&buf, is_cidr);
 	nb = ip_addrsize(addr);
-	if (nb < 0)
-		nb = 0;
 	pq_sendbyte(&buf, nb);
 	addrptr = (char *) ip_addr(addr);
 	for (i = 0; i < nb; i++)
@@ -456,7 +453,7 @@ network_sortsupport(PG_FUNCTION_ARGS)
 
 		ssup->ssup_extra = uss;
 
-		ssup->comparator = network_cmp_abbrev;
+		ssup->comparator = ssup_datum_unsigned_cmp;
 		ssup->abbrev_converter = network_abbrev_convert;
 		ssup->abbrev_abort = network_abbrev_abort;
 		ssup->abbrev_full_comparator = network_fast_cmp;
@@ -477,20 +474,6 @@ network_fast_cmp(Datum x, Datum y, SortSupport ssup)
 	inet	   *arg2 = DatumGetInetPP(y);
 
 	return network_cmp_internal(arg1, arg2);
-}
-
-/*
- * Abbreviated key comparison func
- */
-static int
-network_cmp_abbrev(Datum x, Datum y, SortSupport ssup)
-{
-	if (x > y)
-		return 1;
-	else if (x == y)
-		return 0;
-	else
-		return -1;
 }
 
 /*
@@ -518,13 +501,11 @@ network_abbrev_abort(int memtupcount, SortSupport ssup)
 	 */
 	if (abbr_card > 100000.0)
 	{
-#ifdef TRACE_SORT
 		if (trace_sort)
 			elog(LOG,
 				 "network_abbrev: estimation ends at cardinality %f"
 				 " after " INT64_FORMAT " values (%d rows)",
 				 abbr_card, uss->input_count, memtupcount);
-#endif
 		uss->estimating = false;
 		return false;
 	}
@@ -537,23 +518,19 @@ network_abbrev_abort(int memtupcount, SortSupport ssup)
 	 */
 	if (abbr_card < uss->input_count / 2000.0 + 0.5)
 	{
-#ifdef TRACE_SORT
 		if (trace_sort)
 			elog(LOG,
 				 "network_abbrev: aborting abbreviation at cardinality %f"
 				 " below threshold %f after " INT64_FORMAT " values (%d rows)",
 				 abbr_card, uss->input_count / 2000.0 + 0.5, uss->input_count,
 				 memtupcount);
-#endif
 		return true;
 	}
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "network_abbrev: cardinality %f after " INT64_FORMAT
 			 " values (%d rows)", abbr_card, uss->input_count, memtupcount);
-#endif
 
 	return false;
 }
@@ -1115,38 +1092,12 @@ match_network_subset(Node *leftop,
 	rightopval = ((Const *) rightop)->constvalue;
 
 	/*
-	 * Must check that index's opfamily supports the operators we will want to
-	 * apply.
-	 *
-	 * We insist on the opfamily being the specific one we expect, else we'd
-	 * do the wrong thing if someone were to make a reverse-sort opfamily with
-	 * the same operators.
-	 */
-	if (opfamily != NETWORK_BTREE_FAM_OID)
-		return NIL;
-
-	/*
 	 * create clause "key >= network_scan_first( rightopval )", or ">" if the
 	 * operator disallows equality.
-	 *
-	 * Note: seeing that this function supports only fixed values for opfamily
-	 * and datatype, we could just hard-wire the operator OIDs instead of
-	 * looking them up.  But for now it seems better to be general.
 	 */
-	if (is_eq)
-	{
-		opr1oid = get_opfamily_member(opfamily, datatype, datatype,
-									  BTGreaterEqualStrategyNumber);
-		if (opr1oid == InvalidOid)
-			elog(ERROR, "no >= operator for opfamily %u", opfamily);
-	}
-	else
-	{
-		opr1oid = get_opfamily_member(opfamily, datatype, datatype,
-									  BTGreaterStrategyNumber);
-		if (opr1oid == InvalidOid)
-			elog(ERROR, "no > operator for opfamily %u", opfamily);
-	}
+	opr1oid = get_opfamily_member_for_cmptype(opfamily, datatype, datatype, is_eq ? COMPARE_GE : COMPARE_GT);
+	if (opr1oid == InvalidOid)
+		return NIL;
 
 	opr1right = network_scan_first(rightopval);
 
@@ -1161,10 +1112,9 @@ match_network_subset(Node *leftop,
 
 	/* create clause "key <= network_scan_last( rightopval )" */
 
-	opr2oid = get_opfamily_member(opfamily, datatype, datatype,
-								  BTLessEqualStrategyNumber);
+	opr2oid = get_opfamily_member_for_cmptype(opfamily, datatype, datatype, COMPARE_LE);
 	if (opr2oid == InvalidOid)
-		elog(ERROR, "no <= operator for opfamily %u", opfamily);
+		return NIL;
 
 	opr2right = network_scan_last(rightopval);
 
@@ -1740,9 +1690,7 @@ inet_client_addr(PG_FUNCTION_ARGS)
 	switch (port->raddr.addr.ss_family)
 	{
 		case AF_INET:
-#ifdef HAVE_IPV6
 		case AF_INET6:
-#endif
 			break;
 		default:
 			PG_RETURN_NULL();
@@ -1759,7 +1707,7 @@ inet_client_addr(PG_FUNCTION_ARGS)
 
 	clean_ipv6_addr(port->raddr.addr.ss_family, remote_host);
 
-	PG_RETURN_INET_P(network_in(remote_host, false));
+	PG_RETURN_INET_P(network_in(remote_host, false, NULL));
 }
 
 
@@ -1779,9 +1727,7 @@ inet_client_port(PG_FUNCTION_ARGS)
 	switch (port->raddr.addr.ss_family)
 	{
 		case AF_INET:
-#ifdef HAVE_IPV6
 		case AF_INET6:
-#endif
 			break;
 		default:
 			PG_RETURN_NULL();
@@ -1816,9 +1762,7 @@ inet_server_addr(PG_FUNCTION_ARGS)
 	switch (port->laddr.addr.ss_family)
 	{
 		case AF_INET:
-#ifdef HAVE_IPV6
 		case AF_INET6:
-#endif
 			break;
 		default:
 			PG_RETURN_NULL();
@@ -1835,7 +1779,7 @@ inet_server_addr(PG_FUNCTION_ARGS)
 
 	clean_ipv6_addr(port->laddr.addr.ss_family, local_host);
 
-	PG_RETURN_INET_P(network_in(local_host, false));
+	PG_RETURN_INET_P(network_in(local_host, false, NULL));
 }
 
 
@@ -1855,9 +1799,7 @@ inet_server_port(PG_FUNCTION_ARGS)
 	switch (port->laddr.addr.ss_family)
 	{
 		case AF_INET:
-#ifdef HAVE_IPV6
 		case AF_INET6:
-#endif
 			break;
 		default:
 			PG_RETURN_NULL();
@@ -2117,7 +2059,6 @@ inetmi(PG_FUNCTION_ARGS)
 void
 clean_ipv6_addr(int addr_family, char *addr)
 {
-#ifdef HAVE_IPV6
 	if (addr_family == AF_INET6)
 	{
 		char	   *pct = strchr(addr, '%');
@@ -2125,5 +2066,4 @@ clean_ipv6_addr(int addr_family, char *addr)
 		if (pct)
 			*pct = '\0';
 	}
-#endif
 }

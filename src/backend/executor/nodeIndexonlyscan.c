@@ -3,7 +3,7 @@
  * nodeIndexonlyscan.c
  *	  Routines to support index-only scans
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,25 +31,25 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/tupdesc.h"
 #include "access/visibilitymap.h"
 #include "catalog/pg_type.h"
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/predicate.h"
 #include "utils/builtins.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 
 
 static TupleTableSlot *IndexOnlyNext(IndexOnlyScanState *node);
 static void StoreIndexTuple(IndexOnlyScanState *node, TupleTableSlot *slot,
-							IndexTuple itup, TupleDesc itupdesc);
+							IndexScanDesc scandesc);
 
 
 /* ----------------------------------------------------------------
@@ -72,15 +72,13 @@ IndexOnlyNext(IndexOnlyScanState *node)
 	 * extract necessary information from index scan node
 	 */
 	estate = node->ss.ps.state;
-	direction = estate->es_direction;
-	/* flip direction if this is an overall backward scan */
-	if (ScanDirectionIsBackward(((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir))
-	{
-		if (ScanDirectionIsForward(direction))
-			direction = BackwardScanDirection;
-		else if (ScanDirectionIsBackward(direction))
-			direction = ForwardScanDirection;
-	}
+
+	/*
+	 * Determine which direction to scan the index in based on the plan's scan
+	 * direction and the current direction of execution.
+	 */
+	direction = ScanDirectionCombine(estate->es_direction,
+									 ((IndexOnlyScan *) node->ss.ps.plan)->indexorderdir);
 	scandesc = node->ioss_ScanDesc;
 	econtext = node->ss.ps.ps_ExprContext;
 	slot = node->ss.ss_ScanTupleSlot;
@@ -95,6 +93,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		scandesc = index_beginscan(node->ss.ss_currentRelation,
 								   node->ioss_RelationDesc,
 								   estate->es_snapshot,
+								   &node->ioss_Instrument,
 								   node->ioss_NumScanKeys,
 								   node->ioss_NumOrderByKeys);
 
@@ -192,27 +191,8 @@ IndexOnlyNext(IndexOnlyScanState *node)
 			tuple_from_heap = true;
 		}
 
-		/*
-		 * Fill the scan tuple slot with data from the index.  This might be
-		 * provided in either HeapTuple or IndexTuple format.  Conceivably an
-		 * index AM might fill both fields, in which case we prefer the heap
-		 * format, since it's probably a bit cheaper to fill a slot from.
-		 */
-		if (scandesc->xs_hitup)
-		{
-			/*
-			 * We don't take the trouble to verify that the provided tuple has
-			 * exactly the slot's format, but it seems worth doing a quick
-			 * check on the number of fields.
-			 */
-			Assert(slot->tts_tupleDescriptor->natts ==
-				   scandesc->xs_hitupdesc->natts);
-			ExecForceStoreHeapTuple(scandesc->xs_hitup, slot, false);
-		}
-		else if (scandesc->xs_itup)
-			StoreIndexTuple(node, slot, scandesc->xs_itup, scandesc->xs_itupdesc);
-		else
-			elog(ERROR, "no data returned for index-only scan");
+		/* Fill the scan tuple slot with data from the index */
+		StoreIndexTuple(node, slot, scandesc);
 
 		/*
 		 * If the index was lossy, we have to recheck the index quals.
@@ -262,56 +242,79 @@ IndexOnlyNext(IndexOnlyScanState *node)
 
 /*
  * StoreIndexTuple
- *		Fill the slot with data from the index tuple.
+ *		Fill the slot with the data the index AM returned.
+ *
+ * The data might be provided in either HeapTuple (xs_hitup) or IndexTuple
+ * (xs_itup) format.  Conceivably an index AM might fill both fields, in which
+ * case we prefer the heap format, since it's probably a bit cheaper to fill a
+ * slot from.
  *
  * At some point this might be generally-useful functionality, but
  * right now we don't need it elsewhere.
  */
 static void
 StoreIndexTuple(IndexOnlyScanState *node, TupleTableSlot *slot,
-				IndexTuple itup, TupleDesc itupdesc)
+				IndexScanDesc scandesc)
 {
-	/*
-	 * Note: we must use the tupdesc supplied by the AM in index_deform_tuple,
-	 * not the slot's tupdesc, in case the latter has different datatypes
-	 * (this happens for btree name_ops in particular).  They'd better have
-	 * the same number of columns though, as well as being datatype-compatible
-	 * which is something we can't so easily check.
-	 */
-	Assert(slot->tts_tupleDescriptor->natts == itupdesc->natts);
-
 	ExecClearTuple(slot);
-	index_deform_tuple(itup, itupdesc, slot->tts_values, slot->tts_isnull);
 
 	/*
-	 * Copy all name columns stored as cstrings back into a NAMEDATALEN byte
-	 * sized allocation.  We mark this branch as unlikely as generally "name"
-	 * is used only for the system catalogs and this would have to be a user
-	 * query running on those or some other user table with an index on a name
-	 * column.
+	 * We must deform the tuple using the tupdesc the index AM formed it with
+	 * (xs_hitupdesc or xs_itupdesc), not the slot's tupdesc.  The datums
+	 * returned by the index AM must be binary compatible, but the descriptors
+	 * may align each column differently in certain rare cases. (Actually,
+	 * btree's "name" opclass stores cstring tuples that _aren't_ even binary
+	 * compatible, in the strictest sense.  We directly handle that here.)
 	 */
-	if (unlikely(node->ioss_NameCStringAttNums != NULL))
+	if (scandesc->xs_hitup)
 	{
-		int			attcount = node->ioss_NameCStringCount;
+		Assert(slot->tts_tupleDescriptor->natts == scandesc->xs_hitupdesc->natts);
 
-		for (int idx = 0; idx < attcount; idx++)
+		heap_deform_tuple(scandesc->xs_hitup, scandesc->xs_hitupdesc,
+						  slot->tts_values, slot->tts_isnull);
+	}
+	else if (scandesc->xs_itup)
+	{
+		Assert(slot->tts_tupleDescriptor->natts == scandesc->xs_itupdesc->natts);
+
+		index_deform_tuple(scandesc->xs_itup, scandesc->xs_itupdesc,
+						   slot->tts_values, slot->tts_isnull);
+
+		/*
+		 * Copy all name columns stored as cstrings back into a NAMEDATALEN
+		 * byte sized allocation.  We mark this branch as unlikely as
+		 * generally "name" is used only for the system catalogs and this
+		 * would have to be a user query running on those or some other user
+		 * table with an index on a name column.
+		 */
+		if (unlikely(node->ioss_NameCStringAttNums != NULL))
 		{
-			int			attnum = node->ioss_NameCStringAttNums[idx];
-			Name		name;
+			int			attcount = node->ioss_NameCStringCount;
 
-			/* skip null Datums */
-			if (slot->tts_isnull[attnum])
-				continue;
+			for (int idx = 0; idx < attcount; idx++)
+			{
+				int			attnum = node->ioss_NameCStringAttNums[idx];
+				Name		name;
 
-			/* allocate the NAMEDATALEN and copy the datum into that memory */
-			name = (Name) MemoryContextAlloc(node->ss.ps.ps_ExprContext->ecxt_per_tuple_memory,
-											 NAMEDATALEN);
+				/* skip null Datums */
+				if (slot->tts_isnull[attnum])
+					continue;
 
-			/* use namestrcpy to zero-pad all trailing bytes */
-			namestrcpy(name, DatumGetCString(slot->tts_values[attnum]));
-			slot->tts_values[attnum] = NameGetDatum(name);
+				/*
+				 * allocate the NAMEDATALEN and copy the datum into that
+				 * memory
+				 */
+				name = (Name) MemoryContextAlloc(node->ss.ps.ps_ExprContext->ecxt_per_tuple_memory,
+												 NAMEDATALEN);
+
+				/* use namestrcpy to zero-pad all trailing bytes */
+				namestrcpy(name, DatumGetCString(slot->tts_values[attnum]));
+				slot->tts_values[attnum] = NameGetDatum(name);
+			}
 		}
 	}
+	else
+		elog(ERROR, "no data returned for index-only scan");
 
 	ExecStoreVirtualTuple(slot);
 }
@@ -417,20 +420,25 @@ ExecEndIndexOnlyScan(IndexOnlyScanState *node)
 	}
 
 	/*
-	 * Free the exprcontext(s) ... now dead code, see ExecFreeExprContext
+	 * When ending a parallel worker, copy the statistics gathered by the
+	 * worker back into shared memory so that it can be picked up by the main
+	 * process to report in EXPLAIN ANALYZE
 	 */
-#ifdef NOT_USED
-	ExecFreeExprContext(&node->ss.ps);
-	if (node->ioss_RuntimeContext)
-		FreeExprContext(node->ioss_RuntimeContext, true);
-#endif
+	if (node->ioss_SharedInfo != NULL && IsParallelWorker())
+	{
+		IndexScanInstrumentation *winstrument;
 
-	/*
-	 * clear out tuple table slots
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+		Assert(ParallelWorkerNumber < node->ioss_SharedInfo->num_workers);
+		winstrument = &node->ioss_SharedInfo->winstrument[ParallelWorkerNumber];
+
+		/*
+		 * We have to accumulate the stats rather than performing a memcpy.
+		 * When a Gather/GatherMerge node finishes it will perform planner
+		 * shutdown on the workers.  On rescan it will spin up new workers
+		 * which will have a new IndexOnlyScanState and zeroed stats.
+		 */
+		winstrument->nsearches += node->ioss_Instrument.nsearches;
+	}
 
 	/*
 	 * close the index relation (no-op if we didn't open it)
@@ -677,7 +685,7 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	/* First, count the number of such index keys */
 	for (int attnum = 0; attnum < indnkeyatts; attnum++)
 	{
-		if (indexRelation->rd_att->attrs[attnum].atttypid == CSTRINGOID &&
+		if (TupleDescAttr(indexRelation->rd_att, attnum)->atttypid == CSTRINGOID &&
 			indexRelation->rd_opcintype[attnum] == NAMEOID)
 			namecount++;
 	}
@@ -691,11 +699,11 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 		 * need to be converted from cstring to name.
 		 */
 		indexstate->ioss_NameCStringAttNums = (AttrNumber *)
-									palloc(sizeof(AttrNumber) * namecount);
+			palloc(sizeof(AttrNumber) * namecount);
 
 		for (int attnum = 0; attnum < indnkeyatts; attnum++)
 		{
-			if (indexRelation->rd_att->attrs[attnum].atttypid == CSTRINGOID &&
+			if (TupleDescAttr(indexRelation->rd_att, attnum)->atttypid == CSTRINGOID &&
 				indexRelation->rd_opcintype[attnum] == NAMEOID)
 				indexstate->ioss_NameCStringAttNums[idx++] = (AttrNumber) attnum;
 		}
@@ -726,9 +734,21 @@ ExecIndexOnlyScanEstimate(IndexOnlyScanState *node,
 						  ParallelContext *pcxt)
 {
 	EState	   *estate = node->ss.ps.state;
+	bool		instrument = (node->ss.ps.instrument != NULL);
+	bool		parallel_aware = node->ss.ps.plan->parallel_aware;
+
+	if (!instrument && !parallel_aware)
+	{
+		/* No DSM required by the scan */
+		return;
+	}
 
 	node->ioss_PscanLen = index_parallelscan_estimate(node->ioss_RelationDesc,
-													  estate->es_snapshot);
+													  node->ioss_NumScanKeys,
+													  node->ioss_NumOrderByKeys,
+													  estate->es_snapshot,
+													  instrument, parallel_aware,
+													  pcxt->nworkers);
 	shm_toc_estimate_chunk(&pcxt->estimator, node->ioss_PscanLen);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 }
@@ -745,16 +765,33 @@ ExecIndexOnlyScanInitializeDSM(IndexOnlyScanState *node,
 {
 	EState	   *estate = node->ss.ps.state;
 	ParallelIndexScanDesc piscan;
+	bool		instrument = node->ss.ps.instrument != NULL;
+	bool		parallel_aware = node->ss.ps.plan->parallel_aware;
+
+	if (!instrument && !parallel_aware)
+	{
+		/* No DSM required by the scan */
+		return;
+	}
 
 	piscan = shm_toc_allocate(pcxt->toc, node->ioss_PscanLen);
 	index_parallelscan_initialize(node->ss.ss_currentRelation,
 								  node->ioss_RelationDesc,
 								  estate->es_snapshot,
-								  piscan);
+								  instrument, parallel_aware, pcxt->nworkers,
+								  &node->ioss_SharedInfo, piscan);
 	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, piscan);
+
+	if (!parallel_aware)
+	{
+		/* Only here to initialize SharedInfo in DSM */
+		return;
+	}
+
 	node->ioss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->ioss_RelationDesc,
+								 &node->ioss_Instrument,
 								 node->ioss_NumScanKeys,
 								 node->ioss_NumOrderByKeys,
 								 piscan);
@@ -781,6 +818,7 @@ void
 ExecIndexOnlyScanReInitializeDSM(IndexOnlyScanState *node,
 								 ParallelContext *pcxt)
 {
+	Assert(node->ss.ps.plan->parallel_aware);
 	index_parallelrescan(node->ioss_ScanDesc);
 }
 
@@ -795,11 +833,31 @@ ExecIndexOnlyScanInitializeWorker(IndexOnlyScanState *node,
 								  ParallelWorkerContext *pwcxt)
 {
 	ParallelIndexScanDesc piscan;
+	bool		instrument = node->ss.ps.instrument != NULL;
+	bool		parallel_aware = node->ss.ps.plan->parallel_aware;
+
+	if (!instrument && !parallel_aware)
+	{
+		/* No DSM required by the scan */
+		return;
+	}
 
 	piscan = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
+
+	if (instrument)
+		node->ioss_SharedInfo = (SharedIndexScanInstrumentation *)
+			OffsetToPointer(piscan, piscan->ps_offset_ins);
+
+	if (!parallel_aware)
+	{
+		/* Only here to set up worker node's SharedInfo */
+		return;
+	}
+
 	node->ioss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->ioss_RelationDesc,
+								 &node->ioss_Instrument,
 								 node->ioss_NumScanKeys,
 								 node->ioss_NumOrderByKeys,
 								 piscan);
@@ -813,4 +871,26 @@ ExecIndexOnlyScanInitializeWorker(IndexOnlyScanState *node,
 		index_rescan(node->ioss_ScanDesc,
 					 node->ioss_ScanKeys, node->ioss_NumScanKeys,
 					 node->ioss_OrderByKeys, node->ioss_NumOrderByKeys);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecIndexOnlyScanRetrieveInstrumentation
+ *
+ *		Transfer index-only scan statistics from DSM to private memory.
+ * ----------------------------------------------------------------
+ */
+void
+ExecIndexOnlyScanRetrieveInstrumentation(IndexOnlyScanState *node)
+{
+	SharedIndexScanInstrumentation *SharedInfo = node->ioss_SharedInfo;
+	size_t		size;
+
+	if (SharedInfo == NULL)
+		return;
+
+	/* Create a copy of SharedInfo in backend-local memory */
+	size = offsetof(SharedIndexScanInstrumentation, winstrument) +
+		SharedInfo->num_workers * sizeof(IndexScanInstrumentation);
+	node->ioss_SharedInfo = palloc(size);
+	memcpy(node->ioss_SharedInfo, SharedInfo, size);
 }

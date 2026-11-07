@@ -7,7 +7,7 @@
  * accessed via the extended FE/BE query protocol.
  *
  *
- * Copyright (c) 2002-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/commands/prepare.c
@@ -21,21 +21,21 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/createas.h"
+#include "commands/explain.h"
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
 #include "commands/prepare.h"
-#include "miscadmin.h"
+#include "funcapi.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/analyze.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_type.h"
-#include "rewrite/rewriteHandler.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
-#include "adapter/mysql/adapter.h"
 
 
 /*
@@ -63,9 +63,7 @@ PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	CachedPlanSource *plansource;
 	Oid		   *argtypes = NULL;
 	int			nargs;
-	Query	   *query;
 	List	   *query_list;
-	int			i;
 
 	/*
 	 * Disallow empty-string statement name (conflicts with protocol-level
@@ -97,9 +95,10 @@ PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 
 	if (nargs)
 	{
+		int			i;
 		ListCell   *l;
 
-		argtypes = (Oid *) palloc(nargs * sizeof(Oid));
+		argtypes = palloc_array(Oid, nargs);
 		i = 0;
 
 		foreach(l, stmt->argtypes)
@@ -115,47 +114,10 @@ PrepareQuery(ParseState *pstate, PrepareStmt *stmt,
 	 * Analyze the statement using these parameter types (any parameters
 	 * passed in from above us will not be visible to it), allowing
 	 * information about unknown parameters to be deduced from context.
+	 * Rewrite the query. The result could be 0, 1, or many queries.
 	 */
-	query = parse_analyze_varparams(rawstmt, pstate->p_sourcetext,
-									&argtypes, &nargs);
-
-	/*
-	 * Check that all parameter types were determined.
-	 */
-	for (i = 0; i < nargs; i++)
-	{
-		Oid			argtype = argtypes[i];
-
-		if (argtype == InvalidOid || argtype == UNKNOWNOID)
-			ereport(ERROR,
-					(errcode(ERRCODE_INDETERMINATE_DATATYPE),
-					 errmsg("could not determine data type of parameter $%d",
-							i + 1)));
-	}
-
-	/*
-	 * grammar only allows PreparableStmt, so this check should be redundant
-	 */
-	switch (query->commandType)
-	{
-		case CMD_SELECT:
-		case CMD_INSERT:
-		case CMD_UPDATE:
-		case CMD_DELETE:
-		
-		case CMD_MERGE:
-		
-			/* OK */
-			break;
-		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PSTATEMENT_DEFINITION),
-					 errmsg("utility statements cannot be prepared")));
-			break;
-	}
-
-	/* Rewrite the query. The result could be 0, 1, or many queries. */
-	query_list = QueryRewrite(query);
+	query_list = pg_analyze_and_rewrite_varparams(rawstmt, pstate->p_sourcetext,
+												  &argtypes, &nargs, NULL);
 
 	/* Finish filling in the CachedPlanSource */
 	CompleteCachedPlan(plansource,
@@ -293,7 +255,7 @@ ExecuteQuery(ParseState *pstate,
 	 */
 	PortalStart(portal, paramLI, eflags, GetActiveSnapshot());
 
-	(void) PortalRun(portal, count, false, true, dest, dest, qc);
+	(void) PortalRun(portal, count, false, dest, dest, qc);
 
 	PortalDrop(portal, false);
 
@@ -447,12 +409,12 @@ StorePreparedStatement(const char *stmt_name,
 
 	/* Shouldn't get a duplicate entry */
 	if (found)
-	    ereport(ERROR,
-	            (errcode(ERRCODE_DUPLICATE_PSTATEMENT),
-	             errmsg("prepared statement \"%s\" already exists",
-	                    stmt_name)));
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_PSTATEMENT),
+				 errmsg("prepared statement \"%s\" already exists",
+						stmt_name)));
 
-    /* Fill in the hash table entry */
+	/* Fill in the hash table entry */
 	entry->plansource = plansource;
 	entry->from_sql = from_sql;
 	entry->prepare_time = cur_ts;
@@ -602,13 +564,12 @@ DropAllPreparedStatements(void)
  * "into" is NULL unless we are doing EXPLAIN CREATE TABLE AS EXECUTE,
  * in which case executing the query should result in creating that table.
  *
- * Note: the passed-in queryString is that of the EXPLAIN EXECUTE,
+ * Note: the passed-in pstate's queryString is that of the EXPLAIN EXECUTE,
  * not the original PREPARE; we get the latter string from the plancache.
  */
 void
 ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
-					const char *queryString, ParamListInfo params,
-					QueryEnvironment *queryEnv)
+					ParseState *pstate, ParamListInfo params)
 {
 	PreparedStatement *entry;
 	const char *query_string;
@@ -621,6 +582,19 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 	instr_time	planduration;
 	BufferUsage bufusage_start,
 				bufusage;
+	MemoryContextCounters mem_counters;
+	MemoryContext planner_ctx = NULL;
+	MemoryContext saved_ctx = NULL;
+
+	if (es->memory)
+	{
+		/* See ExplainOneQuery about this */
+		Assert(IsA(CurrentMemoryContext, AllocSetContext));
+		planner_ctx = AllocSetContextCreate(CurrentMemoryContext,
+											"explain analyze planner context",
+											ALLOCSET_DEFAULT_SIZES);
+		saved_ctx = MemoryContextSwitchTo(planner_ctx);
+	}
 
 	if (es->buffers)
 		bufusage_start = pgBufferUsage;
@@ -638,10 +612,10 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 	/* Evaluate parameters, if any */
 	if (entry->plansource->num_params)
 	{
-		ParseState *pstate;
+		ParseState *pstate_params;
 
-		pstate = make_parsestate(NULL);
-		pstate->p_sourcetext = queryString;
+		pstate_params = make_parsestate(NULL);
+		pstate_params->p_sourcetext = pstate->p_sourcetext;
 
 		/*
 		 * Need an EState to evaluate parameters; must not delete it till end
@@ -652,15 +626,21 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 		estate = CreateExecutorState();
 		estate->es_param_list_info = params;
 
-		paramLI = EvaluateParams(pstate, entry, execstmt->params, estate);
+		paramLI = EvaluateParams(pstate_params, entry, execstmt->params, estate);
 	}
 
 	/* Replan if needed, and acquire a transient refcount */
 	cplan = GetCachedPlan(entry->plansource, paramLI,
-						  CurrentResourceOwner, queryEnv);
+						  CurrentResourceOwner, pstate->p_queryEnv);
 
 	INSTR_TIME_SET_CURRENT(planduration);
 	INSTR_TIME_SUBTRACT(planduration, planstart);
+
+	if (es->memory)
+	{
+		MemoryContextSwitchTo(saved_ctx);
+		MemoryContextMemConsumed(planner_ctx, &mem_counters);
+	}
 
 	/* calc differences of buffer counters. */
 	if (es->buffers)
@@ -677,11 +657,11 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 		PlannedStmt *pstmt = lfirst_node(PlannedStmt, p);
 
 		if (pstmt->commandType != CMD_UTILITY)
-			ExplainOnePlan(pstmt, into, es, query_string, paramLI, queryEnv,
-						   &planduration, (es->buffers ? &bufusage : NULL));
+			ExplainOnePlan(pstmt, into, es, query_string, paramLI, pstate->p_queryEnv,
+						   &planduration, (es->buffers ? &bufusage : NULL),
+						   es->memory ? &mem_counters : NULL);
 		else
-			ExplainOneUtility(pstmt->utilityStmt, into, es, query_string,
-							  paramLI, queryEnv);
+			ExplainOneUtility(pstmt->utilityStmt, into, es, pstate, paramLI);
 
 		/* No need for CommandCounterIncrement, as ExplainOnePlan did it */
 
@@ -705,55 +685,12 @@ Datum
 pg_prepared_statement(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
-
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	/* need to build tuplestore in query context */
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	/*
-	 * build tupdesc for result tuples. This must match the definition of the
-	 * pg_prepared_statements view in system_views.sql
-	 */
-	tupdesc = CreateTemplateTupleDesc(7);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "name",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "statement",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "prepare_time",
-					   TIMESTAMPTZOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 4, "parameter_types",
-					   REGTYPEARRAYOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "from_sql",
-					   BOOLOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "generic_plans",
-					   INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "custom_plans",
-					   INT8OID, -1, 0);
 
 	/*
 	 * We put all the tuples into a tuplestore in one scan of the hashtable.
 	 * This avoids any issue of the hashtable possibly changing between calls.
 	 */
-	tupstore =
-		tuplestore_begin_heap(rsinfo->allowedModes & SFRM_Materialize_Random,
-							  false, work_mem);
-
-	/* generate junk in short-term context */
-	MemoryContextSwitchTo(oldcontext);
+	InitMaterializedSRF(fcinfo, 0);
 
 	/* hash table might be uninitialized */
 	if (prepared_queries)
@@ -764,30 +701,39 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 		hash_seq_init(&hash_seq, prepared_queries);
 		while ((prep_stmt = hash_seq_search(&hash_seq)) != NULL)
 		{
-			Datum		values[7];
-			bool		nulls[7];
+			TupleDesc	result_desc;
+			Datum		values[8];
+			bool		nulls[8] = {0};
 
-			MemSet(nulls, 0, sizeof(nulls));
+			result_desc = prep_stmt->plansource->resultDesc;
 
 			values[0] = CStringGetTextDatum(prep_stmt->stmt_name);
 			values[1] = CStringGetTextDatum(prep_stmt->plansource->query_string);
 			values[2] = TimestampTzGetDatum(prep_stmt->prepare_time);
 			values[3] = build_regtype_array(prep_stmt->plansource->param_types,
 											prep_stmt->plansource->num_params);
-			values[4] = BoolGetDatum(prep_stmt->from_sql);
-			values[5] = Int64GetDatumFast(prep_stmt->plansource->num_generic_plans);
-			values[6] = Int64GetDatumFast(prep_stmt->plansource->num_custom_plans);
+			if (result_desc)
+			{
+				Oid		   *result_types;
 
-			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+				result_types = palloc_array(Oid, result_desc->natts);
+				for (int i = 0; i < result_desc->natts; i++)
+					result_types[i] = TupleDescAttr(result_desc, i)->atttypid;
+				values[4] = build_regtype_array(result_types, result_desc->natts);
+			}
+			else
+			{
+				/* no result descriptor (for example, DML statement) */
+				nulls[4] = true;
+			}
+			values[5] = BoolGetDatum(prep_stmt->from_sql);
+			values[6] = Int64GetDatumFast(prep_stmt->plansource->num_generic_plans);
+			values[7] = Int64GetDatumFast(prep_stmt->plansource->num_custom_plans);
+
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
 		}
 	}
-
-	/* clean up and return the tuplestore */
-	tuplestore_donestoring(tupstore);
-
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
 
 	return (Datum) 0;
 }
@@ -804,17 +750,11 @@ build_regtype_array(Oid *param_types, int num_params)
 	ArrayType  *result;
 	int			i;
 
-	tmp_ary = (Datum *) palloc(num_params * sizeof(Datum));
+	tmp_ary = palloc_array(Datum, num_params);
 
 	for (i = 0; i < num_params; i++)
 		tmp_ary[i] = ObjectIdGetDatum(param_types[i]);
 
-	/* XXX: this hardcodes assumptions about the regtype type */
-	result = construct_array(tmp_ary, num_params, REGTYPEOID,
-							 4, true, TYPALIGN_INT);
+	result = construct_array_builtin(tmp_ary, num_params, REGTYPEOID);
 	return PointerGetDatum(result);
 }
-
-
-#include "mysql/mys_prepare.c"
-

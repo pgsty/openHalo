@@ -8,13 +8,15 @@
 #
 # CATALOG_NAME          -- name of the message catalog (xxx.po); probably
 #                          name of the program
-# AVAIL_LANGUAGES       -- list of languages that are provided/supported
 # GETTEXT_FILES         -- list of source files that contain message strings
 # GETTEXT_TRIGGERS      -- (optional) list of functions that contain
 #                          translatable strings
 # GETTEXT_FLAGS         -- (optional) list of gettext --flag arguments to mark
 #                          function arguments that contain C format strings
 #                          (functions must be listed in TRIGGERS and FLAGS)
+#
+# Also, provide a text file 'po/LINGUAS' with a space-separated list
+# of languages that are provided/supported.
 #
 # That's all, the rest is done here, if --enable-nls was specified.
 #
@@ -26,6 +28,8 @@
 
 # existence checked by Makefile.global; otherwise we won't get here
 include $(srcdir)/nls.mk
+
+AVAIL_LANGUAGES := $(shell cat $(srcdir)/po/LINGUAS)
 
 # If user specified the languages he wants in --enable-nls=LANGUAGES,
 # filter out the rest.  Else use all available ones.
@@ -72,10 +76,16 @@ BACKEND_COMMON_GETTEXT_FLAGS = \
 FRONTEND_COMMON_GETTEXT_FILES = $(top_srcdir)/src/common/logging.c
 
 FRONTEND_COMMON_GETTEXT_TRIGGERS = \
-    pg_log_fatal pg_log_error pg_log_warning pg_log_info pg_log_generic:2 pg_log_generic_v:2
+    pg_log_error pg_log_error_detail pg_log_error_hint \
+    pg_log_warning pg_log_warning_detail pg_log_warning_hint \
+    pg_log_info pg_log_info_detail pg_log_info_hint \
+    pg_fatal pg_log_generic:3 pg_log_generic_v:3
 
 FRONTEND_COMMON_GETTEXT_FLAGS = \
-    pg_log_fatal:1:c-format pg_log_error:1:c-format pg_log_warning:1:c-format pg_log_info:1:c-format pg_log_generic:2:c-format pg_log_generic_v:2:c-format
+    pg_log_error:1:c-format pg_log_error_detail:1:c-format pg_log_error_hint:1:c-format \
+    pg_log_warning:1:c-format pg_log_warning_detail:1:c-format pg_log_warning_hint:1:c-format \
+    pg_log_info:1:c-format pg_log_info_detail:1:c-format pg_log_info_hint:1:c-format \
+    pg_fatal:1:c-format pg_log_generic:3:c-format pg_log_generic_v:3:c-format
 
 
 all-po: $(MO_FILES)
@@ -132,8 +142,13 @@ init-po: po/$(CATALOG_NAME).pot
 # For performance reasons, only calculate these when the user actually
 # requested update-po or a specific file.
 ifneq (,$(filter update-po %.po.new,$(MAKECMDGOALS)))
+ifdef PGXS
+ALL_LANGUAGES := $(shell find . -name '*.po' -print | sed 's,^.*/\([^/]*\).po$$,\1,' | LC_ALL=C sort -u)
+all_compendia := $(shell find . -name '*.po' -print | LC_ALL=C sort)
+else
 ALL_LANGUAGES := $(shell find $(top_srcdir) -name '*.po' -print | sed 's,^.*/\([^/]*\).po$$,\1,' | LC_ALL=C sort -u)
 all_compendia := $(shell find $(top_srcdir) -name '*.po' -print | LC_ALL=C sort)
+endif
 else
 ALL_LANGUAGES = $(AVAIL_LANGUAGES)
 all_compendia = FORCE
@@ -161,7 +176,7 @@ all: all-po
 install: install-po
 installdirs: installdirs-po
 uninstall: uninstall-po
-clean distclean maintainer-clean: clean-po
+clean distclean: clean-po
 
 .PHONY: all-po install-po installdirs-po uninstall-po clean-po \
         init-po update-po

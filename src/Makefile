@@ -24,7 +24,6 @@ SUBDIRS = \
 	backend/replication/libpqwalreceiver \
 	backend/replication/pgoutput \
 	fe_utils \
-	backend/utils/ddsm \
 	bin \
 	pl \
 	makefiles \
@@ -44,7 +43,6 @@ $(recurse)
 
 install: install-local
 
-
 install-local: installdirs-local
 	$(INSTALL_DATA) Makefile.global '$(DESTDIR)$(pgxsdir)/$(subdir)/Makefile.global'
 	$(INSTALL_DATA) Makefile.port '$(DESTDIR)$(pgxsdir)/$(subdir)/Makefile.port'
@@ -61,18 +59,17 @@ uninstall: uninstall-local
 uninstall-local:
 	rm -f $(addprefix '$(DESTDIR)$(pgxsdir)/$(subdir)'/, Makefile.global Makefile.port Makefile.shlib nls-global.mk)
 
-distprep:
-	$(MAKE) -C test/isolation $@
-
 clean:
 	$(MAKE) -C test $@
 	$(MAKE) -C tutorial NO_PGXS=1 $@
 	$(MAKE) -C test/isolation $@
+	$(MAKE) -C tools/pg_bsd_indent $@
 
-distclean maintainer-clean:
+distclean:
 	$(MAKE) -C test $@
 	$(MAKE) -C tutorial NO_PGXS=1 $@
 	$(MAKE) -C test/isolation $@
+	$(MAKE) -C tools/pg_bsd_indent $@
 	rm -f Makefile.port Makefile.global
 
 

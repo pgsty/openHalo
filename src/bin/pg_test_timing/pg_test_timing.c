@@ -20,7 +20,7 @@ static uint64 test_timing(unsigned int duration);
 static void output(uint64 loop_count);
 
 /* record duration in powers of 2 microseconds */
-long long int histogram[32];
+static long long int histogram[32];
 
 int
 main(int argc, char *argv[])
@@ -61,7 +61,7 @@ handle_args(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_test_timing (Halo) " PG_VERSION_PREFIX PG_VERSION);
+			puts("pg_test_timing (PostgreSQL) " PG_VERSION);
 			exit(0);
 		}
 	}
@@ -149,7 +149,7 @@ test_timing(unsigned int duration)
 		if (diff < 0)
 		{
 			fprintf(stderr, _("Detected clock going backwards in time.\n"));
-			fprintf(stderr, _("Time warp: %d ms\n"), diff);
+			fprintf(stderr, _("Time warp: %d us\n"), diff);
 			exit(1);
 		}
 

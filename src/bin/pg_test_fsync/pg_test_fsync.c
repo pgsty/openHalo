@@ -1,6 +1,12 @@
-/*
- *	pg_test_fsync.c
- *		tests all supported fsync() methods
+/*-------------------------------------------------------------------------
+ *
+ * pg_test_fsync --- tests all supported fsync() methods
+ *
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ *
+ * src/bin/pg_test_fsync/pg_test_fsync.c
+ *
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres_fe.h"
@@ -13,8 +19,8 @@
 #include <unistd.h>
 #include <signal.h>
 
-#include "access/xlogdefs.h"
 #include "common/logging.h"
+#include "common/pg_prng.h"
 #include "getopt_long.h"
 
 /*
@@ -46,10 +52,7 @@ do { \
 	alarm_triggered = false; \
 	if (CreateThread(NULL, 0, process_alarm, NULL, 0, NULL) == \
 		INVALID_HANDLE_VALUE) \
-	{ \
-		pg_log_error("could not create thread for alarm"); \
-		exit(1); \
-	} \
+		pg_fatal("could not create thread for alarm"); \
 	gettimeofday(&start_t, NULL); \
 } while (0)
 #endif
@@ -70,7 +73,7 @@ static char full_buf[DEFAULT_XLOG_SEG_SIZE],
 		   *filename = FSYNC_FILENAME;
 static struct timeval start_t,
 			stop_t;
-static bool alarm_triggered = false;
+static sig_atomic_t alarm_triggered = false;
 
 
 static void handle_args(int argc, char *argv[]);
@@ -83,18 +86,18 @@ static void test_open_sync(const char *msg, int writes_size);
 static void test_file_descriptor_sync(void);
 
 #ifndef WIN32
-static void process_alarm(int sig);
+static void process_alarm(SIGNAL_ARGS);
 #else
 static DWORD WINAPI process_alarm(LPVOID param);
 #endif
-static void signal_cleanup(int sig);
+static void signal_cleanup(SIGNAL_ARGS);
 
 #ifdef HAVE_FSYNC_WRITETHROUGH
 static int	pg_fsync_writethrough(int fd);
 #endif
 static void print_elapse(struct timeval start_t, struct timeval stop_t, int ops);
 
-#define die(msg) do { pg_log_error("%s: %m", _(msg)); exit(1); } while(0)
+#define die(msg) pg_fatal("%s: %m", _(msg))
 
 
 int
@@ -109,13 +112,14 @@ main(int argc, char *argv[])
 	/* Prevent leaving behind the test file */
 	pqsignal(SIGINT, signal_cleanup);
 	pqsignal(SIGTERM, signal_cleanup);
+
+	/* the following are not valid on Windows */
 #ifndef WIN32
 	pqsignal(SIGALRM, process_alarm);
-#endif
-#ifdef SIGHUP
-	/* Not defined on win32 */
 	pqsignal(SIGHUP, signal_cleanup);
 #endif
+
+	pg_prng_seed(&pg_global_prng_state, (uint64) time(NULL));
 
 	prepare_buf();
 
@@ -161,7 +165,7 @@ handle_args(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_test_fsync (Halo) " PG_VERSION_PREFIX PG_VERSION);
+			puts("pg_test_fsync (PostgreSQL) " PG_VERSION);
 			exit(0);
 		}
 	}
@@ -183,24 +187,20 @@ handle_args(int argc, char *argv[])
 					errno != 0 || optval != (unsigned int) optval)
 				{
 					pg_log_error("invalid argument for option %s", "--secs-per-test");
-					fprintf(stderr, _("Try \"%s --help\" for more information.\n"), progname);
+					pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 					exit(1);
 				}
 
 				secs_per_test = (unsigned int) optval;
 				if (secs_per_test == 0)
-				{
-					pg_log_error("%s must be in range %u..%u",
-								 "--secs-per-test", 1, UINT_MAX);
-					exit(1);
-				}
+					pg_fatal("%s must be in range %u..%u",
+							 "--secs-per-test", 1, UINT_MAX);
 				break;
 
 			default:
-				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-						progname);
+				/* getopt_long already emitted a complaint */
+				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 				exit(1);
-				break;
 		}
 	}
 
@@ -208,8 +208,7 @@ handle_args(int argc, char *argv[])
 	{
 		pg_log_error("too many command-line arguments (first is \"%s\")",
 					 argv[optind]);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
 
@@ -217,8 +216,10 @@ handle_args(int argc, char *argv[])
 					"%u seconds per test\n",
 					secs_per_test),
 		   secs_per_test);
-#if PG_O_DIRECT != 0
+#if defined(O_DIRECT)
 	printf(_("O_DIRECT supported on this platform for open_datasync and open_sync.\n"));
+#elif defined(F_NOCACHE)
+	printf(_("F_NOCACHE supported on this platform for open_datasync and open_sync.\n"));
 #else
 	printf(_("Direct I/O is not supported on this platform.\n"));
 #endif
@@ -231,7 +232,7 @@ prepare_buf(void)
 
 	/* write random data into buffer */
 	for (ops = 0; ops < DEFAULT_XLOG_SEG_SIZE; ops++)
-		full_buf[ops] = random();
+		full_buf[ops] = (char) pg_prng_int32(&pg_global_prng_state);
 
 	buf = (char *) TYPEALIGN(XLOG_BLCKSZ, full_buf);
 }
@@ -258,6 +259,31 @@ test_open(void)
 	close(tmpfile);
 }
 
+static int
+open_direct(const char *path, int flags, mode_t mode)
+{
+	int			fd;
+
+#ifdef O_DIRECT
+	flags |= O_DIRECT;
+#endif
+
+	fd = open(path, flags, mode);
+
+#if !defined(O_DIRECT) && defined(F_NOCACHE)
+	if (fd >= 0 && fcntl(fd, F_NOCACHE, 1) < 0)
+	{
+		int			save_errno = errno;
+
+		close(fd);
+		errno = save_errno;
+		return -1;
+	}
+#endif
+
+	return fd;
+}
+
 static void
 test_sync(int writes_per_op)
 {
@@ -270,7 +296,7 @@ test_sync(int writes_per_op)
 		printf(_("\nCompare file sync methods using one %dkB write:\n"), XLOG_BLCKSZ_K);
 	else
 		printf(_("\nCompare file sync methods using two %dkB writes:\n"), XLOG_BLCKSZ_K);
-	printf(_("(in wal_sync_method preference order, except fdatasync is Linux's default)\n"));
+	printf(_("(in \"wal_sync_method\" preference order, except fdatasync is Linux's default)\n"));
 
 	/*
 	 * Test open_datasync if available
@@ -278,8 +304,8 @@ test_sync(int writes_per_op)
 	printf(LABEL_FORMAT, "open_datasync");
 	fflush(stdout);
 
-#ifdef OPEN_DATASYNC_FLAG
-	if ((tmpfile = open(filename, O_RDWR | O_DSYNC | PG_O_DIRECT | PG_BINARY, 0)) == -1)
+#ifdef O_DSYNC
+	if ((tmpfile = open_direct(filename, O_RDWR | O_DSYNC | PG_BINARY, 0)) == -1)
 	{
 		printf(NA_FORMAT, _("n/a*"));
 		fs_warning = true;
@@ -309,7 +335,6 @@ test_sync(int writes_per_op)
 	printf(LABEL_FORMAT, "fdatasync");
 	fflush(stdout);
 
-#ifdef HAVE_FDATASYNC
 	if ((tmpfile = open(filename, O_RDWR | PG_BINARY, 0)) == -1)
 		die("could not open output file");
 	START_TIMER;
@@ -325,9 +350,6 @@ test_sync(int writes_per_op)
 	}
 	STOP_TIMER;
 	close(tmpfile);
-#else
-	printf(NA_FORMAT, _("n/a"));
-#endif
 
 /*
  * Test fsync
@@ -385,8 +407,8 @@ test_sync(int writes_per_op)
 	printf(LABEL_FORMAT, "open_sync");
 	fflush(stdout);
 
-#ifdef OPEN_SYNC_FLAG
-	if ((tmpfile = open(filename, O_RDWR | OPEN_SYNC_FLAG | PG_O_DIRECT | PG_BINARY, 0)) == -1)
+#ifdef O_SYNC
+	if ((tmpfile = open_direct(filename, O_RDWR | O_SYNC | PG_BINARY, 0)) == -1)
 	{
 		printf(NA_FORMAT, _("n/a*"));
 		fs_warning = true;
@@ -444,7 +466,7 @@ test_open_syncs(void)
 static void
 test_open_sync(const char *msg, int writes_size)
 {
-#ifdef OPEN_SYNC_FLAG
+#ifdef O_SYNC
 	int			tmpfile,
 				ops,
 				writes;
@@ -453,8 +475,8 @@ test_open_sync(const char *msg, int writes_size)
 	printf(LABEL_FORMAT, msg);
 	fflush(stdout);
 
-#ifdef OPEN_SYNC_FLAG
-	if ((tmpfile = open(filename, O_RDWR | OPEN_SYNC_FLAG | PG_O_DIRECT | PG_BINARY, 0)) == -1)
+#ifdef O_SYNC
+	if ((tmpfile = open_direct(filename, O_RDWR | O_SYNC | PG_BINARY, 0)) == -1)
 		printf(NA_FORMAT, _("n/a*"));
 	else
 	{
@@ -572,14 +594,17 @@ test_non_sync(void)
 }
 
 static void
-signal_cleanup(int signum)
+signal_cleanup(SIGNAL_ARGS)
 {
+	int			rc;
+
 	/* Delete the file if it exists. Ignore errors */
 	if (needs_unlink)
 		unlink(filename);
 	/* Finish incomplete line on stdout */
-	puts("");
-	exit(signum);
+	rc = write(STDOUT_FILENO, "\n", 1);
+	(void) rc;					/* silence compiler warnings */
+	_exit(1);
 }
 
 #ifdef HAVE_FSYNC_WRITETHROUGH
@@ -587,9 +612,7 @@ signal_cleanup(int signum)
 static int
 pg_fsync_writethrough(int fd)
 {
-#ifdef WIN32
-	return _commit(fd);
-#elif defined(F_FULLFSYNC)
+#if defined(F_FULLFSYNC)
 	return (fcntl(fd, F_FULLFSYNC, 0) == -1) ? -1 : 0;
 #else
 	errno = ENOSYS;
@@ -605,7 +628,7 @@ static void
 print_elapse(struct timeval start_t, struct timeval stop_t, int ops)
 {
 	double		total_time = (stop_t.tv_sec - start_t.tv_sec) +
-	(stop_t.tv_usec - start_t.tv_usec) * 0.000001;
+		(stop_t.tv_usec - start_t.tv_usec) * 0.000001;
 	double		per_second = ops / total_time;
 	double		avg_op_time_us = (total_time / ops) * USECS_SEC;
 
@@ -614,7 +637,7 @@ print_elapse(struct timeval start_t, struct timeval stop_t, int ops)
 
 #ifndef WIN32
 static void
-process_alarm(int sig)
+process_alarm(SIGNAL_ARGS)
 {
 	alarm_triggered = true;
 }

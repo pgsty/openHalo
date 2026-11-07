@@ -14,7 +14,7 @@
  *
  *	Initial author: Simon Riggs		simon@2ndquadrant.com
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,22 +25,22 @@
  */
 #include "postgres.h"
 
-#include <fcntl.h>
-#include <signal.h>
 #include <time.h>
 #include <sys/stat.h>
-#include <sys/time.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "archive/archive_module.h"
+#include "archive/shell_archive.h"
 #include "lib/binaryheap.h"
 #include "libpq/pqsignal.h"
-#include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/pgarch.h"
+#include "storage/condition_variable.h"
+#include "storage/aio_subsys.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -48,9 +48,11 @@
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/shmem.h"
-#include "storage/spin.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "utils/resowner.h"
+#include "utils/timeout.h"
 
 
 /* ----------
@@ -82,15 +84,16 @@
 /* Shared memory area for archiver process */
 typedef struct PgArchData
 {
-	int			pgprocno;		/* pgprocno of archiver process */
+	int			pgprocno;		/* proc number of archiver process */
 
 	/*
-	 * Forces a directory scan in pgarch_readyXlog().  Protected by arch_lck.
+	 * Forces a directory scan in pgarch_readyXlog().
 	 */
-	bool		force_dir_scan;
-
-	slock_t		arch_lck;
+	pg_atomic_uint32 force_dir_scan;
 } PgArchData;
+
+char	   *XLogArchiveLibrary = "";
+char	   *arch_module_check_errdetail_string;
 
 
 /* ----------
@@ -99,6 +102,10 @@ typedef struct PgArchData
  */
 static time_t last_sigterm_time = 0;
 static PgArchData *PgArch = NULL;
+static const ArchiveModuleCallbacks *ArchiveCallbacks;
+static ArchiveModuleState *archive_module_state;
+static MemoryContext archive_context;
+
 
 /*
  * Stuff for tracking multiple files to archive from each scan of
@@ -141,8 +148,10 @@ static bool pgarch_archiveXlog(char *xlog);
 static bool pgarch_readyXlog(char *xlog);
 static void pgarch_archiveDone(char *xlog);
 static void pgarch_die(int code, Datum arg);
-static void HandlePgArchInterrupts(void);
+static void ProcessPgArchInterrupts(void);
 static int	ready_file_comparator(Datum a, Datum b, void *arg);
+static void LoadArchiveLibrary(void);
+static void pgarch_call_module_shutdown_cb(int code, Datum arg);
 
 /* Report shared memory space needed by PgArchShmemInit */
 Size
@@ -168,8 +177,8 @@ PgArchShmemInit(void)
 	{
 		/* First time through, so initialize */
 		MemSet(PgArch, 0, PgArchShmemSize());
-		PgArch->pgprocno = INVALID_PGPROCNO;
-		SpinLockInit(&PgArch->arch_lck);
+		PgArch->pgprocno = INVALID_PROC_NUMBER;
+		pg_atomic_init_u32(&PgArch->force_dir_scan, 0);
 	}
 }
 
@@ -206,8 +215,13 @@ PgArchCanRestart(void)
 
 /* Main entry point for archiver process */
 void
-PgArchiverMain(void)
+PgArchiverMain(const void *startup_data, size_t startup_data_len)
 {
+	Assert(startup_data_len == 0);
+
+	MyBackendType = B_ARCHIVER;
+	AuxiliaryProcessMainCommon();
+
 	/*
 	 * Ignore all signals usually bound to some action in the postmaster,
 	 * except for SIGHUP, SIGTERM, SIGUSR1, SIGUSR2, and SIGQUIT.
@@ -225,7 +239,7 @@ PgArchiverMain(void)
 	pqsignal(SIGCHLD, SIG_DFL);
 
 	/* Unblock signals (they were blocked when the postmaster forked us) */
-	PG_SETMASK(&UnBlockSig);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/* We shouldn't be launched unnecessarily. */
 	Assert(XLogArchivingActive());
@@ -234,10 +248,10 @@ PgArchiverMain(void)
 	on_shmem_exit(pgarch_die, 0);
 
 	/*
-	 * Advertise our pgprocno so that backends can use our latch to wake us up
-	 * while we're sleeping.
+	 * Advertise our proc number so that backends can use our latch to wake us
+	 * up while we're sleeping.
 	 */
-	PgArch->pgprocno = MyProc->pgprocno;
+	PgArch->pgprocno = MyProcNumber;
 
 	/* Create workspace for pgarch_readyXlog() */
 	arch_files = palloc(sizeof(struct arch_files_state));
@@ -246,6 +260,14 @@ PgArchiverMain(void)
 	/* Initialize our max-heap for prioritizing files to archive. */
 	arch_files->arch_heap = binaryheap_allocate(NUM_FILES_PER_DIRECTORY_SCAN,
 												ready_file_comparator, NULL);
+
+	/* Initialize our memory context. */
+	archive_context = AllocSetContextCreate(TopMemoryContext,
+											"archiver",
+											ALLOCSET_DEFAULT_SIZES);
+
+	/* Load the archive_library. */
+	LoadArchiveLibrary();
 
 	pgarch_MainLoop();
 
@@ -266,7 +288,7 @@ PgArchWakeup(void)
 	 * process' (or no process') latch.  Even in that case the archiver will
 	 * be relaunched shortly and will start archiving.
 	 */
-	if (arch_pgprocno != INVALID_PGPROCNO)
+	if (arch_pgprocno != INVALID_PROC_NUMBER)
 		SetLatch(&ProcGlobal->allProcs[arch_pgprocno].procLatch);
 }
 
@@ -275,13 +297,9 @@ PgArchWakeup(void)
 static void
 pgarch_waken_stop(SIGNAL_ARGS)
 {
-	int			save_errno = errno;
-
 	/* set flag to do a final cycle and shut down afterwards */
 	ready_to_stop = true;
 	SetLatch(MyLatch);
-
-	errno = save_errno;
 }
 
 /*
@@ -292,13 +310,12 @@ pgarch_waken_stop(SIGNAL_ARGS)
 static void
 pgarch_MainLoop(void)
 {
-	pg_time_t	last_copy_time = 0;
 	bool		time_to_stop;
 
 	/*
 	 * There shouldn't be anything for the archiver to do except to wait for a
-	 * signal ... however, the archiver exists to protect our data, so she
-	 * wakes up occasionally to allow herself to be proactive.
+	 * signal ... however, the archiver exists to protect our data, so it
+	 * wakes up occasionally to allow itself to be proactive.
 	 */
 	do
 	{
@@ -308,7 +325,7 @@ pgarch_MainLoop(void)
 		time_to_stop = ready_to_stop;
 
 		/* Check for barrier events and config update */
-		HandlePgArchInterrupts();
+		ProcessPgArchInterrupts();
 
 		/*
 		 * If we've gotten SIGTERM, we normally just sit and do nothing until
@@ -330,30 +347,21 @@ pgarch_MainLoop(void)
 
 		/* Do what we're here for */
 		pgarch_ArchiverCopyLoop();
-		last_copy_time = time(NULL);
 
 		/*
 		 * Sleep until a signal is received, or until a poll is forced by
-		 * PGARCH_AUTOWAKE_INTERVAL having passed since last_copy_time, or
-		 * until postmaster dies.
+		 * PGARCH_AUTOWAKE_INTERVAL, or until postmaster dies.
 		 */
 		if (!time_to_stop)		/* Don't wait during last iteration */
 		{
-			pg_time_t	curtime = (pg_time_t) time(NULL);
-			int			timeout;
+			int			rc;
 
-			timeout = PGARCH_AUTOWAKE_INTERVAL - (curtime - last_copy_time);
-			if (timeout > 0)
-			{
-				int			rc;
-
-				rc = WaitLatch(MyLatch,
-							   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-							   timeout * 1000L,
-							   WAIT_EVENT_ARCHIVER_MAIN);
-				if (rc & WL_POSTMASTER_DEATH)
-					time_to_stop = true;
-			}
+			rc = WaitLatch(MyLatch,
+						   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+						   PGARCH_AUTOWAKE_INTERVAL * 1000L,
+						   WAIT_EVENT_ARCHIVER_MAIN);
+			if (rc & WL_POSTMASTER_DEATH)
+				time_to_stop = true;
 		}
 
 		/*
@@ -408,13 +416,19 @@ pgarch_ArchiverCopyLoop(void)
 			 * we'll adopt a new setting for archive_command as soon as
 			 * possible, even if there is a backlog of files to be archived.
 			 */
-			HandlePgArchInterrupts();
+			ProcessPgArchInterrupts();
 
-			/* can't do anything if no command ... */
-			if (!XLogArchiveCommandSet())
+			/* Reset variables that might be set by the callback */
+			arch_module_check_errdetail_string = NULL;
+
+			/* can't do anything if not configured ... */
+			if (ArchiveCallbacks->check_configured_cb != NULL &&
+				!ArchiveCallbacks->check_configured_cb(archive_module_state))
 			{
 				ereport(WARNING,
-						(errmsg("archive_mode enabled, yet archive_command is not set")));
+						(errmsg("\"archive_mode\" enabled, yet archiving is not configured"),
+						 arch_module_check_errdetail_string ?
+						 errdetail_internal("%s", arch_module_check_errdetail_string) : 0));
 				return;
 			}
 
@@ -464,20 +478,20 @@ pgarch_ArchiverCopyLoop(void)
 				pgarch_archiveDone(xlog);
 
 				/*
-				 * Tell the collector about the WAL file that we successfully
-				 * archived
+				 * Tell the cumulative stats system about the WAL file that we
+				 * successfully archived
 				 */
-				pgstat_send_archiver(xlog, false);
+				pgstat_report_archiver(xlog, false);
 
 				break;			/* out of inner retry loop */
 			}
 			else
 			{
 				/*
-				 * Tell the collector about the WAL file that we failed to
-				 * archive
+				 * Tell the cumulative stats system about the WAL file that we
+				 * failed to archive
 				 */
-				pgstat_send_archiver(xlog, true);
+				pgstat_report_archiver(xlog, true);
 
 				if (++failures >= NUM_ARCHIVE_RETRIES)
 				{
@@ -495,136 +509,114 @@ pgarch_ArchiverCopyLoop(void)
 /*
  * pgarch_archiveXlog
  *
- * Invokes system(3) to copy one archive file to wherever it should go
+ * Invokes archive_file_cb to copy one archive file to wherever it should go
  *
  * Returns true if successful
  */
 static bool
 pgarch_archiveXlog(char *xlog)
 {
-	char		xlogarchcmd[MAXPGPATH];
+	sigjmp_buf	local_sigjmp_buf;
+	MemoryContext oldcontext;
 	char		pathname[MAXPGPATH];
 	char		activitymsg[MAXFNAMELEN + 16];
-	char	   *dp;
-	char	   *endp;
-	const char *sp;
-	int			rc;
+	bool		ret;
 
 	snprintf(pathname, MAXPGPATH, XLOGDIR "/%s", xlog);
-
-	/*
-	 * construct the command to be executed
-	 */
-	dp = xlogarchcmd;
-	endp = xlogarchcmd + MAXPGPATH - 1;
-	*endp = '\0';
-
-	for (sp = XLogArchiveCommand; *sp; sp++)
-	{
-		if (*sp == '%')
-		{
-			switch (sp[1])
-			{
-				case 'p':
-					/* %p: relative path of source file */
-					sp++;
-					strlcpy(dp, pathname, endp - dp);
-					make_native_path(dp);
-					dp += strlen(dp);
-					break;
-				case 'f':
-					/* %f: filename of source file */
-					sp++;
-					strlcpy(dp, xlog, endp - dp);
-					dp += strlen(dp);
-					break;
-				case '%':
-					/* convert %% to a single % */
-					sp++;
-					if (dp < endp)
-						*dp++ = *sp;
-					break;
-				default:
-					/* otherwise treat the % as not special */
-					if (dp < endp)
-						*dp++ = *sp;
-					break;
-			}
-		}
-		else
-		{
-			if (dp < endp)
-				*dp++ = *sp;
-		}
-	}
-	*dp = '\0';
-
-	ereport(DEBUG3,
-			(errmsg_internal("executing archive command \"%s\"",
-							 xlogarchcmd)));
 
 	/* Report archive activity in PS display */
 	snprintf(activitymsg, sizeof(activitymsg), "archiving %s", xlog);
 	set_ps_display(activitymsg);
 
-	rc = system(xlogarchcmd);
-	if (rc != 0)
+	oldcontext = MemoryContextSwitchTo(archive_context);
+
+	/*
+	 * Since the archiver operates at the bottom of the exception stack,
+	 * ERRORs turn into FATALs and cause the archiver process to restart.
+	 * However, using ereport(ERROR, ...) when there are problems is easy to
+	 * code and maintain.  Therefore, we create our own exception handler to
+	 * catch ERRORs and return false instead of restarting the archiver
+	 * whenever there is a failure.
+	 *
+	 * We assume ERRORs from the archiving callback are the most common
+	 * exceptions experienced by the archiver, so we opt to handle exceptions
+	 * here instead of PgArchiverMain() to avoid reinitializing the archiver
+	 * too frequently.  We could instead add a sigsetjmp() block to
+	 * PgArchiverMain() and use PG_TRY/PG_CATCH here, but the extra code to
+	 * avoid the odd archiver restart doesn't seem worth it.
+	 */
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
+		/* Since not using PG_TRY, must reset error stack by hand */
+		error_context_stack = NULL;
+
+		/* Prevent interrupts while cleaning up */
+		HOLD_INTERRUPTS();
+
+		/* Report the error to the server log. */
+		EmitErrorReport();
+
 		/*
-		 * If either the shell itself, or a called command, died on a signal,
-		 * abort the archiver.  We do this because system() ignores SIGINT and
-		 * SIGQUIT while waiting; so a signal is very likely something that
-		 * should have interrupted us too.  Also die if the shell got a hard
-		 * "command not found" type of error.  If we overreact it's no big
-		 * deal, the postmaster will just start the archiver again.
+		 * Try to clean up anything the archive module left behind.  We try to
+		 * cover anything that an archive module could conceivably have left
+		 * behind, but it is of course possible that modules could be doing
+		 * unexpected things that require additional cleanup.  Module authors
+		 * should be sure to do any extra required cleanup in a PG_CATCH block
+		 * within the archiving callback, and they are encouraged to notify
+		 * the pgsql-hackers mailing list so that we can add it here.
 		 */
-		int			lev = wait_result_is_any_signal(rc, true) ? FATAL : LOG;
+		disable_all_timeouts(false);
+		LWLockReleaseAll();
+		ConditionVariableCancelSleep();
+		pgstat_report_wait_end();
+		pgaio_error_cleanup();
+		ReleaseAuxProcessResources(false);
+		AtEOXact_Files(false);
+		AtEOXact_HashTables(false);
 
-		if (WIFEXITED(rc))
-		{
-			ereport(lev,
-					(errmsg("archive command failed with exit code %d",
-							WEXITSTATUS(rc)),
-					 errdetail("The failed archive command was: %s",
-							   xlogarchcmd)));
-		}
-		else if (WIFSIGNALED(rc))
-		{
-#if defined(WIN32)
-			ereport(lev,
-					(errmsg("archive command was terminated by exception 0x%X",
-							WTERMSIG(rc)),
-					 errhint("See C include file \"ntstatus.h\" for a description of the hexadecimal value."),
-					 errdetail("The failed archive command was: %s",
-							   xlogarchcmd)));
-#else
-			ereport(lev,
-					(errmsg("archive command was terminated by signal %d: %s",
-							WTERMSIG(rc), pg_strsignal(WTERMSIG(rc))),
-					 errdetail("The failed archive command was: %s",
-							   xlogarchcmd)));
-#endif
-		}
-		else
-		{
-			ereport(lev,
-					(errmsg("archive command exited with unrecognized status %d",
-							rc),
-					 errdetail("The failed archive command was: %s",
-							   xlogarchcmd)));
-		}
+		/*
+		 * Return to the original memory context and clear ErrorContext for
+		 * next time.
+		 */
+		MemoryContextSwitchTo(oldcontext);
+		FlushErrorState();
 
-		snprintf(activitymsg, sizeof(activitymsg), "failed on %s", xlog);
-		set_ps_display(activitymsg);
+		/* Flush any leaked data */
+		MemoryContextReset(archive_context);
 
-		return false;
+		/* Remove our exception handler */
+		PG_exception_stack = NULL;
+
+		/* Now we can allow interrupts again */
+		RESUME_INTERRUPTS();
+
+		/* Report failure so that the archiver retries this file */
+		ret = false;
 	}
-	elog(DEBUG1, "archived write-ahead log file \"%s\"", xlog);
+	else
+	{
+		/* Enable our exception handler */
+		PG_exception_stack = &local_sigjmp_buf;
 
-	snprintf(activitymsg, sizeof(activitymsg), "last was %s", xlog);
+		/* Archive the file! */
+		ret = ArchiveCallbacks->archive_file_cb(archive_module_state,
+												xlog, pathname);
+
+		/* Remove our exception handler */
+		PG_exception_stack = NULL;
+
+		/* Reset our memory context and switch back to the original one */
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextReset(archive_context);
+	}
+
+	if (ret)
+		snprintf(activitymsg, sizeof(activitymsg), "last was %s", xlog);
+	else
+		snprintf(activitymsg, sizeof(activitymsg), "failed on %s", xlog);
 	set_ps_display(activitymsg);
 
-	return true;
+	return ret;
 }
 
 /*
@@ -655,18 +647,12 @@ pgarch_readyXlog(char *xlog)
 	char		XLogArchiveStatusDir[MAXPGPATH];
 	DIR		   *rldir;
 	struct dirent *rlde;
-	bool		force_dir_scan;
 
 	/*
 	 * If a directory scan was requested, clear the stored file names and
 	 * proceed.
 	 */
-	SpinLockAcquire(&PgArch->arch_lck);
-	force_dir_scan = PgArch->force_dir_scan;
-	PgArch->force_dir_scan = false;
-	SpinLockRelease(&PgArch->arch_lck);
-
-	if (force_dir_scan)
+	if (pg_atomic_exchange_u32(&PgArch->force_dir_scan, 0) == 1)
 		arch_files->arch_files_size = 0;
 
 	/*
@@ -817,9 +803,7 @@ ready_file_comparator(Datum a, Datum b, void *arg)
 void
 PgArchForceDirScan(void)
 {
-	SpinLockAcquire(&PgArch->arch_lck);
-	PgArch->force_dir_scan = true;
-	SpinLockRelease(&PgArch->arch_lck);
+	pg_atomic_write_membarrier_u32(&PgArch->force_dir_scan, 1);
 }
 
 /*
@@ -838,7 +822,19 @@ pgarch_archiveDone(char *xlog)
 
 	StatusFilePath(rlogready, xlog, ".ready");
 	StatusFilePath(rlogdone, xlog, ".done");
-	(void) durable_rename(rlogready, rlogdone, WARNING);
+
+	/*
+	 * To avoid extra overhead, we don't durably rename the .ready file to
+	 * .done.  Archive commands and libraries must gracefully handle attempts
+	 * to re-archive files (e.g., if the server crashes just before this
+	 * function is called), so it should be okay if the .ready file reappears
+	 * after a crash.
+	 */
+	if (rename(rlogready, rlogdone) < 0)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not rename file \"%s\" to \"%s\": %m",
+						rlogready, rlogdone)));
 }
 
 
@@ -850,25 +846,114 @@ pgarch_archiveDone(char *xlog)
 static void
 pgarch_die(int code, Datum arg)
 {
-	PgArch->pgprocno = INVALID_PGPROCNO;
+	PgArch->pgprocno = INVALID_PROC_NUMBER;
 }
 
 /*
  * Interrupt handler for WAL archiver process.
  *
  * This is called in the loops pgarch_MainLoop and pgarch_ArchiverCopyLoop.
- * It checks for barrier events and config update, but not shutdown request
- * because how to handle shutdown request is different between those loops.
+ * It checks for barrier events, config update and request for logging of
+ * memory contexts, but not shutdown request because how to handle
+ * shutdown request is different between those loops.
  */
 static void
-HandlePgArchInterrupts(void)
+ProcessPgArchInterrupts(void)
 {
 	if (ProcSignalBarrierPending)
 		ProcessProcSignalBarrier();
 
+	/* Perform logging of memory contexts of this process */
+	if (LogMemoryContextPending)
+		ProcessLogMemoryContextInterrupt();
+
 	if (ConfigReloadPending)
 	{
+		char	   *archiveLib = pstrdup(XLogArchiveLibrary);
+		bool		archiveLibChanged;
+
 		ConfigReloadPending = false;
 		ProcessConfigFile(PGC_SIGHUP);
+
+		if (XLogArchiveLibrary[0] != '\0' && XLogArchiveCommand[0] != '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("both \"archive_command\" and \"archive_library\" set"),
+					 errdetail("Only one of \"archive_command\", \"archive_library\" may be set.")));
+
+		archiveLibChanged = strcmp(XLogArchiveLibrary, archiveLib) != 0;
+		pfree(archiveLib);
+
+		if (archiveLibChanged)
+		{
+			/*
+			 * Ideally, we would simply unload the previous archive module and
+			 * load the new one, but there is presently no mechanism for
+			 * unloading a library (see the comment above
+			 * internal_load_library()).  To deal with this, we simply restart
+			 * the archiver.  The new archive module will be loaded when the
+			 * new archiver process starts up.  Note that this triggers the
+			 * module's shutdown callback, if defined.
+			 */
+			ereport(LOG,
+					(errmsg("restarting archiver process because value of "
+							"\"archive_library\" was changed")));
+
+			proc_exit(0);
+		}
 	}
+}
+
+/*
+ * LoadArchiveLibrary
+ *
+ * Loads the archiving callbacks into our local ArchiveCallbacks.
+ */
+static void
+LoadArchiveLibrary(void)
+{
+	ArchiveModuleInit archive_init;
+
+	if (XLogArchiveLibrary[0] != '\0' && XLogArchiveCommand[0] != '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("both \"archive_command\" and \"archive_library\" set"),
+				 errdetail("Only one of \"archive_command\", \"archive_library\" may be set.")));
+
+	/*
+	 * If shell archiving is enabled, use our special initialization function.
+	 * Otherwise, load the library and call its _PG_archive_module_init().
+	 */
+	if (XLogArchiveLibrary[0] == '\0')
+		archive_init = shell_archive_init;
+	else
+		archive_init = (ArchiveModuleInit)
+			load_external_function(XLogArchiveLibrary,
+								   "_PG_archive_module_init", false, NULL);
+
+	if (archive_init == NULL)
+		ereport(ERROR,
+				(errmsg("archive modules have to define the symbol %s", "_PG_archive_module_init")));
+
+	ArchiveCallbacks = (*archive_init) ();
+
+	if (ArchiveCallbacks->archive_file_cb == NULL)
+		ereport(ERROR,
+				(errmsg("archive modules must register an archive callback")));
+
+	archive_module_state = (ArchiveModuleState *) palloc0(sizeof(ArchiveModuleState));
+	if (ArchiveCallbacks->startup_cb != NULL)
+		ArchiveCallbacks->startup_cb(archive_module_state);
+
+	before_shmem_exit(pgarch_call_module_shutdown_cb, 0);
+}
+
+/*
+ * Call the shutdown callback of the loaded archive module, if defined.
+ */
+static void
+pgarch_call_module_shutdown_cb(int code, Datum arg)
+{
+	if (ArchiveCallbacks->shutdown_cb != NULL)
+		ArchiveCallbacks->shutdown_cb(archive_module_state);
 }

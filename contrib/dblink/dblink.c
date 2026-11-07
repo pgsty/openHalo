@@ -9,7 +9,7 @@
  * Shridhar Daithankar <shridhar_daithankar@persistent.co.in>
  *
  * contrib/dblink/dblink.c
- * Copyright (c) 2001-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2025, PostgreSQL Global Development Group
  * ALL RIGHTS RESERVED;
  *
  * Permission to use, copy, modify, and distribute this software and its
@@ -43,11 +43,14 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_type.h"
 #include "catalog/pg_user_mapping.h"
+#include "commands/defrem.h"
+#include "common/base64.h"
 #include "executor/spi.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "libpq-fe.h"
+#include "libpq/libpq-be.h"
 #include "libpq/libpq-be-fe-helpers.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -62,7 +65,10 @@
 #include "utils/varlena.h"
 #include "utils/wait_event.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "dblink",
+					.version = PG_VERSION
+);
 
 typedef struct remoteConn
 {
@@ -99,7 +105,7 @@ static PGresult *storeQueryResult(volatile storeInfo *sinfo, PGconn *conn, const
 static void storeRow(volatile storeInfo *sinfo, PGresult *res, bool first);
 static remoteConn *getConnectionByName(const char *name);
 static HTAB *createConnHash(void);
-static void createNewConnection(const char *name, remoteConn *rconn);
+static remoteConn *createNewConnection(const char *name);
 static void deleteConnection(const char *name);
 static char **get_pkey_attnames(Relation rel, int16 *indnkeyatts);
 static char **get_text_array_contents(ArrayType *array, int *numitems);
@@ -112,11 +118,13 @@ static HeapTuple get_tuple_of_interest(Relation rel, int *pkattnums, int pknumat
 static Relation get_rel_from_relname(text *relname_text, LOCKMODE lockmode, AclMode aclmode);
 static char *generate_relation_name(Relation rel);
 static void dblink_connstr_check(const char *connstr);
-static void dblink_security_check(PGconn *conn, remoteConn *rconn);
+static bool dblink_connstr_has_pw(const char *connstr);
+static void dblink_security_check(PGconn *conn, const char *connname,
+								  const char *connstr);
 static void dblink_res_error(PGconn *conn, const char *conname, PGresult *res,
 							 bool fail, const char *fmt,...) pg_attribute_printf(5, 6);
 static char *get_connect_string(const char *servername);
-static char *escape_param_str(const char *from);
+static char *escape_param_str(const char *str);
 static void validate_pkattnums(Relation rel,
 							   int2vector *pkattnums_arg, int32 pknumatts_arg,
 							   int **pkattnums, int *pknumatts);
@@ -124,22 +132,38 @@ static bool is_valid_dblink_option(const PQconninfoOption *options,
 								   const char *option, Oid context);
 static int	applyRemoteGucs(PGconn *conn);
 static void restoreLocalGucs(int nestlevel);
+static bool UseScramPassthrough(ForeignServer *foreign_server, UserMapping *user);
+static void appendSCRAMKeysInfo(StringInfo buf);
+static bool is_valid_dblink_fdw_option(const PQconninfoOption *options, const char *option,
+									   Oid context);
+static bool dblink_connstr_has_required_scram_options(const char *connstr);
 
 /* Global */
 static remoteConn *pconn = NULL;
 static HTAB *remoteConnHash = NULL;
 
+/* custom wait event values, retrieved from shared memory */
+static uint32 dblink_we_connect = 0;
+static uint32 dblink_we_get_conn = 0;
+static uint32 dblink_we_get_result = 0;
+
 /*
- *	Following is list that holds multiple remote connections.
+ *	Following is hash that holds multiple remote connections.
  *	Calling convention of each dblink function changes to accept
- *	connection name as the first parameter. The connection list is
+ *	connection name as the first parameter. The connection hash is
  *	much like ecpg e.g. a mapping between a name and a PGconn object.
+ *
+ *	To avoid potentially leaking a PGconn object in case of out-of-memory
+ *	errors, we first create the hash entry, then open the PGconn.
+ *	Hence, a hash entry whose rconn.conn pointer is NULL must be
+ *	understood as a leftover from a failed create; it should be ignored
+ *	by lookup operations, and silently replaced by create operations.
  */
 
 typedef struct remoteConnHashEnt
 {
 	char		name[NAMEDATALEN];
-	remoteConn *rconn;
+	remoteConn	rconn;
 } remoteConnHashEnt;
 
 /* initial number of connection hashes */
@@ -153,19 +177,16 @@ xpstrdup(const char *in)
 	return pstrdup(in);
 }
 
-static void
-pg_attribute_noreturn()
+pg_noreturn static void
 dblink_res_internalerror(PGconn *conn, PGresult *res, const char *p2)
 {
 	char	   *msg = pchomp(PQerrorMessage(conn));
 
-	if (res)
-		PQclear(res);
+	PQclear(res);
 	elog(ERROR, "%s: %s", p2, msg);
 }
 
-static void
-pg_attribute_noreturn()
+pg_noreturn static void
 dblink_conn_not_avail(const char *conname)
 {
 	if (conname)
@@ -202,43 +223,24 @@ dblink_get_conn(char *conname_or_str,
 			connstr = conname_or_str;
 		dblink_connstr_check(connstr);
 
-		/*
-		 * We must obey fd.c's limit on non-virtual file descriptors.  Assume
-		 * that a PGconn represents one long-lived FD.  (Doing this here also
-		 * ensures that VFDs are closed if needed to make room.)
-		 */
-		if (!AcquireExternalFD())
-		{
-#ifndef WIN32					/* can't write #if within ereport() macro */
-			ereport(ERROR,
-					(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-					 errmsg("could not establish connection"),
-					 errdetail("There are too many open files on the local server."),
-					 errhint("Raise the server's max_files_per_process and/or \"ulimit -n\" limits.")));
-#else
-			ereport(ERROR,
-					(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-					 errmsg("could not establish connection"),
-					 errdetail("There are too many open files on the local server."),
-					 errhint("Raise the server's max_files_per_process setting.")));
-#endif
-		}
+		/* first time, allocate or get the custom wait event */
+		if (dblink_we_get_conn == 0)
+			dblink_we_get_conn = WaitEventExtensionNew("DblinkGetConnect");
 
 		/* OK to make connection */
-		conn = PQconnectdb(connstr);
+		conn = libpqsrv_connect(connstr, dblink_we_get_conn);
 
 		if (PQstatus(conn) == CONNECTION_BAD)
 		{
 			char	   *msg = pchomp(PQerrorMessage(conn));
 
-			PQfinish(conn);
-			ReleaseExternalFD();
+			libpqsrv_disconnect(conn);
 			ereport(ERROR,
 					(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
 					 errmsg("could not establish connection"),
 					 errdetail_internal("%s", msg)));
 		}
-		dblink_security_check(conn, rconn);
+		dblink_security_check(conn, NULL, connstr);
 		if (PQclientEncoding(conn) != GetDatabaseEncoding())
 			PQsetClientEncoding(conn, GetDatabaseEncodingName());
 		freeconn = true;
@@ -267,6 +269,9 @@ dblink_init(void)
 {
 	if (!pconn)
 	{
+		if (dblink_we_get_result == 0)
+			dblink_we_get_result = WaitEventExtensionNew("DblinkGetResult");
+
 		pconn = (remoteConn *) MemoryContextAlloc(TopMemoryContext, sizeof(remoteConn));
 		pconn->conn = NULL;
 		pconn->openCursorCount = 0;
@@ -298,15 +303,6 @@ dblink_connect(PG_FUNCTION_ARGS)
 	else if (PG_NARGS() == 1)
 		conname_or_str = text_to_cstring(PG_GETARG_TEXT_PP(0));
 
-	if (connname)
-	{
-		rconn = (remoteConn *) MemoryContextAlloc(TopMemoryContext,
-												  sizeof(remoteConn));
-		rconn->conn = NULL;
-		rconn->openCursorCount = 0;
-		rconn->newXactForCursor = false;
-	}
-
 	/* first check for valid foreign data server */
 	connstr = get_connect_string(conname_or_str);
 	if (connstr == NULL)
@@ -315,38 +311,26 @@ dblink_connect(PG_FUNCTION_ARGS)
 	/* check password in connection string if not superuser */
 	dblink_connstr_check(connstr);
 
-	/*
-	 * We must obey fd.c's limit on non-virtual file descriptors.  Assume that
-	 * a PGconn represents one long-lived FD.  (Doing this here also ensures
-	 * that VFDs are closed if needed to make room.)
-	 */
-	if (!AcquireExternalFD())
+	/* first time, allocate or get the custom wait event */
+	if (dblink_we_connect == 0)
+		dblink_we_connect = WaitEventExtensionNew("DblinkConnect");
+
+	/* if we need a hashtable entry, make that first, since it might fail */
+	if (connname)
 	{
-#ifndef WIN32					/* can't write #if within ereport() macro */
-		ereport(ERROR,
-				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-				 errmsg("could not establish connection"),
-				 errdetail("There are too many open files on the local server."),
-				 errhint("Raise the server's max_files_per_process and/or \"ulimit -n\" limits.")));
-#else
-		ereport(ERROR,
-				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-				 errmsg("could not establish connection"),
-				 errdetail("There are too many open files on the local server."),
-				 errhint("Raise the server's max_files_per_process setting.")));
-#endif
+		rconn = createNewConnection(connname);
+		Assert(rconn->conn == NULL);
 	}
 
 	/* OK to make connection */
-	conn = PQconnectdb(connstr);
+	conn = libpqsrv_connect(connstr, dblink_we_connect);
 
 	if (PQstatus(conn) == CONNECTION_BAD)
 	{
 		msg = pchomp(PQerrorMessage(conn));
-		PQfinish(conn);
-		ReleaseExternalFD();
-		if (rconn)
-			pfree(rconn);
+		libpqsrv_disconnect(conn);
+		if (connname)
+			deleteConnection(connname);
 
 		ereport(ERROR,
 				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
@@ -355,24 +339,21 @@ dblink_connect(PG_FUNCTION_ARGS)
 	}
 
 	/* check password actually used if not superuser */
-	dblink_security_check(conn, rconn);
+	dblink_security_check(conn, connname, connstr);
 
 	/* attempt to set client encoding to match server encoding, if needed */
 	if (PQclientEncoding(conn) != GetDatabaseEncoding())
 		PQsetClientEncoding(conn, GetDatabaseEncodingName());
 
+	/* all OK, save away the conn */
 	if (connname)
 	{
 		rconn->conn = conn;
-		createNewConnection(connname, rconn);
 	}
 	else
 	{
 		if (pconn->conn)
-		{
-			PQfinish(pconn->conn);
-			ReleaseExternalFD();
-		}
+			libpqsrv_disconnect(pconn->conn);
 		pconn->conn = conn;
 	}
 
@@ -405,13 +386,9 @@ dblink_disconnect(PG_FUNCTION_ARGS)
 	if (!conn)
 		dblink_conn_not_avail(conname);
 
-	PQfinish(conn);
-	ReleaseExternalFD();
+	libpqsrv_disconnect(conn);
 	if (rconn)
-	{
 		deleteConnection(conname);
-		pfree(rconn);
-	}
 	else
 		pconn->conn = NULL;
 
@@ -480,7 +457,7 @@ dblink_open(PG_FUNCTION_ARGS)
 	/* If we are not in a transaction, start one */
 	if (PQtransactionStatus(conn) == PQTRANS_IDLE)
 	{
-		res = libpqsrv_exec(conn, "BEGIN", PG_WAIT_EXTENSION);
+		res = libpqsrv_exec(conn, "BEGIN", dblink_we_get_result);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			dblink_res_internalerror(conn, res, "begin error");
 		PQclear(res);
@@ -499,7 +476,7 @@ dblink_open(PG_FUNCTION_ARGS)
 		(rconn->openCursorCount)++;
 
 	appendStringInfo(&buf, "DECLARE %s CURSOR FOR %s", curname, sql);
-	res = libpqsrv_exec(conn, buf.data, PG_WAIT_EXTENSION);
+	res = libpqsrv_exec(conn, buf.data, dblink_we_get_result);
 	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		dblink_res_error(conn, conname, res, fail,
@@ -568,7 +545,7 @@ dblink_close(PG_FUNCTION_ARGS)
 	appendStringInfo(&buf, "CLOSE %s", curname);
 
 	/* close the cursor */
-	res = libpqsrv_exec(conn, buf.data, PG_WAIT_EXTENSION);
+	res = libpqsrv_exec(conn, buf.data, dblink_we_get_result);
 	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
 		dblink_res_error(conn, conname, res, fail,
@@ -588,7 +565,7 @@ dblink_close(PG_FUNCTION_ARGS)
 		{
 			rconn->newXactForCursor = false;
 
-			res = libpqsrv_exec(conn, "COMMIT", PG_WAIT_EXTENSION);
+			res = libpqsrv_exec(conn, "COMMIT", dblink_we_get_result);
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				dblink_res_internalerror(conn, res, "commit error");
 			PQclear(res);
@@ -670,7 +647,7 @@ dblink_fetch(PG_FUNCTION_ARGS)
 	 * PGresult will be long-lived even though we are still in a short-lived
 	 * memory context.
 	 */
-	res = libpqsrv_exec(conn, buf.data, PG_WAIT_EXTENSION);
+	res = libpqsrv_exec(conn, buf.data, dblink_we_get_result);
 	if (!res ||
 		(PQresultStatus(res) != PGRES_COMMAND_OK &&
 		 PQresultStatus(res) != PGRES_TUPLES_OK))
@@ -818,7 +795,7 @@ dblink_record_internal(FunctionCallInfo fcinfo, bool is_async)
 		else
 		{
 			/* async result retrieval, do it the old way */
-			PGresult   *res = libpqsrv_get_result(conn, PG_WAIT_EXTENSION);
+			PGresult   *res = libpqsrv_get_result(conn, dblink_we_get_result);
 
 			/* NULL means we're all done with the async results */
 			if (res)
@@ -841,10 +818,7 @@ dblink_record_internal(FunctionCallInfo fcinfo, bool is_async)
 	{
 		/* if needed, close the connection to the database */
 		if (freeconn)
-		{
-			PQfinish(conn);
-			ReleaseExternalFD();
-		}
+			libpqsrv_disconnect(conn);
 	}
 	PG_END_TRY();
 
@@ -975,7 +949,7 @@ materializeResult(FunctionCallInfo fcinfo, PGconn *conn, PGresult *res)
 			rsinfo->setDesc = tupdesc;
 			MemoryContextSwitchTo(oldcontext);
 
-			values = (char **) palloc(nfields * sizeof(char *));
+			values = palloc_array(char *, nfields);
 
 			/* put all tuples into the tuplestore */
 			for (row = 0; row < ntuples; row++)
@@ -1006,9 +980,6 @@ materializeResult(FunctionCallInfo fcinfo, PGconn *conn, PGresult *res)
 
 			/* clean up GUC settings, if we changed any */
 			restoreLocalGucs(nestlevel);
-
-			/* clean up and return the tuplestore */
-			tuplestore_donestoring(tupstore);
 		}
 	}
 	PG_FINALLY();
@@ -1132,7 +1103,7 @@ materializeQueryResult(FunctionCallInfo fcinfo,
 		PQclear(sinfo.last_res);
 		PQclear(sinfo.cur_res);
 		/* and clear out any pending data in libpq */
-		while ((res = libpqsrv_get_result(conn, PG_WAIT_EXTENSION)) !=
+		while ((res = libpqsrv_get_result(conn, dblink_we_get_result)) !=
 			   NULL)
 			PQclear(res);
 		PG_RE_THROW();
@@ -1160,7 +1131,7 @@ storeQueryResult(volatile storeInfo *sinfo, PGconn *conn, const char *sql)
 	{
 		CHECK_FOR_INTERRUPTS();
 
-		sinfo->cur_res = libpqsrv_get_result(conn, PG_WAIT_EXTENSION);
+		sinfo->cur_res = libpqsrv_get_result(conn, dblink_we_get_result);
 		if (!sinfo->cur_res)
 			break;
 
@@ -1283,7 +1254,7 @@ storeRow(volatile storeInfo *sinfo, PGresult *res, bool first)
 		 */
 		if (sinfo->cstrs)
 			pfree(sinfo->cstrs);
-		sinfo->cstrs = (char **) palloc(nfields * sizeof(char *));
+		sinfo->cstrs = palloc_array(char *, nfields);
 	}
 
 	/* Should have a single-row result if we get here */
@@ -1335,6 +1306,9 @@ dblink_get_connections(PG_FUNCTION_ARGS)
 		hash_seq_init(&status, remoteConnHash);
 		while ((hentry = (remoteConnHashEnt *) hash_seq_search(&status)) != NULL)
 		{
+			/* ignore it if it's not an open connection */
+			if (hentry->rconn.conn == NULL)
+				continue;
 			/* stash away current value */
 			astate = accumArrayResult(astate,
 									  CStringGetTextDatum(hentry->name),
@@ -1343,8 +1317,8 @@ dblink_get_connections(PG_FUNCTION_ARGS)
 	}
 
 	if (astate)
-		PG_RETURN_ARRAYTYPE_P(makeArrayResult(astate,
-											  CurrentMemoryContext));
+		PG_RETURN_DATUM(makeArrayResult(astate,
+										CurrentMemoryContext));
 	else
 		PG_RETURN_NULL();
 }
@@ -1385,22 +1359,19 @@ PG_FUNCTION_INFO_V1(dblink_cancel_query);
 Datum
 dblink_cancel_query(PG_FUNCTION_ARGS)
 {
-	int			res;
 	PGconn	   *conn;
-	PGcancel   *cancel;
-	char		errbuf[256];
+	const char *msg;
+	TimestampTz endtime;
 
 	dblink_init();
 	conn = dblink_get_named_conn(text_to_cstring(PG_GETARG_TEXT_PP(0)));
-	cancel = PQgetCancel(conn);
+	endtime = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+										  30000);
+	msg = libpqsrv_cancel(conn, endtime);
+	if (msg == NULL)
+		msg = "OK";
 
-	res = PQcancel(cancel, errbuf, 256);
-	PQfreeCancel(cancel);
-
-	if (res == 1)
-		PG_RETURN_TEXT_P(cstring_to_text("OK"));
-	else
-		PG_RETURN_TEXT_P(cstring_to_text(errbuf));
+	PG_RETURN_TEXT_P(cstring_to_text(msg));
 }
 
 
@@ -1488,7 +1459,7 @@ dblink_exec(PG_FUNCTION_ARGS)
 		if (!conn)
 			dblink_conn_not_avail(conname);
 
-		res = libpqsrv_exec(conn, sql, PG_WAIT_EXTENSION);
+		res = libpqsrv_exec(conn, sql, dblink_we_get_result);
 		if (!res ||
 			(PQresultStatus(res) != PGRES_COMMAND_OK &&
 			 PQresultStatus(res) != PGRES_TUPLES_OK))
@@ -1523,10 +1494,7 @@ dblink_exec(PG_FUNCTION_ARGS)
 	{
 		/* if needed, close the connection to the database */
 		if (freeconn)
-		{
-			PQfinish(conn);
-			ReleaseExternalFD();
-		}
+			libpqsrv_disconnect(conn);
 	}
 	PG_END_TRY();
 
@@ -1625,7 +1593,7 @@ dblink_get_pkey(PG_FUNCTION_ARGS)
 		HeapTuple	tuple;
 		Datum		result;
 
-		values = (char **) palloc(2 * sizeof(char *));
+		values = palloc_array(char *, 2);
 		values[0] = psprintf("%d", call_cntr + 1);
 		values[1] = results[call_cntr];
 
@@ -1933,12 +1901,6 @@ dblink_get_notify(PG_FUNCTION_ARGS)
 	PGconn	   *conn;
 	PGnotify   *notify;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
-
-	prepTuplestoreResult(fcinfo);
 
 	dblink_init();
 	if (PG_NARGS() == 1)
@@ -1946,23 +1908,7 @@ dblink_get_notify(PG_FUNCTION_ARGS)
 	else
 		conn = pconn->conn;
 
-	/* create the tuplestore in per-query memory */
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	tupdesc = CreateTemplateTupleDesc(DBLINK_NOTIFY_COLS);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "notify_name",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "be_pid",
-					   INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "extra",
-					   TEXTOID, -1, 0);
-
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-
-	MemoryContextSwitchTo(oldcontext);
+	InitMaterializedSRF(fcinfo, 0);
 
 	PQconsumeInput(conn);
 	while ((notify = PQnotifies(conn)) != NULL)
@@ -1985,14 +1931,11 @@ dblink_get_notify(PG_FUNCTION_ARGS)
 		else
 			nulls[2] = true;
 
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
 		PQfreemem(notify);
 		PQconsumeInput(conn);
 	}
-
-	/* clean up and return the tuplestore */
-	tuplestore_donestoring(tupstore);
 
 	return (Datum) 0;
 }
@@ -2036,30 +1979,40 @@ dblink_fdw_validator(PG_FUNCTION_ARGS)
 	{
 		DefElem    *def = (DefElem *) lfirst(cell);
 
-		if (!is_valid_dblink_option(options, def->defname, context))
+		if (!is_valid_dblink_fdw_option(options, def->defname, context))
 		{
 			/*
 			 * Unknown option, or invalid option for the context specified, so
-			 * complain about it.  Provide a hint with list of valid options
-			 * for the context.
+			 * complain about it.  Provide a hint with a valid option that
+			 * looks similar, if there is one.
 			 */
-			StringInfoData buf;
 			const PQconninfoOption *opt;
+			const char *closest_match;
+			ClosestMatchState match_state;
+			bool		has_valid_options = false;
 
-			initStringInfo(&buf);
+			initClosestMatch(&match_state, def->defname, 4);
 			for (opt = options; opt->keyword; opt++)
 			{
 				if (is_valid_dblink_option(options, opt->keyword, context))
-					appendStringInfo(&buf, "%s%s",
-									 (buf.len > 0) ? ", " : "",
-									 opt->keyword);
+				{
+					has_valid_options = true;
+					updateClosestMatch(&match_state, opt->keyword);
+				}
 			}
+
+			closest_match = getClosestMatch(&match_state);
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
 					 errmsg("invalid option \"%s\"", def->defname),
-					 errhint("Valid options in this context are: %s",
-							 buf.data)));
+					 has_valid_options ? closest_match ?
+					 errhint("Perhaps you meant the option \"%s\".",
+							 closest_match) : 0 :
+					 errhint("There are no valid options in this context.")));
 		}
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			(void) defGetBoolean(def);	/* accept only boolean values */
 	}
 
 	PG_RETURN_VOID();
@@ -2113,7 +2066,7 @@ get_pkey_attnames(Relation rel, int16 *indnkeyatts)
 			*indnkeyatts = index->indnkeyatts;
 			if (*indnkeyatts > 0)
 			{
-				result = (char **) palloc(*indnkeyatts * sizeof(char *));
+				result = palloc_array(char *, *indnkeyatts);
 
 				for (i = 0; i < *indnkeyatts; i++)
 					result[i] = SPI_fname(tupdesc, index->indkey.values[i]);
@@ -2154,7 +2107,7 @@ get_text_array_contents(ArrayType *array, int *numitems)
 	get_typlenbyvalalign(ARR_ELEMTYPE(array),
 						 &typlen, &typbyval, &typalign);
 
-	values = (char **) palloc(nitems * sizeof(char *));
+	values = palloc_array(char *, nitems);
 
 	ptr = ARR_DATA_PTR(array);
 	bitmap = ARR_NULLBITMAP(array);
@@ -2440,9 +2393,7 @@ get_tuple_of_interest(Relation rel, int *pkattnums, int pknumatts, char **src_pk
 	/*
 	 * Connect to SPI manager
 	 */
-	if ((ret = SPI_connect()) < 0)
-		/* internal error */
-		elog(ERROR, "SPI connect failure - returned %d", ret);
+	SPI_connect();
 
 	initStringInfo(&buf);
 
@@ -2596,8 +2547,8 @@ getConnectionByName(const char *name)
 	hentry = (remoteConnHashEnt *) hash_search(remoteConnHash,
 											   key, HASH_FIND, NULL);
 
-	if (hentry)
-		return hentry->rconn;
+	if (hentry && hentry->rconn.conn != NULL)
+		return &hentry->rconn;
 
 	return NULL;
 }
@@ -2614,8 +2565,8 @@ createConnHash(void)
 					   HASH_ELEM | HASH_STRINGS);
 }
 
-static void
-createNewConnection(const char *name, remoteConn *rconn)
+static remoteConn *
+createNewConnection(const char *name)
 {
 	remoteConnHashEnt *hentry;
 	bool		found;
@@ -2629,19 +2580,15 @@ createNewConnection(const char *name, remoteConn *rconn)
 	hentry = (remoteConnHashEnt *) hash_search(remoteConnHash, key,
 											   HASH_ENTER, &found);
 
-	if (found)
-	{
-		PQfinish(rconn->conn);
-		ReleaseExternalFD();
-		pfree(rconn);
-
+	if (found && hentry->rconn.conn != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("duplicate connection name")));
-	}
 
-	hentry->rconn = rconn;
-	strlcpy(hentry->name, name, sizeof(hentry->name));
+	/* New, or reusable, so initialize the rconn struct to zeroes */
+	memset(&hentry->rconn, 0, sizeof(remoteConn));
+
+	return &hentry->rconn;
 }
 
 static void
@@ -2663,68 +2610,182 @@ deleteConnection(const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("undefined connection name")));
-
 }
 
-static void
-dblink_security_check(PGconn *conn, remoteConn *rconn)
+ /*
+  * Ensure that require_auth and SCRAM keys are correctly set on connstr.
+  * SCRAM keys used to pass-through are coming from the initial connection
+  * from the client with the server.
+  *
+  * All required SCRAM options are set by dblink, so we just need to ensure
+  * that these options are not overwritten by the user.
+  *
+  * See appendSCRAMKeysInfo and its usage for more.
+  */
+bool
+dblink_connstr_has_required_scram_options(const char *connstr)
 {
-	if (!superuser())
-	{
-		if (!PQconnectionUsedPassword(conn))
-		{
-			PQfinish(conn);
-			ReleaseExternalFD();
-			if (rconn)
-				pfree(rconn);
+	PQconninfoOption *options;
+	bool		has_scram_server_key = false;
+	bool		has_scram_client_key = false;
+	bool		has_require_auth = false;
+	bool		has_scram_keys = false;
 
-			ereport(ERROR,
-					(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
-					 errmsg("password is required"),
-					 errdetail("Non-superuser cannot connect if the server does not request a password."),
-					 errhint("Target server's authentication method must be changed.")));
+	options = PQconninfoParse(connstr, NULL);
+	if (options)
+	{
+		/*
+		 * Continue iterating even if we found the keys that we need to
+		 * validate to make sure that there is no other declaration of these
+		 * keys that can overwrite the first.
+		 */
+		for (PQconninfoOption *option = options; option->keyword != NULL; option++)
+		{
+			if (strcmp(option->keyword, "require_auth") == 0)
+			{
+				if (option->val != NULL && strcmp(option->val, "scram-sha-256") == 0)
+					has_require_auth = true;
+				else
+					has_require_auth = false;
+			}
+
+			if (strcmp(option->keyword, "scram_client_key") == 0)
+			{
+				if (option->val != NULL && option->val[0] != '\0')
+					has_scram_client_key = true;
+				else
+					has_scram_client_key = false;
+			}
+
+			if (strcmp(option->keyword, "scram_server_key") == 0)
+			{
+				if (option->val != NULL && option->val[0] != '\0')
+					has_scram_server_key = true;
+				else
+					has_scram_server_key = false;
+			}
 		}
+		PQconninfoFree(options);
 	}
+
+	has_scram_keys = has_scram_client_key && has_scram_server_key && MyProcPort != NULL && MyProcPort->has_scram_keys;
+
+	return (has_scram_keys && has_require_auth);
 }
 
 /*
- * For non-superusers, insist that the connstr specify a password.  This
- * prevents a password from being picked up from .pgpass, a service file,
- * the environment, etc.  We don't want the postgres user's passwords
- * to be accessible to non-superusers.
+ * We need to make sure that the connection made used credentials
+ * which were provided by the user, so check what credentials were
+ * used to connect and then make sure that they came from the user.
+ *
+ * On failure, we close "conn" and also delete the hashtable entry
+ * identified by "connname" (if that's not NULL).
+ */
+static void
+dblink_security_check(PGconn *conn, const char *connname, const char *connstr)
+{
+	/* Superuser bypasses security check */
+	if (superuser())
+		return;
+
+	/* If password was used to connect, make sure it was one provided */
+	if (PQconnectionUsedPassword(conn) && dblink_connstr_has_pw(connstr))
+		return;
+
+	/*
+	 * Password was not used to connect, check if SCRAM pass-through is in
+	 * use.
+	 *
+	 * If dblink_connstr_has_required_scram_options is true we assume that
+	 * UseScramPassthrough is also true because the required SCRAM keys are
+	 * only added if UseScramPassthrough is set, and the user is not allowed
+	 * to add the SCRAM keys on fdw and user mapping options.
+	 */
+	if (MyProcPort != NULL && MyProcPort->has_scram_keys && dblink_connstr_has_required_scram_options(connstr))
+		return;
+
+#ifdef ENABLE_GSS
+	/* If GSSAPI creds used to connect, make sure it was one delegated */
+	if (PQconnectionUsedGSSAPI(conn) && be_gssapi_get_delegation(MyProcPort))
+		return;
+#endif
+
+	/* Otherwise, fail out */
+	libpqsrv_disconnect(conn);
+	if (connname)
+		deleteConnection(connname);
+
+	ereport(ERROR,
+			(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+			 errmsg("password or GSSAPI delegated credentials required"),
+			 errdetail("Non-superusers may only connect using credentials they provide, eg: password in connection string or delegated GSSAPI credentials"),
+			 errhint("Ensure provided credentials match target server's authentication method.")));
+}
+
+/*
+ * Function to check if the connection string includes an explicit
+ * password, needed to ensure that non-superuser password-based auth
+ * is using a provided password and not one picked up from the
+ * environment.
+ */
+static bool
+dblink_connstr_has_pw(const char *connstr)
+{
+	PQconninfoOption *options;
+	PQconninfoOption *option;
+	bool		connstr_gives_password = false;
+
+	options = PQconninfoParse(connstr, NULL);
+	if (options)
+	{
+		for (option = options; option->keyword != NULL; option++)
+		{
+			if (strcmp(option->keyword, "password") == 0)
+			{
+				if (option->val != NULL && option->val[0] != '\0')
+				{
+					connstr_gives_password = true;
+					break;
+				}
+			}
+		}
+		PQconninfoFree(options);
+	}
+
+	return connstr_gives_password;
+}
+
+/*
+ * For non-superusers, insist that the connstr specify a password, except if
+ * GSSAPI credentials have been delegated (and we check that they are used for
+ * the connection in dblink_security_check later) or if SCRAM pass-through is
+ * being used.  This prevents a password or GSSAPI credentials from being
+ * picked up from .pgpass, a service file, the environment, etc.  We don't want
+ * the postgres user's passwords or Kerberos credentials to be accessible to
+ * non-superusers. In case of SCRAM pass-through insist that the connstr
+ * has the required SCRAM pass-through options.
  */
 static void
 dblink_connstr_check(const char *connstr)
 {
-	if (!superuser())
-	{
-		PQconninfoOption *options;
-		PQconninfoOption *option;
-		bool		connstr_gives_password = false;
+	if (superuser())
+		return;
 
-		options = PQconninfoParse(connstr, NULL);
-		if (options)
-		{
-			for (option = options; option->keyword != NULL; option++)
-			{
-				if (strcmp(option->keyword, "password") == 0)
-				{
-					if (option->val != NULL && option->val[0] != '\0')
-					{
-						connstr_gives_password = true;
-						break;
-					}
-				}
-			}
-			PQconninfoFree(options);
-		}
+	if (dblink_connstr_has_pw(connstr))
+		return;
 
-		if (!connstr_gives_password)
-			ereport(ERROR,
-					(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
-					 errmsg("password is required"),
-					 errdetail("Non-superusers must provide a password in the connection string.")));
-	}
+	if (MyProcPort != NULL && MyProcPort->has_scram_keys && dblink_connstr_has_required_scram_options(connstr))
+		return;
+
+#ifdef ENABLE_GSS
+	if (be_gssapi_get_delegation(MyProcPort))
+		return;
+#endif
+
+	ereport(ERROR,
+			(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+			 errmsg("password or GSSAPI delegated credentials required"),
+			 errdetail("Non-superusers must provide a password in the connection string or send delegated GSSAPI credentials.")));
 }
 
 /*
@@ -2786,8 +2847,7 @@ dblink_res_error(PGconn *conn, const char *conname, PGresult *res,
 	 * leaking all the strings too, but those are in palloc'd memory that will
 	 * get cleaned up eventually.
 	 */
-	if (res)
-		PQclear(res);
+	PQclear(res);
 
 	/*
 	 * Format the basic errcontext string.  Below, we'll add on something
@@ -2865,9 +2925,17 @@ get_connect_string(const char *servername)
 		fdw = GetForeignDataWrapper(fdwid);
 
 		/* Check permissions, user must have usage on the server. */
-		aclresult = pg_foreign_server_aclcheck(serverid, userid, ACL_USAGE);
+		aclresult = object_aclcheck(ForeignServerRelationId, serverid, userid, ACL_USAGE);
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_FOREIGN_SERVER, foreign_server->servername);
+
+		/*
+		 * First append hardcoded options needed for SCRAM pass-through, so if
+		 * the user overwrites these options we can ereport on
+		 * dblink_connstr_check and dblink_security_check.
+		 */
+		if (MyProcPort != NULL && MyProcPort->has_scram_keys && UseScramPassthrough(foreign_server, user_mapping))
+			appendSCRAMKeysInfo(&buf);
 
 		foreach(cell, fdw->options)
 		{
@@ -2960,7 +3028,7 @@ validate_pkattnums(Relation rel,
 				 errmsg("number of key attributes must be > 0")));
 
 	/* Allocate output array */
-	*pkattnums = (int *) palloc(pknumatts_arg * sizeof(int));
+	*pkattnums = palloc_array(int, pknumatts_arg);
 	*pknumatts = pknumatts_arg;
 
 	/* Validate attnums and convert to internal form */
@@ -3036,6 +3104,13 @@ is_valid_dblink_option(const PQconninfoOption *options, const char *option,
 		return false;
 
 	/*
+	 * Disallow OAuth options for now, since the builtin flow communicates on
+	 * stderr by default and can't cache tokens yet.
+	 */
+	if (strncmp(opt->keyword, "oauth_", strlen("oauth_")) == 0)
+		return false;
+
+	/*
 	 * If the option is "user" or marked secure, it should be specified only
 	 * in USER MAPPING.  Others should be specified only in SERVER.
 	 */
@@ -3051,6 +3126,27 @@ is_valid_dblink_option(const PQconninfoOption *options, const char *option,
 	}
 
 	return true;
+}
+
+/*
+ * Same as is_valid_dblink_option but also check for only dblink_fdw specific
+ * options.
+ */
+static bool
+is_valid_dblink_fdw_option(const PQconninfoOption *options, const char *option,
+						   Oid context)
+{
+	/*
+	 * These options are only valid for foreign server or user mapping
+	 * contexts
+	 */
+	if (context == ForeignServerRelationId || context == UserMappingRelationId)
+	{
+		if (strcmp(option, "use_scram_passthrough") == 0)
+			return true;
+	}
+
+	return is_valid_dblink_option(options, option, context);
 }
 
 /*
@@ -3121,4 +3217,73 @@ restoreLocalGucs(int nestlevel)
 	/* Do nothing if no new nestlevel was created */
 	if (nestlevel > 0)
 		AtEOXact_GUC(true, nestlevel);
+}
+
+/*
+ * Append SCRAM client key and server key information from the global
+ * MyProcPort into the given StringInfo buffer.
+ */
+static void
+appendSCRAMKeysInfo(StringInfo buf)
+{
+	int			len;
+	int			encoded_len;
+	char	   *client_key;
+	char	   *server_key;
+
+	len = pg_b64_enc_len(sizeof(MyProcPort->scram_ClientKey));
+	/* don't forget the zero-terminator */
+	client_key = palloc0(len + 1);
+	encoded_len = pg_b64_encode(MyProcPort->scram_ClientKey,
+								sizeof(MyProcPort->scram_ClientKey),
+								client_key, len);
+	if (encoded_len < 0)
+		elog(ERROR, "could not encode SCRAM client key");
+
+	len = pg_b64_enc_len(sizeof(MyProcPort->scram_ServerKey));
+	/* don't forget the zero-terminator */
+	server_key = palloc0(len + 1);
+	encoded_len = pg_b64_encode(MyProcPort->scram_ServerKey,
+								sizeof(MyProcPort->scram_ServerKey),
+								server_key, len);
+	if (encoded_len < 0)
+		elog(ERROR, "could not encode SCRAM server key");
+
+	appendStringInfo(buf, "scram_client_key='%s' ", client_key);
+	appendStringInfo(buf, "scram_server_key='%s' ", server_key);
+	appendStringInfoString(buf, "require_auth='scram-sha-256' ");
+
+	pfree(client_key);
+	pfree(server_key);
+}
+
+
+/*
+ * Return whether SCRAM pass-through is enabled.
+ *
+ * If use_scram_passthrough is specified in both the foreign server
+ * and the user mapping, the user mapping setting takes precedence.
+ */
+static bool
+UseScramPassthrough(ForeignServer *foreign_server, UserMapping *user)
+{
+	ListCell   *cell;
+
+	foreach(cell, user->options)
+	{
+		DefElem    *def = lfirst(cell);
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			return defGetBoolean(def);
+	}
+
+	foreach(cell, foreign_server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(cell);
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			return defGetBoolean(def);
+	}
+
+	return false;
 }

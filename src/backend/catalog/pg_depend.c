@@ -3,7 +3,7 @@
  * pg_depend.c
  *	  routines to support manipulation of the pg_depend relation
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,24 +17,31 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
-#include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_type.h"
+#include "catalog/partition.h"
 #include "commands/extension.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 
-static bool isObjectPinned(const ObjectAddress *object, Relation rel);
+static bool isObjectPinned(const ObjectAddress *object);
+static void dependencyLockAndCheckObject(Oid classId, Oid objectId);
 
 
 /*
- * Record a dependency between 2 objects via their respective objectAddress.
+ * Record a dependency between 2 objects via their respective ObjectAddress.
  * The first argument is the dependent object, the second the one it
  * references.
  *
@@ -70,8 +77,11 @@ recordMultipleDependencies(const ObjectAddress *depender,
 		return;					/* nothing to do */
 
 	/*
-	 * During bootstrap, do nothing since pg_depend may not exist yet. initdb
-	 * will fill in appropriate pg_depend entries after bootstrap.
+	 * During bootstrap, do nothing since pg_depend may not exist yet.
+	 *
+	 * Objects created during bootstrap are most likely pinned, and the few
+	 * that are not do not have dependencies on each other, so that there
+	 * would be no need to make a pg_depend entry anyway.
 	 */
 	if (IsBootstrapProcessingMode())
 		return;
@@ -100,8 +110,15 @@ recordMultipleDependencies(const ObjectAddress *depender,
 		 * need to record dependencies on it.  This saves lots of space in
 		 * pg_depend, so it's worth the time taken to check.
 		 */
-		if (isObjectPinned(referenced, dependDesc))
+		if (isObjectPinned(referenced))
 			continue;
+
+		/*
+		 * Make sure the new referenced object doesn't go away while we record
+		 * the dependency.  DROP routines should lock the object exclusively
+		 * before they check dependencies.
+		 */
+		dependencyLockAndCheckObject(referenced->classId, referenced->objectId);
 
 		if (slot_init_count < max_slots)
 		{
@@ -330,7 +347,7 @@ deleteDependencyRecordsFor(Oid classId, Oid objectId,
 	systable_endscan(scan);
 
 	table_close(depRel, RowExclusiveLock);
-	CommandCounterIncrement();
+
 	return count;
 }
 
@@ -464,8 +481,6 @@ changeDependencyFor(Oid classId, Oid objectId,
 	bool		oldIsPinned;
 	bool		newIsPinned;
 
-	depRel = table_open(DependRelationId, RowExclusiveLock);
-
 	/*
 	 * Check to see if either oldRefObjectId or newRefObjectId is pinned.
 	 * Pinned objects should not have any dependency entries pointing to them,
@@ -476,16 +491,14 @@ changeDependencyFor(Oid classId, Oid objectId,
 	objAddr.objectId = oldRefObjectId;
 	objAddr.objectSubId = 0;
 
-	oldIsPinned = isObjectPinned(&objAddr, depRel);
+	oldIsPinned = isObjectPinned(&objAddr);
 
 	objAddr.objectId = newRefObjectId;
 
-	newIsPinned = isObjectPinned(&objAddr, depRel);
+	newIsPinned = isObjectPinned(&objAddr);
 
 	if (oldIsPinned)
 	{
-		table_close(depRel, RowExclusiveLock);
-
 		/*
 		 * If both are pinned, we need do nothing.  However, return 1 not 0,
 		 * else callers will think this is an error case.
@@ -504,6 +517,15 @@ changeDependencyFor(Oid classId, Oid objectId,
 
 		return 1;
 	}
+
+	/*
+	 * Make sure the new referenced object doesn't go away while we record the
+	 * dependency.
+	 */
+	if (!newIsPinned)
+		dependencyLockAndCheckObject(refClassId, newRefObjectId);
+
+	depRel = table_open(DependRelationId, RowExclusiveLock);
 
 	/* There should be existing dependency record(s), so search. */
 	ScanKeyInit(&key[0],
@@ -639,7 +661,7 @@ changeDependenciesOn(Oid refClassId, Oid oldRefObjectId,
 	objAddr.objectId = oldRefObjectId;
 	objAddr.objectSubId = 0;
 
-	if (isObjectPinned(&objAddr, depRel))
+	if (isObjectPinned(&objAddr))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot remove dependency on %s because it is a system object",
@@ -651,7 +673,7 @@ changeDependenciesOn(Oid refClassId, Oid oldRefObjectId,
 	 */
 	objAddr.objectId = newRefObjectId;
 
-	newIsPinned = isObjectPinned(&objAddr, depRel);
+	newIsPinned = isObjectPinned(&objAddr);
 
 	/* Now search for dependency records */
 	ScanKeyInit(&key[0],
@@ -699,52 +721,129 @@ changeDependenciesOn(Oid refClassId, Oid oldRefObjectId,
  * isObjectPinned()
  *
  * Test if an object is required for basic database functionality.
- * Caller must already have opened pg_depend.
  *
  * The passed subId, if any, is ignored; we assume that only whole objects
  * are pinned (and that this implies pinning their components).
  */
 static bool
-isObjectPinned(const ObjectAddress *object, Relation rel)
+isObjectPinned(const ObjectAddress *object)
 {
-	bool		ret = false;
-	SysScanDesc scan;
-	HeapTuple	tup;
-	ScanKeyData key[2];
-
-	ScanKeyInit(&key[0],
-				Anum_pg_depend_refclassid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(object->classId));
-
-	ScanKeyInit(&key[1],
-				Anum_pg_depend_refobjid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(object->objectId));
-
-	scan = systable_beginscan(rel, DependReferenceIndexId, true,
-							  NULL, 2, key);
-
-	/*
-	 * Since we won't generate additional pg_depend entries for pinned
-	 * objects, there can be at most one entry referencing a pinned object.
-	 * Hence, it's sufficient to look at the first returned tuple; we don't
-	 * need to loop.
-	 */
-	tup = systable_getnext(scan);
-	if (HeapTupleIsValid(tup))
-	{
-		Form_pg_depend foundDep = (Form_pg_depend) GETSTRUCT(tup);
-
-		if (foundDep->deptype == DEPENDENCY_PIN)
-			ret = true;
-	}
-
-	systable_endscan(scan);
-
-	return ret;
+	return IsPinnedObject(object->classId, object->objectId);
 }
 
+
+/*
+ * dependencyLockAndCheckObject
+ *
+ * Lock the object that we are about to record a dependency on.  After it's
+ * locked, verify that it hasn't been dropped while we weren't looking.  If it
+ * has been dropped, throw an an error.
+ *
+ * If the caller already holds a lock that conflicts with DROP
+ * (AccessShareLock or stronger), this does nothing.  Callers should acquire
+ * locks already when they look up the referenced objects, but many callers
+ * currently do not.  This is a backstop to make sure that we don't record a
+ * bogus reference permanently in the catalogs in that case.  In the future,
+ * after we have tightened up all the callers to acquire locks earlier, this
+ * could just verify that the object is already locked and throw an error if
+ * not.
+ */
+static void
+dependencyLockAndCheckObject(Oid classId, Oid objectId)
+{
+	/*
+	 * Pinned objects cannot be dropped concurrently, and callers checked this
+	 * already.
+	 */
+	Assert(!IsPinnedObject(classId, objectId));
+
+	if (classId != RelationRelationId)
+	{
+		LOCKTAG		tag;
+		int			cache;
+		Relation	rel;
+		SysScanDesc scan;
+		ScanKeyData skey;
+		HeapTuple	tuple;
+
+		SET_LOCKTAG_OBJECT(tag,
+						   MyDatabaseId,
+						   classId,
+						   objectId,
+						   0);
+
+		if (LockHeldByMe(&tag, AccessShareLock, true))
+			return;
+
+		/* Assume we should lock the whole object not a sub-object */
+		LockDatabaseObject(classId, objectId, 0, AccessShareLock);
+
+		/*
+		 * Check that the object still exists.  If the catalog has a suitable
+		 * syscache, check that first.
+		 */
+		cache = get_object_catcache_oid(classId);
+		if (cache != -1)
+		{
+			if (SearchSysCacheExists1(cache, ObjectIdGetDatum(objectId)))
+				return;
+		}
+
+		/*
+		 * If it's not found in the syscache, or there's no suitable syscache
+		 * we can use, scan the catalog table using SnapshotSelf.  This
+		 * handles the case that it's an object we just created (for example,
+		 * if it's a composite type created as part of creating a table).
+		 */
+		rel = table_open(classId, AccessShareLock);
+
+		ScanKeyInit(&skey,
+					get_object_attnum_oid(classId),
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(objectId));
+
+		scan = systable_beginscan(rel, get_object_oid_index(classId),
+								  true, SnapshotSelf, 1, &skey);
+
+		tuple = systable_getnext(scan);
+		if (!HeapTupleIsValid(tuple))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("referenced %s was concurrently dropped",
+							get_object_class_descr(classId))));
+
+		systable_endscan(scan);
+		table_close(rel, AccessShareLock);
+	}
+	else
+	{
+		/*
+		 * Same logic for pg_class entries, but locking relations is handled
+		 * by different functions.
+		 *
+		 * Callers are more careful with locking relations than other objects,
+		 * so we should already have a lock on the relation, or on another
+		 * object that indirectly prevents the relation from being dropped.
+		 * For example, we might have a strong lock on a table while adding
+		 * dependency to its index.  However, we cannot detect the indirectly
+		 * protected case here easily.  To err on the safe side, acquire a
+		 * lock directly on the relation if we're not holding one already.
+		 */
+
+		/* all shared relations are pinned */
+		Assert(!IsSharedRelation(objectId));
+
+		if (CheckRelationOidLockedByMe(objectId, AccessShareLock, true))
+			return;
+		LockRelationOid(objectId, AccessShareLock);
+
+		if (SearchSysCacheExists1(RELOID, ObjectIdGetDatum(objectId)))
+			return;
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("referenced relation was concurrently dropped")));
+	}
+}
 
 /*
  * Various special-purpose lookups and manipulations of pg_depend.
@@ -838,6 +937,77 @@ getAutoExtensionsOfObject(Oid classId, Oid objectId)
 		if (depform->refclassid == ExtensionRelationId &&
 			depform->deptype == DEPENDENCY_AUTO_EXTENSION)
 			result = lappend_oid(result, depform->refobjid);
+	}
+
+	systable_endscan(scan);
+
+	table_close(depRel, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * Look up a type belonging to an extension.
+ *
+ * Returns the type's OID, or InvalidOid if not found.
+ *
+ * Notice that the type is specified by name only, without a schema.
+ * That's because this will typically be used by relocatable extensions
+ * which can't make a-priori assumptions about which schema their objects
+ * are in.  As long as the extension only defines one type of this name,
+ * the answer is unique anyway.
+ *
+ * We might later add the ability to look up functions, operators, etc.
+ */
+Oid
+getExtensionType(Oid extensionOid, const char *typname)
+{
+	Oid			result = InvalidOid;
+	Relation	depRel;
+	ScanKeyData key[3];
+	SysScanDesc scan;
+	HeapTuple	tup;
+
+	depRel = table_open(DependRelationId, AccessShareLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ExtensionRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(extensionOid));
+	ScanKeyInit(&key[2],
+				Anum_pg_depend_refobjsubid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(0));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							  NULL, 3, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (depform->classid == TypeRelationId &&
+			depform->deptype == DEPENDENCY_EXTENSION)
+		{
+			Oid			typoid = depform->objid;
+			HeapTuple	typtup;
+
+			typtup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typoid));
+			if (!HeapTupleIsValid(typtup))
+				continue;		/* should we throw an error? */
+			if (strcmp(NameStr(((Form_pg_type) GETSTRUCT(typtup))->typname),
+					   typname) == 0)
+			{
+				result = typoid;
+				ReleaseSysCache(typtup);
+				break;			/* no need to keep searching */
+			}
+			ReleaseSysCache(typtup);
+		}
 	}
 
 	systable_endscan(scan);
@@ -976,13 +1146,32 @@ getOwnedSequences(Oid relid)
  * Get owned identity sequence, error if not exactly one.
  */
 Oid
-getIdentitySequence(Oid relid, AttrNumber attnum, bool missing_ok)
+getIdentitySequence(Relation rel, AttrNumber attnum, bool missing_ok)
 {
-	List	   *seqlist = getOwnedSequences_internal(relid, attnum, DEPENDENCY_INTERNAL);
+	Oid			relid = RelationGetRelid(rel);
+	List	   *seqlist;
 
+	/*
+	 * The identity sequence is associated with the topmost partitioned table,
+	 * which might have column order different than the given partition.
+	 */
+	if (RelationGetForm(rel)->relispartition)
+	{
+		List	   *ancestors = get_partition_ancestors(relid);
+		const char *attname = get_attname(relid, attnum, false);
+
+		relid = llast_oid(ancestors);
+		attnum = get_attnum(relid, attname);
+		if (attnum == InvalidAttrNumber)
+			elog(ERROR, "cache lookup failed for attribute \"%s\" of relation %u",
+				 attname, relid);
+		list_free(ancestors);
+	}
+
+	seqlist = getOwnedSequences_internal(relid, attnum, DEPENDENCY_INTERNAL);
 	if (list_length(seqlist) > 1)
 		elog(ERROR, "more than one owned sequence found");
-	else if (list_length(seqlist) < 1)
+	else if (seqlist == NIL)
 	{
 		if (missing_ok)
 			return InvalidOid;

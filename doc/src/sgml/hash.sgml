@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/hash.sgml -->
 
-<chapter id="hash-index">
+<sect1 id="hash-index">
 <title>Hash Indexes</title>
 
    <indexterm>
@@ -8,7 +8,7 @@
     <secondary>Hash</secondary>
    </indexterm>
 
-<sect1 id="hash-intro">
+<sect2 id="hash-intro">
  <title>Overview</title>
 
  <para>
@@ -49,7 +49,7 @@
   contrast, a hash index allows accessing the bucket pages directly,
   thereby potentially reducing index access time in larger tables. This
   reduction in "logical I/O" becomes even more pronounced on indexes/data
-  larger than shared_buffers/RAM. 
+  larger than shared_buffers/RAM.
  </para>
 
  <para>
@@ -89,7 +89,7 @@
   overflow page becomes empty, overflow pages can be recycled for reuse
   in other buckets, though we never return them to the operating system.
   There is currently no provision to shrink a hash index, other than by
-  rebuilding it with REINDEX.  
+  rebuilding it with REINDEX.
   There is no provision for reducing the number of buckets, either.
  </para>
 
@@ -108,9 +108,9 @@
   with rapidly increasing number of rows.
  </para>
 
-</sect1>
+</sect2>
 
-<sect1 id="hash-implementation">
+<sect2 id="hash-implementation">
  <title>Implementation</title>
 
  <para>
@@ -125,11 +125,10 @@
   Both scanning the index and inserting tuples require locating the bucket
   where a given tuple ought to be located. To do this, we need the bucket
   count, highmask, and lowmask from the metapage; however, it's undesirable
-  for performance reasons to have to have to lock and pin the metapage for
-  every such operation. Instead, we retain a cached copy of the metapage
-  in each backend's relcache entry. This will produce the correct bucket
-  mapping as long as the target bucket hasn't been split since the last
-  cache refresh.
+  for performance reasons to have to lock and pin the metapage for every such
+  operation. Instead, we retain a cached copy of the metapage in each
+  backend's relcache entry. This will produce the correct bucket mapping as
+  long as the target bucket hasn't been split since the last cache refresh.
  </para>
 
  <para>
@@ -157,6 +156,6 @@
   successfully.
  </para>
 
-</sect1>
+</sect2>
 
-</chapter>
+</sect1>

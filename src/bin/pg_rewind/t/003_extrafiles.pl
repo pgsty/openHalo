@@ -1,12 +1,13 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Test how pg_rewind reacts to extra files and directories in the data dirs.
 
 use strict;
-use warnings;
-use TestLib;
-use Test::More tests => 5;
+use warnings FATAL => 'all';
+use Config;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 use File::Find;
 
@@ -53,6 +54,10 @@ sub run_test
 	append_to_file
 	  "$test_standby_datadir/tst_standby_dir/standby_subdir/standby_file4",
 	  "in standby4";
+	# Skip testing .DS_Store files on macOS to avoid risk of side effects
+	append_to_file "$test_standby_datadir/tst_standby_dir/.DS_Store",
+	  "macOS system file"
+	  unless ($Config{osname} eq 'darwin');
 
 	mkdir "$test_primary_datadir/tst_primary_dir";
 	append_to_file "$test_primary_datadir/tst_primary_dir/primary_file1",
@@ -116,4 +121,4 @@ sub run_test
 run_test('local');
 run_test('remote');
 
-exit(0);
+done_testing();

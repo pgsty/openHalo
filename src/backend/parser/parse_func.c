@@ -3,7 +3,7 @@
  * parse_func.c
  *		handle function calls in parser
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,18 +30,16 @@
 #include "parser/parse_relation.h"
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
-#include "parser/parserapi.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
-#include "utils/catcache.h"
 
 
 /* Possible error codes from LookupFuncNameInternal */
 typedef enum
 {
 	FUNCLOOKUP_NOSUCHFUNC,
-	FUNCLOOKUP_AMBIGUOUS
+	FUNCLOOKUP_AMBIGUOUS,
 } FuncLookupError;
 
 static void unify_hypothetical_args(ParseState *pstate,
@@ -119,9 +117,6 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	FuncDetailCode fdresult;
 	char		aggkind = 0;
 	ParseCallbackState pcbstate;
-
-	if (parserengine->ParseFuncOrColumn)
-		return parserengine->ParseFuncOrColumn(pstate, funcname, fargs, last_srf, fn, proc_call, location);
 
 	/*
 	 * If there's an aggregate filter, transform it using transformWhereClause
@@ -677,6 +672,32 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 											   rettype,
 											   false);
 
+	/*
+	 * Reject any attempt to call a function that takes or returns type
+	 * internal from SQL.  (The FUNCDETAIL_COERCION case does not reach this
+	 * check because of the early return above, but that's okay because we
+	 * disallow coercions to or from type internal.)  Note that we are
+	 * checking the resolved argument and result types, so this will reject
+	 * calls to polymorphic functions that pass internal-type arguments.  The
+	 * casting rules should prevent that anyway, since we won't cast internal
+	 * to any polymorphic type, but no harm in being doubly sure.
+	 */
+	for (int i = 0; i < nargsplusdefs; i++)
+	{
+		if (declared_arg_types[i] == INTERNALOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("functions accepting type \"%s\" cannot be called explicitly",
+							"internal"),
+					 parser_errposition(pstate, location)));
+	}
+	if (rettype == INTERNALOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("functions returning type \"%s\" cannot be called explicitly",
+						"internal"),
+				 parser_errposition(pstate, location)));
+
 	/* perform the necessary typecasting of arguments */
 	make_fn_arguments(pstate, fargs, actual_arg_types, declared_arg_types);
 
@@ -779,11 +800,28 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		aggref->aggstar = agg_star;
 		aggref->aggvariadic = func_variadic;
 		aggref->aggkind = aggkind;
+		aggref->aggpresorted = false;
 		/* agglevelsup will be set by transformAggregateCall */
 		aggref->aggsplit = AGGSPLIT_SIMPLE; /* planner might change this */
 		aggref->aggno = -1;		/* planner will set aggno and aggtransno */
 		aggref->aggtransno = -1;
 		aggref->location = location;
+
+		/*
+		 * The argument-count limit for aggregates is one less than for other
+		 * kinds of functions (cf. AggregateCreate).  Now that we know it's an
+		 * aggregate, apply the stricter limit.  We need an explicit check
+		 * because hypothetical-set aggregates don't have a fixed number of
+		 * arguments, so having matched the pg_proc entry proves nothing.
+		 */
+		if (list_length(fargs) > FUNC_MAX_ARGS - 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					 errmsg_plural("aggregates cannot have more than %d argument",
+								   "aggregates cannot have more than %d arguments",
+								   FUNC_MAX_ARGS - 1,
+								   FUNC_MAX_ARGS - 1),
+					 parser_errposition(pstate, location)));
 
 		/*
 		 * Reject attempt to call a parameterless aggregate without (*)
@@ -838,14 +876,76 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		wfunc->winstar = agg_star;
 		wfunc->winagg = (fdresult == FUNCDETAIL_AGGREGATE);
 		wfunc->aggfilter = agg_filter;
+		wfunc->runCondition = NIL;
 		wfunc->location = location;
 
 		/*
 		 * agg_star is allowed for aggregate functions but distinct isn't
 		 */
-		
-		preTransformWindowAgg(pstate, wfunc, funcname, agg_distinct, agg_order, last_srf, retset);
-		
+		if (agg_distinct)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("DISTINCT is not implemented for window functions"),
+					 parser_errposition(pstate, location)));
+
+		/*
+		 * As above, enforce the correct argument-count limit if it's really
+		 * an aggregate.
+		 */
+		if (wfunc->winagg && list_length(fargs) > FUNC_MAX_ARGS - 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					 errmsg_plural("aggregates cannot have more than %d argument",
+								   "aggregates cannot have more than %d arguments",
+								   FUNC_MAX_ARGS - 1,
+								   FUNC_MAX_ARGS - 1),
+					 parser_errposition(pstate, location)));
+
+		/*
+		 * Reject attempt to call a parameterless aggregate without (*)
+		 * syntax.  This is mere pedantry but some folks insisted ...
+		 */
+		if (wfunc->winagg && fargs == NIL && !agg_star)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("%s(*) must be used to call a parameterless aggregate function",
+							NameListToString(funcname)),
+					 parser_errposition(pstate, location)));
+
+		/*
+		 * ordered aggs not allowed in windows yet
+		 */
+		if (agg_order != NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("aggregate ORDER BY is not implemented for window functions"),
+					 parser_errposition(pstate, location)));
+
+		/*
+		 * FILTER is not yet supported with true window functions
+		 */
+		if (!wfunc->winagg && agg_filter)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("FILTER is not implemented for non-aggregate window functions"),
+					 parser_errposition(pstate, location)));
+
+		/*
+		 * Window functions can't either take or return sets
+		 */
+		if (pstate->p_last_srf != last_srf)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("window function calls cannot contain set-returning function calls"),
+					 errhint("You might be able to move the set-returning function into a LATERAL FROM item."),
+					 parser_errposition(pstate,
+										exprLocation(pstate->p_last_srf))));
+
+		if (retset)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+					 errmsg("window functions cannot return sets"),
+					 parser_errposition(pstate, location)));
 
 		/* parse_agg.c does additional window-func-specific processing */
 		transformWindowFuncCall(pstate, wfunc, over);
@@ -1366,14 +1466,6 @@ func_get_detail(List *funcname,
 	FuncCandidateList raw_candidates;
 	FuncCandidateList best_candidate;
 
-    if (parserengine->func_get_detail)
-		return parserengine->func_get_detail(funcname, fargs, fargnames, nargs,
-                                             argtypes,
-                                             expand_variadic, expand_defaults, include_out_arguments,
-                                             funcid, rettype, retset,
-                                             nvargs, vatype,
-                                             true_typeids, argdefaults);
-
 	/* initialize output arguments to silence compiler warnings */
 	*funcid = InvalidOid;
 	*rettype = InvalidOid;
@@ -1522,7 +1614,7 @@ func_get_detail(List *funcname,
 			 */
 			else if (ncandidates > 1)
 			{
-                best_candidate = func_select_candidate(nargs,
+				best_candidate = func_select_candidate(nargs,
 													   argtypes,
 													   current_candidates);
 
@@ -1596,7 +1688,6 @@ func_get_detail(List *funcname,
 		if (argdefaults && best_candidate->ndargs > 0)
 		{
 			Datum		proargdefaults;
-			bool		isnull;
 			char	   *str;
 			List	   *defaults;
 
@@ -1604,10 +1695,8 @@ func_get_detail(List *funcname,
 			if (best_candidate->ndargs > pform->pronargdefaults)
 				elog(ERROR, "not enough default arguments");
 
-			proargdefaults = SysCacheGetAttr(PROCOID, ftup,
-											 Anum_pg_proc_proargdefaults,
-											 &isnull);
-			Assert(!isnull);
+			proargdefaults = SysCacheGetAttrNotNull(PROCOID, ftup,
+													Anum_pg_proc_proargdefaults);
 			str = TextDatumGetCString(proargdefaults);
 			defaults = castNode(List, stringToNode(str));
 			pfree(str);
@@ -1796,11 +1885,6 @@ make_fn_arguments(ParseState *pstate,
 	ListCell   *current_fargs;
 	int			i = 0;
 
-    if (parserengine->make_fn_arguments != NULL)
-    {
-        return parserengine->make_fn_arguments(pstate, fargs, actual_arg_types, declared_arg_types);
-    }
-
 	foreach(current_fargs, fargs)
 	{
 		/* types don't match? then force coercion using a function call... */
@@ -1815,25 +1899,25 @@ make_fn_arguments(ParseState *pstate,
 			if (IsA(node, NamedArgExpr))
 			{
 				NamedArgExpr *na = (NamedArgExpr *) node;
-            
-                node = coerce_type(pstate,
-                                    (Node *) na->arg,
-                                    actual_arg_types[i],
-                                    declared_arg_types[i], -1,
-                                    COERCION_IMPLICIT,
-                                    COERCE_IMPLICIT_CAST,
-                                    -1);
+
+				node = coerce_type(pstate,
+								   (Node *) na->arg,
+								   actual_arg_types[i],
+								   declared_arg_types[i], -1,
+								   COERCION_IMPLICIT,
+								   COERCE_IMPLICIT_CAST,
+								   -1);
 				na->arg = (Expr *) node;
 			}
 			else
 			{
-                node = coerce_type(pstate,
-                                    node,
-                                    actual_arg_types[i],
-                                    declared_arg_types[i], -1,
-                                    COERCION_IMPLICIT,
-                                    COERCE_IMPLICIT_CAST,
-                                    -1);
+				node = coerce_type(pstate,
+								   node,
+								   actual_arg_types[i],
+								   declared_arg_types[i], -1,
+								   COERCION_IMPLICIT,
+								   COERCE_IMPLICIT_CAST,
+								   -1);
 				lfirst(current_fargs) = node;
 			}
 		}
@@ -1901,9 +1985,7 @@ ParseComplexProjection(ParseState *pstate, const char *funcname, Node *first_arg
 	{
 		ParseNamespaceItem *nsitem;
 
-		nsitem = GetNSItemByRangeTablePosn(pstate,
-										   ((Var *) first_arg)->varno,
-										   ((Var *) first_arg)->varlevelsup);
+		nsitem = GetNSItemByVar(pstate, (Var *) first_arg);
 		/* Return a Var if funcname matches a column, else NULL */
 		return scanNSItemForColumn(pstate, nsitem,
 								   ((Var *) first_arg)->varlevelsup,
@@ -2571,6 +2653,7 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 			errkind = true;
 			break;
 		case EXPR_KIND_RETURNING:
+		case EXPR_KIND_MERGE_RETURNING:
 			errkind = true;
 			break;
 		case EXPR_KIND_VALUES:
@@ -2581,6 +2664,9 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 			/* okay, since we process this like a SELECT tlist */
 			pstate->p_hasTargetSRFs = true;
 			break;
+		case EXPR_KIND_MERGE_WHEN:
+			err = _("set-returning functions are not allowed in MERGE WHEN conditions");
+			break;
 		case EXPR_KIND_CHECK_CONSTRAINT:
 		case EXPR_KIND_DOMAIN_CHECK:
 			err = _("set-returning functions are not allowed in check constraints");
@@ -2589,11 +2675,6 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 		case EXPR_KIND_FUNCTION_DEFAULT:
 			err = _("set-returning functions are not allowed in DEFAULT expressions");
 			break;
-		
-		case EXPR_KIND_VARIABLE_DEFAULT:
-			err = _("set-returning functions are not allowed in DEFAULT expressions");
-			break;
-		
 		case EXPR_KIND_INDEX_EXPRESSION:
 			err = _("set-returning functions are not allowed in index expressions");
 			break;
@@ -2630,10 +2711,6 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 		case EXPR_KIND_CYCLE_MARK:
 			errkind = true;
 			break;
-		case EXPR_KIND_MERGE_WHEN:
-			err = _("set-returning functions are not allowed in MERGE WHEN conditions");
-			break;
-		
 
 			/*
 			 * There is intentionally no default: case here, so that the

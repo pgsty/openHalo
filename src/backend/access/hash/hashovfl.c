@@ -3,7 +3,7 @@
  * hashovfl.c
  *	  Overflow page management code for the Postgres hash access method
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,6 +19,7 @@
 
 #include "access/hash.h"
 #include "access/hash_xlog.h"
+#include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "utils/rel.h"
 
@@ -158,7 +159,7 @@ _hash_addovflpage(Relation rel, Buffer metabuf, Buffer buf, bool retain_pin)
 		BlockNumber nextblkno;
 
 		page = BufferGetPage(buf);
-		pageopaque = (HashPageOpaque) PageGetSpecialPointer(page);
+		pageopaque = HashPageGetOpaque(page);
 		nextblkno = pageopaque->hasho_nextblkno;
 
 		if (!BlockNumberIsValid(nextblkno))
@@ -363,7 +364,7 @@ found:
 
 	/* initialize new overflow page */
 	ovflpage = BufferGetPage(ovflbuf);
-	ovflopaque = (HashPageOpaque) PageGetSpecialPointer(ovflpage);
+	ovflopaque = HashPageGetOpaque(ovflpage);
 	ovflopaque->hasho_prevblkno = BufferGetBlockNumber(buf);
 	ovflopaque->hasho_nextblkno = InvalidBlockNumber;
 	ovflopaque->hasho_bucket = pageopaque->hasho_bucket;
@@ -387,24 +388,24 @@ found:
 		xlrec.bmsize = metap->hashm_bmsize;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, SizeOfHashAddOvflPage);
+		XLogRegisterData(&xlrec, SizeOfHashAddOvflPage);
 
 		XLogRegisterBuffer(0, ovflbuf, REGBUF_WILL_INIT);
-		XLogRegisterBufData(0, (char *) &pageopaque->hasho_bucket, sizeof(Bucket));
+		XLogRegisterBufData(0, &pageopaque->hasho_bucket, sizeof(Bucket));
 
 		XLogRegisterBuffer(1, buf, REGBUF_STANDARD);
 
 		if (BufferIsValid(mapbuf))
 		{
 			XLogRegisterBuffer(2, mapbuf, REGBUF_STANDARD);
-			XLogRegisterBufData(2, (char *) &bitmap_page_bit, sizeof(uint32));
+			XLogRegisterBufData(2, &bitmap_page_bit, sizeof(uint32));
 		}
 
 		if (BufferIsValid(newmapbuf))
 			XLogRegisterBuffer(3, newmapbuf, REGBUF_WILL_INIT);
 
 		XLogRegisterBuffer(4, metabuf, REGBUF_STANDARD);
-		XLogRegisterBufData(4, (char *) &metap->hashm_firstfree, sizeof(uint32));
+		XLogRegisterBufData(4, &metap->hashm_firstfree, sizeof(uint32));
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_ADD_OVFL_PAGE);
 
@@ -515,7 +516,7 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 	_hash_checkpage(rel, ovflbuf, LH_OVERFLOW_PAGE);
 	ovflblkno = BufferGetBlockNumber(ovflbuf);
 	ovflpage = BufferGetPage(ovflbuf);
-	ovflopaque = (HashPageOpaque) PageGetSpecialPointer(ovflpage);
+	ovflopaque = HashPageGetOpaque(ovflpage);
 	nextblkno = ovflopaque->hasho_nextblkno;
 	prevblkno = ovflopaque->hasho_prevblkno;
 	writeblkno = BufferGetBlockNumber(wbuf);
@@ -599,11 +600,11 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 	 */
 	_hash_pageinit(ovflpage, BufferGetPageSize(ovflbuf));
 
-	ovflopaque = (HashPageOpaque) PageGetSpecialPointer(ovflpage);
+	ovflopaque = HashPageGetOpaque(ovflpage);
 
 	ovflopaque->hasho_prevblkno = InvalidBlockNumber;
 	ovflopaque->hasho_nextblkno = InvalidBlockNumber;
-	ovflopaque->hasho_bucket = -1;
+	ovflopaque->hasho_bucket = InvalidBucket;
 	ovflopaque->hasho_flag = LH_UNUSED_PAGE;
 	ovflopaque->hasho_page_id = HASHO_PAGE_ID;
 
@@ -612,7 +613,7 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 	if (BufferIsValid(prevbuf))
 	{
 		Page		prevpage = BufferGetPage(prevbuf);
-		HashPageOpaque prevopaque = (HashPageOpaque) PageGetSpecialPointer(prevpage);
+		HashPageOpaque prevopaque = HashPageGetOpaque(prevpage);
 
 		Assert(prevopaque->hasho_bucket == bucket);
 		prevopaque->hasho_nextblkno = nextblkno;
@@ -621,7 +622,7 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 	if (BufferIsValid(nextbuf))
 	{
 		Page		nextpage = BufferGetPage(nextbuf);
-		HashPageOpaque nextopaque = (HashPageOpaque) PageGetSpecialPointer(nextpage);
+		HashPageOpaque nextopaque = HashPageGetOpaque(nextpage);
 
 		Assert(nextopaque->hasho_bucket == bucket);
 		nextopaque->hasho_prevblkno = prevblkno;
@@ -646,6 +647,7 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 		xl_hash_squeeze_page xlrec;
 		XLogRecPtr	recptr;
 		int			i;
+		bool		mod_wbuf = false;
 
 		xlrec.prevblkno = prevblkno;
 		xlrec.nextblkno = nextblkno;
@@ -654,22 +656,54 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 		xlrec.is_prev_bucket_same_wrt = (wbuf == prevbuf);
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, SizeOfHashSqueezePage);
+		XLogRegisterData(&xlrec, SizeOfHashSqueezePage);
 
 		/*
-		 * bucket buffer needs to be registered to ensure that we can acquire
-		 * a cleanup lock on it during replay.
+		 * bucket buffer was not changed, but still needs to be registered to
+		 * ensure that we can acquire a cleanup lock on it during replay.
 		 */
 		if (!xlrec.is_prim_bucket_same_wrt)
-			XLogRegisterBuffer(0, bucketbuf, REGBUF_STANDARD | REGBUF_NO_IMAGE);
+		{
+			uint8		flags = REGBUF_STANDARD | REGBUF_NO_IMAGE | REGBUF_NO_CHANGE;
 
-		XLogRegisterBuffer(1, wbuf, REGBUF_STANDARD);
+			XLogRegisterBuffer(0, bucketbuf, flags);
+		}
+
 		if (xlrec.ntups > 0)
 		{
-			XLogRegisterBufData(1, (char *) itup_offsets,
+			XLogRegisterBuffer(1, wbuf, REGBUF_STANDARD);
+
+			/* Remember that wbuf is modified. */
+			mod_wbuf = true;
+
+			XLogRegisterBufData(1, itup_offsets,
 								nitups * sizeof(OffsetNumber));
 			for (i = 0; i < nitups; i++)
-				XLogRegisterBufData(1, (char *) itups[i], tups_size[i]);
+				XLogRegisterBufData(1, itups[i], tups_size[i]);
+		}
+		else if (xlrec.is_prim_bucket_same_wrt || xlrec.is_prev_bucket_same_wrt)
+		{
+			uint8		wbuf_flags;
+
+			/*
+			 * A write buffer needs to be registered even if no tuples are
+			 * added to it to ensure that we can acquire a cleanup lock on it
+			 * if it is the same as primary bucket buffer or update the
+			 * nextblkno if it is same as the previous bucket buffer.
+			 */
+			Assert(xlrec.ntups == 0);
+
+			wbuf_flags = REGBUF_STANDARD;
+			if (!xlrec.is_prev_bucket_same_wrt)
+			{
+				wbuf_flags |= REGBUF_NO_CHANGE;
+			}
+			else
+			{
+				/* Remember that wbuf is modified. */
+				mod_wbuf = true;
+			}
+			XLogRegisterBuffer(1, wbuf, wbuf_flags);
 		}
 
 		XLogRegisterBuffer(2, ovflbuf, REGBUF_STANDARD);
@@ -687,17 +721,20 @@ _hash_freeovflpage(Relation rel, Buffer bucketbuf, Buffer ovflbuf,
 			XLogRegisterBuffer(4, nextbuf, REGBUF_STANDARD);
 
 		XLogRegisterBuffer(5, mapbuf, REGBUF_STANDARD);
-		XLogRegisterBufData(5, (char *) &bitmapbit, sizeof(uint32));
+		XLogRegisterBufData(5, &bitmapbit, sizeof(uint32));
 
 		if (update_metap)
 		{
 			XLogRegisterBuffer(6, metabuf, REGBUF_STANDARD);
-			XLogRegisterBufData(6, (char *) &metap->hashm_firstfree, sizeof(uint32));
+			XLogRegisterBufData(6, &metap->hashm_firstfree, sizeof(uint32));
 		}
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_SQUEEZE_PAGE);
 
-		PageSetLSN(BufferGetPage(wbuf), recptr);
+		/* Set LSN iff wbuf is modified. */
+		if (mod_wbuf)
+			PageSetLSN(BufferGetPage(wbuf), recptr);
+
 		PageSetLSN(BufferGetPage(ovflbuf), recptr);
 
 		if (BufferIsValid(prevbuf) && !xlrec.is_prev_bucket_same_wrt)
@@ -750,16 +787,16 @@ _hash_initbitmapbuffer(Buffer buf, uint16 bmsize, bool initpage)
 		_hash_pageinit(pg, BufferGetPageSize(buf));
 
 	/* initialize the page's special space */
-	op = (HashPageOpaque) PageGetSpecialPointer(pg);
+	op = HashPageGetOpaque(pg);
 	op->hasho_prevblkno = InvalidBlockNumber;
 	op->hasho_nextblkno = InvalidBlockNumber;
-	op->hasho_bucket = -1;
+	op->hasho_bucket = InvalidBucket;
 	op->hasho_flag = LH_BITMAP_PAGE;
 	op->hasho_page_id = HASHO_PAGE_ID;
 
 	/* set all of the bits to 1 */
 	freep = HashPageGetBitmap(pg);
-	MemSet(freep, 0xFF, bmsize);
+	memset(freep, 0xFF, bmsize);
 
 	/*
 	 * Set pd_lower just past the end of the bitmap page data.  We could even
@@ -823,7 +860,7 @@ _hash_squeezebucket(Relation rel,
 	wblkno = bucket_blkno;
 	wbuf = bucket_buf;
 	wpage = BufferGetPage(wbuf);
-	wopaque = (HashPageOpaque) PageGetSpecialPointer(wpage);
+	wopaque = HashPageGetOpaque(wpage);
 
 	/*
 	 * if there aren't any overflow pages, there's nothing to squeeze. caller
@@ -854,7 +891,7 @@ _hash_squeezebucket(Relation rel,
 										  LH_OVERFLOW_PAGE,
 										  bstrategy);
 		rpage = BufferGetPage(rbuf);
-		ropaque = (HashPageOpaque) PageGetSpecialPointer(rpage);
+		ropaque = HashPageGetOpaque(rpage);
 		Assert(ropaque->hasho_bucket == bucket);
 	} while (BlockNumberIsValid(ropaque->hasho_nextblkno));
 
@@ -953,26 +990,31 @@ readpage:
 						xl_hash_move_page_contents xlrec;
 
 						xlrec.ntups = nitups;
-						xlrec.is_prim_bucket_same_wrt = (wbuf == bucket_buf) ? true : false;
+						xlrec.is_prim_bucket_same_wrt = (wbuf == bucket_buf);
 
 						XLogBeginInsert();
-						XLogRegisterData((char *) &xlrec, SizeOfHashMovePageContents);
+						XLogRegisterData(&xlrec, SizeOfHashMovePageContents);
 
 						/*
-						 * bucket buffer needs to be registered to ensure that
-						 * we can acquire a cleanup lock on it during replay.
+						 * bucket buffer was not changed, but still needs to
+						 * be registered to ensure that we can acquire a
+						 * cleanup lock on it during replay.
 						 */
 						if (!xlrec.is_prim_bucket_same_wrt)
-							XLogRegisterBuffer(0, bucket_buf, REGBUF_STANDARD | REGBUF_NO_IMAGE);
+						{
+							int			flags = REGBUF_STANDARD | REGBUF_NO_IMAGE | REGBUF_NO_CHANGE;
+
+							XLogRegisterBuffer(0, bucket_buf, flags);
+						}
 
 						XLogRegisterBuffer(1, wbuf, REGBUF_STANDARD);
-						XLogRegisterBufData(1, (char *) itup_offsets,
+						XLogRegisterBufData(1, itup_offsets,
 											nitups * sizeof(OffsetNumber));
 						for (i = 0; i < nitups; i++)
-							XLogRegisterBufData(1, (char *) itups[i], tups_size[i]);
+							XLogRegisterBufData(1, itups[i], tups_size[i]);
 
 						XLogRegisterBuffer(2, rbuf, REGBUF_STANDARD);
-						XLogRegisterBufData(2, (char *) deletable,
+						XLogRegisterBufData(2, deletable,
 											ndeletable * sizeof(OffsetNumber));
 
 						recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_MOVE_PAGE_CONTENTS);
@@ -1004,7 +1046,7 @@ readpage:
 
 				wbuf = next_wbuf;
 				wpage = BufferGetPage(wbuf);
-				wopaque = (HashPageOpaque) PageGetSpecialPointer(wpage);
+				wopaque = HashPageGetOpaque(wpage);
 				Assert(wopaque->hasho_bucket == bucket);
 				retain_pin = false;
 
@@ -1075,7 +1117,7 @@ readpage:
 										  LH_OVERFLOW_PAGE,
 										  bstrategy);
 		rpage = BufferGetPage(rbuf);
-		ropaque = (HashPageOpaque) PageGetSpecialPointer(rpage);
+		ropaque = HashPageGetOpaque(rpage);
 		Assert(ropaque->hasho_bucket == bucket);
 	}
 

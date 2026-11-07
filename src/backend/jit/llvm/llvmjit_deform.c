@@ -7,7 +7,7 @@
  * knowledge of the tuple descriptor. Fixed column widths, NOT NULLness, etc
  * can be taken advantage of.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -105,27 +105,32 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 	funcname = llvm_expand_funcname(context, "deform");
 
 	/*
-	 * Check which columns have to exist, so we don't have to check the row's
-	 * natts unnecessarily.
+	 * Check which columns have to exist in all tuples, so we don't have to
+	 * check the row's natts unnecessarily.
 	 */
 	for (attnum = 0; attnum < desc->natts; attnum++)
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, attnum);
+		CompactAttribute *catt = TupleDescCompactAttr(desc, attnum);
+		Form_pg_attribute attr = TupleDescAttr(desc, attnum);
 
 		/*
 		 * If the column is declared NOT NULL then it must be present in every
 		 * tuple, unless there's a "missing" entry that could provide a
 		 * non-NULL value for it. That in turn guarantees that the NULL bitmap
 		 * - if there are any NULLable columns - is at least long enough to
-		 * cover columns up to attnum.
+		 * cover columns up to attnum.  We treat virtual generated columns
+		 * similar to atthasmissing columns, as these columns could either not
+		 * be represented in the tuple or could have the column represented as
+		 * a NULL in the null bitmap.
 		 *
 		 * Be paranoid and also check !attisdropped, even though the
 		 * combination of attisdropped && attnotnull combination shouldn't
 		 * exist.
 		 */
-		if (att->attnotnull &&
-			!att->atthasmissing &&
-			!att->attisdropped)
+		if (catt->attnullability == ATTNULLABLE_VALID &&
+			!catt->atthasmissing &&
+			!catt->attisdropped &&
+			attr->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL)
 			guaranteed_column_number = attnum;
 	}
 
@@ -194,7 +199,6 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		v_tupleheaderp =
 			l_load_struct_gep(b, StructHeapTupleTableSlot, v_heapslot, FIELDNO_HEAPTUPLETABLESLOT_TUPLE,
 							  "tupleheader");
-
 	}
 	else if (ops == &TTSOpsMinimalTuple)
 	{
@@ -378,7 +382,6 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 
 			LLVMAddCase(v_switch, v_attno, attcheckattnoblocks[attnum]);
 		}
-
 	}
 	else
 	{
@@ -395,9 +398,11 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 	 */
 	for (attnum = 0; attnum < natts; attnum++)
 	{
-		Form_pg_attribute att = TupleDescAttr(desc, attnum);
+		CompactAttribute *att = TupleDescCompactAttr(desc, attnum);
+		Form_pg_attribute attr = TupleDescAttr(desc, attnum);
+
 		LLVMValueRef v_incby;
-		int			alignto;
+		int			alignto = att->attalignby;
 		LLVMValueRef l_attno = l_int16_const(lc, attnum);
 		LLVMValueRef v_attdatap;
 		LLVMValueRef v_resultp;
@@ -438,9 +443,12 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		/*
 		 * Check for nulls if necessary. No need to take missing attributes
 		 * into account, because if they're present the heaptuple's natts
-		 * would have indicated that a slot_getmissingattrs() is needed.
+		 * would have indicated that a slot_getmissingattrs() is needed. When
+		 * present in the tuple, virtual generated columns are always stored
+		 * as NULL, so we must always perform NULL checks for these.
 		 */
-		if (!att->attnotnull)
+		if (att->attnullability != ATTNULLABLE_VALID ||
+			attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 		{
 			LLVMBasicBlockRef b_ifnotnull;
 			LLVMBasicBlockRef b_ifnull;
@@ -496,21 +504,6 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		}
 		LLVMPositionBuilderAtEnd(b, attcheckalignblocks[attnum]);
 
-		/* determine required alignment */
-		if (att->attalign == TYPALIGN_INT)
-			alignto = ALIGNOF_INT;
-		else if (att->attalign == TYPALIGN_CHAR)
-			alignto = 1;
-		else if (att->attalign == TYPALIGN_DOUBLE)
-			alignto = ALIGNOF_DOUBLE;
-		else if (att->attalign == TYPALIGN_SHORT)
-			alignto = ALIGNOF_SHORT;
-		else
-		{
-			elog(ERROR, "unknown alignment");
-			alignto = 0;
-		}
-
 		/* ------
 		 * Even if alignment is required, we can skip doing it if provably
 		 * unnecessary:
@@ -544,8 +537,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 				v_off = l_load(b, TypeSizeT, v_offp, "");
 
 				v_possible_padbyte =
-					l_load_gep1(b, LLVMInt8TypeInContext(lc), v_tupdata_base,
-								v_off, "padbyte");
+					l_load_gep1(b, LLVMInt8TypeInContext(lc), v_tupdata_base, v_off, "padbyte");
 				v_ispad =
 					LLVMBuildICmp(b, LLVMIntEQ,
 								  v_possible_padbyte, l_int8_const(lc, 0),
@@ -622,7 +614,8 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 			known_alignment = -1;
 			attguaranteedalign = false;
 		}
-		else if (att->attnotnull && attguaranteedalign && known_alignment >= 0)
+		else if (att->attnullability == ATTNULLABLE_VALID &&
+				 attguaranteedalign && known_alignment >= 0)
 		{
 			/*
 			 * If the offset to the column was previously known, a NOT NULL &
@@ -632,12 +625,15 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 			Assert(att->attlen > 0);
 			known_alignment += att->attlen;
 		}
-		else if (att->attnotnull && (att->attlen % alignto) == 0)
+		else if (att->attnullability == ATTNULLABLE_VALID &&
+				 attr->attgenerated != ATTRIBUTE_GENERATED_VIRTUAL &&
+				 (att->attlen % alignto) == 0)
 		{
 			/*
-			 * After a NOT NULL fixed-width column with a length that is a
-			 * multiple of its alignment requirement, we know the following
-			 * column is aligned to at least the current column's alignment.
+			 * After a NOT NULL (and not virtual generated) fixed-width column
+			 * with a length that is a multiple of its alignment requirement,
+			 * we know the following column is aligned to at least the current
+			 * column's alignment.
 			 */
 			Assert(att->attlen > 0);
 			known_alignment = alignto;
@@ -679,7 +675,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 			v_tmp_loaddata =
 				LLVMBuildPointerCast(b, v_attdatap, vartypep, "");
 			v_tmp_loaddata = l_load(b, vartype, v_tmp_loaddata, "attr_byval");
-			v_tmp_loaddata = LLVMBuildZExt(b, v_tmp_loaddata, TypeSizeT, "");
+			v_tmp_loaddata = LLVMBuildSExt(b, v_tmp_loaddata, TypeSizeT, "");
 
 			LLVMBuildStore(b, v_tmp_loaddata, v_resultp);
 		}

@@ -3,7 +3,7 @@
  * verify_heapam.c
  *	  Functions to check postgresql heap relations for corruption
  *
- * Copyright (c) 2016-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  *	  contrib/amcheck/verify_heapam.c
  *-------------------------------------------------------------------------
@@ -12,23 +12,31 @@
 
 #include "access/detoast.h"
 #include "access/genam.h"
-#include "access/heapam.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
+#include "access/relation.h"
+#include "access/table.h"
 #include "access/toast_internals.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
+#include "storage/read_stream.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/rel.h"
 
 PG_FUNCTION_INFO_V1(verify_heapam);
 
 /* The number of columns in tuples returned by verify_heapam */
 #define HEAPCHECK_RELATION_COLS 4
+
+/* The largest valid toast va_rawsize */
+#define VARLENA_SIZE_LIMIT 0x3FFFFFFF
 
 /*
  * Despite the name, we use this for reporting problems with both XIDs and
@@ -40,7 +48,7 @@ typedef enum XidBoundsViolation
 	XID_IN_FUTURE,
 	XID_PRECEDES_CLUSTERMIN,
 	XID_PRECEDES_RELMIN,
-	XID_BOUNDS_OK
+	XID_BOUNDS_OK,
 } XidBoundsViolation;
 
 typedef enum XidCommitStatus
@@ -48,14 +56,14 @@ typedef enum XidCommitStatus
 	XID_COMMITTED,
 	XID_IS_CURRENT_XID,
 	XID_IN_PROGRESS,
-	XID_ABORTED
+	XID_ABORTED,
 } XidCommitStatus;
 
 typedef enum SkipPages
 {
 	SKIP_PAGES_ALL_FROZEN,
 	SKIP_PAGES_ALL_VISIBLE,
-	SKIP_PAGES_NONE
+	SKIP_PAGES_NONE,
 } SkipPages;
 
 /*
@@ -78,12 +86,12 @@ typedef struct ToastedAttribute
 typedef struct HeapCheckContext
 {
 	/*
-	 * Cached copies of values from ShmemVariableCache and computed values
-	 * from them.
+	 * Cached copies of values from TransamVariables and computed values from
+	 * them.
 	 */
-	FullTransactionId next_fxid;	/* ShmemVariableCache->nextXid */
+	FullTransactionId next_fxid;	/* TransamVariables->nextXid */
 	TransactionId next_xid;		/* 32-bit version of next_fxid */
-	TransactionId oldest_xid;	/* ShmemVariableCache->oldestXid */
+	TransactionId oldest_xid;	/* TransamVariables->oldestXid */
 	FullTransactionId oldest_fxid;	/* 64-bit version of oldest_xid, computed
 									 * relative to next_fxid */
 	TransactionId safe_xmin;	/* this XID and newer ones can't become
@@ -111,7 +119,10 @@ typedef struct HeapCheckContext
 	Relation	valid_toast_index;
 	int			num_toast_indexes;
 
-	/* Values for iterating over pages in the relation */
+	/*
+	 * Values for iterating over pages in the relation. `blkno` is the most
+	 * recent block in the buffer yielded by the read stream API.
+	 */
 	BlockNumber blkno;
 	BufferAccessStrategy bstrategy;
 	Buffer		buffer;
@@ -146,9 +157,35 @@ typedef struct HeapCheckContext
 	Tuplestorestate *tupstore;
 } HeapCheckContext;
 
+/*
+ * The per-relation data provided to the read stream API for heap amcheck to
+ * use in its callback for the SKIP_PAGES_ALL_FROZEN and
+ * SKIP_PAGES_ALL_VISIBLE options.
+ */
+typedef struct HeapCheckReadStreamData
+{
+	/*
+	 * `range` is used by all SkipPages options. SKIP_PAGES_NONE uses the
+	 * default read stream callback, block_range_read_stream_cb(), which takes
+	 * a BlockRangeReadStreamPrivate as its callback_private_data. `range`
+	 * keeps track of the current block number across
+	 * read_stream_next_buffer() invocations.
+	 */
+	BlockRangeReadStreamPrivate range;
+	SkipPages	skip_option;
+	Relation	rel;
+	Buffer	   *vmbuffer;
+} HeapCheckReadStreamData;
+
+
 /* Internal implementation */
-static void sanity_check_relation(Relation rel);
-static void check_tuple(HeapCheckContext *ctx);
+static BlockNumber heapcheck_read_stream_next_unskippable(ReadStream *stream,
+														  void *callback_private_data,
+														  void *per_buffer_data);
+
+static void check_tuple(HeapCheckContext *ctx,
+						bool *xmin_commit_status_ok,
+						XidCommitStatus *xmin_commit_status);
 static void check_toast_tuple(HeapTuple toasttup, HeapCheckContext *ctx,
 							  ToastedAttribute *ta, int32 *expected_chunk_seq,
 							  uint32 extsize);
@@ -158,12 +195,13 @@ static void check_toasted_attribute(HeapCheckContext *ctx,
 									ToastedAttribute *ta);
 
 static bool check_tuple_header(HeapCheckContext *ctx);
-static bool check_tuple_visibility(HeapCheckContext *ctx);
+static bool check_tuple_visibility(HeapCheckContext *ctx,
+								   bool *xmin_commit_status_ok,
+								   XidCommitStatus *xmin_commit_status);
 
 static void report_corruption(HeapCheckContext *ctx, char *msg);
 static void report_toast_corruption(HeapCheckContext *ctx,
 									ToastedAttribute *ta, char *msg);
-static TupleDesc verify_heapam_tupdesc(void);
 static FullTransactionId FullTransactionIdFromXidAndCtx(TransactionId xid,
 														const HeapCheckContext *ctx);
 static void update_cached_xid_range(HeapCheckContext *ctx);
@@ -212,8 +250,6 @@ Datum
 verify_heapam(PG_FUNCTION_ARGS)
 {
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	MemoryContext old_context;
-	bool		random_access;
 	HeapCheckContext ctx;
 	Buffer		vmbuffer = InvalidBuffer;
 	Oid			relid;
@@ -224,16 +260,11 @@ verify_heapam(PG_FUNCTION_ARGS)
 	BlockNumber last_block;
 	BlockNumber nblocks;
 	const char *skip;
-
-	/* Check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
+	ReadStream *stream;
+	int			stream_flags;
+	ReadStreamBlockNumberCB stream_cb;
+	void	   *stream_data;
+	HeapCheckReadStreamData stream_skip_data;
 
 	/* Check supplied arguments */
 	if (PG_ARGISNULL(0))
@@ -288,19 +319,34 @@ verify_heapam(PG_FUNCTION_ARGS)
 	 */
 	ctx.attnum = -1;
 
-	/* The tupdesc and tuplestore must be created in ecxt_per_query_memory */
-	old_context = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-	random_access = (rsinfo->allowedModes & SFRM_Materialize_Random) != 0;
-	ctx.tupdesc = verify_heapam_tupdesc();
-	ctx.tupstore = tuplestore_begin_heap(random_access, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = ctx.tupstore;
-	rsinfo->setDesc = ctx.tupdesc;
-	MemoryContextSwitchTo(old_context);
+	/* Construct the tuplestore and tuple descriptor */
+	InitMaterializedSRF(fcinfo, 0);
+	ctx.tupdesc = rsinfo->setDesc;
+	ctx.tupstore = rsinfo->setResult;
 
 	/* Open relation, check relkind and access method */
 	ctx.rel = relation_open(relid, AccessShareLock);
-	sanity_check_relation(ctx.rel);
+
+	/*
+	 * Check that a relation's relkind and access method are both supported.
+	 */
+	if (!RELKIND_HAS_TABLE_AM(ctx.rel->rd_rel->relkind) &&
+		ctx.rel->rd_rel->relkind != RELKIND_SEQUENCE)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot check relation \"%s\"",
+						RelationGetRelationName(ctx.rel)),
+				 errdetail_relkind_not_supported(ctx.rel->rd_rel->relkind)));
+
+	/*
+	 * Sequences always use heap AM, but they don't show that in the catalogs.
+	 * Other relkinds might be using a different AM, so check.
+	 */
+	if (ctx.rel->rd_rel->relkind != RELKIND_SEQUENCE &&
+		ctx.rel->rd_rel->relam != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("only heap AM is supported")));
 
 	/*
 	 * Early exit for unlogged relations during recovery.  These will have no
@@ -392,36 +438,63 @@ verify_heapam(PG_FUNCTION_ARGS)
 	if (TransactionIdIsNormal(ctx.relfrozenxid))
 		ctx.oldest_xid = ctx.relfrozenxid;
 
-	for (ctx.blkno = first_block; ctx.blkno <= last_block; ctx.blkno++)
+	/* Now that `ctx` is set up, set up the read stream */
+	stream_skip_data.range.current_blocknum = first_block;
+	stream_skip_data.range.last_exclusive = last_block + 1;
+	stream_skip_data.skip_option = skip_option;
+	stream_skip_data.rel = ctx.rel;
+	stream_skip_data.vmbuffer = &vmbuffer;
+
+	if (skip_option == SKIP_PAGES_NONE)
+	{
+		/*
+		 * It is safe to use batchmode as block_range_read_stream_cb takes no
+		 * locks.
+		 */
+		stream_cb = block_range_read_stream_cb;
+		stream_flags = READ_STREAM_SEQUENTIAL |
+			READ_STREAM_FULL |
+			READ_STREAM_USE_BATCHING;
+		stream_data = &stream_skip_data.range;
+	}
+	else
+	{
+		/*
+		 * It would not be safe to naively use batchmode, as
+		 * heapcheck_read_stream_next_unskippable takes locks. It shouldn't be
+		 * too hard to convert though.
+		 */
+		stream_cb = heapcheck_read_stream_next_unskippable;
+		stream_flags = READ_STREAM_DEFAULT;
+		stream_data = &stream_skip_data;
+	}
+
+	stream = read_stream_begin_relation(stream_flags,
+										ctx.bstrategy,
+										ctx.rel,
+										MAIN_FORKNUM,
+										stream_cb,
+										stream_data,
+										0);
+
+	while ((ctx.buffer = read_stream_next_buffer(stream, NULL)) != InvalidBuffer)
 	{
 		OffsetNumber maxoff;
+		OffsetNumber predecessor[MaxOffsetNumber];
+		OffsetNumber successor[MaxOffsetNumber];
+		bool		lp_valid[MaxOffsetNumber];
+		bool		xmin_commit_status_ok[MaxOffsetNumber];
+		XidCommitStatus xmin_commit_status[MaxOffsetNumber];
 
 		CHECK_FOR_INTERRUPTS();
 
-		/* Optionally skip over all-frozen or all-visible blocks */
-		if (skip_option != SKIP_PAGES_NONE)
-		{
-			int32		mapbits;
+		memset(predecessor, 0, sizeof(OffsetNumber) * MaxOffsetNumber);
 
-			mapbits = (int32) visibilitymap_get_status(ctx.rel, ctx.blkno,
-													   &vmbuffer);
-			if (skip_option == SKIP_PAGES_ALL_FROZEN)
-			{
-				if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
-					continue;
-			}
-
-			if (skip_option == SKIP_PAGES_ALL_VISIBLE)
-			{
-				if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
-					continue;
-			}
-		}
-
-		/* Read and lock the next page. */
-		ctx.buffer = ReadBufferExtended(ctx.rel, MAIN_FORKNUM, ctx.blkno,
-										RBM_NORMAL, ctx.bstrategy);
+		/* Lock the next page. */
+		Assert(BufferIsValid(ctx.buffer));
 		LockBuffer(ctx.buffer, BUFFER_LOCK_SHARE);
+
+		ctx.blkno = BufferGetBlockNumber(ctx.buffer);
 		ctx.page = BufferGetPage(ctx.buffer);
 
 		/* Perform tuple checks */
@@ -429,6 +502,12 @@ verify_heapam(PG_FUNCTION_ARGS)
 		for (ctx.offnum = FirstOffsetNumber; ctx.offnum <= maxoff;
 			 ctx.offnum = OffsetNumberNext(ctx.offnum))
 		{
+			BlockNumber nextblkno;
+			OffsetNumber nextoffnum;
+
+			successor[ctx.offnum] = InvalidOffsetNumber;
+			lp_valid[ctx.offnum] = false;
+			xmin_commit_status_ok[ctx.offnum] = false;
 			ctx.itemid = PageGetItemId(ctx.page, ctx.offnum);
 
 			/* Skip over unused/dead line pointers */
@@ -460,11 +539,43 @@ verify_heapam(PG_FUNCTION_ARGS)
 											   (unsigned) maxoff));
 					continue;
 				}
+
+				/*
+				 * Since we've checked that this redirect points to a line
+				 * pointer between FirstOffsetNumber and maxoff, it should now
+				 * be safe to fetch the referenced line pointer. We expect it
+				 * to be LP_NORMAL; if not, that's corruption.
+				 */
 				rditem = PageGetItemId(ctx.page, rdoffnum);
 				if (!ItemIdIsUsed(rditem))
+				{
 					report_corruption(&ctx,
-									  psprintf("line pointer redirection to unused item at offset %u",
+									  psprintf("redirected line pointer points to an unused item at offset %u",
 											   (unsigned) rdoffnum));
+					continue;
+				}
+				else if (ItemIdIsDead(rditem))
+				{
+					report_corruption(&ctx,
+									  psprintf("redirected line pointer points to a dead item at offset %u",
+											   (unsigned) rdoffnum));
+					continue;
+				}
+				else if (ItemIdIsRedirected(rditem))
+				{
+					report_corruption(&ctx,
+									  psprintf("redirected line pointer points to another redirected line pointer at offset %u",
+											   (unsigned) rdoffnum));
+					continue;
+				}
+
+				/*
+				 * Record the fact that this line pointer has passed basic
+				 * sanity checking, and also the offset number to which it
+				 * points.
+				 */
+				lp_valid[ctx.offnum] = true;
+				successor[ctx.offnum] = rdoffnum;
 				continue;
 			}
 
@@ -498,11 +609,228 @@ verify_heapam(PG_FUNCTION_ARGS)
 			}
 
 			/* It should be safe to examine the tuple's header, at least */
+			lp_valid[ctx.offnum] = true;
 			ctx.tuphdr = (HeapTupleHeader) PageGetItem(ctx.page, ctx.itemid);
 			ctx.natts = HeapTupleHeaderGetNatts(ctx.tuphdr);
 
 			/* Ok, ready to check this next tuple */
-			check_tuple(&ctx);
+			check_tuple(&ctx,
+						&xmin_commit_status_ok[ctx.offnum],
+						&xmin_commit_status[ctx.offnum]);
+
+			/*
+			 * If the CTID field of this tuple seems to point to another tuple
+			 * on the same page, record that tuple as the successor of this
+			 * one.
+			 */
+			nextblkno = ItemPointerGetBlockNumber(&(ctx.tuphdr)->t_ctid);
+			nextoffnum = ItemPointerGetOffsetNumber(&(ctx.tuphdr)->t_ctid);
+			if (nextblkno == ctx.blkno && nextoffnum != ctx.offnum &&
+				nextoffnum >= FirstOffsetNumber && nextoffnum <= maxoff)
+				successor[ctx.offnum] = nextoffnum;
+		}
+
+		/*
+		 * Update chain validation. Check each line pointer that's got a valid
+		 * successor against that successor.
+		 */
+		ctx.attnum = -1;
+		for (ctx.offnum = FirstOffsetNumber; ctx.offnum <= maxoff;
+			 ctx.offnum = OffsetNumberNext(ctx.offnum))
+		{
+			ItemId		curr_lp;
+			ItemId		next_lp;
+			HeapTupleHeader curr_htup;
+			HeapTupleHeader next_htup;
+			TransactionId curr_xmin;
+			TransactionId curr_xmax;
+			TransactionId next_xmin;
+			OffsetNumber nextoffnum = successor[ctx.offnum];
+
+			/*
+			 * The current line pointer may not have a successor, either
+			 * because it's not valid or because it didn't point to anything.
+			 * In either case, we have to give up.
+			 *
+			 * If the current line pointer does point to something, it's
+			 * possible that the target line pointer isn't valid. We have to
+			 * give up in that case, too.
+			 */
+			if (nextoffnum == InvalidOffsetNumber || !lp_valid[nextoffnum])
+				continue;
+
+			/* We have two valid line pointers that we can examine. */
+			curr_lp = PageGetItemId(ctx.page, ctx.offnum);
+			next_lp = PageGetItemId(ctx.page, nextoffnum);
+
+			/* Handle the cases where the current line pointer is a redirect. */
+			if (ItemIdIsRedirected(curr_lp))
+			{
+				/*
+				 * We should not have set successor[ctx.offnum] to a value
+				 * other than InvalidOffsetNumber unless that line pointer is
+				 * LP_NORMAL.
+				 */
+				Assert(ItemIdIsNormal(next_lp));
+
+				/* Can only redirect to a HOT tuple. */
+				next_htup = (HeapTupleHeader) PageGetItem(ctx.page, next_lp);
+				if (!HeapTupleHeaderIsHeapOnly(next_htup))
+				{
+					report_corruption(&ctx,
+									  psprintf("redirected line pointer points to a non-heap-only tuple at offset %u",
+											   (unsigned) nextoffnum));
+				}
+
+				/* HOT chains should not intersect. */
+				if (predecessor[nextoffnum] != InvalidOffsetNumber)
+				{
+					report_corruption(&ctx,
+									  psprintf("redirect line pointer points to offset %u, but offset %u also points there",
+											   (unsigned) nextoffnum, (unsigned) predecessor[nextoffnum]));
+					continue;
+				}
+
+				/*
+				 * This redirect and the tuple to which it points seem to be
+				 * part of an update chain.
+				 */
+				predecessor[nextoffnum] = ctx.offnum;
+				continue;
+			}
+
+			/*
+			 * If the next line pointer is a redirect, or if it's a tuple but
+			 * the XMAX of this tuple doesn't match the XMIN of the next
+			 * tuple, then the two aren't part of the same update chain and
+			 * there is nothing more to do.
+			 */
+			if (ItemIdIsRedirected(next_lp))
+				continue;
+			curr_htup = (HeapTupleHeader) PageGetItem(ctx.page, curr_lp);
+			curr_xmax = HeapTupleHeaderGetUpdateXid(curr_htup);
+			next_htup = (HeapTupleHeader) PageGetItem(ctx.page, next_lp);
+			next_xmin = HeapTupleHeaderGetXmin(next_htup);
+			if (!TransactionIdIsValid(curr_xmax) ||
+				!TransactionIdEquals(curr_xmax, next_xmin))
+				continue;
+
+			/* HOT chains should not intersect. */
+			if (predecessor[nextoffnum] != InvalidOffsetNumber)
+			{
+				report_corruption(&ctx,
+								  psprintf("tuple points to new version at offset %u, but offset %u also points there",
+										   (unsigned) nextoffnum, (unsigned) predecessor[nextoffnum]));
+				continue;
+			}
+
+			/*
+			 * This tuple and the tuple to which it points seem to be part of
+			 * an update chain.
+			 */
+			predecessor[nextoffnum] = ctx.offnum;
+
+			/*
+			 * If the current tuple is marked as HOT-updated, then the next
+			 * tuple should be marked as a heap-only tuple. Conversely, if the
+			 * current tuple isn't marked as HOT-updated, then the next tuple
+			 * shouldn't be marked as a heap-only tuple.
+			 *
+			 * NB: Can't use HeapTupleHeaderIsHotUpdated() as it checks if
+			 * hint bits indicate xmin/xmax aborted.
+			 */
+			if (!(curr_htup->t_infomask2 & HEAP_HOT_UPDATED) &&
+				HeapTupleHeaderIsHeapOnly(next_htup))
+			{
+				report_corruption(&ctx,
+								  psprintf("non-heap-only update produced a heap-only tuple at offset %u",
+										   (unsigned) nextoffnum));
+			}
+			if ((curr_htup->t_infomask2 & HEAP_HOT_UPDATED) &&
+				!HeapTupleHeaderIsHeapOnly(next_htup))
+			{
+				report_corruption(&ctx,
+								  psprintf("heap-only update produced a non-heap only tuple at offset %u",
+										   (unsigned) nextoffnum));
+			}
+
+			/*
+			 * If the current tuple's xmin is still in progress but the
+			 * successor tuple's xmin is committed, that's corruption.
+			 *
+			 * NB: We recheck the commit status of the current tuple's xmin
+			 * here, because it might have committed after we checked it and
+			 * before we checked the commit status of the successor tuple's
+			 * xmin. This should be safe because the xmin itself can't have
+			 * changed, only its commit status.
+			 */
+			curr_xmin = HeapTupleHeaderGetXmin(curr_htup);
+			if (xmin_commit_status_ok[ctx.offnum] &&
+				xmin_commit_status[ctx.offnum] == XID_IN_PROGRESS &&
+				xmin_commit_status_ok[nextoffnum] &&
+				xmin_commit_status[nextoffnum] == XID_COMMITTED &&
+				TransactionIdIsInProgress(curr_xmin))
+			{
+				report_corruption(&ctx,
+								  psprintf("tuple with in-progress xmin %u was updated to produce a tuple at offset %u with committed xmin %u",
+										   (unsigned) curr_xmin,
+										   (unsigned) ctx.offnum,
+										   (unsigned) next_xmin));
+			}
+
+			/*
+			 * If the current tuple's xmin is aborted but the successor
+			 * tuple's xmin is in-progress or committed, that's corruption.
+			 */
+			if (xmin_commit_status_ok[ctx.offnum] &&
+				xmin_commit_status[ctx.offnum] == XID_ABORTED &&
+				xmin_commit_status_ok[nextoffnum])
+			{
+				if (xmin_commit_status[nextoffnum] == XID_IN_PROGRESS)
+					report_corruption(&ctx,
+									  psprintf("tuple with aborted xmin %u was updated to produce a tuple at offset %u with in-progress xmin %u",
+											   (unsigned) curr_xmin,
+											   (unsigned) ctx.offnum,
+											   (unsigned) next_xmin));
+				else if (xmin_commit_status[nextoffnum] == XID_COMMITTED)
+					report_corruption(&ctx,
+									  psprintf("tuple with aborted xmin %u was updated to produce a tuple at offset %u with committed xmin %u",
+											   (unsigned) curr_xmin,
+											   (unsigned) ctx.offnum,
+											   (unsigned) next_xmin));
+			}
+		}
+
+		/*
+		 * An update chain can start either with a non-heap-only tuple or with
+		 * a redirect line pointer, but not with a heap-only tuple.
+		 *
+		 * (This check is in a separate loop because we need the predecessor
+		 * array to be fully populated before we can perform it.)
+		 */
+		for (ctx.offnum = FirstOffsetNumber;
+			 ctx.offnum <= maxoff;
+			 ctx.offnum = OffsetNumberNext(ctx.offnum))
+		{
+			if (xmin_commit_status_ok[ctx.offnum] &&
+				(xmin_commit_status[ctx.offnum] == XID_COMMITTED ||
+				 xmin_commit_status[ctx.offnum] == XID_IN_PROGRESS) &&
+				predecessor[ctx.offnum] == InvalidOffsetNumber)
+			{
+				ItemId		curr_lp;
+
+				curr_lp = PageGetItemId(ctx.page, ctx.offnum);
+				if (!ItemIdIsRedirected(curr_lp))
+				{
+					HeapTupleHeader curr_htup;
+
+					curr_htup = (HeapTupleHeader)
+						PageGetItem(ctx.page, curr_lp);
+					if (HeapTupleHeaderIsHeapOnly(curr_htup))
+						report_corruption(&ctx,
+										  psprintf("tuple is root of chain but is marked as heap-only tuple"));
+				}
+			}
 		}
 
 		/* clean up */
@@ -525,6 +853,8 @@ verify_heapam(PG_FUNCTION_ARGS)
 			break;
 	}
 
+	read_stream_end(stream);
+
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 
@@ -542,22 +872,39 @@ verify_heapam(PG_FUNCTION_ARGS)
 }
 
 /*
- * Check that a relation's relkind and access method are both supported.
+ * Heap amcheck's read stream callback for getting the next unskippable block.
+ * This callback is only used when 'all-visible' or 'all-frozen' is provided
+ * as the skip option to verify_heapam(). With the default 'none',
+ * block_range_read_stream_cb() is used instead.
  */
-static void
-sanity_check_relation(Relation rel)
+static BlockNumber
+heapcheck_read_stream_next_unskippable(ReadStream *stream,
+									   void *callback_private_data,
+									   void *per_buffer_data)
 {
-	if (rel->rd_rel->relkind != RELKIND_RELATION &&
-		rel->rd_rel->relkind != RELKIND_MATVIEW &&
-		rel->rd_rel->relkind != RELKIND_TOASTVALUE)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table, materialized view, or TOAST table",
-						RelationGetRelationName(rel))));
-	if (rel->rd_rel->relam != HEAP_TABLE_AM_OID)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("only heap AM is supported")));
+	HeapCheckReadStreamData *p = callback_private_data;
+
+	/* Loops over [current_blocknum, last_exclusive) blocks */
+	for (BlockNumber i; (i = p->range.current_blocknum++) < p->range.last_exclusive;)
+	{
+		uint8		mapbits = visibilitymap_get_status(p->rel, i, p->vmbuffer);
+
+		if (p->skip_option == SKIP_PAGES_ALL_FROZEN)
+		{
+			if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
+				continue;
+		}
+
+		if (p->skip_option == SKIP_PAGES_ALL_VISIBLE)
+		{
+			if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
+				continue;
+		}
+
+		return i;
+	}
+
+	return InvalidBlockNumber;
 }
 
 /*
@@ -569,12 +916,10 @@ report_corruption_internal(Tuplestorestate *tupstore, TupleDesc tupdesc,
 						   BlockNumber blkno, OffsetNumber offnum,
 						   AttrNumber attnum, char *msg)
 {
-	Datum		values[HEAPCHECK_RELATION_COLS];
-	bool		nulls[HEAPCHECK_RELATION_COLS];
+	Datum		values[HEAPCHECK_RELATION_COLS] = {0};
+	bool		nulls[HEAPCHECK_RELATION_COLS] = {0};
 	HeapTuple	tuple;
 
-	MemSet(values, 0, sizeof(values));
-	MemSet(nulls, 0, sizeof(nulls));
 	values[0] = Int64GetDatum(blkno);
 	values[1] = Int32GetDatum(offnum);
 	values[2] = Int32GetDatum(attnum);
@@ -628,26 +973,6 @@ report_toast_corruption(HeapCheckContext *ctx, ToastedAttribute *ta,
 }
 
 /*
- * Construct the TupleDesc used to report messages about corruptions found
- * while scanning the heap.
- */
-static TupleDesc
-verify_heapam_tupdesc(void)
-{
-	TupleDesc	tupdesc;
-	AttrNumber	a = 0;
-
-	tupdesc = CreateTemplateTupleDesc(HEAPCHECK_RELATION_COLS);
-	TupleDescInitEntry(tupdesc, ++a, "blkno", INT8OID, -1, 0);
-	TupleDescInitEntry(tupdesc, ++a, "offnum", INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, ++a, "attnum", INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, ++a, "msg", TEXTOID, -1, 0);
-	Assert(a == HEAPCHECK_RELATION_COLS);
-
-	return BlessTupleDesc(tupdesc);
-}
-
-/*
  * Check for tuple header corruption.
  *
  * Some kinds of corruption make it unsafe to check the tuple attributes, for
@@ -675,6 +1000,7 @@ check_tuple_header(HeapCheckContext *ctx)
 {
 	HeapTupleHeader tuphdr = ctx->tuphdr;
 	uint16		infomask = tuphdr->t_infomask;
+	TransactionId curr_xmax = HeapTupleHeaderGetUpdateXid(tuphdr);
 	bool		result = true;
 	unsigned	expected_hoff;
 
@@ -698,6 +1024,28 @@ check_tuple_header(HeapCheckContext *ctx)
 		 * whether the tuple is visible or to interpret other relevant header
 		 * fields.
 		 */
+	}
+
+	if (!TransactionIdIsValid(curr_xmax) &&
+		HeapTupleHeaderIsHotUpdated(tuphdr))
+	{
+		report_corruption(ctx,
+						  psprintf("tuple has been HOT updated, but xmax is 0"));
+
+		/*
+		 * As above, even though this shouldn't happen, it's not sufficient
+		 * justification for skipping further checks, we should still be able
+		 * to perform sensibly.
+		 */
+	}
+
+	if (HeapTupleHeaderIsHeapOnly(tuphdr) &&
+		((tuphdr->t_infomask & HEAP_UPDATED) == 0))
+	{
+		report_corruption(ctx,
+						  psprintf("tuple is heap only, but not the result of an update"));
+
+		/* Here again, we can still perform further checks. */
 	}
 
 	if (infomask & HEAP_HASNULL)
@@ -755,9 +1103,14 @@ check_tuple_header(HeapCheckContext *ctx)
  * Returns true if the tuple itself should be checked, false otherwise.  Sets
  * ctx->tuple_could_be_pruned if the tuple -- and thus also any associated
  * TOAST tuples -- are eligible for pruning.
+ *
+ * Sets *xmin_commit_status_ok to true if the commit status of xmin is known
+ * and false otherwise. If it's set to true, then also set *xmin_commit_status
+ * to the actual commit status.
  */
 static bool
-check_tuple_visibility(HeapCheckContext *ctx)
+check_tuple_visibility(HeapCheckContext *ctx, bool *xmin_commit_status_ok,
+					   XidCommitStatus *xmin_commit_status)
 {
 	TransactionId xmin;
 	TransactionId xvac;
@@ -768,6 +1121,7 @@ check_tuple_visibility(HeapCheckContext *ctx)
 	HeapTupleHeader tuphdr = ctx->tuphdr;
 
 	ctx->tuple_could_be_pruned = true;	/* have not yet proven otherwise */
+	*xmin_commit_status_ok = false; /* have not yet proven otherwise */
 
 	/* If xmin is normal, it should be within valid range */
 	xmin = HeapTupleHeaderGetXmin(tuphdr);
@@ -777,6 +1131,8 @@ check_tuple_visibility(HeapCheckContext *ctx)
 			/* Could be the result of a speculative insertion that aborted. */
 			return false;
 		case XID_BOUNDS_OK:
+			*xmin_commit_status_ok = true;
+			*xmin_commit_status = xmin_status;
 			break;
 		case XID_IN_FUTURE:
 			report_corruption(ctx,
@@ -1307,11 +1663,11 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	struct varlena *attr;
 	char	   *tp;				/* pointer to the tuple data */
 	uint16		infomask;
-	Form_pg_attribute thisatt;
+	CompactAttribute *thisatt;
 	struct varatt_external toast_pointer;
 
 	infomask = ctx->tuphdr->t_infomask;
-	thisatt = TupleDescAttr(RelationGetDescr(ctx->rel), ctx->attnum);
+	thisatt = TupleDescCompactAttr(RelationGetDescr(ctx->rel), ctx->attnum);
 
 	tp = (char *) ctx->tuphdr + ctx->tuphdr->t_hoff;
 
@@ -1332,7 +1688,7 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	/* Skip non-varlena values, but update offset first */
 	if (thisatt->attlen != -1)
 	{
-		ctx->offset = att_align_nominal(ctx->offset, thisatt->attalign);
+		ctx->offset = att_nominal_alignby(ctx->offset, thisatt->attalignby);
 		ctx->offset = att_addlength_pointer(ctx->offset, thisatt->attlen,
 											tp + ctx->offset);
 		if (ctx->tuphdr->t_hoff + ctx->offset > ctx->lp_len)
@@ -1348,8 +1704,8 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	}
 
 	/* Ok, we're looking at a varlena attribute. */
-	ctx->offset = att_align_pointer(ctx->offset, thisatt->attalign, -1,
-									tp + ctx->offset);
+	ctx->offset = att_pointer_alignby(ctx->offset, thisatt->attalignby, -1,
+									  tp + ctx->offset);
 
 	/* Get the (possibly corrupt) varlena datum */
 	attdatum = fetchatt(thisatt, tp + ctx->offset);
@@ -1360,7 +1716,7 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	 */
 
 	/*
-	 * Check that VARTAG_SIZE won't hit a TrapMacro on a corrupt va_tag before
+	 * Check that VARTAG_SIZE won't hit an Assert on a corrupt va_tag before
 	 * risking a call into att_addlength_pointer
 	 */
 	if (VARATT_IS_EXTERNAL(tp + ctx->offset))
@@ -1416,6 +1772,41 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	 */
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
 
+	/* Toasted attributes too large to be untoasted should never be stored */
+	if (toast_pointer.va_rawsize > VARLENA_SIZE_LIMIT)
+		report_corruption(ctx,
+						  psprintf("toast value %u rawsize %d exceeds limit %d",
+								   toast_pointer.va_valueid,
+								   toast_pointer.va_rawsize,
+								   VARLENA_SIZE_LIMIT));
+
+	if (VARATT_EXTERNAL_IS_COMPRESSED(toast_pointer))
+	{
+		ToastCompressionId cmid;
+		bool		valid = false;
+
+		/* Compressed attributes should have a valid compression method */
+		cmid = TOAST_COMPRESS_METHOD(&toast_pointer);
+		switch (cmid)
+		{
+				/* List of all valid compression method IDs */
+			case TOAST_PGLZ_COMPRESSION_ID:
+			case TOAST_LZ4_COMPRESSION_ID:
+				valid = true;
+				break;
+
+				/* Recognized but invalid compression method ID */
+			case TOAST_INVALID_COMPRESSION_ID:
+				break;
+
+				/* Intentionally no default here */
+		}
+		if (!valid)
+			report_corruption(ctx,
+							  psprintf("toast value %u has invalid compression method id %d",
+									   toast_pointer.va_valueid, cmid));
+	}
+
 	/* The tuple header better claim to contain toasted values */
 	if (!(infomask & HEAP_HASEXTERNAL))
 	{
@@ -1468,7 +1859,6 @@ check_tuple_attribute(HeapCheckContext *ctx)
 static void
 check_toasted_attribute(HeapCheckContext *ctx, ToastedAttribute *ta)
 {
-	SnapshotData SnapshotToast;
 	ScanKeyData toastkey;
 	SysScanDesc toastscan;
 	bool		found_toasttup;
@@ -1492,10 +1882,9 @@ check_toasted_attribute(HeapCheckContext *ctx, ToastedAttribute *ta)
 	 * Check if any chunks for this toasted object exist in the toast table,
 	 * accessible via the index.
 	 */
-	init_toast_snapshot(&SnapshotToast);
 	toastscan = systable_beginscan_ordered(ctx->toast_rel,
 										   ctx->valid_toast_index,
-										   &SnapshotToast, 1,
+										   get_toast_snapshot(), 1,
 										   &toastkey);
 	found_toasttup = false;
 	while ((toasttup =
@@ -1521,9 +1910,13 @@ check_toasted_attribute(HeapCheckContext *ctx, ToastedAttribute *ta)
 /*
  * Check the current tuple as tracked in ctx, recording any corruption found in
  * ctx->tupstore.
+ *
+ * We return some information about the status of xmin to aid in validating
+ * update chains.
  */
 static void
-check_tuple(HeapCheckContext *ctx)
+check_tuple(HeapCheckContext *ctx, bool *xmin_commit_status_ok,
+			XidCommitStatus *xmin_commit_status)
 {
 	/*
 	 * Check various forms of tuple header corruption, and if the header is
@@ -1537,7 +1930,8 @@ check_tuple(HeapCheckContext *ctx)
 	 * cannot assume our relation description matches the tuple structure, and
 	 * therefore cannot check it.
 	 */
-	if (!check_tuple_visibility(ctx))
+	if (!check_tuple_visibility(ctx, xmin_commit_status_ok,
+								xmin_commit_status))
 		return;
 
 	/*
@@ -1575,7 +1969,9 @@ check_tuple(HeapCheckContext *ctx)
 /*
  * Convert a TransactionId into a FullTransactionId using our cached values of
  * the valid transaction ID range.  It is the caller's responsibility to have
- * already updated the cached values, if necessary.
+ * already updated the cached values, if necessary.  This is akin to
+ * FullTransactionIdFromAllowableAt(), but it tolerates corruption in the form
+ * of an xid before epoch 0.
  */
 static FullTransactionId
 FullTransactionIdFromXidAndCtx(TransactionId xid, const HeapCheckContext *ctx)
@@ -1597,8 +1993,8 @@ FullTransactionIdFromXidAndCtx(TransactionId xid, const HeapCheckContext *ctx)
 	diff = (int32) (ctx->next_xid - xid);
 
 	/*
-	 * In cases of corruption we might see a 32bit xid that is before epoch
-	 * 0. We can't represent that as a 64bit xid, due to 64bit xids being
+	 * In cases of corruption we might see a 32bit xid that is before epoch 0.
+	 * We can't represent that as a 64bit xid, due to 64bit xids being
 	 * unsigned integers, without the modulo arithmetic of 32bit xid. There's
 	 * no really nice way to deal with that, but it works ok enough to use
 	 * FirstNormalFullTransactionId in that case, as a freshly initdb'd
@@ -1624,8 +2020,8 @@ update_cached_xid_range(HeapCheckContext *ctx)
 {
 	/* Make cached copies */
 	LWLockAcquire(XidGenLock, LW_SHARED);
-	ctx->next_fxid = ShmemVariableCache->nextXid;
-	ctx->oldest_xid = ShmemVariableCache->oldestXid;
+	ctx->next_fxid = TransamVariables->nextXid;
+	ctx->oldest_xid = TransamVariables->oldestXid;
 	LWLockRelease(XidGenLock);
 
 	/* And compute alternate versions of the same */
@@ -1762,7 +2158,7 @@ get_xid_status(TransactionId xid, HeapCheckContext *ctx,
 	*status = XID_COMMITTED;
 	LWLockAcquire(XactTruncationLock, LW_SHARED);
 	clog_horizon =
-		FullTransactionIdFromXidAndCtx(ShmemVariableCache->oldestClogXid,
+		FullTransactionIdFromXidAndCtx(TransamVariables->oldestClogXid,
 									   ctx);
 	if (FullTransactionIdPrecedesOrEquals(clog_horizon, fxid))
 	{

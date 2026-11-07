@@ -7,7 +7,7 @@
  *	 ExecProcNode, or ExecEndNode on its subnodes and do the appropriate
  *	 processing.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -125,7 +125,7 @@ static bool ExecShutdownNode_walker(PlanState *node, void *context);
 
 
 /* ------------------------------------------------------------------------
- *		standard_ExecInitNode
+ *		ExecInitNode
  *
  *		Recursively initializes all the nodes in the plan tree rooted
  *		at 'node'.
@@ -139,7 +139,7 @@ static bool ExecShutdownNode_walker(PlanState *node, void *context);
  * ------------------------------------------------------------------------
  */
 PlanState *
-standard_ExecInitNode(Plan *node, EState *estate, int eflags)
+ExecInitNode(Plan *node, EState *estate, int eflags)
 {
 	PlanState  *result;
 	List	   *subps;
@@ -393,6 +393,10 @@ standard_ExecInitNode(Plan *node, EState *estate, int eflags)
 	/*
 	 * Initialize any initPlans present in this node.  The planner put them in
 	 * a separate list for us.
+	 *
+	 * The defining characteristic of initplans is that they don't have
+	 * arguments, so we don't need to evaluate them (in contrast to
+	 * ExecInitSubPlanExpr()).
 	 */
 	subps = NIL;
 	foreach(l, node->initPlan)
@@ -401,6 +405,7 @@ standard_ExecInitNode(Plan *node, EState *estate, int eflags)
 		SubPlanState *sstate;
 
 		Assert(IsA(subplan, SubPlan));
+		Assert(subplan->args == NIL);
 		sstate = ExecInitSubPlan(subplan, result);
 		subps = lappend(subps, sstate);
 	}
@@ -486,7 +491,7 @@ ExecProcNodeInstr(PlanState *node)
 
 
 /* ----------------------------------------------------------------
- *		standard_MultiExecProcNode
+ *		MultiExecProcNode
  *
  *		Execute a node that doesn't return individual tuples
  *		(it might return a hashtable, bitmap, etc).  Caller should
@@ -499,7 +504,7 @@ ExecProcNodeInstr(PlanState *node)
  * ----------------------------------------------------------------
  */
 Node *
-standard_MultiExecProcNode(PlanState *node)
+MultiExecProcNode(PlanState *node)
 {
 	Node	   *result;
 
@@ -543,7 +548,7 @@ standard_MultiExecProcNode(PlanState *node)
 
 
 /* ----------------------------------------------------------------
- *		standard_ExecEndNode
+ *		ExecEndNode
  *
  *		Recursively cleans up all the nodes in the plan rooted
  *		at 'node'.
@@ -554,7 +559,7 @@ standard_MultiExecProcNode(PlanState *node)
  * ----------------------------------------------------------------
  */
 void
-standard_ExecEndNode(PlanState *node)
+ExecEndNode(PlanState *node)
 {
 	/*
 	 * do nothing when we get to the end of a leaf on tree.
@@ -667,20 +672,8 @@ standard_ExecEndNode(PlanState *node)
 			ExecEndTableFuncScan((TableFuncScanState *) node);
 			break;
 
-		case T_ValuesScanState:
-			ExecEndValuesScan((ValuesScanState *) node);
-			break;
-
 		case T_CteScanState:
 			ExecEndCteScan((CteScanState *) node);
-			break;
-
-		case T_NamedTuplestoreScanState:
-			ExecEndNamedTuplestoreScan((NamedTuplestoreScanState *) node);
-			break;
-
-		case T_WorkTableScanState:
-			ExecEndWorkTableScan((WorkTableScanState *) node);
 			break;
 
 		case T_ForeignScanState:
@@ -757,6 +750,12 @@ standard_ExecEndNode(PlanState *node)
 			ExecEndLimit((LimitState *) node);
 			break;
 
+			/* No clean up actions for these nodes. */
+		case T_ValuesScanState:
+		case T_NamedTuplestoreScanState:
+		case T_WorkTableScanState:
+			break;
+
 		default:
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
 			break;
@@ -764,15 +763,15 @@ standard_ExecEndNode(PlanState *node)
 }
 
 /*
- * standard_ExecShutdownNode
+ * ExecShutdownNode
  *
  * Give execution nodes a chance to stop asynchronous resource consumption
  * and release any resources still held.
  */
-bool
-standard_ExecShutdownNode(PlanState *node)
+void
+ExecShutdownNode(PlanState *node)
 {
-	return ExecShutdownNode_walker(node, NULL);
+	(void) ExecShutdownNode_walker(node, NULL);
 }
 
 static bool

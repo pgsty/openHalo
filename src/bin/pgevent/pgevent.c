@@ -15,14 +15,14 @@
 #include <olectl.h>
 
 /* Global variables */
-HANDLE		g_module = NULL;	/* hModule of DLL */
+static HANDLE g_module = NULL;	/* hModule of DLL */
 
 /*
  * The event source is stored as a registry key.
  * The maximum length of a registry key is 255 characters.
  * http://msdn.microsoft.com/en-us/library/ms724872(v=vs.85).aspx
  */
-char		event_source[256] = DEFAULT_EVENT_SOURCE;
+static char event_source[256] = DEFAULT_EVENT_SOURCE;
 
 /* Prototypes */
 HRESULT		DllInstall(BOOL bInstall, LPCWSTR pszCmdLine);
@@ -72,7 +72,7 @@ DllRegisterServer(void)
 	/* Set the name of DLL full path name. */
 	if (!GetModuleFileName((HMODULE) g_module, buffer, sizeof(buffer)))
 	{
-		MessageBox(NULL, "Could not retrieve DLL filename", "Halo server error", MB_OK | MB_ICONSTOP);
+		MessageBox(NULL, "Could not retrieve DLL filename", "PostgreSQL error", MB_OK | MB_ICONSTOP);
 		return SELFREG_E_TYPELIB;
 	}
 
@@ -85,7 +85,7 @@ DllRegisterServer(void)
 			  event_source);
 	if (RegCreateKey(HKEY_LOCAL_MACHINE, key_name, &key))
 	{
-		MessageBox(NULL, "Could not create the registry key.", "Halo server error", MB_OK | MB_ICONSTOP);
+		MessageBox(NULL, "Could not create the registry key.", "PostgreSQL error", MB_OK | MB_ICONSTOP);
 		return SELFREG_E_TYPELIB;
 	}
 
@@ -97,7 +97,7 @@ DllRegisterServer(void)
 					  (LPBYTE) buffer,
 					  strlen(buffer) + 1))
 	{
-		MessageBox(NULL, "Could not set the event message file.", "Halo server error", MB_OK | MB_ICONSTOP);
+		MessageBox(NULL, "Could not set the event message file.", "PostgreSQL error", MB_OK | MB_ICONSTOP);
 		return SELFREG_E_TYPELIB;
 	}
 
@@ -111,7 +111,7 @@ DllRegisterServer(void)
 					  (LPBYTE) &data,
 					  sizeof(DWORD)))
 	{
-		MessageBox(NULL, "Could not set the supported types.", "Halo server error", MB_OK | MB_ICONSTOP);
+		MessageBox(NULL, "Could not set the supported types.", "PostgreSQL error", MB_OK | MB_ICONSTOP);
 		return SELFREG_E_TYPELIB;
 	}
 
@@ -138,7 +138,7 @@ DllUnregisterServer(void)
 			  event_source);
 	if (RegDeleteKey(HKEY_LOCAL_MACHINE, key_name))
 	{
-		MessageBox(NULL, "Could not delete the registry key.", "Halo server error", MB_OK | MB_ICONSTOP);
+		MessageBox(NULL, "Could not delete the registry key.", "PostgreSQL error", MB_OK | MB_ICONSTOP);
 		return SELFREG_E_TYPELIB;
 	}
 	return S_OK;

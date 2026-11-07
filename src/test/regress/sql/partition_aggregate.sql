@@ -74,6 +74,11 @@ EXPLAIN (COSTS OFF)
 SELECT a FROM pagg_tab WHERE a < 3 GROUP BY a ORDER BY 1;
 SELECT a FROM pagg_tab WHERE a < 3 GROUP BY a ORDER BY 1;
 
+-- Test partitionwise aggregation with ordered append path built from fractional paths
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pagg_tab GROUP BY c ORDER BY c LIMIT 1;
+SELECT count(*) FROM pagg_tab GROUP BY c ORDER BY c LIMIT 1;
+
 RESET enable_hashagg;
 
 -- ROLLUP, partitionwise aggregation does not apply
@@ -222,6 +227,7 @@ ANALYZE pagg_tab_ml;
 
 -- For Parallel Append
 SET max_parallel_workers_per_gather TO 2;
+SET parallel_setup_cost = 0;
 
 -- Full aggregation at level 1 as GROUP BY clause matches with PARTITION KEY
 -- for level 1 only. For subpartitions, GROUP BY clause does not match with
@@ -234,6 +240,8 @@ SELECT a, sum(b), array_agg(distinct c), count(*) FROM pagg_tab_ml GROUP BY a HA
 -- Without ORDER BY clause, to test Gather at top-most path
 EXPLAIN (COSTS OFF)
 SELECT a, sum(b), array_agg(distinct c), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3;
+
+RESET parallel_setup_cost;
 
 -- Full aggregation at level 1 as GROUP BY clause matches with PARTITION KEY
 -- for level 1 only. For subpartitions, GROUP BY clause does not match with

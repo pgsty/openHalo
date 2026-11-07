@@ -38,11 +38,25 @@ PostgreSQL documentation
   </para>
 
   <para>
-   <application>pg_basebackup</application> makes an exact copy of the database
-   cluster's files, while making sure the server is put into and
-   out of backup mode automatically. Backups are always taken of the entire
-   database cluster; it is not possible to back up individual databases or
-   database objects. For selective backups, another tool such as
+   <application>pg_basebackup</application> can take a full or incremental
+   base backup of the database. When used to take a full backup, it makes an
+   exact copy of the database cluster's files. When used to take an incremental
+   backup, some files that would have been part of a full backup may be
+   replaced with incremental versions of the same files, containing only those
+   blocks that have been modified since the reference backup. An incremental
+   backup cannot be used directly; instead,
+   <xref linkend="app-pgcombinebackup"/> must first
+   be used to combine it with the previous backups upon which it depends.
+   See <xref linkend="backup-incremental-backup" /> for more information
+   about incremental backups, and <xref linkend="backup-pitr-recovery" />
+   for steps to recover from a backup.
+  </para>
+
+  <para>
+   In any mode, <application>pg_basebackup</application> makes sure the server
+   is put into and out of backup mode automatically. Backups are always taken of
+   the entire database cluster; it is not possible to back up individual
+   databases or database objects. For selective backups, another tool such as
    <xref linkend="app-pgdump"/> must be used.
   </para>
 
@@ -101,9 +115,7 @@ PostgreSQL documentation
     <listitem>
      <para>
       All WAL records required for the backup must contain sufficient full-page writes,
-      which requires you to enable <varname>full_page_writes</varname> on the primary and
-      not to use a tool like <application>pg_compresslog</application> as
-      <varname>archive_command</varname> to remove full-page writes from WAL files.
+      which requires you to enable <varname>full_page_writes</varname> on the primary.
      </para>
     </listitem>
    </itemizedlist>
@@ -200,6 +212,19 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>-i <replaceable class="parameter">old_manifest_file</replaceable></option></term>
+      <term><option>--incremental=<replaceable class="parameter">old_manifest_file</replaceable></option></term>
+      <listitem>
+       <para>
+        Performs an <link linkend="backup-incremental-backup">incremental
+        backup</link>. The backup manifest for the reference
+        backup must be provided, and will be uploaded to the server, which will
+        respond by sending the requested incremental backup.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-R</option></term>
       <term><option>--write-recovery-conf</option></term>
       <listitem>
@@ -218,7 +243,42 @@ PostgreSQL documentation
         The <filename>postgresql.auto.conf</filename> file will record the connection
         settings and, if specified, the replication slot
         that <application>pg_basebackup</application> is using, so that
-        streaming replication will use the same settings later on.
+        streaming replication and <link linkend="logicaldecoding-replication-slots-synchronization">
+        logical replication slot synchronization</link> will use the same
+        settings later on. The dbname will be recorded only if the dbname was
+        specified explicitly in the connection string or <link linkend="libpq-envars">
+        environment variable</link>.
+       </para>
+
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-t <replaceable class="parameter">target</replaceable></option></term>
+      <term><option>--target=<replaceable class="parameter">target</replaceable></option></term>
+      <listitem>
+
+       <para>
+        Instructs the server where to place the base backup. The default target
+        is <literal>client</literal>, which specifies that the backup should
+        be sent to the machine where <application>pg_basebackup</application>
+        is running. If the target is instead set to
+        <literal>server:/some/path</literal>, the backup will be stored on
+        the machine where the server is running in the
+        <literal>/some/path</literal> directory. Storing a backup on the
+        server requires superuser privileges or having privileges of the
+        <literal>pg_write_server_files</literal> role. If the target is set to
+        <literal>blackhole</literal>, the contents are discarded and not
+        stored anywhere. This should only be used for testing purposes, as you
+        will not end up with an actual backup.
+       </para>
+
+       <para>
+        Since WAL streaming is implemented by
+        <application>pg_basebackup</application> rather than by the server,
+        this option cannot be used together with <literal>-Xstream</literal>.
+        Since that is the default, when this option is specified, you must also
+        specify either <literal>-Xfetch</literal> or <literal>-Xnone</literal>.
        </para>
 
       </listitem>
@@ -287,7 +347,7 @@ PostgreSQL documentation
         backup. This will include all write-ahead logs generated during
         the backup. Unless the method <literal>none</literal> is specified,
         it is possible to start a postmaster in the target
-        directory without the need to consult the log archive, thus
+        directory without the need to consult the WAL archive, thus
         making the output a completely standalone backup.
        </para>
        <para>
@@ -368,14 +428,63 @@ PostgreSQL documentation
 
      <varlistentry>
       <term><option>-Z <replaceable class="parameter">level</replaceable></option></term>
+      <term><option>-Z [{client|server}-]<replaceable class="parameter">method</replaceable>[:<replaceable>detail</replaceable>]</option></term>
       <term><option>--compress=<replaceable class="parameter">level</replaceable></option></term>
+      <term><option>--compress=[{client|server}-]<replaceable class="parameter">method</replaceable>[:<replaceable>detail</replaceable>]</option></term>
       <listitem>
        <para>
-        Enables gzip compression of tar file output, and specifies the
-        compression level (0 through 9, 0 being no compression and 9 being best
-        compression). Compression is only available when using the tar
-        format, and the suffix <filename>.gz</filename> will
-        automatically be added to all tar filenames.
+        Requests compression of the backup. If <literal>client</literal> or
+        <literal>server</literal> is included, it specifies where the
+        compression is to be performed. Compressing on the server will reduce
+        transfer bandwidth but will increase server CPU consumption.  The
+        default is <literal>client</literal> except when
+        <literal>--target</literal> is used. In that case, the backup is not
+        being sent to the client, so only server compression is sensible.
+        When <literal>-Xstream</literal>, which is the default, is used,
+        server-side compression will not be applied to the WAL. To compress
+        the WAL, use client-side compression, or
+        specify <literal>-Xfetch</literal>.
+       </para>
+       <para>
+        The compression method can be set to <literal>gzip</literal>,
+        <literal>lz4</literal>, <literal>zstd</literal>,
+        <literal>none</literal> for no compression or an integer (no
+        compression if 0, <literal>gzip</literal> if greater than 0).
+        A compression detail string can optionally be specified.
+        If the detail string is an integer, it specifies the compression
+        level.  Otherwise, it should be a comma-separated list of items,
+        each of the form
+        <replaceable>keyword</replaceable> or
+        <replaceable>keyword=value</replaceable>.
+        Currently, the supported keywords are <literal>level</literal>,
+        <literal>long</literal>, and <literal>workers</literal>.
+        The detail string cannot be used when the compression method
+        is specified as a plain integer.
+       </para>
+       <para>
+        If no compression level is specified, the default compression level
+        will be used. If only a level is specified without mentioning an
+        algorithm, <literal>gzip</literal> compression will be used if the
+        level is greater than 0, and no compression will be used if the level
+        is 0.
+       </para>
+       <para>
+        When the tar format is used with <literal>gzip</literal>,
+        <literal>lz4</literal>, or <literal>zstd</literal>, the suffix
+        <filename>.gz</filename>, <filename>.lz4</filename>, or
+        <filename>.zst</filename>, respectively, will be automatically added to
+        all tar filenames. When the plain format is used, client-side
+        compression may not be specified, but it is still possible to request
+        server-side compression. If this is done, the server will compress the
+        backup for transmission, and the client will decompress and extract it.
+       </para>
+       <para>
+        When this option is used in combination with
+        <literal>-Xstream</literal>, <literal>pg_wal.tar</literal> will
+        be compressed using <literal>gzip</literal> if client-side gzip
+        compression is selected, but will not be compressed if any other
+        compression algorithm is selected, or if server-side compression
+        is selected.
        </para>
       </listitem>
      </varlistentry>
@@ -387,8 +496,8 @@ PostgreSQL documentation
 
     <variablelist>
      <varlistentry>
-      <term><option>-c <replaceable class="parameter">fast|spread</replaceable></option></term>
-      <term><option>--checkpoint=<replaceable class="parameter">fast|spread</replaceable></option></term>
+      <term><option>-c {fast|spread}</option></term>
+      <term><option>--checkpoint={fast|spread}</option></term>
       <listitem>
        <para>
         Sets checkpoint mode to fast (immediate) or spread (the default)
@@ -518,6 +627,31 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--sync-method=<replaceable class="parameter">method</replaceable></option></term>
+      <listitem>
+       <para>
+        When set to <literal>fsync</literal>, which is the default,
+        <command>pg_basebackup</command> will recursively open and synchronize
+        all files in the backup directory.  When the plain format is used, the
+        search for files will follow symbolic links for the WAL directory and
+        each configured tablespace.
+       </para>
+       <para>
+        On Linux, <literal>syncfs</literal> may be used instead to ask the
+        operating system to synchronize the whole file system that contains the
+        backup directory.  When the plain format is used,
+        <command>pg_basebackup</command> will also synchronize the file systems
+        that contain the WAL files and each tablespace.  See
+        <xref linkend="guc-recovery-init-sync-method"/> for information about
+        the caveats to be aware of when using <literal>syncfs</literal>.
+       </para>
+       <para>
+        This option has no effect when <option>--no-sync</option> is used.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-v</option></term>
       <term><option>--verbose</option></term>
       <listitem>
@@ -553,7 +687,7 @@ PostgreSQL documentation
        <para>
         Using a SHA hash function provides a cryptographically secure digest
         of each file for users who wish to verify that the backup has not been
-        tampered with, while the CRC32C algorithm provides a checksum that is
+        tampered with, while the CRC-32C algorithm provides a checksum that is
         much faster to calculate; it is good at catching errors due to accidental
         changes but is not resistant to malicious modifications.  Note that, to
         be useful against an adversary who has access to the backup, the backup
@@ -673,10 +807,19 @@ PostgreSQL documentation
         will override any conflicting command line options.
        </para>
        <para>
-        The option is called <literal>--dbname</literal> for consistency with other
+        This option is called <literal>--dbname</literal> for consistency with other
         client applications, but because <application>pg_basebackup</application>
         doesn't connect to any particular database in the cluster, any database
-        name in the connection string will be ignored.
+        name included in the connection string will be ignored by the server.
+        However, a database name supplied that way overrides the default
+        database name (<literal>replication</literal>) for purposes of
+        looking up the replication connection's password
+        in <filename>~/.pgpass</filename>.  Similarly, middleware or proxies
+        used in connecting to <productname>PostgreSQL</productname> might
+        utilize the name for purposes such as connection routing.  The
+        database name can also be used
+        by <link linkend="logicaldecoding-replication-slots-synchronization">
+        logical replication slot synchronization</link>.
        </para>
       </listitem>
      </varlistentry>
@@ -832,7 +975,8 @@ PostgreSQL documentation
    The backup will include all files in the data directory and tablespaces,
    including the configuration files and any additional files placed in the
    directory by third parties, except certain temporary files managed by
-   PostgreSQL.  But only regular files and directories are copied, except that
+   PostgreSQL and operating system files.  But only regular files and
+   directories are copied, except that
    symbolic links used for tablespaces are preserved.  Symbolic links pointing
    to certain directories known to PostgreSQL are copied as empty directories.
    Other symbolic links and special device files are skipped.
@@ -861,10 +1005,11 @@ PostgreSQL documentation
 
   <para>
    <application>pg_basebackup</application> works with servers of the same
-   or an older major version, down to 9.1. However, WAL streaming mode (<literal>-X
-   stream</literal>) only works with server version 9.3 and later, and tar format
+   or older major version, down to 9.1. However, WAL streaming mode (<literal>-X
+   stream</literal>) only works with server version 9.3 and later, the tar format
    (<literal>--format=tar</literal>) only works with server version 9.5
-   and later.
+   and later, and incremental backup (<literal>--incremental</literal>) only works
+   with server version 17 and later.
   </para>
 
   <para>
@@ -912,6 +1057,15 @@ PostgreSQL documentation
 <screen>
 <prompt>$</prompt> <userinput>pg_basebackup -D backup/data -T /opt/ts=$(pwd)/backup/ts</userinput>
 </screen></para>
+
+  <para>
+   To create a backup of the local server with one tar file for each tablespace
+   compressed with <application>gzip</application> at level 9, stored in the
+   directory <filename>backup</filename>:
+<screen>
+<prompt>$</prompt> <userinput>pg_basebackup -D backup -Ft --compress=gzip:9</userinput>
+</screen></para>
+
  </refsect1>
 
  <refsect1>

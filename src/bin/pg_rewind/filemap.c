@@ -16,7 +16,7 @@
  * for each file.  Finally, it sorts the array to the final order that the
  * actions should be executed in.
  *
- * Copyright (c) 2013-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2025, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -26,24 +26,24 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "access/xlog_internal.h"
 #include "catalog/pg_tablespace_d.h"
-#include "common/hashfn.h"
+#include "common/file_utils.h"
+#include "common/hashfn_unstable.h"
 #include "common/string.h"
 #include "datapagemap.h"
 #include "filemap.h"
 #include "pg_rewind.h"
-#include "storage/fd.h"
 
 /*
  * Define a hash table which we can use to store information about the files
  * appearing in source and target systems.
  */
-static uint32 hash_string_pointer(const char *s);
 #define SH_PREFIX				filehash
 #define SH_ELEMENT_TYPE			file_entry_t
 #define SH_KEY_TYPE				const char *
 #define SH_KEY					path
-#define SH_HASH_KEY(tb, key)	hash_string_pointer(key)
+#define SH_HASH_KEY(tb, key)	hash_string(key)
 #define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
 #define SH_SCOPE				static inline
 #define SH_RAW_ALLOCATOR		pg_malloc0
@@ -56,7 +56,7 @@ static uint32 hash_string_pointer(const char *s);
 static filehash_hash *filehash;
 
 static bool isRelDataFile(const char *path);
-static char *datasegpath(RelFileNode rnode, ForkNumber forknum,
+static char *datasegpath(RelFileLocator rlocator, ForkNumber forknum,
 						 BlockNumber segno);
 
 static file_entry_t *insert_filehash_entry(const char *path);
@@ -75,7 +75,7 @@ typedef struct keepwal_entry
 #define SH_ELEMENT_TYPE			keepwal_entry
 #define SH_KEY_TYPE				const char *
 #define SH_KEY					path
-#define SH_HASH_KEY(tb, key)	hash_string_pointer(key)
+#define SH_HASH_KEY(tb, key)	hash_string(key)
 #define SH_EQUAL(tb, a, b)		(strcmp(a, b) == 0)
 #define SH_SCOPE				static inline
 #define SH_RAW_ALLOCATOR		pg_malloc0
@@ -114,12 +114,11 @@ struct exclude_list_item
  * they are defined in backend-only headers.  So this list is maintained
  * with a best effort in mind.
  */
-static const char *excludeDirContents[] =
+static const char *const excludeDirContents[] =
 {
 	/*
-	 * Skip temporary statistics files. PG_STAT_TMP_DIR must be skipped even
-	 * when stats_temp_directory is set because PGSS_TEXT_FILE is always
-	 * created there.
+	 * Skip temporary statistics files. PG_STAT_TMP_DIR must be skipped
+	 * because extensions like pg_stat_statements store data there.
 	 */
 	"pg_stat_tmp",				/* defined as PG_STAT_TMP_DIR */
 
@@ -128,7 +127,7 @@ static const char *excludeDirContents[] =
 	 * even if the intention is to restore to another primary. See backup.sgml
 	 * for a more detailed description.
 	 */
-	"pg_replslot",
+	"pg_replslot",				/* defined as PG_REPLSLOT_DIR */
 
 	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
 	"pg_dynshmem",				/* defined as PG_DYNSHMEM_DIR */
@@ -169,9 +168,9 @@ static const struct exclude_list_item excludeFiles[] =
 	{"pg_internal.init", true}, /* defined as RELCACHE_INIT_FILENAME */
 
 	/*
-	 * If there's a backup_label or tablespace_map file, it belongs to a
-	 * backup started by the user with pg_start_backup().  It is *not* correct
-	 * for this backup.  Our backup_label is written later on separately.
+	 * If there is a backup_label or tablespace_map file, it indicates that a
+	 * recovery failed and this cluster probably can't be rewound, but exclude
+	 * them anyway if they are found.
 	 */
 	{"backup_label", false},	/* defined as BACKUP_LABEL_FILE */
 	{"tablespace_map", false},	/* defined as TABLESPACE_MAP */
@@ -351,7 +350,7 @@ process_target_file(const char *path, file_type_t type, size_t size,
  * hash table!
  */
 void
-process_target_wal_block_change(ForkNumber forknum, RelFileNode rnode,
+process_target_wal_block_change(ForkNumber forknum, RelFileLocator rlocator,
 								BlockNumber blkno)
 {
 	char	   *path;
@@ -362,7 +361,7 @@ process_target_wal_block_change(ForkNumber forknum, RelFileNode rnode,
 	segno = blkno / RELSEG_SIZE;
 	blkno_inseg = blkno % RELSEG_SIZE;
 
-	path = datasegpath(rnode, forknum, segno);
+	path = datasegpath(rlocator, forknum, segno);
 	entry = lookup_filehash_entry(path);
 	pfree(path);
 
@@ -571,7 +570,7 @@ print_filemap(filemap_t *filemap)
 static bool
 isRelDataFile(const char *path)
 {
-	RelFileNode rnode;
+	RelFileLocator rlocator;
 	unsigned int segNo;
 	int			nmatch;
 	bool		matched;
@@ -595,32 +594,32 @@ isRelDataFile(const char *path)
 	 *
 	 *----
 	 */
-	rnode.spcNode = InvalidOid;
-	rnode.dbNode = InvalidOid;
-	rnode.relNode = InvalidOid;
+	rlocator.spcOid = InvalidOid;
+	rlocator.dbOid = InvalidOid;
+	rlocator.relNumber = InvalidRelFileNumber;
 	segNo = 0;
 	matched = false;
 
-	nmatch = sscanf(path, "global/%u.%u", &rnode.relNode, &segNo);
+	nmatch = sscanf(path, "global/%u.%u", &rlocator.relNumber, &segNo);
 	if (nmatch == 1 || nmatch == 2)
 	{
-		rnode.spcNode = GLOBALTABLESPACE_OID;
-		rnode.dbNode = 0;
+		rlocator.spcOid = GLOBALTABLESPACE_OID;
+		rlocator.dbOid = 0;
 		matched = true;
 	}
 	else
 	{
 		nmatch = sscanf(path, "base/%u/%u.%u",
-						&rnode.dbNode, &rnode.relNode, &segNo);
+						&rlocator.dbOid, &rlocator.relNumber, &segNo);
 		if (nmatch == 2 || nmatch == 3)
 		{
-			rnode.spcNode = DEFAULTTABLESPACE_OID;
+			rlocator.spcOid = DEFAULTTABLESPACE_OID;
 			matched = true;
 		}
 		else
 		{
 			nmatch = sscanf(path, "pg_tblspc/%u/" TABLESPACE_VERSION_DIRECTORY "/%u/%u.%u",
-							&rnode.spcNode, &rnode.dbNode, &rnode.relNode,
+							&rlocator.spcOid, &rlocator.dbOid, &rlocator.relNumber,
 							&segNo);
 			if (nmatch == 3 || nmatch == 4)
 				matched = true;
@@ -630,12 +629,12 @@ isRelDataFile(const char *path)
 	/*
 	 * The sscanf tests above can match files that have extra characters at
 	 * the end. To eliminate such cases, cross-check that GetRelationPath
-	 * creates the exact same filename, when passed the RelFileNode
+	 * creates the exact same filename, when passed the RelFileLocator
 	 * information we extracted from the filename.
 	 */
 	if (matched)
 	{
-		char	   *check_path = datasegpath(rnode, MAIN_FORKNUM, segNo);
+		char	   *check_path = datasegpath(rlocator, MAIN_FORKNUM, segNo);
 
 		if (strcmp(check_path, path) != 0)
 			matched = false;
@@ -652,20 +651,19 @@ isRelDataFile(const char *path)
  * The returned path is palloc'd
  */
 static char *
-datasegpath(RelFileNode rnode, ForkNumber forknum, BlockNumber segno)
+datasegpath(RelFileLocator rlocator, ForkNumber forknum, BlockNumber segno)
 {
-	char	   *path;
+	RelPathStr	path;
 	char	   *segpath;
 
-	path = relpathperm(rnode, forknum);
+	path = relpathperm(rlocator, forknum);
 	if (segno > 0)
 	{
-		segpath = psprintf("%s.%u", path, segno);
-		pfree(path);
+		segpath = psprintf("%s.%u", path.str, segno);
 		return segpath;
 	}
 	else
-		return path;
+		return pstrdup(path.str);
 }
 
 /*
@@ -707,7 +705,11 @@ decide_file_action(file_entry_t *entry)
 	 * Don't touch the control file. It is handled specially, after copying
 	 * all the other files.
 	 */
-	if (strcmp(path, "global/pg_control") == 0)
+	if (strcmp(path, XLOG_CONTROL_FILE) == 0)
+		return FILE_ACTION_NONE;
+
+	/* Skip macOS system files */
+	if (strstr(path, ".DS_Store") != NULL)
 		return FILE_ACTION_NONE;
 
 	/*
@@ -887,16 +889,4 @@ decide_file_actions(void)
 		  final_filemap_cmp);
 
 	return filemap;
-}
-
-
-/*
- * Helper function for filemap hash table.
- */
-static uint32
-hash_string_pointer(const char *s)
-{
-	unsigned char *ss = (unsigned char *) s;
-
-	return hash_bytes(ss, strlen(s));
 }

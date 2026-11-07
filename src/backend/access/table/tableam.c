@@ -3,7 +3,7 @@
  * tableam.c
  *		Table access method routines too big to be inline functions.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "access/syncscan.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
@@ -112,22 +113,12 @@ TableScanDesc
 table_beginscan_catalog(Relation relation, int nkeys, struct ScanKeyData *key)
 {
 	uint32		flags = SO_TYPE_SEQSCAN |
-	SO_ALLOW_STRAT | SO_ALLOW_SYNC | SO_ALLOW_PAGEMODE | SO_TEMP_SNAPSHOT;
+		SO_ALLOW_STRAT | SO_ALLOW_SYNC | SO_ALLOW_PAGEMODE | SO_TEMP_SNAPSHOT;
 	Oid			relid = RelationGetRelid(relation);
 	Snapshot	snapshot = RegisterSnapshot(GetCatalogSnapshot(relid));
 
 	return relation->rd_tableam->scan_begin(relation, snapshot, nkeys, key,
 											NULL, flags);
-}
-
-void
-table_scan_update_snapshot(TableScanDesc scan, Snapshot snapshot)
-{
-	Assert(IsMVCCSnapshot(snapshot));
-
-	RegisterSnapshot(snapshot);
-	scan->rs_snapshot = snapshot;
-	scan->rs_flags |= SO_TEMP_SNAPSHOT;
 }
 
 
@@ -172,19 +163,18 @@ table_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan,
 }
 
 TableScanDesc
-table_beginscan_parallel(Relation relation, ParallelTableScanDesc parallel_scan)
+table_beginscan_parallel(Relation relation, ParallelTableScanDesc pscan)
 {
 	Snapshot	snapshot;
 	uint32		flags = SO_TYPE_SEQSCAN |
-	SO_ALLOW_STRAT | SO_ALLOW_SYNC | SO_ALLOW_PAGEMODE;
+		SO_ALLOW_STRAT | SO_ALLOW_SYNC | SO_ALLOW_PAGEMODE;
 
-	Assert(RelationGetRelid(relation) == parallel_scan->phs_relid);
+	Assert(RelFileLocatorEquals(relation->rd_locator, pscan->phs_locator));
 
-	if (!parallel_scan->phs_snapshot_any)
+	if (!pscan->phs_snapshot_any)
 	{
 		/* Snapshot was serialized -- restore it */
-		snapshot = RestoreSnapshot((char *) parallel_scan +
-								   parallel_scan->phs_snapshot_off);
+		snapshot = RestoreSnapshot((char *) pscan + pscan->phs_snapshot_off);
 		RegisterSnapshot(snapshot);
 		flags |= SO_TEMP_SNAPSHOT;
 	}
@@ -195,7 +185,7 @@ table_beginscan_parallel(Relation relation, ParallelTableScanDesc parallel_scan)
 	}
 
 	return relation->rd_tableam->scan_begin(relation, snapshot, 0, NULL,
-											parallel_scan, flags);
+											pscan, flags);
 }
 
 
@@ -346,7 +336,7 @@ void
 simple_table_tuple_update(Relation rel, ItemPointer otid,
 						  TupleTableSlot *slot,
 						  Snapshot snapshot,
-						  bool *update_indexes)
+						  TU_UpdateIndexes *update_indexes)
 {
 	TM_Result	result;
 	TM_FailureData tmfd;
@@ -381,7 +371,6 @@ simple_table_tuple_update(Relation rel, ItemPointer otid,
 			elog(ERROR, "unrecognized table_tuple_update status: %u", result);
 			break;
 	}
-
 }
 
 
@@ -401,7 +390,7 @@ table_block_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 {
 	ParallelBlockTableScanDesc bpscan = (ParallelBlockTableScanDesc) pscan;
 
-	bpscan->base.phs_relid = RelationGetRelid(rel);
+	bpscan->base.phs_locator = rel->rd_locator;
 	bpscan->phs_nblocks = RelationGetNumberOfBlocks(rel);
 	/* compare phs_syncscan initialization to similar logic in initscan */
 	bpscan->base.phs_syncscan = synchronize_seqscans &&
@@ -739,11 +728,21 @@ table_block_relation_estimate_size(Relation rel, int32 *attr_widths,
 		 * and (c) different table AMs might use different padding schemes.
 		 */
 		int32		tuple_width;
+		int			fillfactor;
+
+		/*
+		 * Without reltuples/relpages, we also need to consider fillfactor.
+		 * The other branch considers it implicitly by calculating density
+		 * from actual relpages/reltuples statistics.
+		 */
+		fillfactor = RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR);
 
 		tuple_width = get_rel_data_width(rel, attr_widths);
 		tuple_width += overhead_bytes_per_tuple;
 		/* note: integer division is intentional here */
-		density = usable_bytes_per_page / tuple_width;
+		density = (usable_bytes_per_page * fillfactor / 100) / tuple_width;
+		/* There's at least one row on the page, even with low fillfactor. */
+		density = clamp_row_est(density);
 	}
 	*tuples = rint(density * (double) curpages);
 

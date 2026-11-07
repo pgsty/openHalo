@@ -41,7 +41,7 @@
  *	  - SH_SCOPE - in which scope (e.g. extern, static inline) do function
  *		declarations reside
  *	  - SH_RAW_ALLOCATOR - if defined, memory contexts are not used; instead,
- *	    use this to allocate bytes
+ *	    use this to allocate bytes. The allocator must zero the returned space.
  *	  - SH_USE_NONDEFAULT_ALLOCATOR - if defined no element allocator functions
  *		are defined, so you can supply your own
  *	  The following parameters are only relevant when SH_DEFINE is defined:
@@ -87,7 +87,7 @@
  *	  looking or is done - buckets following a deleted element are shifted
  *	  backwards, unless they're empty or already at their optimal position.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/lib/simplehash.h
@@ -128,7 +128,8 @@
 #define SH_STAT SH_MAKE_NAME(stat)
 
 /* internal helper functions (no externally visible prototypes) */
-#define SH_COMPUTE_PARAMETERS SH_MAKE_NAME(compute_parameters)
+#define SH_COMPUTE_SIZE SH_MAKE_NAME(compute_size)
+#define SH_UPDATE_PARAMETERS SH_MAKE_NAME(update_parameters)
 #define SH_NEXT SH_MAKE_NAME(next)
 #define SH_PREV SH_MAKE_NAME(prev)
 #define SH_DISTANCE_FROM_OPTIMAL SH_MAKE_NAME(distance)
@@ -293,8 +294,7 @@ SH_SCOPE void SH_STAT(SH_TYPE * tb);
 #define SIMPLEHASH_H
 
 #ifdef FRONTEND
-#define sh_error(...) \
-	do { pg_log_fatal(__VA_ARGS__); exit(1); } while(0)
+#define sh_error(...) pg_fatal(__VA_ARGS__)
 #define sh_log(...) pg_log_info(__VA_ARGS__)
 #else
 #define sh_error(...) elog(ERROR, __VA_ARGS__)
@@ -304,11 +304,11 @@ SH_SCOPE void SH_STAT(SH_TYPE * tb);
 #endif
 
 /*
- * Compute sizing parameters for hashtable. Called when creating and growing
- * the hashtable.
+ * Compute allocation size for hashtable. Result can be passed to
+ * SH_UPDATE_PARAMETERS.
  */
-static inline void
-SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint64 newsize)
+static inline uint64
+SH_COMPUTE_SIZE(uint64 newsize)
 {
 	uint64		size;
 
@@ -325,6 +325,18 @@ SH_COMPUTE_PARAMETERS(SH_TYPE * tb, uint64 newsize)
 	 */
 	if (unlikely((((uint64) sizeof(SH_ELEMENT_TYPE)) * size) >= SIZE_MAX / 2))
 		sh_error("hash table too large");
+
+	return size;
+}
+
+/*
+ * Update sizing parameters for hashtable. Called when creating and growing
+ * the hashtable.
+ */
+static inline void
+SH_UPDATE_PARAMETERS(SH_TYPE * tb, uint64 newsize)
+{
+	uint64		size = SH_COMPUTE_SIZE(newsize);
 
 	/* now set size */
 	tb->size = size;
@@ -447,10 +459,11 @@ SH_CREATE(MemoryContext ctx, uint32 nelements, void *private_data)
 	/* increase nelements by fillfactor, want to store nelements elements */
 	size = Min((double) SH_MAX_SIZE, ((double) nelements) / SH_FILLFACTOR);
 
-	SH_COMPUTE_PARAMETERS(tb, size);
+	size = SH_COMPUTE_SIZE(size);
 
-	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
+	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * size);
 
+	SH_UPDATE_PARAMETERS(tb, size);
 	return tb;
 }
 
@@ -491,10 +504,15 @@ SH_GROW(SH_TYPE * tb, uint64 newsize)
 	Assert(oldsize != SH_MAX_SIZE);
 	Assert(oldsize < newsize);
 
-	/* compute parameters for new table */
-	SH_COMPUTE_PARAMETERS(tb, newsize);
+	newsize = SH_COMPUTE_SIZE(newsize);
 
-	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * tb->size);
+	tb->data = (SH_ELEMENT_TYPE *) SH_ALLOCATE(tb, sizeof(SH_ELEMENT_TYPE) * newsize);
+
+	/*
+	 * Update parameters for new table after allocation succeeds to avoid
+	 * inconsistent state on OOM.
+	 */
+	SH_UPDATE_PARAMETERS(tb, newsize);
 
 	newdata = tb->data;
 
@@ -547,13 +565,13 @@ SH_GROW(SH_TYPE * tb, uint64 newsize)
 		if (oldentry->status == SH_STATUS_IN_USE)
 		{
 			uint32		hash;
-			uint32		startelem;
+			uint32		startelem2;
 			uint32		curelem;
 			SH_ELEMENT_TYPE *newentry;
 
 			hash = SH_ENTRY_HASH(tb, oldentry);
-			startelem = SH_INITIAL_BUCKET(tb, hash);
-			curelem = startelem;
+			startelem2 = SH_INITIAL_BUCKET(tb, hash);
+			curelem = startelem2;
 
 			/* find empty element to put data into */
 			while (true)
@@ -565,7 +583,7 @@ SH_GROW(SH_TYPE * tb, uint64 newsize)
 					break;
 				}
 
-				curelem = SH_NEXT(tb, curelem, startelem);
+				curelem = SH_NEXT(tb, curelem, startelem2);
 			}
 
 			/* copy entry to new slot */
@@ -752,9 +770,8 @@ restart:
 }
 
 /*
- * Insert the key key into the hash-table, set *found to true if the key
- * already exists, false otherwise. Returns the hash-table entry in either
- * case.
+ * Insert the key into the hash-table, set *found to true if the key already
+ * exists, false otherwise. Returns the hash-table entry in either case.
  */
 SH_SCOPE	SH_ELEMENT_TYPE *
 SH_INSERT(SH_TYPE * tb, SH_KEY_TYPE key, bool *found)
@@ -765,9 +782,9 @@ SH_INSERT(SH_TYPE * tb, SH_KEY_TYPE key, bool *found)
 }
 
 /*
- * Insert the key key into the hash-table using an already-calculated
- * hash. Set *found to true if the key already exists, false
- * otherwise. Returns the hash-table entry in either case.
+ * Insert the key into the hash-table using an already-calculated hash. Set
+ * *found to true if the key already exists, false otherwise. Returns the
+ * hash-table entry in either case.
  */
 SH_SCOPE	SH_ELEMENT_TYPE *
 SH_INSERT_HASH(SH_TYPE * tb, SH_KEY_TYPE key, uint32 hash, bool *found)
@@ -811,7 +828,7 @@ SH_LOOKUP_HASH_INTERNAL(SH_TYPE * tb, SH_KEY_TYPE key, uint32 hash)
 }
 
 /*
- * Lookup up entry in hash table.  Returns NULL if key not present.
+ * Lookup entry in hash table.  Returns NULL if key not present.
  */
 SH_SCOPE	SH_ELEMENT_TYPE *
 SH_LOOKUP(SH_TYPE * tb, SH_KEY_TYPE key)
@@ -822,7 +839,7 @@ SH_LOOKUP(SH_TYPE * tb, SH_KEY_TYPE key)
 }
 
 /*
- * Lookup up entry in hash table using an already-calculated hash.
+ * Lookup entry in hash table using an already-calculated hash.
  *
  * Returns NULL if key not present.
  */
@@ -1027,6 +1044,10 @@ SH_START_ITERATE_AT(SH_TYPE * tb, SH_ITERATOR * iter, uint32 at)
 SH_SCOPE	SH_ELEMENT_TYPE *
 SH_ITERATE(SH_TYPE * tb, SH_ITERATOR * iter)
 {
+	/* validate sanity of the given iterator */
+	Assert(iter->cur < tb->size);
+	Assert(iter->end < tb->size);
+
 	while (!iter->done)
 	{
 		SH_ELEMENT_TYPE *elem;
@@ -1118,7 +1139,7 @@ SH_STAT(SH_TYPE * tb)
 		avg_collisions = 0;
 	}
 
-	sh_log("size: " UINT64_FORMAT ", members: %u, filled: %f, total chain: %u, max chain: %u, avg chain: %f, total_collisions: %u, max_collisions: %i, avg_collisions: %f",
+	sh_log("size: " UINT64_FORMAT ", members: %u, filled: %f, total chain: %u, max chain: %u, avg chain: %f, total_collisions: %u, max_collisions: %u, avg_collisions: %f",
 		   tb->size, tb->members, fillfactor, total_chain_length, max_chain_length, avg_chain_length,
 		   total_collisions, max_collisions, avg_collisions);
 }
@@ -1177,7 +1198,8 @@ SH_STAT(SH_TYPE * tb)
 #undef SH_STAT
 
 /* internal function names */
-#undef SH_COMPUTE_PARAMETERS
+#undef SH_COMPUTE_SIZE
+#undef SH_UPDATE_PARAMETERS
 #undef SH_COMPARE_KEYS
 #undef SH_INITIAL_BUCKET
 #undef SH_NEXT

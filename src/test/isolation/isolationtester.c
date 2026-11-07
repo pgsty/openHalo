@@ -7,10 +7,8 @@
 
 #include "postgres_fe.h"
 
-#include <sys/time.h>
-#ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
-#endif
+#include <sys/time.h>
 
 #include "datatype/timestamp.h"
 #include "isolationtester.h"
@@ -46,7 +44,7 @@ static int	nconns = 0;
 static bool any_new_notice = false;
 
 /* Maximum time to wait before giving up on a step (in usec) */
-static int64 max_step_wait = 300 * USECS_PER_SEC;
+static int64 max_step_wait = 360 * USECS_PER_SEC;
 
 
 static void check_testspec(TestSpec *testspec);
@@ -101,7 +99,7 @@ main(int argc, char **argv)
 		switch (opt)
 		{
 			case 'V':
-				puts("isolationtester (Halo) " PG_VERSION_PREFIX PG_VERSION);
+				puts("isolationtester (PostgreSQL) " PG_VERSION);
 				exit(0);
 			default:
 				fprintf(stderr, "Usage: isolationtester [CONNINFO]\n");
@@ -128,12 +126,12 @@ main(int argc, char **argv)
 		conninfo = "dbname = postgres";
 
 	/*
-	 * If PGISOLATIONTIMEOUT is set in the environment, adopt its value (given
-	 * in seconds) as the max time to wait for any one step to complete.
+	 * If PG_TEST_TIMEOUT_DEFAULT is set, adopt its value (given in seconds)
+	 * as half the max time to wait for any one step to complete.
 	 */
-	env_wait = getenv("PGISOLATIONTIMEOUT");
+	env_wait = getenv("PG_TEST_TIMEOUT_DEFAULT");
 	if (env_wait != NULL)
-		max_step_wait = ((int64) atoi(env_wait)) * USECS_PER_SEC;
+		max_step_wait = 2 * ((int64) atoi(env_wait)) * USECS_PER_SEC;
 
 	/* Read the test spec from stdin */
 	spec_yyparse();
@@ -180,7 +178,7 @@ main(int argc, char **argv)
 		if (i != 0)
 			PQsetNoticeProcessor(conns[i].conn,
 								 isotesterNoticeProcessor,
-								 (void *) &conns[i]);
+								 &conns[i]);
 		else
 			PQsetNoticeProcessor(conns[i].conn,
 								 blackholeNoticeProcessor,
@@ -873,7 +871,7 @@ try_complete_step(TestSpec *testspec, PermutationStep *pstep, int flags)
 		{
 			if (errno == EINTR)
 				continue;
-			fprintf(stderr, "select failed: %s\n", strerror(errno));
+			fprintf(stderr, "select failed: %m\n");
 			exit(1);
 		}
 		else if (ret == 0)		/* select() timeout: check for lock wait */
@@ -948,26 +946,21 @@ try_complete_step(TestSpec *testspec, PermutationStep *pstep, int flags)
 			 */
 			if (td > max_step_wait && !canceled)
 			{
-				PGcancel   *cancel = PQgetCancel(conn);
+				PGcancelConn *cancel_conn = PQcancelCreate(conn);
 
-				if (cancel != NULL)
+				if (PQcancelBlocking(cancel_conn))
 				{
-					char		buf[256];
-
-					if (PQcancel(cancel, buf, sizeof(buf)))
-					{
-						/*
-						 * print to stdout not stderr, as this should appear
-						 * in the test case's results
-						 */
-						printf("isolationtester: canceling step %s after %d seconds\n",
-							   step->name, (int) (td / USECS_PER_SEC));
-						canceled = true;
-					}
-					else
-						fprintf(stderr, "PQcancel failed: %s\n", buf);
-					PQfreeCancel(cancel);
+					/*
+					 * print to stdout not stderr, as this should appear in
+					 * the test case's results
+					 */
+					printf("isolationtester: canceling step %s after %d seconds\n",
+						   step->name, (int) (td / USECS_PER_SEC));
+					canceled = true;
 				}
+				else
+					fprintf(stderr, "PQcancel failed: %s\n", PQcancelErrorMessage(cancel_conn));
+				PQcancelFinish(cancel_conn);
 			}
 
 			/*

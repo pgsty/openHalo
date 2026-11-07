@@ -3,7 +3,7 @@
  * blcost.c
  *		Cost estimate function for bloom indexes.
  *
- * Copyright (c) 2016-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blcost.c
@@ -13,7 +13,6 @@
 #include "postgres.h"
 
 #include "bloom.h"
-#include "fmgr.h"
 #include "utils/selfuncs.h"
 
 /*
@@ -26,9 +25,7 @@ blcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			   double *indexPages)
 {
 	IndexOptInfo *index = path->indexinfo;
-	GenericCosts costs;
-
-	MemSet(&costs, 0, sizeof(costs));
+	GenericCosts costs = {0};
 
 	/* We have to visit all index tuples anyway */
 	costs.numIndexTuples = index->tuples;

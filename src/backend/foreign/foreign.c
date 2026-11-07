@@ -3,7 +3,7 @@
  * foreign.c
  *		  support for foreign-data wrappers, servers and user mappings.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/foreign/foreign.c
@@ -20,19 +20,15 @@
 #include "catalog/pg_user_mapping.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
-#include "lib/stringinfo.h"
+#include "funcapi.h"
 #include "miscadmin.h"
+#include "optimizer/paths.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
-#include "utils/fmgroids.h"
-#include "access/relscan.h"
-#include "access/tableam.h"
-#include "access/table.h"
-#include "access/heapam.h"
+#include "utils/varlena.h"
 
 
 /*
@@ -222,10 +218,14 @@ GetUserMapping(Oid userid, Oid serverid)
 	}
 
 	if (!HeapTupleIsValid(tp))
+	{
+		ForeignServer *server = GetForeignServer(serverid);
+
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("user mapping not found for \"%s\"",
-						MappingUserName(userid))));
+				 errmsg("user mapping not found for user \"%s\", server \"%s\"",
+						MappingUserName(userid), server->servername)));
+	}
 
 	um = (UserMapping *) palloc(sizeof(UserMapping));
 	um->umid = ((Form_pg_user_mapping) GETSTRUCT(tp))->oid;
@@ -515,46 +515,29 @@ IsImportableForeignTable(const char *tablename,
 
 
 /*
- * deflist_to_tuplestore - Helper function to convert DefElem list to
- * tuplestore usable in SRF.
+ * pg_options_to_table - Convert options array to name/value table
+ *
+ * This is useful to provide details for information_schema and pg_dump.
  */
-static void
-deflist_to_tuplestore(ReturnSetInfo *rsinfo, List *options)
+Datum
+pg_options_to_table(PG_FUNCTION_ARGS)
 {
+	Datum		array = PG_GETARG_DATUM(0);
 	ListCell   *cell;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore;
-	Datum		values[2];
-	bool		nulls[2];
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
+	List	   *options;
+	ReturnSetInfo *rsinfo;
 
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize) ||
-		rsinfo->expectedDesc == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
+	options = untransformRelOptions(array);
+	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	/*
-	 * Now prepare the result set.
-	 */
-	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
+	/* prepare the result set */
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 
 	foreach(cell, options)
 	{
 		DefElem    *def = lfirst(cell);
+		Datum		values[2];
+		bool		nulls[2];
 
 		values[0] = CStringGetTextDatum(def->defname);
 		nulls[0] = false;
@@ -568,27 +551,9 @@ deflist_to_tuplestore(ReturnSetInfo *rsinfo, List *options)
 			values[1] = (Datum) 0;
 			nulls[1] = true;
 		}
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
 	}
-
-	/* clean up and return the tuplestore */
-	tuplestore_donestoring(tupstore);
-
-	MemoryContextSwitchTo(oldcontext);
-}
-
-
-/*
- * Convert options array to name/value table.  Useful for information
- * schema and pg_dump.
- */
-Datum
-pg_options_to_table(PG_FUNCTION_ARGS)
-{
-	Datum		array = PG_GETARG_DATUM(0);
-
-	deflist_to_tuplestore((ReturnSetInfo *) fcinfo->resultinfo,
-						  untransformRelOptions(array));
 
 	return (Datum) 0;
 }
@@ -623,6 +588,7 @@ static const struct ConnectionOption libpq_conninfo_options[] = {
 	{"requiressl", ForeignServerRelationId},
 	{"sslmode", ForeignServerRelationId},
 	{"gsslib", ForeignServerRelationId},
+	{"gssdelegation", ForeignServerRelationId},
 	{NULL, InvalidOid}
 };
 
@@ -671,23 +637,32 @@ postgresql_fdw_validator(PG_FUNCTION_ARGS)
 		if (!is_conninfo_option(def->defname, catalog))
 		{
 			const struct ConnectionOption *opt;
-			StringInfoData buf;
+			const char *closest_match;
+			ClosestMatchState match_state;
+			bool		has_valid_options = false;
 
 			/*
 			 * Unknown option specified, complain about it. Provide a hint
-			 * with list of valid options for the object.
+			 * with a valid option that looks similar, if there is one.
 			 */
-			initStringInfo(&buf);
+			initClosestMatch(&match_state, def->defname, 4);
 			for (opt = libpq_conninfo_options; opt->optname; opt++)
+			{
 				if (catalog == opt->optcontext)
-					appendStringInfo(&buf, "%s%s", (buf.len > 0) ? ", " : "",
-									 opt->optname);
+				{
+					has_valid_options = true;
+					updateClosestMatch(&match_state, opt->optname);
+				}
+			}
 
+			closest_match = getClosestMatch(&match_state);
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("invalid option \"%s\"", def->defname),
-					 errhint("Valid options in this context are: %s",
-							 buf.data)));
+					 has_valid_options ? closest_match ?
+					 errhint("Perhaps you meant the option \"%s\".",
+							 closest_match) : 0 :
+					 errhint("There are no valid options in this context.")));
 
 			PG_RETURN_BOOL(false);
 		}
@@ -834,7 +809,24 @@ GetExistingLocalJoinPath(RelOptInfo *joinrel)
 
 			foreign_path = (ForeignPath *) joinpath->outerjoinpath;
 			if (IS_JOIN_REL(foreign_path->path.parent))
+			{
 				joinpath->outerjoinpath = foreign_path->fdw_outerpath;
+
+				if (joinpath->path.pathtype == T_MergeJoin)
+				{
+					MergePath  *merge_path = (MergePath *) joinpath;
+
+					/*
+					 * If the new outer path is already well enough ordered
+					 * for the mergejoin, we can skip doing an explicit sort.
+					 */
+					if (merge_path->outersortkeys &&
+						pathkeys_count_contained_in(merge_path->outersortkeys,
+													joinpath->outerjoinpath->pathkeys,
+													&merge_path->outer_presorted_keys))
+						merge_path->outersortkeys = NIL;
+				}
+			}
 		}
 
 		if (IsA(joinpath->innerjoinpath, ForeignPath))
@@ -843,7 +835,23 @@ GetExistingLocalJoinPath(RelOptInfo *joinrel)
 
 			foreign_path = (ForeignPath *) joinpath->innerjoinpath;
 			if (IS_JOIN_REL(foreign_path->path.parent))
+			{
 				joinpath->innerjoinpath = foreign_path->fdw_outerpath;
+
+				if (joinpath->path.pathtype == T_MergeJoin)
+				{
+					MergePath  *merge_path = (MergePath *) joinpath;
+
+					/*
+					 * If the new inner path is already well enough ordered
+					 * for the mergejoin, we can skip doing an explicit sort.
+					 */
+					if (merge_path->innersortkeys &&
+						pathkeys_contained_in(merge_path->innersortkeys,
+											  joinpath->innerjoinpath->pathkeys))
+						merge_path->innersortkeys = NIL;
+				}
+			}
 		}
 
 		return (Path *) joinpath;

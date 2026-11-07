@@ -3,7 +3,7 @@
  *
  *	tablespace functions
  *
- *	Copyright (c) 2010-2021, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/tablespace.c
  */
 
@@ -26,7 +26,7 @@ init_tablespaces(void)
 	if (os_info.num_old_tablespaces > 0 &&
 		strcmp(old_cluster.tablespace_suffix, new_cluster.tablespace_suffix) == 0)
 		pg_fatal("Cannot upgrade to/from the same system catalog version when\n"
-				 "using tablespaces.\n");
+				 "using tablespaces.");
 }
 
 
@@ -46,13 +46,10 @@ get_tablespace_paths(void)
 	char		query[QUERY_ALLOC];
 
 	snprintf(query, sizeof(query),
-			 "SELECT	%s "
+			 "SELECT pg_catalog.pg_tablespace_location(oid) AS spclocation "
 			 "FROM	pg_catalog.pg_tablespace "
 			 "WHERE	spcname != 'pg_default' AND "
-			 "		spcname != 'pg_global'",
-	/* 9.2 removed the spclocation column */
-			 (GET_MAJOR_VERSION(old_cluster.major_version) <= 901) ?
-			 "spclocation" : "pg_catalog.pg_tablespace_location(oid) AS spclocation");
+			 "		spcname != 'pg_global'");
 
 	res = executeQueryOrDie(conn, "%s", query);
 
@@ -83,16 +80,16 @@ get_tablespace_paths(void)
 		{
 			if (errno == ENOENT)
 				report_status(PG_FATAL,
-							  "tablespace directory \"%s\" does not exist\n",
+							  "tablespace directory \"%s\" does not exist",
 							  os_info.old_tablespaces[tblnum]);
 			else
 				report_status(PG_FATAL,
-							  "could not stat tablespace directory \"%s\": %s\n",
-							  os_info.old_tablespaces[tblnum], strerror(errno));
+							  "could not stat tablespace directory \"%s\": %m",
+							  os_info.old_tablespaces[tblnum]);
 		}
 		if (!S_ISDIR(statBuf.st_mode))
 			report_status(PG_FATAL,
-						  "tablespace path \"%s\" is not a directory\n",
+						  "tablespace path \"%s\" is not a directory",
 						  os_info.old_tablespaces[tblnum]);
 	}
 
@@ -105,15 +102,10 @@ get_tablespace_paths(void)
 static void
 set_tablespace_directory_suffix(ClusterInfo *cluster)
 {
-	if (GET_MAJOR_VERSION(cluster->major_version) <= 804)
-		cluster->tablespace_suffix = pg_strdup("");
-	else
-	{
-		/* This cluster has a version-specific subdirectory */
+	/* This cluster has a version-specific subdirectory */
 
-		/* The leading slash is needed to start a new directory. */
-		cluster->tablespace_suffix = psprintf("/PG_%s_%d",
-											  cluster->major_version_str,
-											  cluster->controldata.cat_ver);
-	}
+	/* The leading slash is needed to start a new directory. */
+	cluster->tablespace_suffix = psprintf("/PG_%s_%d",
+										  cluster->major_version_str,
+										  cluster->controldata.cat_ver);
 }

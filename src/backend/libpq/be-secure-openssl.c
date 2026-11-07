@@ -4,7 +4,7 @@
  *	  functions for OpenSSL support in the backend.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,55 +24,71 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#endif
 
-#include <openssl/ssl.h>
-#include <openssl/dh.h>
-#include <openssl/conf.h>
-#ifndef OPENSSL_NO_ECDH
-#include <openssl/ec.h>
-#endif
-
-#include "common/openssl.h"
+#include "common/string.h"
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/latch.h"
-#include "tcop/tcopprot.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
+
+/*
+ * These SSL-related #includes must come after all system-provided headers.
+ * This ensures that OpenSSL can take care of conflicts with Windows'
+ * <wincrypt.h> by #undef'ing the conflicting macros.  (We don't directly
+ * include <wincrypt.h>, but some other Windows headers do.)
+ */
+#include "common/openssl.h"
+#include <openssl/bn.h>
+#include <openssl/conf.h>
+#include <openssl/dh.h>
+#ifndef OPENSSL_NO_ECDH
+#include <openssl/ec.h>
+#endif
+#include <openssl/x509v3.h>
+
 
 /* default init hook can be overridden by a shared library */
 static void default_openssl_tls_init(SSL_CTX *context, bool isServerStart);
 openssl_tls_init_hook_typ openssl_tls_init_hook = default_openssl_tls_init;
 
-static int	my_sock_read(BIO *h, char *buf, int size);
-static int	my_sock_write(BIO *h, const char *buf, int size);
-static BIO_METHOD *my_BIO_s_socket(void);
-static int	my_SSL_set_fd(Port *port, int fd);
+static int	port_bio_read(BIO *h, char *buf, int size);
+static int	port_bio_write(BIO *h, const char *buf, int size);
+static BIO_METHOD *port_bio_method(void);
+static int	ssl_set_port_bio(Port *port);
 
 static DH  *load_dh_file(char *filename, bool isServerStart);
-static DH  *load_dh_buffer(const char *, size_t);
+static DH  *load_dh_buffer(const char *buffer, size_t len);
 static int	ssl_external_passwd_cb(char *buf, int size, int rwflag, void *userdata);
 static int	dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata);
-static int	verify_cb(int, X509_STORE_CTX *);
+static int	verify_cb(int ok, X509_STORE_CTX *ctx);
 static void info_cb(const SSL *ssl, int type, int args);
+static int	alpn_cb(SSL *ssl,
+					const unsigned char **out,
+					unsigned char *outlen,
+					const unsigned char *in,
+					unsigned int inlen,
+					void *userdata);
 static bool initialize_dh(SSL_CTX *context, bool isServerStart);
 static bool initialize_ecdh(SSL_CTX *context, bool isServerStart);
+static const char *SSLerrmessageExt(unsigned long ecode, const char *replacement);
 static const char *SSLerrmessage(unsigned long ecode);
 
-static char *X509_NAME_to_cstring(X509_NAME *name);
+static char *X509_NAME_to_cstring(const X509_NAME *name);
 
 static SSL_CTX *SSL_context = NULL;
-static bool SSL_initialized = false;
 static bool dummy_ssl_passwd_cb_called = false;
 static bool ssl_is_server_start;
 
 static int	ssl_protocol_version_to_openssl(int v);
 static const char *ssl_protocol_version_to_string(int v);
+
+/* for passing data back from verify_cb() */
+static const char *cert_errdetail;
 
 /* ------------------------------------------------------------ */
 /*						 Public interface						*/
@@ -84,19 +100,6 @@ be_tls_init(bool isServerStart)
 	SSL_CTX    *context;
 	int			ssl_ver_min = -1;
 	int			ssl_ver_max = -1;
-
-	/* This stuff need be done only once. */
-	if (!SSL_initialized)
-	{
-#ifdef HAVE_OPENSSL_INIT_SSL
-		OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
-#else
-		OPENSSL_config(NULL);
-		SSL_library_init();
-		SSL_load_error_strings();
-#endif
-		SSL_initialized = true;
-	}
 
 	/*
 	 * Create a new SSL context into which we'll load all the configuration
@@ -234,7 +237,8 @@ be_tls_init(bool isServerStart)
 		if (ssl_ver_min > ssl_ver_max)
 		{
 			ereport(isServerStart ? FATAL : LOG,
-					(errmsg("could not set SSL protocol version range"),
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not set SSL protocol version range"),
 					 errdetail("\"%s\" cannot be higher than \"%s\"",
 							   "ssl_min_protocol_version",
 							   "ssl_max_protocol_version")));
@@ -247,7 +251,7 @@ be_tls_init(bool isServerStart)
 	 * tickets for TLSv1.3, and stateless ticket for TLSv1.2. SSL_OP_NO_TICKET
 	 * is available since 0.9.8f but only turns off stateless tickets. In
 	 * order to turn off stateful tickets we need SSL_CTX_set_num_tickets,
-	 * which is available since OpenSSL 1.1.1. LibreSSL 3.5.4 (from OpenBSD
+	 * which is available since OpenSSL 1.1.1.  LibreSSL 3.5.4 (from OpenBSD
 	 * 7.1) introduced this API for compatibility, but doesn't support session
 	 * tickets at all so it's a no-op there.
 	 */
@@ -262,14 +266,19 @@ be_tls_init(bool isServerStart)
 	/* disallow SSL compression */
 	SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
 
-#ifdef SSL_OP_NO_RENEGOTIATION
-
 	/*
-	 * Disallow SSL renegotiation, option available since 1.1.0h.  This
-	 * concerns only TLSv1.2 and older protocol versions, as TLSv1.3 has no
-	 * support for renegotiation.
+	 * Disallow SSL renegotiation.  This concerns only TLSv1.2 and older
+	 * protocol versions, as TLSv1.3 has no support for renegotiation.
+	 * SSL_OP_NO_RENEGOTIATION is available in OpenSSL since 1.1.0h (via a
+	 * backport from 1.1.1). SSL_OP_NO_CLIENT_RENEGOTIATION is available in
+	 * LibreSSL since 2.5.1 disallowing all client-initiated renegotiation
+	 * (this is usually on by default).
 	 */
+#ifdef SSL_OP_NO_RENEGOTIATION
 	SSL_CTX_set_options(context, SSL_OP_NO_RENEGOTIATION);
+#endif
+#ifdef SSL_OP_NO_CLIENT_RENEGOTIATION
+	SSL_CTX_set_options(context, SSL_OP_NO_CLIENT_RENEGOTIATION);
 #endif
 
 	/* set up ephemeral DH and ECDH keys */
@@ -278,13 +287,29 @@ be_tls_init(bool isServerStart)
 	if (!initialize_ecdh(context, isServerStart))
 		goto error;
 
-	/* set up the allowed cipher list */
-	if (SSL_CTX_set_cipher_list(context, SSLCipherSuites) != 1)
+	/* set up the allowed cipher list for TLSv1.2 and below */
+	if (SSL_CTX_set_cipher_list(context, SSLCipherList) != 1)
 	{
 		ereport(isServerStart ? FATAL : LOG,
 				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("could not set the cipher list (no valid ciphers available)")));
+				 errmsg("could not set the TLSv1.2 cipher list (no valid ciphers available)")));
 		goto error;
+	}
+
+	/*
+	 * Set up the allowed cipher suites for TLSv1.3. If the GUC is an empty
+	 * string we leave the allowed suites to be the OpenSSL default value.
+	 */
+	if (SSLCipherSuites[0])
+	{
+		/* set up the allowed cipher suites */
+		if (SSL_CTX_set_ciphersuites(context, SSLCipherSuites) != 1)
+		{
+			ereport(isServerStart ? FATAL : LOG,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("could not set the TLSv1.3 cipher suites (no valid ciphers available)")));
+			goto error;
+		}
 	}
 
 	/* Let server choose order */
@@ -433,6 +458,9 @@ be_tls_open_server(Port *port)
 	/* set up debugging/info callback */
 	SSL_CTX_set_info_callback(SSL_context, info_cb);
 
+	/* enable ALPN */
+	SSL_CTX_set_alpn_select_cb(SSL_context, alpn_cb, port);
+
 	if (!(port->ssl = SSL_new(SSL_context)))
 	{
 		ereport(COMMERROR,
@@ -441,7 +469,7 @@ be_tls_open_server(Port *port)
 						SSLerrmessage(ERR_get_error()))));
 		return -1;
 	}
-	if (!my_SSL_set_fd(port, port->sock))
+	if (!ssl_set_port_bio(port))
 	{
 		ereport(COMMERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -494,7 +522,7 @@ aloop:
 				else
 					waitfor = WL_SOCKET_WRITEABLE | WL_EXIT_ON_PM_DEATH;
 
-				(void) WaitLatchOrSocket(MyLatch, waitfor, port->sock, 0,
+				(void) WaitLatchOrSocket(NULL, waitfor, port->sock, 0,
 										 WAIT_EVENT_SSL_OPEN_SERVER);
 				goto aloop;
 			case SSL_ERROR_SYSCALL:
@@ -534,6 +562,8 @@ aloop:
 					case SSL_R_TLSV1_ALERT_PROTOCOL_VERSION:
 #ifdef SSL_R_VERSION_TOO_HIGH
 					case SSL_R_VERSION_TOO_HIGH:
+#endif
+#ifdef SSL_R_VERSION_TOO_LOW
 					case SSL_R_VERSION_TOO_LOW:
 #endif
 						give_proto_hint = true;
@@ -546,6 +576,7 @@ aloop:
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),
 						 errmsg("could not accept SSL connection: %s",
 								SSLerrmessage(ecode)),
+						 cert_errdetail ? errdetail_internal("%s", cert_errdetail) : 0,
 						 give_proto_hint ?
 						 errhint("This may indicate that the client does not support any SSL protocol version between %s and %s.",
 								 ssl_min_protocol_version ?
@@ -554,6 +585,7 @@ aloop:
 								 ssl_max_protocol_version ?
 								 ssl_protocol_version_to_string(ssl_max_protocol_version) :
 								 MAX_OPENSSL_TLS_VERSION) : 0));
+				cert_errdetail = NULL;
 				break;
 			case SSL_ERROR_ZERO_RETURN:
 				ereport(COMMERROR,
@@ -570,6 +602,32 @@ aloop:
 		return -1;
 	}
 
+	/* Get the protocol selected by ALPN */
+	port->alpn_used = false;
+	{
+		const unsigned char *selected;
+		unsigned int len;
+
+		SSL_get0_alpn_selected(port->ssl, &selected, &len);
+
+		/* If ALPN is used, check that we negotiated the expected protocol */
+		if (selected != NULL)
+		{
+			if (len == strlen(PG_ALPN_PROTOCOL) &&
+				memcmp(selected, PG_ALPN_PROTOCOL, strlen(PG_ALPN_PROTOCOL)) == 0)
+			{
+				port->alpn_used = true;
+			}
+			else
+			{
+				/* shouldn't happen */
+				ereport(COMMERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("received SSL connection request with unexpected ALPN protocol")));
+			}
+		}
+	}
+
 	/* Get client certificate, if available. */
 	port->peer = SSL_get_peer_certificate(port->ssl);
 
@@ -580,18 +638,18 @@ aloop:
 	if (port->peer != NULL)
 	{
 		int			len;
-		X509_NAME  *x509name = X509_get_subject_name(port->peer);
+		const X509_NAME *x509name = X509_get_subject_name(port->peer);
 		char	   *peer_dn;
 		BIO		   *bio = NULL;
 		BUF_MEM    *bio_buf = NULL;
 
-		len = X509_NAME_get_text_by_NID(x509name, NID_commonName, NULL, 0);
+		len = X509_NAME_get_text_by_NID(unconstify(X509_NAME *, x509name), NID_commonName, NULL, 0);
 		if (len != -1)
 		{
 			char	   *peer_cn;
 
 			peer_cn = MemoryContextAlloc(TopMemoryContext, len + 1);
-			r = X509_NAME_get_text_by_NID(x509name, NID_commonName, peer_cn,
+			r = X509_NAME_get_text_by_NID(unconstify(X509_NAME *, x509name), NID_commonName, peer_cn,
 										  len + 1);
 			peer_cn[len] = '\0';
 			if (r != len)
@@ -620,8 +678,11 @@ aloop:
 		bio = BIO_new(BIO_s_mem());
 		if (!bio)
 		{
-			pfree(port->peer_cn);
-			port->peer_cn = NULL;
+			if (port->peer_cn != NULL)
+			{
+				pfree(port->peer_cn);
+				port->peer_cn = NULL;
+			}
 			return -1;
 		}
 
@@ -632,12 +693,15 @@ aloop:
 		 * which make regular expression matching a bit easier. Also note that
 		 * it prints the Subject fields in reverse order.
 		 */
-		X509_NAME_print_ex(bio, x509name, 0, XN_FLAG_RFC2253);
-		if (BIO_get_mem_ptr(bio, &bio_buf) <= 0)
+		if (X509_NAME_print_ex(bio, x509name, 0, XN_FLAG_RFC2253) == -1 ||
+			BIO_get_mem_ptr(bio, &bio_buf) <= 0)
 		{
 			BIO_free(bio);
-			pfree(port->peer_cn);
-			port->peer_cn = NULL;
+			if (port->peer_cn != NULL)
+			{
+				pfree(port->peer_cn);
+				port->peer_cn = NULL;
+			}
 			return -1;
 		}
 		peer_dn = MemoryContextAlloc(TopMemoryContext, bio_buf->length + 1);
@@ -651,8 +715,11 @@ aloop:
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
 					 errmsg("SSL certificate's distinguished name contains embedded null")));
 			pfree(peer_dn);
-			pfree(port->peer_cn);
-			port->peer_cn = NULL;
+			if (port->peer_cn != NULL)
+			{
+				pfree(port->peer_cn);
+				port->peer_cn = NULL;
+			}
 			return -1;
 		}
 
@@ -754,7 +821,7 @@ be_tls_read(Port *port, void *ptr, size_t len, int *waitfor)
 }
 
 ssize_t
-be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
+be_tls_write(Port *port, const void *ptr, size_t len, int *waitfor)
 {
 	ssize_t		n;
 	int			err;
@@ -837,21 +904,21 @@ be_tls_write(Port *port, void *ptr, size_t len, int *waitfor)
  *
  * These functions are closely modelled on the standard socket BIO in OpenSSL;
  * see sock_read() and sock_write() in OpenSSL's crypto/bio/bss_sock.c.
- * XXX OpenSSL 1.0.1e considers many more errcodes than just EINTR as reasons
- * to retry; do we need to adopt their logic for that?
  */
 
-static BIO_METHOD *my_bio_methods = NULL;
+static BIO_METHOD *port_bio_method_ptr = NULL;
 
 static int
-my_sock_read(BIO *h, char *buf, int size)
+port_bio_read(BIO *h, char *buf, int size)
 {
 	int			res = 0;
+	Port	   *port = (Port *) BIO_get_data(h);
 
 	if (buf != NULL)
 	{
-		res = secure_raw_read(((Port *) BIO_get_app_data(h)), buf, size);
+		res = secure_raw_read(port, buf, size);
 		BIO_clear_retry_flags(h);
+		port->last_read_was_eof = res == 0;
 		if (res <= 0)
 		{
 			/* If we were interrupted, tell caller to retry */
@@ -866,11 +933,11 @@ my_sock_read(BIO *h, char *buf, int size)
 }
 
 static int
-my_sock_write(BIO *h, const char *buf, int size)
+port_bio_write(BIO *h, const char *buf, int size)
 {
 	int			res = 0;
 
-	res = secure_raw_write(((Port *) BIO_get_app_data(h)), buf, size);
+	res = secure_raw_write(((Port *) BIO_get_data(h)), buf, size);
 	BIO_clear_retry_flags(h);
 	if (res <= 0)
 	{
@@ -884,75 +951,81 @@ my_sock_write(BIO *h, const char *buf, int size)
 	return res;
 }
 
-static BIO_METHOD *
-my_BIO_s_socket(void)
+static long
+port_bio_ctrl(BIO *h, int cmd, long num, void *ptr)
 {
-	if (!my_bio_methods)
+	long		res;
+	Port	   *port = (Port *) BIO_get_data(h);
+
+	switch (cmd)
 	{
-		BIO_METHOD *biom = (BIO_METHOD *) BIO_s_socket();
-#ifdef HAVE_BIO_METH_NEW
+		case BIO_CTRL_EOF:
+
+			/*
+			 * This should not be needed. port_bio_read already has a way to
+			 * signal EOF to OpenSSL. However, OpenSSL made an undocumented,
+			 * backwards-incompatible change and now expects EOF via BIO_ctrl.
+			 * See https://github.com/openssl/openssl/issues/8208
+			 */
+			res = port->last_read_was_eof;
+			break;
+		case BIO_CTRL_FLUSH:
+			/* libssl expects all BIOs to support BIO_flush. */
+			res = 1;
+			break;
+		default:
+			res = 0;
+			break;
+	}
+
+	return res;
+}
+
+static BIO_METHOD *
+port_bio_method(void)
+{
+	if (!port_bio_method_ptr)
+	{
 		int			my_bio_index;
 
 		my_bio_index = BIO_get_new_index();
 		if (my_bio_index == -1)
 			return NULL;
-		my_bio_index |= (BIO_TYPE_DESCRIPTOR | BIO_TYPE_SOURCE_SINK);
-		my_bio_methods = BIO_meth_new(my_bio_index, "PostgreSQL backend socket");
-		if (!my_bio_methods)
+		my_bio_index |= BIO_TYPE_SOURCE_SINK;
+		port_bio_method_ptr = BIO_meth_new(my_bio_index, "PostgreSQL backend socket");
+		if (!port_bio_method_ptr)
 			return NULL;
-		if (!BIO_meth_set_write(my_bio_methods, my_sock_write) ||
-			!BIO_meth_set_read(my_bio_methods, my_sock_read) ||
-			!BIO_meth_set_gets(my_bio_methods, BIO_meth_get_gets(biom)) ||
-			!BIO_meth_set_puts(my_bio_methods, BIO_meth_get_puts(biom)) ||
-			!BIO_meth_set_ctrl(my_bio_methods, BIO_meth_get_ctrl(biom)) ||
-			!BIO_meth_set_create(my_bio_methods, BIO_meth_get_create(biom)) ||
-			!BIO_meth_set_destroy(my_bio_methods, BIO_meth_get_destroy(biom)) ||
-			!BIO_meth_set_callback_ctrl(my_bio_methods, BIO_meth_get_callback_ctrl(biom)))
+		if (!BIO_meth_set_write(port_bio_method_ptr, port_bio_write) ||
+			!BIO_meth_set_read(port_bio_method_ptr, port_bio_read) ||
+			!BIO_meth_set_ctrl(port_bio_method_ptr, port_bio_ctrl))
 		{
-			BIO_meth_free(my_bio_methods);
-			my_bio_methods = NULL;
+			BIO_meth_free(port_bio_method_ptr);
+			port_bio_method_ptr = NULL;
 			return NULL;
 		}
-#else
-		my_bio_methods = malloc(sizeof(BIO_METHOD));
-		if (!my_bio_methods)
-			return NULL;
-		memcpy(my_bio_methods, biom, sizeof(BIO_METHOD));
-		my_bio_methods->bread = my_sock_read;
-		my_bio_methods->bwrite = my_sock_write;
-#endif
 	}
-	return my_bio_methods;
+	return port_bio_method_ptr;
 }
 
-/* This should exactly match OpenSSL's SSL_set_fd except for using my BIO */
 static int
-my_SSL_set_fd(Port *port, int fd)
+ssl_set_port_bio(Port *port)
 {
-	int			ret = 0;
 	BIO		   *bio;
 	BIO_METHOD *bio_method;
 
-	bio_method = my_BIO_s_socket();
+	bio_method = port_bio_method();
 	if (bio_method == NULL)
-	{
-		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
-		goto err;
-	}
+		return 0;
+
 	bio = BIO_new(bio_method);
-
 	if (bio == NULL)
-	{
-		SSLerr(SSL_F_SSL_SET_FD, ERR_R_BUF_LIB);
-		goto err;
-	}
-	BIO_set_app_data(bio, port);
+		return 0;
 
-	BIO_set_fd(bio, fd, BIO_NOCLOSE);
+	BIO_set_data(bio, port);
+	BIO_set_init(bio, 1);
+
 	SSL_set_bio(port->ssl, bio, bio);
-	ret = 1;
-err:
-	return ret;
+	return 1;
 }
 
 /*
@@ -1026,7 +1099,7 @@ load_dh_file(char *filename, bool isServerStart)
  *	Load hardcoded DH parameters.
  *
  *	If DH parameters cannot be loaded from a specified file, we can load
- *	the	hardcoded DH parameters supplied with the backend to prevent
+ *	the hardcoded DH parameters supplied with the backend to prevent
  *	problems.
  */
 static DH  *
@@ -1035,7 +1108,7 @@ load_dh_buffer(const char *buffer, size_t len)
 	BIO		   *bio;
 	DH		   *dh = NULL;
 
-	bio = BIO_new_mem_buf(unconstify(char *, buffer), len);
+	bio = BIO_new_mem_buf(buffer, len);
 	if (bio == NULL)
 		return NULL;
 	dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
@@ -1083,11 +1156,46 @@ dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata)
 }
 
 /*
+ * Examines the provided certificate name, and if it's too long to log or
+ * contains unprintable ASCII, escapes and truncates it. The return value is
+ * always a new palloc'd string. (The input string is still modified in place,
+ * for ease of implementation.)
+ */
+static char *
+prepare_cert_name(char *name)
+{
+	size_t		namelen = strlen(name);
+	char	   *truncated = name;
+
+	/*
+	 * Common Names are 64 chars max, so for a common case where the CN is the
+	 * last field, we can still print the longest possible CN with a
+	 * 7-character prefix (".../CN=[64 chars]"), for a reasonable limit of 71
+	 * characters.
+	 */
+#define MAXLEN 71
+
+	if (namelen > MAXLEN)
+	{
+		/*
+		 * Keep the end of the name, not the beginning, since the most
+		 * specific field is likely to give users the most information.
+		 */
+		truncated = name + namelen - MAXLEN;
+		truncated[0] = truncated[1] = truncated[2] = '.';
+		namelen = MAXLEN;
+	}
+
+#undef MAXLEN
+
+	return pg_clean_ascii(truncated, 0);
+}
+
+/*
  *	Certificate verification callback
  *
- *	This callback allows us to log intermediate problems during
- *	verification, but for now we'll see if the final error message
- *	contains enough information.
+ *	This callback allows us to examine intermediate problems during
+ *	verification, for later logging.
  *
  *	This callback also allows us to override the default acceptance
  *	criteria (e.g., accepting self-signed or expired certs), but
@@ -1096,6 +1204,75 @@ dummy_ssl_passwd_cb(char *buf, int size, int rwflag, void *userdata)
 static int
 verify_cb(int ok, X509_STORE_CTX *ctx)
 {
+	int			depth;
+	int			errcode;
+	const char *errstring;
+	StringInfoData str;
+	X509	   *cert;
+
+	if (ok)
+	{
+		/* Nothing to do for the successful case. */
+		return ok;
+	}
+
+	/* Pull all the information we have on the verification failure. */
+	depth = X509_STORE_CTX_get_error_depth(ctx);
+	errcode = X509_STORE_CTX_get_error(ctx);
+	errstring = X509_verify_cert_error_string(errcode);
+
+	initStringInfo(&str);
+	appendStringInfo(&str,
+					 _("Client certificate verification failed at depth %d: %s."),
+					 depth, errstring);
+
+	cert = X509_STORE_CTX_get_current_cert(ctx);
+	if (cert)
+	{
+		char	   *subject,
+				   *issuer;
+		char	   *sub_prepared,
+				   *iss_prepared;
+		char	   *serialno;
+		ASN1_INTEGER *sn;
+		BIGNUM	   *b;
+
+		/*
+		 * Get the Subject and Issuer for logging, but don't let maliciously
+		 * huge certs flood the logs, and don't reflect non-ASCII bytes into
+		 * it either.
+		 */
+		subject = X509_NAME_to_cstring(X509_get_subject_name(cert));
+		sub_prepared = prepare_cert_name(subject);
+		pfree(subject);
+
+		issuer = X509_NAME_to_cstring(X509_get_issuer_name(cert));
+		iss_prepared = prepare_cert_name(issuer);
+		pfree(issuer);
+
+		/*
+		 * Pull the serial number, too, in case a Subject is still ambiguous.
+		 * This mirrors be_tls_get_peer_serial().
+		 */
+		sn = X509_get_serialNumber(cert);
+		b = ASN1_INTEGER_to_BN(sn, NULL);
+		serialno = BN_bn2dec(b);
+
+		appendStringInfoChar(&str, '\n');
+		appendStringInfo(&str,
+						 _("Failed certificate data (unverified): subject \"%s\", serial number %s, issuer \"%s\"."),
+						 sub_prepared, serialno ? serialno : _("unknown"),
+						 iss_prepared);
+
+		BN_free(b);
+		OPENSSL_free(serialno);
+		pfree(iss_prepared);
+		pfree(sub_prepared);
+	}
+
+	/* Store our detail message to be logged later. */
+	cert_errdetail = str.data;
+
 	return ok;
 }
 
@@ -1146,6 +1323,52 @@ info_cb(const SSL *ssl, int type, int args)
 			break;
 	}
 }
+
+/* See pqcomm.h comments on OpenSSL implementation of ALPN (RFC 7301) */
+static const unsigned char alpn_protos[] = PG_ALPN_PROTOCOL_VECTOR;
+
+/*
+ * Server callback for ALPN negotiation. We use the standard "helper" function
+ * even though currently we only accept one value.
+ */
+static int
+alpn_cb(SSL *ssl,
+		const unsigned char **out,
+		unsigned char *outlen,
+		const unsigned char *in,
+		unsigned int inlen,
+		void *userdata)
+{
+	/*
+	 * Why does OpenSSL provide a helper function that requires a nonconst
+	 * vector when the callback is declared to take a const vector? What are
+	 * we to do with that?
+	 */
+	int			retval;
+
+	Assert(userdata != NULL);
+	Assert(out != NULL);
+	Assert(outlen != NULL);
+	Assert(in != NULL);
+
+	retval = SSL_select_next_proto((unsigned char **) out, outlen,
+								   alpn_protos, sizeof(alpn_protos),
+								   in, inlen);
+	if (*out == NULL || *outlen > sizeof(alpn_protos) || *outlen <= 0)
+		return SSL_TLSEXT_ERR_NOACK;	/* can't happen */
+
+	if (retval == OPENSSL_NPN_NEGOTIATED)
+		return SSL_TLSEXT_ERR_OK;
+	else
+	{
+		/*
+		 * The client doesn't support our protocol.  Reject the connection
+		 * with TLS "no_application_protocol" alert, per RFC 7301.
+		 */
+		return SSL_TLSEXT_ERR_ALERT_FATAL;
+	}
+}
+
 
 /*
  * Set DH parameters for generating ephemeral DH keys.  The
@@ -1202,33 +1425,48 @@ static bool
 initialize_ecdh(SSL_CTX *context, bool isServerStart)
 {
 #ifndef OPENSSL_NO_ECDH
-	EC_KEY	   *ecdh;
-	int			nid;
-
-	nid = OBJ_sn2nid(SSLECDHCurve);
-	if (!nid)
+	if (SSL_CTX_set1_groups_list(context, SSLECDHCurve) != 1)
 	{
+		/*
+		 * OpenSSL 3.3.0 introduced proper error messages for group parsing
+		 * errors, earlier versions returns "no SSL error reported" which is
+		 * far from helpful. For older versions, we replace with a better
+		 * error message. Injecting the error into the OpenSSL error queue
+		 * need APIs from OpenSSL 3.0.
+		 */
 		ereport(isServerStart ? FATAL : LOG,
-				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("ECDH: unrecognized curve name: %s", SSLECDHCurve)));
+				errcode(ERRCODE_CONFIG_FILE_ERROR),
+				errmsg("could not set group names specified in ssl_groups: %s",
+					   SSLerrmessageExt(ERR_get_error(),
+										_("No valid groups found"))),
+				errhint("Ensure that each group name is spelled correctly and supported by the installed version of OpenSSL."));
 		return false;
 	}
-
-	ecdh = EC_KEY_new_by_curve_name(nid);
-	if (!ecdh)
-	{
-		ereport(isServerStart ? FATAL : LOG,
-				(errcode(ERRCODE_CONFIG_FILE_ERROR),
-				 errmsg("ECDH: could not create key")));
-		return false;
-	}
-
-	SSL_CTX_set_options(context, SSL_OP_SINGLE_ECDH_USE);
-	SSL_CTX_set_tmp_ecdh(context, ecdh);
-	EC_KEY_free(ecdh);
 #endif
 
 	return true;
+}
+
+/*
+ * Obtain reason string for passed SSL errcode with replacement
+ *
+ * The error message supplied in replacement will be used in case the error
+ * code from OpenSSL is 0, else the error message from SSLerrmessage() will
+ * be returned.
+ *
+ * Not all versions of OpenSSL place an error on the queue even for failing
+ * operations, which will yield "no SSL error reported" by SSLerrmessage. This
+ * function can be used to ensure that a proper error message is displayed for
+ * versions reporting no error, while using the OpenSSL error via SSLerrmessage
+ * for versions where there is one.
+ */
+static const char *
+SSLerrmessageExt(unsigned long ecode, const char *replacement)
+{
+	if (ecode == 0)
+		return replacement;
+	else
+		return SSLerrmessage(ecode);
 }
 
 /*
@@ -1340,7 +1578,6 @@ be_tls_get_peer_serial(Port *port, char *ptr, size_t len)
 		ptr[0] = '\0';
 }
 
-#if defined(HAVE_X509_GET_SIGNATURE_NID) || defined(HAVE_X509_GET_SIGNATURE_INFO)
 char *
 be_tls_get_certificate_hash(Port *port, size_t *len)
 {
@@ -1399,21 +1636,20 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
 
 	return cert_hash;
 }
-#endif
 
 /*
  * Convert an X509 subject name to a cstring.
  *
  */
 static char *
-X509_NAME_to_cstring(X509_NAME *name)
+X509_NAME_to_cstring(const X509_NAME *name)
 {
 	BIO		   *membuf = BIO_new(BIO_s_mem());
 	int			i,
 				nid,
 				count = X509_NAME_entry_count(name);
-	X509_NAME_ENTRY *e;
-	ASN1_STRING *v;
+	const X509_NAME_ENTRY *e;
+	const ASN1_STRING *v;
 	const char *field_name;
 	size_t		size;
 	char		nullterm;
@@ -1468,7 +1704,8 @@ X509_NAME_to_cstring(X509_NAME *name)
  * Convert TLS protocol version GUC enum to OpenSSL values
  *
  * This is a straightforward one-to-one mapping, but doing it this way makes
- * guc.c independent of OpenSSL availability and version.
+ * the definitions of ssl_min_protocol_version and ssl_max_protocol_version
+ * independent of OpenSSL availability and version.
  *
  * If a version is passed that is not supported by the current OpenSSL
  * version, then we return -1.  If a nonnegative value is returned,

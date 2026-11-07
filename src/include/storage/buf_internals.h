@@ -5,7 +5,7 @@
  *	  strategy.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/buf_internals.h
@@ -15,16 +15,19 @@
 #ifndef BUFMGR_INTERNALS_H
 #define BUFMGR_INTERNALS_H
 
+#include "pgstat.h"
 #include "port/atomics.h"
+#include "storage/aio_types.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
-#include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "utils/relcache.h"
+#include "utils/resowner.h"
 
 /*
  * Buffer state is a single 32-bit variable where following data is combined.
@@ -38,12 +41,19 @@
  *
  * The definition of buffer state components is below.
  */
+#define BUF_REFCOUNT_BITS 18
+#define BUF_USAGECOUNT_BITS 4
+#define BUF_FLAG_BITS 10
+
+StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS == 32,
+				 "parts of buffer state space need to equal 32");
+
 #define BUF_REFCOUNT_ONE 1
-#define BUF_REFCOUNT_MASK ((1U << 18) - 1)
-#define BUF_USAGECOUNT_MASK 0x003C0000U
-#define BUF_USAGECOUNT_ONE (1U << 18)
-#define BUF_USAGECOUNT_SHIFT 18
-#define BUF_FLAG_MASK 0xFFC00000U
+#define BUF_REFCOUNT_MASK ((1U << BUF_REFCOUNT_BITS) - 1)
+#define BUF_USAGECOUNT_MASK (((1U << BUF_USAGECOUNT_BITS) - 1) << (BUF_REFCOUNT_BITS))
+#define BUF_USAGECOUNT_ONE (1U << BUF_REFCOUNT_BITS)
+#define BUF_USAGECOUNT_SHIFT BUF_REFCOUNT_BITS
+#define BUF_FLAG_MASK (((1U << BUF_FLAG_BITS) - 1) << (BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS))
 
 /* Get refcount and usagecount from buffer state */
 #define BUF_STATE_GET_REFCOUNT(state) ((state) & BUF_REFCOUNT_MASK)
@@ -76,6 +86,11 @@
  */
 #define BM_MAX_USAGE_COUNT	5
 
+StaticAssertDecl(BM_MAX_USAGE_COUNT < (1 << BUF_USAGECOUNT_BITS),
+				 "BM_MAX_USAGE_COUNT doesn't fit in BUF_USAGECOUNT_BITS bits");
+StaticAssertDecl(MAX_BACKENDS_BITS <= BUF_REFCOUNT_BITS,
+				 "MAX_BACKENDS_BITS needs to be <= BUF_REFCOUNT_BITS");
+
 /*
  * Buffer tag identifies which disk block the buffer contains.
  *
@@ -85,38 +100,88 @@
  * relation is visible yet (its xact may have started before the xact that
  * created the rel).  The storage manager must be able to cope anyway.
  *
- * Note: if there's any pad bytes in the struct, INIT_BUFFERTAG will have
+ * Note: if there's any pad bytes in the struct, InitBufferTag will have
  * to be fixed to zero them, since this struct is used as a hash key.
  */
 typedef struct buftag
 {
-	RelFileNode rnode;			/* physical relation identifier */
-	ForkNumber	forkNum;
+	Oid			spcOid;			/* tablespace oid */
+	Oid			dbOid;			/* database oid */
+	RelFileNumber relNumber;	/* relation file number */
+	ForkNumber	forkNum;		/* fork number */
 	BlockNumber blockNum;		/* blknum relative to begin of reln */
 } BufferTag;
 
-#define CLEAR_BUFFERTAG(a) \
-( \
-	(a).rnode.spcNode = InvalidOid, \
-	(a).rnode.dbNode = InvalidOid, \
-	(a).rnode.relNode = InvalidOid, \
-	(a).forkNum = InvalidForkNumber, \
-	(a).blockNum = InvalidBlockNumber \
-)
+static inline RelFileNumber
+BufTagGetRelNumber(const BufferTag *tag)
+{
+	return tag->relNumber;
+}
 
-#define INIT_BUFFERTAG(a,xx_rnode,xx_forkNum,xx_blockNum) \
-( \
-	(a).rnode = (xx_rnode), \
-	(a).forkNum = (xx_forkNum), \
-	(a).blockNum = (xx_blockNum) \
-)
+static inline ForkNumber
+BufTagGetForkNum(const BufferTag *tag)
+{
+	return tag->forkNum;
+}
 
-#define BUFFERTAGS_EQUAL(a,b) \
-( \
-	RelFileNodeEquals((a).rnode, (b).rnode) && \
-	(a).blockNum == (b).blockNum && \
-	(a).forkNum == (b).forkNum \
-)
+static inline void
+BufTagSetRelForkDetails(BufferTag *tag, RelFileNumber relnumber,
+						ForkNumber forknum)
+{
+	tag->relNumber = relnumber;
+	tag->forkNum = forknum;
+}
+
+static inline RelFileLocator
+BufTagGetRelFileLocator(const BufferTag *tag)
+{
+	RelFileLocator rlocator;
+
+	rlocator.spcOid = tag->spcOid;
+	rlocator.dbOid = tag->dbOid;
+	rlocator.relNumber = BufTagGetRelNumber(tag);
+
+	return rlocator;
+}
+
+static inline void
+ClearBufferTag(BufferTag *tag)
+{
+	tag->spcOid = InvalidOid;
+	tag->dbOid = InvalidOid;
+	BufTagSetRelForkDetails(tag, InvalidRelFileNumber, InvalidForkNumber);
+	tag->blockNum = InvalidBlockNumber;
+}
+
+static inline void
+InitBufferTag(BufferTag *tag, const RelFileLocator *rlocator,
+			  ForkNumber forkNum, BlockNumber blockNum)
+{
+	tag->spcOid = rlocator->spcOid;
+	tag->dbOid = rlocator->dbOid;
+	BufTagSetRelForkDetails(tag, rlocator->relNumber, forkNum);
+	tag->blockNum = blockNum;
+}
+
+static inline bool
+BufferTagsEqual(const BufferTag *tag1, const BufferTag *tag2)
+{
+	return (tag1->spcOid == tag2->spcOid) &&
+		(tag1->dbOid == tag2->dbOid) &&
+		(tag1->relNumber == tag2->relNumber) &&
+		(tag1->blockNum == tag2->blockNum) &&
+		(tag1->forkNum == tag2->forkNum);
+}
+
+static inline bool
+BufTagMatchesRelFileLocator(const BufferTag *tag,
+							const RelFileLocator *rlocator)
+{
+	return (tag->spcOid == rlocator->spcOid) &&
+		(tag->dbOid == rlocator->dbOid) &&
+		(BufTagGetRelNumber(tag) == rlocator->relNumber);
+}
+
 
 /*
  * The shared buffer mapping table is partitioned to reduce contention.
@@ -124,19 +189,30 @@ typedef struct buftag
  * hash code with BufTableHashCode(), then apply BufMappingPartitionLock().
  * NB: NUM_BUFFER_PARTITIONS must be a power of 2!
  */
-#define BufTableHashPartition(hashcode) \
-	((hashcode) % NUM_BUFFER_PARTITIONS)
-#define BufMappingPartitionLock(hashcode) \
-	(&MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + \
-		BufTableHashPartition(hashcode)].lock)
-#define BufMappingPartitionLockByIndex(i) \
-	(&MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + (i)].lock)
+static inline uint32
+BufTableHashPartition(uint32 hashcode)
+{
+	return hashcode % NUM_BUFFER_PARTITIONS;
+}
+
+static inline LWLock *
+BufMappingPartitionLock(uint32 hashcode)
+{
+	return &MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET +
+							BufTableHashPartition(hashcode)].lock;
+}
+
+static inline LWLock *
+BufMappingPartitionLockByIndex(uint32 index)
+{
+	return &MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + index].lock;
+}
 
 /*
  *	BufferDesc -- shared descriptor/state data for a single shared buffer.
  *
  * Note: Buffer header lock (BM_LOCKED flag) must be held to examine or change
- * the tag, state or wait_backend_pid fields.  In general, buffer header lock
+ * tag, state or wait_backend_pgprocno fields.  In general, buffer header lock
  * is a spinlock which is combined with flags, refcount and usagecount into
  * single atomic variable.  This layout allow us to do some operations in a
  * single atomic operation, without actually acquiring and releasing spinlock;
@@ -161,8 +237,8 @@ typedef struct buftag
  *
  * We can't physically remove items from a disk page if another backend has
  * the buffer pinned.  Hence, a backend may need to wait for all other pins
- * to go away.  This is signaled by storing its own PID into
- * wait_backend_pid and setting flag bit BM_PIN_COUNT_WAITER.  At present,
+ * to go away.  This is signaled by storing its own pgprocno into
+ * wait_backend_pgprocno and setting flag bit BM_PIN_COUNT_WAITER.  At present,
  * there can be only one such waiter per buffer.
  *
  * We use this same struct for local buffer headers, but the locks are not
@@ -187,8 +263,10 @@ typedef struct BufferDesc
 	/* state of the tag, containing flags, refcount and usagecount */
 	pg_atomic_uint32 state;
 
-	int			wait_backend_pid;	/* backend PID of pin-count waiter */
+	int			wait_backend_pgprocno;	/* backend of pin-count waiter */
 	int			freeNext;		/* link in freelist chain */
+
+	PgAioWaitRef io_wref;		/* set iff AIO is in progress */
 	LWLock		content_lock;	/* to lock access to buffer contents */
 } BufferDesc;
 
@@ -220,37 +298,6 @@ typedef union BufferDescPadded
 	char		pad[BUFFERDESC_PAD_TO_SIZE];
 } BufferDescPadded;
 
-#define GetBufferDescriptor(id) (&BufferDescriptors[(id)].bufferdesc)
-#define GetLocalBufferDescriptor(id) (&LocalBufferDescriptors[(id)])
-
-#define BufferDescriptorGetBuffer(bdesc) ((bdesc)->buf_id + 1)
-
-#define BufferDescriptorGetIOCV(bdesc) \
-	(&(BufferIOCVArray[(bdesc)->buf_id]).cv)
-#define BufferDescriptorGetContentLock(bdesc) \
-	((LWLock*) (&(bdesc)->content_lock))
-
-extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
-
-/*
- * The freeNext field is either the index of the next freelist entry,
- * or one of these special values:
- */
-#define FREENEXT_END_OF_LIST	(-1)
-#define FREENEXT_NOT_IN_LIST	(-2)
-
-/*
- * Functions for acquiring/releasing a shared buffer header's spinlock.  Do
- * not apply these to local buffers!
- */
-extern uint32 LockBufHdr(BufferDesc *desc);
-#define UnlockBufHdr(desc, s)	\
-	do {	\
-		pg_write_barrier(); \
-		pg_atomic_write_u32(&(desc)->state, (s) & (~BM_LOCKED)); \
-	} while (0)
-
-
 /*
  * The PendingWriteback & WritebackContext structure are used to keep
  * information about pending flush requests to be issued to the OS.
@@ -276,10 +323,62 @@ typedef struct WritebackContext
 
 /* in buf_init.c */
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
+extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 
 /* in localbuf.c */
-extern BufferDesc *LocalBufferDescriptors;
+extern PGDLLIMPORT BufferDesc *LocalBufferDescriptors;
+
+
+static inline BufferDesc *
+GetBufferDescriptor(uint32 id)
+{
+	return &(BufferDescriptors[id]).bufferdesc;
+}
+
+static inline BufferDesc *
+GetLocalBufferDescriptor(uint32 id)
+{
+	return &LocalBufferDescriptors[id];
+}
+
+static inline Buffer
+BufferDescriptorGetBuffer(const BufferDesc *bdesc)
+{
+	return (Buffer) (bdesc->buf_id + 1);
+}
+
+static inline ConditionVariable *
+BufferDescriptorGetIOCV(const BufferDesc *bdesc)
+{
+	return &(BufferIOCVArray[bdesc->buf_id]).cv;
+}
+
+static inline LWLock *
+BufferDescriptorGetContentLock(const BufferDesc *bdesc)
+{
+	return (LWLock *) (&bdesc->content_lock);
+}
+
+/*
+ * The freeNext field is either the index of the next freelist entry,
+ * or one of these special values:
+ */
+#define FREENEXT_END_OF_LIST	(-1)
+#define FREENEXT_NOT_IN_LIST	(-2)
+
+/*
+ * Functions for acquiring/releasing a shared buffer header's spinlock.  Do
+ * not apply these to local buffers!
+ */
+extern uint32 LockBufHdr(BufferDesc *desc);
+
+static inline void
+UnlockBufHdr(BufferDesc *desc, uint32 buf_state)
+{
+	pg_write_barrier();
+	pg_atomic_write_u32(&desc->state, buf_state & (~BM_LOCKED));
+}
 
 /* in bufmgr.c */
 
@@ -292,28 +391,62 @@ extern BufferDesc *LocalBufferDescriptors;
 typedef struct CkptSortItem
 {
 	Oid			tsId;
-	Oid			relNode;
+	RelFileNumber relNumber;
 	ForkNumber	forkNum;
 	BlockNumber blockNum;
 	int			buf_id;
 } CkptSortItem;
 
-extern CkptSortItem *CkptBufferIds;
+extern PGDLLIMPORT CkptSortItem *CkptBufferIds;
+
+/* ResourceOwner callbacks to hold buffer I/Os and pins */
+extern PGDLLIMPORT const ResourceOwnerDesc buffer_io_resowner_desc;
+extern PGDLLIMPORT const ResourceOwnerDesc buffer_pin_resowner_desc;
+
+/* Convenience wrappers over ResourceOwnerRemember/Forget */
+static inline void
+ResourceOwnerRememberBuffer(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerRemember(owner, Int32GetDatum(buffer), &buffer_pin_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetBuffer(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerForget(owner, Int32GetDatum(buffer), &buffer_pin_resowner_desc);
+}
+static inline void
+ResourceOwnerRememberBufferIO(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerRemember(owner, Int32GetDatum(buffer), &buffer_io_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetBufferIO(ResourceOwner owner, Buffer buffer)
+{
+	ResourceOwnerForget(owner, Int32GetDatum(buffer), &buffer_io_resowner_desc);
+}
 
 /*
  * Internal buffer management routines
  */
 /* bufmgr.c */
 extern void WritebackContextInit(WritebackContext *context, int *max_pending);
-extern void IssuePendingWritebacks(WritebackContext *context);
-extern void ScheduleBufferTagForWriteback(WritebackContext *context, BufferTag *tag);
+extern void IssuePendingWritebacks(WritebackContext *wb_context, IOContext io_context);
+extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
+										  IOContext io_context, BufferTag *tag);
+
+/* solely to make it easier to write tests */
+extern bool StartBufferIO(BufferDesc *buf, bool forInput, bool nowait);
+extern void TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits,
+							  bool forget_owner, bool release_aio);
+
 
 /* freelist.c */
+extern IOContext IOContextForStrategy(BufferAccessStrategy strategy);
 extern BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
-									 uint32 *buf_state);
+									 uint32 *buf_state, bool *from_ring);
 extern void StrategyFreeBuffer(BufferDesc *buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
-								 BufferDesc *buf);
+								 BufferDesc *buf, bool from_ring);
 
 extern int	StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc);
 extern void StrategyNotifyBgWriter(int bgwprocno);
@@ -331,15 +464,31 @@ extern int	BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag *tagPtr, uint32 hashcode);
 
 /* localbuf.c */
+extern bool PinLocalBuffer(BufferDesc *buf_hdr, bool adjust_usagecount);
+extern void UnpinLocalBuffer(Buffer buffer);
+extern void UnpinLocalBufferNoOwner(Buffer buffer);
 extern PrefetchBufferResult PrefetchLocalBuffer(SMgrRelation smgr,
 												ForkNumber forkNum,
 												BlockNumber blockNum);
 extern BufferDesc *LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum,
 									BlockNumber blockNum, bool *foundPtr);
+extern BlockNumber ExtendBufferedRelLocal(BufferManagerRelation bmr,
+										  ForkNumber fork,
+										  uint32 flags,
+										  uint32 extend_by,
+										  BlockNumber extend_upto,
+										  Buffer *buffers,
+										  uint32 *extended_by);
 extern void MarkLocalBufferDirty(Buffer buffer);
-extern void DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
-										BlockNumber firstDelBlock);
-extern void DropRelFileNodeAllLocalBuffers(RelFileNode rnode);
+extern void TerminateLocalBufferIO(BufferDesc *bufHdr, bool clear_dirty,
+								   uint32 set_flag_bits, bool release_aio);
+extern bool StartLocalBufferIO(BufferDesc *bufHdr, bool forInput, bool nowait);
+extern void FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln);
+extern void InvalidateLocalBuffer(BufferDesc *bufHdr, bool check_unreferenced);
+extern void DropRelationLocalBuffers(RelFileLocator rlocator,
+									 ForkNumber forkNum,
+									 BlockNumber firstDelBlock);
+extern void DropRelationAllLocalBuffers(RelFileLocator rlocator);
 extern void AtEOXact_LocalBuffers(bool isCommit);
 
 #endif							/* BUFMGR_INTERNALS_H */

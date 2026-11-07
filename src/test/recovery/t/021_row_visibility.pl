@@ -1,18 +1,17 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Checks that snapshots on standbys behave in a minimally reasonable
 # way.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
-use PostgresNode;
-use TestLib;
-use Test::More tests => 10;
-use Config;
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 # Initialize primary node
-my $node_primary = get_new_node('primary');
+my $node_primary = PostgreSQL::Test::Cluster->new('primary');
 $node_primary->init(allows_streaming => 1);
 $node_primary->append_conf('postgresql.conf', 'max_prepared_transactions=10');
 $node_primary->start;
@@ -26,37 +25,39 @@ my $backup_name = 'my_backup';
 $node_primary->backup($backup_name);
 
 # Create streaming standby from backup
-my $node_standby = get_new_node('standby');
+my $node_standby = PostgreSQL::Test::Cluster->new('standby');
 $node_standby->init_from_backup($node_primary, $backup_name,
 	has_streaming => 1);
 $node_standby->append_conf('postgresql.conf', 'max_prepared_transactions=10');
 $node_standby->start;
 
 my $psql_timeout =
-  IPC::Run::timer(2 * $TestLib::timeout_default);
+  IPC::Run::timer(2 * $PostgreSQL::Test::Utils::timeout_default);
 
 # One psql to primary and standby each, for all queries. That allows
 # to check uncommitted changes being replicated and such.
 my %psql_primary = (stdin => '', stdout => '', stderr => '');
 $psql_primary{run} = IPC::Run::start(
-	[ 'psql', '-XA', '-f', '-', '-d', $node_primary->connstr('postgres') ],
-	'<',
-	\$psql_primary{stdin},
-	'>',
-	\$psql_primary{stdout},
-	'2>',
-	\$psql_primary{stderr},
+	[
+		'psql', '--no-psqlrc', '--no-align',
+		'--file' => '-',
+		'--dbname' => $node_primary->connstr('postgres'),
+	],
+	'<' => \$psql_primary{stdin},
+	'>' => \$psql_primary{stdout},
+	'2>' => \$psql_primary{stderr},
 	$psql_timeout);
 
 my %psql_standby = ('stdin' => '', 'stdout' => '', 'stderr' => '');
 $psql_standby{run} = IPC::Run::start(
-	[ 'psql', '-XA', '-f', '-', '-d', $node_standby->connstr('postgres') ],
-	'<',
-	\$psql_standby{stdin},
-	'>',
-	\$psql_standby{stdout},
-	'2>',
-	\$psql_standby{stderr},
+	[
+		'psql', '--no-psqlrc', '--no-align',
+		'--file' => '-',
+		'--dbname' => $node_standby->connstr('postgres'),
+	],
+	'<' => \$psql_standby{stdin},
+	'>' => \$psql_standby{stdout},
+	'2>' => \$psql_standby{stderr},
 	$psql_timeout);
 
 #
@@ -73,8 +74,7 @@ ok( send_query_and_wait(
 #
 $node_primary->psql('postgres',
 	"INSERT INTO test_visibility VALUES ('first insert')");
-$node_primary->wait_for_catchup($node_standby, 'replay',
-	$node_primary->lsn('insert'));
+$node_primary->wait_for_catchup($node_standby);
 
 ok( send_query_and_wait(
 		\%psql_standby,
@@ -95,8 +95,7 @@ UPDATE test_visibility SET data = 'first update' RETURNING data;
 	'UPDATE');
 
 $node_primary->psql('postgres', "SELECT txid_current();");  # ensure WAL flush
-$node_primary->wait_for_catchup($node_standby, 'replay',
-	$node_primary->lsn('insert'));
+$node_primary->wait_for_catchup($node_standby);
 
 ok( send_query_and_wait(
 		\%psql_standby,
@@ -109,8 +108,7 @@ ok( send_query_and_wait(
 #
 ok(send_query_and_wait(\%psql_primary, q[COMMIT;], qr/^COMMIT$/m), 'COMMIT');
 
-$node_primary->wait_for_catchup($node_standby, 'replay',
-	$node_primary->lsn('insert'));
+$node_primary->wait_for_catchup($node_standby);
 
 ok( send_query_and_wait(
 		\%psql_standby,
@@ -139,8 +137,7 @@ PREPARE TRANSACTION 'will_abort';
 		qr/^PREPARE TRANSACTION$/m),
 	'prepared will_abort');
 
-$node_primary->wait_for_catchup($node_standby, 'replay',
-	$node_primary->lsn('insert'));
+$node_primary->wait_for_catchup($node_standby);
 
 ok( send_query_and_wait(
 		\%psql_standby,
@@ -151,8 +148,7 @@ ok( send_query_and_wait(
 # For some variation, finish prepared xacts via separate connections
 $node_primary->safe_psql('postgres', "COMMIT PREPARED 'will_commit';");
 $node_primary->safe_psql('postgres', "ROLLBACK PREPARED 'will_abort';");
-$node_primary->wait_for_catchup($node_standby, 'replay',
-	$node_primary->lsn('insert'));
+$node_primary->wait_for_catchup($node_standby);
 
 ok( send_query_and_wait(
 		\%psql_standby,
@@ -174,7 +170,6 @@ $node_standby->stop;
 sub send_query_and_wait
 {
 	my ($psql, $query, $untl) = @_;
-	my $ret;
 
 	# send query
 	$$psql{stdin} .= $query;
@@ -207,3 +202,5 @@ sub send_query_and_wait
 
 	return 1;
 }
+
+done_testing();

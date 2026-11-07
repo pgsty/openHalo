@@ -2,8 +2,6 @@
 -- CREATE SEQUENCE
 --
 -- various error cases
-CREATE UNLOGGED SEQUENCE sequence_testx;
-ERROR:  unlogged sequences are not supported
 CREATE SEQUENCE sequence_testx INCREMENT BY 0;
 ERROR:  INCREMENT must not be zero
 CREATE SEQUENCE sequence_testx INCREMENT BY -1 MINVALUE 20;
@@ -21,7 +19,8 @@ CREATE SEQUENCE sequence_testx OWNED BY nobody;  -- nonsense word
 ERROR:  invalid OWNED BY option
 HINT:  Specify OWNED BY table.column or OWNED BY NONE.
 CREATE SEQUENCE sequence_testx OWNED BY pg_class_oid_index.oid;  -- not a table
-ERROR:  referenced relation "pg_class_oid_index" is not a table or foreign table
+ERROR:  sequence cannot be owned by relation "pg_class_oid_index"
+DETAIL:  This operation is not supported for indexes.
 CREATE SEQUENCE sequence_testx OWNED BY pg_class.relname;  -- not same schema
 ERROR:  sequence must be in same schema as table it is linked to
 CREATE TABLE sequence_test_table (a int);
@@ -314,7 +313,8 @@ ALTER SEQUENCE IF EXISTS sequence_test2 RESTART WITH 24
   INCREMENT BY 4 MAXVALUE 36 MINVALUE 5 CYCLE;
 NOTICE:  relation "sequence_test2" does not exist, skipping
 ALTER SEQUENCE serialTest1 CYCLE;  -- error, not a sequence
-ERROR:  "serialtest1" is not a sequence
+ERROR:  cannot open relation "serialtest1"
+DETAIL:  This operation is not supported for tables.
 CREATE SEQUENCE sequence_test2 START WITH 32;
 CREATE SEQUENCE sequence_test4 INCREMENT BY -1;
 SELECT nextval('sequence_test2');
@@ -599,6 +599,24 @@ DROP SEQUENCE seq2;
 -- should fail
 SELECT lastval();
 ERROR:  lastval is not yet defined in this session
+-- unlogged sequences
+-- (more tests in src/test/recovery/)
+CREATE UNLOGGED SEQUENCE sequence_test_unlogged;
+ALTER SEQUENCE sequence_test_unlogged SET LOGGED;
+\d sequence_test_unlogged
+                   Sequence "public.sequence_test_unlogged"
+  Type  | Start | Minimum |       Maximum       | Increment | Cycles? | Cache 
+--------+-------+---------+---------------------+-----------+---------+-------
+ bigint |     1 |       1 | 9223372036854775807 |         1 | no      |     1
+
+ALTER SEQUENCE sequence_test_unlogged SET UNLOGGED;
+\d sequence_test_unlogged
+              Unlogged sequence "public.sequence_test_unlogged"
+  Type  | Start | Minimum |       Maximum       | Increment | Cycles? | Cache 
+--------+-------+---------+---------------------+-----------+---------+-------
+ bigint |     1 |       1 | 9223372036854775807 |         1 | no      |     1
+
+DROP SEQUENCE sequence_test_unlogged;
 -- Test sequences in read-only transactions
 CREATE TEMPORARY SEQUENCE sequence_test_temp1;
 START TRANSACTION READ ONLY;
@@ -819,6 +837,13 @@ SELECT nextval('test_seq1');
  nextval 
 ---------
        3
+(1 row)
+
+-- pg_get_sequence_data
+SELECT * FROM pg_get_sequence_data('test_seq1');
+ last_value | is_called 
+------------+-----------
+         10 | t
 (1 row)
 
 DROP SEQUENCE test_seq1;

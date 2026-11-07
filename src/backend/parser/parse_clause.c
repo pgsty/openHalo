@@ -3,7 +3,7 @@
  * parse_clause.c
  *	  handle clauses in parser
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,10 +20,8 @@
 #include "access/table.h"
 #include "access/tsmapi.h"
 #include "catalog/catalog.h"
-#include "catalog/heap.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amproc.h"
-#include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -42,23 +40,16 @@
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
-#include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
-#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-#include "utils/guc.h"
-#include "utils/syscache.h"
-#include "catalog/pg_foreign_server.h"
-#include "catalog/pg_class.h"
-#include "catalog/pg_inherits.h"
-#include "foreign/foreign.h"
-#include "nodes/makefuncs.h"
 
-static int	extractRemainingColumns(ParseNamespaceColumn *src_nscolumns,
+
+static int	extractRemainingColumns(ParseState *pstate,
+									ParseNamespaceColumn *src_nscolumns,
 									List *src_colnames,
 									List **src_colnos,
 									List **res_colnames, List **res_colvars,
@@ -73,7 +64,7 @@ static ParseNamespaceItem *transformRangeSubselect(ParseState *pstate,
 static ParseNamespaceItem *transformRangeFunction(ParseState *pstate,
 												  RangeFunction *r);
 static ParseNamespaceItem *transformRangeTableFunc(ParseState *pstate,
-												   RangeTableFunc *t);
+												   RangeTableFunc *rtf);
 static TableSampleClause *transformRangeTableSample(ParseState *pstate,
 													RangeTableSample *rts);
 static ParseNamespaceItem *getNSItemForSpecialRelationTypes(ParseState *pstate,
@@ -81,9 +72,11 @@ static ParseNamespaceItem *getNSItemForSpecialRelationTypes(ParseState *pstate,
 static Node *transformFromClauseItem(ParseState *pstate, Node *n,
 									 ParseNamespaceItem **top_nsitem,
 									 List **namespace);
-static Var *buildVarFromNSColumn(ParseNamespaceColumn *nscol);
+static Var *buildVarFromNSColumn(ParseState *pstate,
+								 ParseNamespaceColumn *nscol);
 static Node *buildMergedJoinVar(ParseState *pstate, JoinType jointype,
 								Var *l_colvar, Var *r_colvar);
+static void markRelsAsNulledBy(ParseState *pstate, Node *n, int jindex);
 static void setNamespaceColumnVisibility(List *namespace, bool cols_visible);
 static void setNamespaceLateralState(List *namespace,
 									 bool lateral_only, bool lateral_ok);
@@ -106,7 +99,7 @@ static Node *transformFrameOffset(ParseState *pstate, int frameOptions,
 
 
 /*
- * standard_transformFromClause -
+ * transformFromClause -
  *	  Process the FROM clause and add items to the query's range table,
  *	  joinlist, and namespace.
  *
@@ -116,7 +109,7 @@ static Node *transformFrameOffset(ParseState *pstate, int frameOptions,
  * processing, as well as for UPDATE and DELETE.
  */
 void
-standard_transformFromClause(ParseState *pstate, List *frmList)
+transformFromClause(ParseState *pstate, List *frmList)
 {
 	ListCell   *fl;
 
@@ -136,8 +129,8 @@ standard_transformFromClause(ParseState *pstate, List *frmList)
 		List	   *namespace;
 
 		n = transformFromClauseItem(pstate, n,
-										&nsitem,
-										&namespace);
+									&nsitem,
+									&namespace);
 
 		checkNameSpaceConflicts(pstate, pstate->p_namespace, namespace);
 
@@ -159,7 +152,7 @@ standard_transformFromClause(ParseState *pstate, List *frmList)
 
 /*
  * setTargetTable
- *	  Add the target relation of INSERT/UPDATE/DELETE to the range table,
+ *	  Add the target relation of INSERT/UPDATE/DELETE/MERGE to the range table,
  *	  and make the special links to it in the ParseState.
  *
  *	  We also open the target relation and acquire a write lock on it.
@@ -169,7 +162,9 @@ standard_transformFromClause(ParseState *pstate, List *frmList)
  *
  *	  If alsoSource is true, add the target to the query's joinlist and
  *	  namespace.  For INSERT, we don't want the target to be joined to;
- *	  it's a destination of tuples, not a source.   For UPDATE/DELETE,
+ *	  it's a destination of tuples, not a source.  MERGE is actually
+ *	  both, but we'll add it separately to joinlist and namespace, so
+ *	  doing nothing (like INSERT) is correct here.  For UPDATE/DELETE,
  *	  we do need to scan or join the target.  (NOTE: we do not bother
  *	  to check for namespace conflict; we assume that the namespace was
  *	  initially empty in these cases.)
@@ -229,7 +224,7 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
 	 * analysis, we will add the ACL_SELECT bit back again; see
 	 * markVarForSelectPriv and its callers.
 	 */
-	nsitem->p_rte->requiredPerms = requiredPerms;
+	nsitem->p_perminfo->requiredPerms = requiredPerms;
 
 	/*
 	 * If UPDATE/DELETE, add table to joinlist and namespace.
@@ -255,7 +250,8 @@ setTargetTable(ParseState *pstate, RangeVar *relation,
  * Returns the number of columns added.
  */
 static int
-extractRemainingColumns(ParseNamespaceColumn *src_nscolumns,
+extractRemainingColumns(ParseState *pstate,
+						ParseNamespaceColumn *src_nscolumns,
 						List *src_colnames,
 						List **src_colnos,
 						List **res_colnames, List **res_colvars,
@@ -291,7 +287,8 @@ extractRemainingColumns(ParseNamespaceColumn *src_nscolumns,
 			*src_colnos = lappend_int(*src_colnos, attnum);
 			*res_colnames = lappend(*res_colnames, lfirst(lc));
 			*res_colvars = lappend(*res_colvars,
-								   buildVarFromNSColumn(src_nscolumns + attnum - 1));
+								   buildVarFromNSColumn(pstate,
+														src_nscolumns + attnum - 1));
 			/* Copy the input relation's nscolumn data for this column */
 			res_nscolumns[colcount] = src_nscolumns[attnum - 1];
 			colcount++;
@@ -410,16 +407,6 @@ transformRangeSubselect(ParseState *pstate, RangeSubselect *r)
 	Query	   *query;
 
 	/*
-	 * We require user to supply an alias for a subselect, per SQL92. To relax
-	 * this, we'd have to be prepared to gin up a unique alias for an
-	 * unlabeled subselect.  (This is just elog, not ereport, because the
-	 * grammar should have enforced it already.  It'd probably be better to
-	 * report the error here, but we don't have a good error location here.)
-	 */
-	if (r->alias == NULL)
-		elog(ERROR, "subquery in FROM must have an alias");
-
-	/*
 	 * Set p_expr_kind to show this parse level is recursing to a subselect.
 	 * We can't be nested within any expression, so don't need save-restore
 	 * logic here.
@@ -436,10 +423,14 @@ transformRangeSubselect(ParseState *pstate, RangeSubselect *r)
 	pstate->p_lateral_active = r->lateral;
 
 	/*
-	 * Analyze and transform the subquery.
+	 * Analyze and transform the subquery.  Note that if the subquery doesn't
+	 * have an alias, it can't be explicitly selected for locking, but locking
+	 * might still be required (if there is an all-tables locking clause).
 	 */
 	query = parse_sub_analyze(r->subquery, pstate, NULL,
-							  isLockedRefname(pstate, r->alias->aliasname),
+							  isLockedRefname(pstate,
+											  r->alias == NULL ? NULL :
+											  r->alias->aliasname),
 							  true);
 
 	/* Restore state */
@@ -551,11 +542,11 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 				!fc->func_variadic &&
 				coldeflist == NIL)
 			{
-				ListCell   *lc;
+				ListCell   *lc2;
 
-				foreach(lc, fc->args)
+				foreach(lc2, fc->args)
 				{
-					Node	   *arg = (Node *) lfirst(lc);
+					Node	   *arg = (Node *) lfirst(lc2);
 					FuncCall   *newfc;
 
 					last_srf = pstate->p_last_srf;
@@ -677,10 +668,10 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 
 	/*
 	 * OK, build an RTE and nsitem for the function.
-	 */						 
-		return addRangeTableEntryForFunction(pstate,
-												funcnames, funcexprs, coldeflists,
-												r, is_lateral, true);
+	 */
+	return addRangeTableEntryForFunction(pstate,
+										 funcnames, funcexprs, coldeflists,
+										 r, is_lateral, true);
 }
 
 /*
@@ -702,7 +693,11 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
 	char	  **names;
 	int			colno;
 
-	/* Currently only XMLTABLE is supported */
+	/*
+	 * Currently we only support XMLTABLE here.  See transformJsonTable() for
+	 * JSON_TABLE support.
+	 */
+	tf->functype = TFT_XMLTABLE;
 	constructName = "XMLTABLE";
 	docType = XMLOID;
 
@@ -858,7 +853,7 @@ transformRangeTableFunc(ParseState *pstate, RangeTableFunc *rtf)
 			{
 				foreach(lc2, ns_names)
 				{
-					Value	   *ns_node = (Value *) lfirst(lc2);
+					String	   *ns_node = lfirst_node(String, lc2);
 
 					if (ns_node == NULL)
 						continue;
@@ -1037,13 +1032,611 @@ getNSItemForSpecialRelationTypes(ParseState *pstate, RangeVar *rv)
 }
 
 /*
+ * transformFromClauseItem -
+ *	  Transform a FROM-clause item, adding any required entries to the
+ *	  range table list being built in the ParseState, and return the
+ *	  transformed item ready to include in the joinlist.  Also build a
+ *	  ParseNamespaceItem list describing the names exposed by this item.
+ *	  This routine can recurse to handle SQL92 JOIN expressions.
+ *
+ * The function return value is the node to add to the jointree (a
+ * RangeTblRef or JoinExpr).  Additional output parameters are:
+ *
+ * *top_nsitem: receives the ParseNamespaceItem directly corresponding to the
+ * jointree item.  (This is only used during internal recursion, not by
+ * outside callers.)
+ *
+ * *namespace: receives a List of ParseNamespaceItems for the RTEs exposed
+ * as table/column names by this item.  (The lateral_only flags in these items
+ * are indeterminate and should be explicitly set by the caller before use.)
+ */
+static Node *
+transformFromClauseItem(ParseState *pstate, Node *n,
+						ParseNamespaceItem **top_nsitem,
+						List **namespace)
+{
+	/* Guard against stack overflow due to overly deep subtree */
+	check_stack_depth();
+
+	if (IsA(n, RangeVar))
+	{
+		/* Plain relation reference, or perhaps a CTE reference */
+		RangeVar   *rv = (RangeVar *) n;
+		RangeTblRef *rtr;
+		ParseNamespaceItem *nsitem;
+
+		/* Check if it's a CTE or tuplestore reference */
+		nsitem = getNSItemForSpecialRelationTypes(pstate, rv);
+
+		/* if not found above, must be a table reference */
+		if (!nsitem)
+			nsitem = transformTableEntry(pstate, rv);
+
+		*top_nsitem = nsitem;
+		*namespace = list_make1(nsitem);
+		rtr = makeNode(RangeTblRef);
+		rtr->rtindex = nsitem->p_rtindex;
+		return (Node *) rtr;
+	}
+	else if (IsA(n, RangeSubselect))
+	{
+		/* sub-SELECT is like a plain relation */
+		RangeTblRef *rtr;
+		ParseNamespaceItem *nsitem;
+
+		nsitem = transformRangeSubselect(pstate, (RangeSubselect *) n);
+		*top_nsitem = nsitem;
+		*namespace = list_make1(nsitem);
+		rtr = makeNode(RangeTblRef);
+		rtr->rtindex = nsitem->p_rtindex;
+		return (Node *) rtr;
+	}
+	else if (IsA(n, RangeFunction))
+	{
+		/* function is like a plain relation */
+		RangeTblRef *rtr;
+		ParseNamespaceItem *nsitem;
+
+		nsitem = transformRangeFunction(pstate, (RangeFunction *) n);
+		*top_nsitem = nsitem;
+		*namespace = list_make1(nsitem);
+		rtr = makeNode(RangeTblRef);
+		rtr->rtindex = nsitem->p_rtindex;
+		return (Node *) rtr;
+	}
+	else if (IsA(n, RangeTableFunc) || IsA(n, JsonTable))
+	{
+		/* table function is like a plain relation */
+		RangeTblRef *rtr;
+		ParseNamespaceItem *nsitem;
+
+		if (IsA(n, JsonTable))
+			nsitem = transformJsonTable(pstate, (JsonTable *) n);
+		else
+			nsitem = transformRangeTableFunc(pstate, (RangeTableFunc *) n);
+
+		*top_nsitem = nsitem;
+		*namespace = list_make1(nsitem);
+		rtr = makeNode(RangeTblRef);
+		rtr->rtindex = nsitem->p_rtindex;
+		return (Node *) rtr;
+	}
+	else if (IsA(n, RangeTableSample))
+	{
+		/* TABLESAMPLE clause (wrapping some other valid FROM node) */
+		RangeTableSample *rts = (RangeTableSample *) n;
+		Node	   *rel;
+		RangeTblEntry *rte;
+
+		/* Recursively transform the contained relation */
+		rel = transformFromClauseItem(pstate, rts->relation,
+									  top_nsitem, namespace);
+		rte = (*top_nsitem)->p_rte;
+		/* We only support this on plain relations and matviews */
+		if (rte->rtekind != RTE_RELATION ||
+			(rte->relkind != RELKIND_RELATION &&
+			 rte->relkind != RELKIND_MATVIEW &&
+			 rte->relkind != RELKIND_PARTITIONED_TABLE))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("TABLESAMPLE clause can only be applied to tables and materialized views"),
+					 parser_errposition(pstate, exprLocation(rts->relation))));
+
+		/* Transform TABLESAMPLE details and attach to the RTE */
+		rte->tablesample = transformRangeTableSample(pstate, rts);
+		return rel;
+	}
+	else if (IsA(n, JoinExpr))
+	{
+		/* A newfangled join expression */
+		JoinExpr   *j = (JoinExpr *) n;
+		ParseNamespaceItem *nsitem;
+		ParseNamespaceItem *l_nsitem;
+		ParseNamespaceItem *r_nsitem;
+		List	   *l_namespace,
+				   *r_namespace,
+				   *my_namespace,
+				   *l_colnames,
+				   *r_colnames,
+				   *res_colnames,
+				   *l_colnos,
+				   *r_colnos,
+				   *res_colvars;
+		ParseNamespaceColumn *l_nscolumns,
+				   *r_nscolumns,
+				   *res_nscolumns;
+		int			res_colindex;
+		bool		lateral_ok;
+		int			sv_namespace_length;
+		int			k;
+
+		/*
+		 * Recursively process the left subtree, then the right.  We must do
+		 * it in this order for correct visibility of LATERAL references.
+		 */
+		j->larg = transformFromClauseItem(pstate, j->larg,
+										  &l_nsitem,
+										  &l_namespace);
+
+		/*
+		 * Make the left-side RTEs available for LATERAL access within the
+		 * right side, by temporarily adding them to the pstate's namespace
+		 * list.  Per SQL:2008, if the join type is not INNER or LEFT then the
+		 * left-side names must still be exposed, but it's an error to
+		 * reference them.  (Stupid design, but that's what it says.)  Hence,
+		 * we always push them into the namespace, but mark them as not
+		 * lateral_ok if the jointype is wrong.
+		 *
+		 * Notice that we don't require the merged namespace list to be
+		 * conflict-free.  See the comments for scanNameSpaceForRefname().
+		 */
+		lateral_ok = (j->jointype == JOIN_INNER || j->jointype == JOIN_LEFT);
+		setNamespaceLateralState(l_namespace, true, lateral_ok);
+
+		sv_namespace_length = list_length(pstate->p_namespace);
+		pstate->p_namespace = list_concat(pstate->p_namespace, l_namespace);
+
+		/* And now we can process the RHS */
+		j->rarg = transformFromClauseItem(pstate, j->rarg,
+										  &r_nsitem,
+										  &r_namespace);
+
+		/* Remove the left-side RTEs from the namespace list again */
+		pstate->p_namespace = list_truncate(pstate->p_namespace,
+											sv_namespace_length);
+
+		/*
+		 * Check for conflicting refnames in left and right subtrees. Must do
+		 * this because higher levels will assume I hand back a self-
+		 * consistent namespace list.
+		 */
+		checkNameSpaceConflicts(pstate, l_namespace, r_namespace);
+
+		/*
+		 * Generate combined namespace info for possible use below.
+		 */
+		my_namespace = list_concat(l_namespace, r_namespace);
+
+		/*
+		 * We'll work from the nscolumns data and eref alias column names for
+		 * each of the input nsitems.  Note that these include dropped
+		 * columns, which is helpful because we can keep track of physical
+		 * input column numbers more easily.
+		 */
+		l_nscolumns = l_nsitem->p_nscolumns;
+		l_colnames = l_nsitem->p_names->colnames;
+		r_nscolumns = r_nsitem->p_nscolumns;
+		r_colnames = r_nsitem->p_names->colnames;
+
+		/*
+		 * Natural join does not explicitly specify columns; must generate
+		 * columns to join. Need to run through the list of columns from each
+		 * table or join result and match up the column names. Use the first
+		 * table, and check every column in the second table for a match.
+		 * (We'll check that the matches were unique later on.) The result of
+		 * this step is a list of column names just like an explicitly-written
+		 * USING list.
+		 */
+		if (j->isNatural)
+		{
+			List	   *rlist = NIL;
+			ListCell   *lx,
+					   *rx;
+
+			Assert(j->usingClause == NIL);	/* shouldn't have USING() too */
+
+			foreach(lx, l_colnames)
+			{
+				char	   *l_colname = strVal(lfirst(lx));
+				String	   *m_name = NULL;
+
+				if (l_colname[0] == '\0')
+					continue;	/* ignore dropped columns */
+
+				foreach(rx, r_colnames)
+				{
+					char	   *r_colname = strVal(lfirst(rx));
+
+					if (strcmp(l_colname, r_colname) == 0)
+					{
+						m_name = makeString(l_colname);
+						break;
+					}
+				}
+
+				/* matched a right column? then keep as join column... */
+				if (m_name != NULL)
+					rlist = lappend(rlist, m_name);
+			}
+
+			j->usingClause = rlist;
+		}
+
+		/*
+		 * If a USING clause alias was specified, save the USING columns as
+		 * its column list.
+		 */
+		if (j->join_using_alias)
+			j->join_using_alias->colnames = j->usingClause;
+
+		/*
+		 * Now transform the join qualifications, if any.
+		 */
+		l_colnos = NIL;
+		r_colnos = NIL;
+		res_colnames = NIL;
+		res_colvars = NIL;
+
+		/* this may be larger than needed, but it's not worth being exact */
+		res_nscolumns = (ParseNamespaceColumn *)
+			palloc0((list_length(l_colnames) + list_length(r_colnames)) *
+					sizeof(ParseNamespaceColumn));
+		res_colindex = 0;
+
+		if (j->usingClause)
+		{
+			/*
+			 * JOIN/USING (or NATURAL JOIN, as transformed above). Transform
+			 * the list into an explicit ON-condition.
+			 */
+			List	   *ucols = j->usingClause;
+			List	   *l_usingvars = NIL;
+			List	   *r_usingvars = NIL;
+			ListCell   *ucol;
+
+			Assert(j->quals == NULL);	/* shouldn't have ON() too */
+
+			foreach(ucol, ucols)
+			{
+				char	   *u_colname = strVal(lfirst(ucol));
+				ListCell   *col;
+				int			ndx;
+				int			l_index = -1;
+				int			r_index = -1;
+				Var		   *l_colvar,
+						   *r_colvar;
+
+				Assert(u_colname[0] != '\0');
+
+				/* Check for USING(foo,foo) */
+				foreach(col, res_colnames)
+				{
+					char	   *res_colname = strVal(lfirst(col));
+
+					if (strcmp(res_colname, u_colname) == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_DUPLICATE_COLUMN),
+								 errmsg("column name \"%s\" appears more than once in USING clause",
+										u_colname)));
+				}
+
+				/* Find it in left input */
+				ndx = 0;
+				foreach(col, l_colnames)
+				{
+					char	   *l_colname = strVal(lfirst(col));
+
+					if (strcmp(l_colname, u_colname) == 0)
+					{
+						if (l_index >= 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+									 errmsg("common column name \"%s\" appears more than once in left table",
+											u_colname)));
+						l_index = ndx;
+					}
+					ndx++;
+				}
+				if (l_index < 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_COLUMN),
+							 errmsg("column \"%s\" specified in USING clause does not exist in left table",
+									u_colname)));
+				l_colnos = lappend_int(l_colnos, l_index + 1);
+
+				/* Find it in right input */
+				ndx = 0;
+				foreach(col, r_colnames)
+				{
+					char	   *r_colname = strVal(lfirst(col));
+
+					if (strcmp(r_colname, u_colname) == 0)
+					{
+						if (r_index >= 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+									 errmsg("common column name \"%s\" appears more than once in right table",
+											u_colname)));
+						r_index = ndx;
+					}
+					ndx++;
+				}
+				if (r_index < 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_UNDEFINED_COLUMN),
+							 errmsg("column \"%s\" specified in USING clause does not exist in right table",
+									u_colname)));
+				r_colnos = lappend_int(r_colnos, r_index + 1);
+
+				/* Build Vars to use in the generated JOIN ON clause */
+				l_colvar = buildVarFromNSColumn(pstate, l_nscolumns + l_index);
+				l_usingvars = lappend(l_usingvars, l_colvar);
+				r_colvar = buildVarFromNSColumn(pstate, r_nscolumns + r_index);
+				r_usingvars = lappend(r_usingvars, r_colvar);
+
+				/*
+				 * While we're here, add column names to the res_colnames
+				 * list.  It's a bit ugly to do this here while the
+				 * corresponding res_colvars entries are not made till later,
+				 * but doing this later would require an additional traversal
+				 * of the usingClause list.
+				 */
+				res_colnames = lappend(res_colnames, lfirst(ucol));
+			}
+
+			/* Construct the generated JOIN ON clause */
+			j->quals = transformJoinUsingClause(pstate,
+												l_usingvars,
+												r_usingvars);
+		}
+		else if (j->quals)
+		{
+			/* User-written ON-condition; transform it */
+			j->quals = transformJoinOnClause(pstate, j, my_namespace);
+		}
+		else
+		{
+			/* CROSS JOIN: no quals */
+		}
+
+		/*
+		 * If this is an outer join, now mark the appropriate child RTEs as
+		 * being nulled by this join.  We have finished processing the child
+		 * join expressions as well as the current join's quals, which deal in
+		 * non-nulled input columns.  All future references to those RTEs will
+		 * see possibly-nulled values, and we should mark generated Vars to
+		 * account for that.  In particular, the join alias Vars that we're
+		 * about to build should reflect the nulling effects of this join.
+		 *
+		 * A difficulty with doing this is that we need the join's RT index,
+		 * which we don't officially have yet.  However, no other RTE can get
+		 * made between here and the addRangeTableEntryForJoin call, so we can
+		 * predict what the assignment will be.  (Alternatively, we could call
+		 * addRangeTableEntryForJoin before we have all the data computed, but
+		 * this seems less ugly.)
+		 */
+		j->rtindex = list_length(pstate->p_rtable) + 1;
+
+		switch (j->jointype)
+		{
+			case JOIN_INNER:
+				break;
+			case JOIN_LEFT:
+				markRelsAsNulledBy(pstate, j->rarg, j->rtindex);
+				break;
+			case JOIN_FULL:
+				markRelsAsNulledBy(pstate, j->larg, j->rtindex);
+				markRelsAsNulledBy(pstate, j->rarg, j->rtindex);
+				break;
+			case JOIN_RIGHT:
+				markRelsAsNulledBy(pstate, j->larg, j->rtindex);
+				break;
+			default:
+				/* shouldn't see any other types here */
+				elog(ERROR, "unrecognized join type: %d",
+					 (int) j->jointype);
+				break;
+		}
+
+		/*
+		 * Now we can construct join alias expressions for the USING columns.
+		 */
+		if (j->usingClause)
+		{
+			ListCell   *lc1,
+					   *lc2;
+
+			/* Scan the colnos lists to recover info from the previous loop */
+			forboth(lc1, l_colnos, lc2, r_colnos)
+			{
+				int			l_index = lfirst_int(lc1) - 1;
+				int			r_index = lfirst_int(lc2) - 1;
+				Var		   *l_colvar,
+						   *r_colvar;
+				Node	   *u_colvar;
+				ParseNamespaceColumn *res_nscolumn;
+
+				/*
+				 * Note we re-build these Vars: they might have different
+				 * varnullingrels than the ones made in the previous loop.
+				 */
+				l_colvar = buildVarFromNSColumn(pstate, l_nscolumns + l_index);
+				r_colvar = buildVarFromNSColumn(pstate, r_nscolumns + r_index);
+
+				/* Construct the join alias Var for this column */
+				u_colvar = buildMergedJoinVar(pstate,
+											  j->jointype,
+											  l_colvar,
+											  r_colvar);
+				res_colvars = lappend(res_colvars, u_colvar);
+
+				/* Construct column's res_nscolumns[] entry */
+				res_nscolumn = res_nscolumns + res_colindex;
+				res_colindex++;
+				if (u_colvar == (Node *) l_colvar)
+				{
+					/* Merged column is equivalent to left input */
+					*res_nscolumn = l_nscolumns[l_index];
+				}
+				else if (u_colvar == (Node *) r_colvar)
+				{
+					/* Merged column is equivalent to right input */
+					*res_nscolumn = r_nscolumns[r_index];
+				}
+				else
+				{
+					/*
+					 * Merged column is not semantically equivalent to either
+					 * input, so it needs to be referenced as the join output
+					 * column.
+					 */
+					res_nscolumn->p_varno = j->rtindex;
+					res_nscolumn->p_varattno = res_colindex;
+					res_nscolumn->p_vartype = exprType(u_colvar);
+					res_nscolumn->p_vartypmod = exprTypmod(u_colvar);
+					res_nscolumn->p_varcollid = exprCollation(u_colvar);
+					res_nscolumn->p_varnosyn = j->rtindex;
+					res_nscolumn->p_varattnosyn = res_colindex;
+				}
+			}
+		}
+
+		/* Add remaining columns from each side to the output columns */
+		res_colindex +=
+			extractRemainingColumns(pstate,
+									l_nscolumns, l_colnames, &l_colnos,
+									&res_colnames, &res_colvars,
+									res_nscolumns + res_colindex);
+		res_colindex +=
+			extractRemainingColumns(pstate,
+									r_nscolumns, r_colnames, &r_colnos,
+									&res_colnames, &res_colvars,
+									res_nscolumns + res_colindex);
+
+		/* If join has an alias, it syntactically hides all inputs */
+		if (j->alias)
+		{
+			for (k = 0; k < res_colindex; k++)
+			{
+				ParseNamespaceColumn *nscol = res_nscolumns + k;
+
+				nscol->p_varnosyn = j->rtindex;
+				nscol->p_varattnosyn = k + 1;
+			}
+		}
+
+		/*
+		 * Now build an RTE and nsitem for the result of the join.
+		 */
+		nsitem = addRangeTableEntryForJoin(pstate,
+										   res_colnames,
+										   res_nscolumns,
+										   j->jointype,
+										   list_length(j->usingClause),
+										   res_colvars,
+										   l_colnos,
+										   r_colnos,
+										   j->join_using_alias,
+										   j->alias,
+										   true);
+
+		/* Verify that we correctly predicted the join's RT index */
+		Assert(j->rtindex == nsitem->p_rtindex);
+		/* Cross-check number of columns, too */
+		Assert(res_colindex == list_length(nsitem->p_names->colnames));
+
+		/*
+		 * Save a link to the JoinExpr in the proper element of p_joinexprs.
+		 * Since we maintain that list lazily, it may be necessary to fill in
+		 * empty entries before we can add the JoinExpr in the right place.
+		 */
+		for (k = list_length(pstate->p_joinexprs) + 1; k < j->rtindex; k++)
+			pstate->p_joinexprs = lappend(pstate->p_joinexprs, NULL);
+		pstate->p_joinexprs = lappend(pstate->p_joinexprs, j);
+		Assert(list_length(pstate->p_joinexprs) == j->rtindex);
+
+		/*
+		 * If the join has a USING alias, build a ParseNamespaceItem for that
+		 * and add it to the list of nsitems in the join's input.
+		 */
+		if (j->join_using_alias)
+		{
+			ParseNamespaceItem *jnsitem;
+
+			jnsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
+			jnsitem->p_names = j->join_using_alias;
+			jnsitem->p_rte = nsitem->p_rte;
+			jnsitem->p_rtindex = nsitem->p_rtindex;
+			jnsitem->p_perminfo = NULL;
+			/* no need to copy the first N columns, just use res_nscolumns */
+			jnsitem->p_nscolumns = res_nscolumns;
+			/* set default visibility flags; might get changed later */
+			jnsitem->p_rel_visible = true;
+			jnsitem->p_cols_visible = true;
+			jnsitem->p_lateral_only = false;
+			jnsitem->p_lateral_ok = true;
+			jnsitem->p_returning_type = VAR_RETURNING_DEFAULT;
+			/* Per SQL, we must check for alias conflicts */
+			checkNameSpaceConflicts(pstate, list_make1(jnsitem), my_namespace);
+			my_namespace = lappend(my_namespace, jnsitem);
+		}
+
+		/*
+		 * Prepare returned namespace list.  If the JOIN has an alias then it
+		 * hides the contained RTEs completely; otherwise, the contained RTEs
+		 * are still visible as table names, but are not visible for
+		 * unqualified column-name access.
+		 *
+		 * Note: if there are nested alias-less JOINs, the lower-level ones
+		 * will remain in the list although they have neither p_rel_visible
+		 * nor p_cols_visible set.  We could delete such list items, but it's
+		 * unclear that it's worth expending cycles to do so.
+		 */
+		if (j->alias != NULL)
+			my_namespace = NIL;
+		else
+			setNamespaceColumnVisibility(my_namespace, false);
+
+		/*
+		 * The join RTE itself is always made visible for unqualified column
+		 * names.  It's visible as a relation name only if it has an alias.
+		 */
+		nsitem->p_rel_visible = (j->alias != NULL);
+		nsitem->p_cols_visible = true;
+		nsitem->p_lateral_only = false;
+		nsitem->p_lateral_ok = true;
+
+		*top_nsitem = nsitem;
+		*namespace = lappend(my_namespace, nsitem);
+
+		return (Node *) j;
+	}
+	else
+		elog(ERROR, "unrecognized node type: %d", (int) nodeTag(n));
+	return NULL;				/* can't get here, keep compiler quiet */
+}
+
+/*
  * buildVarFromNSColumn -
  *	  build a Var node using ParseNamespaceColumn data
  *
- * We assume varlevelsup should be 0, and no location is specified
+ * This is used to construct joinaliasvars entries.
+ * We can assume varlevelsup should be 0, and no location is specified.
+ * Note also that no column SELECT privilege is requested here; that would
+ * happen only if the column is actually referenced in the query.
  */
 static Var *
-buildVarFromNSColumn(ParseNamespaceColumn *nscol)
+buildVarFromNSColumn(ParseState *pstate, ParseNamespaceColumn *nscol)
 {
 	Var		   *var;
 
@@ -1055,8 +1648,13 @@ buildVarFromNSColumn(ParseNamespaceColumn *nscol)
 				  nscol->p_varcollid,
 				  0);
 	/* makeVar doesn't offer parameters for these, so set by hand: */
+	var->varreturningtype = nscol->p_varreturningtype;
 	var->varnosyn = nscol->p_varnosyn;
 	var->varattnosyn = nscol->p_varattnosyn;
+
+	/* ... and update varnullingrels */
+	markNullableIfNeeded(pstate, var);
+
 	return var;
 }
 
@@ -1169,6 +1767,47 @@ buildMergedJoinVar(ParseState *pstate, JoinType jointype,
 }
 
 /*
+ * markRelsAsNulledBy -
+ *	  Mark the given jointree node and its children as nulled by join jindex
+ */
+static void
+markRelsAsNulledBy(ParseState *pstate, Node *n, int jindex)
+{
+	int			varno;
+	ListCell   *lc;
+
+	/* Note: we can't see FromExpr here */
+	if (IsA(n, RangeTblRef))
+	{
+		varno = ((RangeTblRef *) n)->rtindex;
+	}
+	else if (IsA(n, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) n;
+
+		/* recurse to children */
+		markRelsAsNulledBy(pstate, j->larg, jindex);
+		markRelsAsNulledBy(pstate, j->rarg, jindex);
+		varno = j->rtindex;
+	}
+	else
+	{
+		elog(ERROR, "unrecognized node type: %d", (int) nodeTag(n));
+		varno = 0;				/* keep compiler quiet */
+	}
+
+	/*
+	 * Now add jindex to the p_nullingrels set for relation varno.  Since we
+	 * maintain the p_nullingrels list lazily, we might need to extend it to
+	 * make the varno'th entry exist.
+	 */
+	while (list_length(pstate->p_nullingrels) < varno)
+		pstate->p_nullingrels = lappend(pstate->p_nullingrels, NULL);
+	lc = list_nth_cell(pstate->p_nullingrels, varno - 1);
+	lfirst(lc) = bms_add_member((Bitmapset *) lfirst(lc), jindex);
+}
+
+/*
  * setNamespaceColumnVisibility -
  *	  Convenience subroutine to update cols_visible flags in a namespace list.
  */
@@ -1205,14 +1844,14 @@ setNamespaceLateralState(List *namespace, bool lateral_only, bool lateral_ok)
 
 
 /*
- * standard_transformWhereClause -
+ * transformWhereClause -
  *	  Transform the qualification and make sure it is of type boolean.
  *	  Used for WHERE and allied clauses.
  *
  * constructName does not affect the semantics, but is used in error messages
  */
 Node *
-standard_transformWhereClause(ParseState *pstate, Node *clause,
+transformWhereClause(ParseState *pstate, Node *clause,
 					 ParseExprKind exprKind, const char *constructName)
 {
 	Node	   *qual;
@@ -1229,7 +1868,7 @@ standard_transformWhereClause(ParseState *pstate, Node *clause,
 
 
 /*
- * standard_transformLimitClause -
+ * transformLimitClause -
  *	  Transform the expression and make sure it is of type bigint.
  *	  Used for LIMIT and allied clauses.
  *
@@ -1239,7 +1878,7 @@ standard_transformWhereClause(ParseState *pstate, Node *clause,
  * constructName does not affect the semantics, but is used in error messages
  */
 Node *
-standard_transformLimitClause(ParseState *pstate, Node *clause,
+transformLimitClause(ParseState *pstate, Node *clause,
 					 ParseExprKind exprKind, const char *constructName,
 					 LimitOption limitOption)
 {
@@ -1262,7 +1901,7 @@ standard_transformLimitClause(ParseState *pstate, Node *clause,
 	 * unadorned NULL that's not accepted back by the grammar.
 	 */
 	if (exprKind == EXPR_KIND_LIMIT && limitOption == LIMIT_OPTION_WITH_TIES &&
-		IsA(clause, A_Const) && ((A_Const *) clause)->val.type == T_Null)
+		IsA(clause, A_Const) && castNode(A_Const, clause)->isnull)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ROW_COUNT_IN_LIMIT_CLAUSE),
 				 errmsg("row count cannot be null in FETCH FIRST ... WITH TIES clause")));
@@ -1475,20 +2114,19 @@ findTargetlistEntrySQL92(ParseState *pstate, Node *node, List **tlist,
 	}
 	if (IsA(node, A_Const))
 	{
-		Value	   *val = &((A_Const *) node)->val;
-		int			location = ((A_Const *) node)->location;
+		A_Const    *aconst = castNode(A_Const, node);
 		int			targetlist_pos = 0;
 		int			target_pos;
 
-		if (!IsA(val, Integer))
+		if (!IsA(&aconst->val, Integer))
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 			/* translator: %s is name of a SQL construct, eg ORDER BY */
 					 errmsg("non-integer constant in %s",
 							ParseExprKindName(exprKind)),
-					 parser_errposition(pstate, location)));
+					 parser_errposition(pstate, aconst->location)));
 
-		target_pos = intVal(val);
+		target_pos = intVal(&aconst->val);
 		foreach(tl, *tlist)
 		{
 			TargetEntry *tle = (TargetEntry *) lfirst(tl);
@@ -1508,7 +2146,7 @@ findTargetlistEntrySQL92(ParseState *pstate, Node *node, List **tlist,
 		/* translator: %s is name of a SQL construct, eg ORDER BY */
 				 errmsg("%s position %d is not in select list",
 						ParseExprKindName(exprKind), target_pos),
-				 parser_errposition(pstate, location)));
+				 parser_errposition(pstate, aconst->location)));
 	}
 
 	/*
@@ -1954,7 +2592,7 @@ transformGroupingSet(List **flatresult,
 
 
 /*
- * standard_transformGroupClause -
+ * transformGroupClause -
  *	  transform a GROUP BY clause
  *
  * GROUP BY items will be added to the targetlist (as resjunk columns)
@@ -1991,7 +2629,7 @@ transformGroupingSet(List **flatresult,
  * useSQL99		SQL99 rather than SQL92 syntax
  */
 List *
-standard_transformGroupClause(ParseState *pstate, List *grouplist, List **groupingSets,
+transformGroupClause(ParseState *pstate, List *grouplist, List **groupingSets,
 					 List **targetlist, List *sortClause,
 					 ParseExprKind exprKind, bool useSQL99)
 {
@@ -2081,7 +2719,7 @@ standard_transformGroupClause(ParseState *pstate, List *grouplist, List **groupi
 }
 
 /*
- * standard_transformSortClause -
+ * transformSortClause -
  *	  transform an ORDER BY clause
  *
  * ORDER BY items will be added to the targetlist (as resjunk columns)
@@ -2091,7 +2729,7 @@ standard_transformGroupClause(ParseState *pstate, List *grouplist, List **groupi
  * almost the same, but are always interpreted per SQL99 rules).
  */
 List *
-standard_transformSortClause(ParseState *pstate,
+transformSortClause(ParseState *pstate,
 					List *orderlist,
 					List **targetlist,
 					ParseExprKind exprKind,
@@ -2120,11 +2758,11 @@ standard_transformSortClause(ParseState *pstate,
 }
 
 /*
- * standard_transformWindowDefinitions -
+ * transformWindowDefinitions -
  *		transform window definitions (WindowDef to WindowClause)
  */
 List *
-standard_transformWindowDefinitions(ParseState *pstate,
+transformWindowDefinitions(ParseState *pstate,
 						   List *windowdefs,
 						   List **targetlist)
 {
@@ -2277,25 +2915,25 @@ standard_transformWindowDefinitions(ParseState *pstate,
 		{
 			SortGroupClause *sortcl;
 			Node	   *sortkey;
-			int16		rangestrategy;
+			CompareType rangecmptype;
 
 			if (list_length(wc->orderClause) != 1)
 				ereport(ERROR,
 						(errcode(ERRCODE_WINDOWING_ERROR),
 						 errmsg("RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column"),
 						 parser_errposition(pstate, windef->location)));
-			sortcl = castNode(SortGroupClause, linitial(wc->orderClause));
+			sortcl = linitial_node(SortGroupClause, wc->orderClause);
 			sortkey = get_sortgroupclause_expr(sortcl, *targetlist);
 			/* Find the sort operator in pg_amop */
 			if (!get_ordering_op_properties(sortcl->sortop,
 											&rangeopfamily,
 											&rangeopcintype,
-											&rangestrategy))
+											&rangecmptype))
 				elog(ERROR, "operator %u is not a valid ordering operator",
 					 sortcl->sortop);
 			/* Record properties of sort ordering */
 			wc->inRangeColl = exprCollation(sortkey);
-			wc->inRangeAsc = (rangestrategy == BTLessStrategyNumber);
+			wc->inRangeAsc = !sortcl->reverse_sort;
 			wc->inRangeNullsFirst = sortcl->nulls_first;
 		}
 
@@ -2327,7 +2965,7 @@ standard_transformWindowDefinitions(ParseState *pstate,
 }
 
 /*
- * standard_transformDistinctClause -
+ * transformDistinctClause -
  *	  transform a DISTINCT clause
  *
  * Since we may need to add items to the query's targetlist, that list
@@ -2344,7 +2982,7 @@ standard_transformWindowDefinitions(ParseState *pstate,
  * of error messages.
  */
 List *
-standard_transformDistinctClause(ParseState *pstate,
+transformDistinctClause(ParseState *pstate,
 						List **targetlist, List *sortClause, bool is_agg)
 {
 	List	   *result = NIL;
@@ -2415,7 +3053,7 @@ standard_transformDistinctClause(ParseState *pstate,
 }
 
 /*
- * standard_transformDistinctOnClause -
+ * transformDistinctOnClause -
  *	  transform a DISTINCT ON clause
  *
  * Since we may need to add items to the query's targetlist, that list
@@ -2428,7 +3066,7 @@ standard_transformDistinctClause(ParseState *pstate,
  * operator.
  */
 List *
-standard_transformDistinctOnClause(ParseState *pstate, List *distinctlist,
+transformDistinctOnClause(ParseState *pstate, List *distinctlist,
 						  List **targetlist, List *sortClause)
 {
 	List	   *result = NIL;
@@ -2648,7 +3286,7 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
 }
 
 /*
- * standard_transformOnConflictArbiter -
+ * transformOnConflictArbiter -
  *		transform arbiter expressions in an ON CONFLICT clause.
  *
  * Transformed expressions used to infer one unique index relation to serve as
@@ -2656,7 +3294,7 @@ resolve_unique_index_expr(ParseState *pstate, InferClause *infer,
  * clause from inference specification clause.
  */
 void
-standard_transformOnConflictArbiter(ParseState *pstate,
+transformOnConflictArbiter(ParseState *pstate,
 						   OnConflictClause *onConflictClause,
 						   List **arbiterExpr, Node **arbiterWhere,
 						   Oid *constraint)
@@ -2719,16 +3357,17 @@ standard_transformOnConflictArbiter(ParseState *pstate,
 		if (infer->conname)
 		{
 			Oid			relid = RelationGetRelid(pstate->p_target_relation);
-			RangeTblEntry *rte = pstate->p_target_nsitem->p_rte;
+			RTEPermissionInfo *perminfo = pstate->p_target_nsitem->p_perminfo;
 			Bitmapset  *conattnos;
 
 			conattnos = get_relation_constraint_attnos(relid, infer->conname,
 													   false, constraint);
 
 			/* Make sure the rel as a whole is marked for SELECT access */
-			rte->requiredPerms |= ACL_SELECT;
+			perminfo->requiredPerms |= ACL_SELECT;
 			/* Mark the constrained columns as requiring SELECT access */
-			rte->selectedCols = bms_add_members(rte->selectedCols, conattnos);
+			perminfo->selectedCols = bms_add_members(perminfo->selectedCols,
+													 conattnos);
 		}
 	}
 
@@ -2850,6 +3489,7 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 		sortcl->eqop = eqop;
 		sortcl->sortop = sortop;
 		sortcl->hashable = hashable;
+		sortcl->reverse_sort = reverse;
 
 		switch (sortby->sortby_nulls)
 		{
@@ -2932,6 +3572,8 @@ addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
 		grpcl->tleSortGroupRef = assignSortGroupRef(tle, targetlist);
 		grpcl->eqop = eqop;
 		grpcl->sortop = sortop;
+		grpcl->reverse_sort = false;	/* sortop is "less than", or
+										 * InvalidOid */
 		grpcl->nulls_first = false; /* OK with or without sortop */
 		grpcl->hashable = hashable;
 
@@ -3180,521 +3822,4 @@ transformFrameOffset(ParseState *pstate, int frameOptions,
 	checkExprIsVarFree(pstate, node, constructName);
 
 	return node;
-}
-
-/*
- * transformFromClauseItem -
- *	  Transform a FROM-clause item, adding any required entries to the
- *	  range table list being built in the ParseState, and return the
- *	  transformed item ready to include in the joinlist.  Also build a
- *	  ParseNamespaceItem list describing the names exposed by this item.
- *	  This routine can recurse to handle SQL92 JOIN expressions.
- *
- * The function return value is the node to add to the jointree (a
- * RangeTblRef or JoinExpr).  Additional output parameters are:
- *
- * *top_nsitem: receives the ParseNamespaceItem directly corresponding to the
- * jointree item.  (This is only used during internal recursion, not by
- * outside callers.)
- *
- * *namespace: receives a List of ParseNamespaceItems for the RTEs exposed
- * as table/column names by this item.  (The lateral_only flags in these items
- * are indeterminate and should be explicitly set by the caller before use.)
- */
-static Node *
-transformFromClauseItem(ParseState *pstate, Node *n,
-						ParseNamespaceItem **top_nsitem,
-						List **namespace)
-{
-	/* Guard against stack overflow due to overly deep subtree */
-	check_stack_depth();
-
-	if (IsA(n, RangeVar))
-	{
-		/* Plain relation reference, or perhaps a CTE reference */
-		RangeVar   *rv = (RangeVar *) n;
-		RangeTblRef *rtr;
-		ParseNamespaceItem *nsitem;
-
-		/* Check if it's a CTE or tuplestore reference */
-		nsitem = getNSItemForSpecialRelationTypes(pstate, rv);
-
-		/* if not found above, must be a table reference */
-		if (!nsitem)
-			nsitem = transformTableEntry(pstate, rv);
-
-		*top_nsitem = nsitem;
-		*namespace = list_make1(nsitem);
-		rtr = makeNode(RangeTblRef);
-		rtr->rtindex = nsitem->p_rtindex;
-		return (Node *) rtr;
-	}
-	else if (IsA(n, RangeSubselect))
-	{
-		/* sub-SELECT is like a plain relation */
-		RangeTblRef *rtr;
-		ParseNamespaceItem *nsitem;
-
-		nsitem = transformRangeSubselect(pstate, (RangeSubselect *) n);
-		*top_nsitem = nsitem;
-		*namespace = list_make1(nsitem);
-		rtr = makeNode(RangeTblRef);
-		rtr->rtindex = nsitem->p_rtindex;
-		return (Node *) rtr;
-	}
-	else if (IsA(n, RangeFunction))
-	{
-		/* function is like a plain relation */
-		RangeTblRef *rtr;
-		ParseNamespaceItem *nsitem;
-
-		nsitem = transformRangeFunction(pstate, (RangeFunction *) n);
-		*top_nsitem = nsitem;
-		*namespace = list_make1(nsitem);
-		rtr = makeNode(RangeTblRef);
-		rtr->rtindex = nsitem->p_rtindex;
-		return (Node *) rtr;
-	}
-	else if (IsA(n, RangeTableFunc))
-	{
-		/* table function is like a plain relation */
-		RangeTblRef *rtr;
-		ParseNamespaceItem *nsitem;
-
-		nsitem = transformRangeTableFunc(pstate, (RangeTableFunc *) n);
-		*top_nsitem = nsitem;
-		*namespace = list_make1(nsitem);
-		rtr = makeNode(RangeTblRef);
-		rtr->rtindex = nsitem->p_rtindex;
-		return (Node *) rtr;
-	}
-	else if (IsA(n, RangeTableSample))
-	{
-		/* TABLESAMPLE clause (wrapping some other valid FROM node) */
-		RangeTableSample *rts = (RangeTableSample *) n;
-		Node	   *rel;
-		RangeTblEntry *rte;
-
-		/* Recursively transform the contained relation */
-		rel = transformFromClauseItem(pstate, rts->relation,
-									  top_nsitem, namespace);
-		rte = (*top_nsitem)->p_rte;
-		/* We only support this on plain relations and matviews */
-		if (rte->rtekind != RTE_RELATION ||
-			(rte->relkind != RELKIND_RELATION &&
-			 rte->relkind != RELKIND_MATVIEW &&
-			 rte->relkind != RELKIND_PARTITIONED_TABLE))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("TABLESAMPLE clause can only be applied to tables and materialized views"),
-					 parser_errposition(pstate, exprLocation(rts->relation))));
-
-		/* Transform TABLESAMPLE details and attach to the RTE */
-		rte->tablesample = transformRangeTableSample(pstate, rts);
-		return rel;
-	}
-	else if (IsA(n, JoinExpr))
-	{
-		/* A newfangled join expression */
-		JoinExpr   *j = (JoinExpr *) n;
-		ParseNamespaceItem *nsitem;
-		ParseNamespaceItem *l_nsitem;
-		ParseNamespaceItem *r_nsitem;
-		List	   *l_namespace,
-				   *r_namespace,
-				   *my_namespace,
-				   *l_colnames,
-				   *r_colnames,
-				   *res_colnames,
-				   *l_colnos,
-				   *r_colnos,
-				   *res_colvars;
-		ParseNamespaceColumn *l_nscolumns,
-				   *r_nscolumns,
-				   *res_nscolumns;
-		int			res_colindex;
-		bool		lateral_ok;
-		int			sv_namespace_length;
-		int			k;
-
-		/*
-		 * Recursively process the left subtree, then the right.  We must do
-		 * it in this order for correct visibility of LATERAL references.
-		 */
-		j->larg = transformFromClauseItem(pstate, j->larg,
-										  &l_nsitem,
-										  &l_namespace);
-
-		/*
-		 * Make the left-side RTEs available for LATERAL access within the
-		 * right side, by temporarily adding them to the pstate's namespace
-		 * list.  Per SQL:2008, if the join type is not INNER or LEFT then the
-		 * left-side names must still be exposed, but it's an error to
-		 * reference them.  (Stupid design, but that's what it says.)  Hence,
-		 * we always push them into the namespace, but mark them as not
-		 * lateral_ok if the jointype is wrong.
-		 *
-		 * Notice that we don't require the merged namespace list to be
-		 * conflict-free.  See the comments for scanNameSpaceForRefname().
-		 */
-		lateral_ok = (j->jointype == JOIN_INNER || j->jointype == JOIN_LEFT);
-		setNamespaceLateralState(l_namespace, true, lateral_ok);
-
-		sv_namespace_length = list_length(pstate->p_namespace);
-		pstate->p_namespace = list_concat(pstate->p_namespace, l_namespace);
-
-		/* And now we can process the RHS */
-		j->rarg = transformFromClauseItem(pstate, j->rarg,
-										  &r_nsitem,
-										  &r_namespace);
-
-		/* Remove the left-side RTEs from the namespace list again */
-		pstate->p_namespace = list_truncate(pstate->p_namespace,
-											sv_namespace_length);
-
-		/*
-		 * Check for conflicting refnames in left and right subtrees. Must do
-		 * this because higher levels will assume I hand back a self-
-		 * consistent namespace list.
-		 */
-		checkNameSpaceConflicts(pstate, l_namespace, r_namespace);
-
-		/*
-		 * Generate combined namespace info for possible use below.
-		 */
-		my_namespace = list_concat(l_namespace, r_namespace);
-
-		/*
-		 * We'll work from the nscolumns data and eref alias column names for
-		 * each of the input nsitems.  Note that these include dropped
-		 * columns, which is helpful because we can keep track of physical
-		 * input column numbers more easily.
-		 */
-		l_nscolumns = l_nsitem->p_nscolumns;
-		l_colnames = l_nsitem->p_names->colnames;
-		r_nscolumns = r_nsitem->p_nscolumns;
-		r_colnames = r_nsitem->p_names->colnames;
-
-		/*
-		 * Natural join does not explicitly specify columns; must generate
-		 * columns to join. Need to run through the list of columns from each
-		 * table or join result and match up the column names. Use the first
-		 * table, and check every column in the second table for a match.
-		 * (We'll check that the matches were unique later on.) The result of
-		 * this step is a list of column names just like an explicitly-written
-		 * USING list.
-		 */
-		if (j->isNatural)
-		{
-			List	   *rlist = NIL;
-			ListCell   *lx,
-					   *rx;
-
-			Assert(j->usingClause == NIL);	/* shouldn't have USING() too */
-
-			foreach(lx, l_colnames)
-			{
-				char	   *l_colname = strVal(lfirst(lx));
-				Value	   *m_name = NULL;
-
-				if (l_colname[0] == '\0')
-					continue;	/* ignore dropped columns */
-
-				foreach(rx, r_colnames)
-				{
-					char	   *r_colname = strVal(lfirst(rx));
-
-					if (strcmp(l_colname, r_colname) == 0)
-					{
-						m_name = makeString(l_colname);
-						break;
-					}
-				}
-
-				/* matched a right column? then keep as join column... */
-				if (m_name != NULL)
-					rlist = lappend(rlist, m_name);
-			}
-
-			j->usingClause = rlist;
-		}
-
-		/*
-		 * If a USING clause alias was specified, save the USING columns as
-		 * its column list.
-		 */
-		if (j->join_using_alias)
-			j->join_using_alias->colnames = j->usingClause;
-
-		/*
-		 * Now transform the join qualifications, if any.
-		 */
-		l_colnos = NIL;
-		r_colnos = NIL;
-		res_colnames = NIL;
-		res_colvars = NIL;
-
-		/* this may be larger than needed, but it's not worth being exact */
-		res_nscolumns = (ParseNamespaceColumn *)
-			palloc0((list_length(l_colnames) + list_length(r_colnames)) *
-					sizeof(ParseNamespaceColumn));
-		res_colindex = 0;
-
-		if (j->usingClause)
-		{
-			/*
-			 * JOIN/USING (or NATURAL JOIN, as transformed above). Transform
-			 * the list into an explicit ON-condition, and generate a list of
-			 * merged result columns.
-			 */
-			List	   *ucols = j->usingClause;
-			List	   *l_usingvars = NIL;
-			List	   *r_usingvars = NIL;
-			ListCell   *ucol;
-
-			Assert(j->quals == NULL);	/* shouldn't have ON() too */
-
-			foreach(ucol, ucols)
-			{
-				char	   *u_colname = strVal(lfirst(ucol));
-				ListCell   *col;
-				int			ndx;
-				int			l_index = -1;
-				int			r_index = -1;
-				Var		   *l_colvar,
-						   *r_colvar;
-				Node	   *u_colvar;
-				ParseNamespaceColumn *res_nscolumn;
-
-				Assert(u_colname[0] != '\0');
-
-				/* Check for USING(foo,foo) */
-				foreach(col, res_colnames)
-				{
-					char	   *res_colname = strVal(lfirst(col));
-
-					if (strcmp(res_colname, u_colname) == 0)
-						ereport(ERROR,
-								(errcode(ERRCODE_DUPLICATE_COLUMN),
-								 errmsg("column name \"%s\" appears more than once in USING clause",
-										u_colname)));
-				}
-
-				/* Find it in left input */
-				ndx = 0;
-				foreach(col, l_colnames)
-				{
-					char	   *l_colname = strVal(lfirst(col));
-
-					if (strcmp(l_colname, u_colname) == 0)
-					{
-						if (l_index >= 0)
-							ereport(ERROR,
-									(errcode(ERRCODE_AMBIGUOUS_COLUMN),
-									 errmsg("common column name \"%s\" appears more than once in left table",
-											u_colname)));
-						l_index = ndx;
-					}
-					ndx++;
-				}
-				if (l_index < 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_UNDEFINED_COLUMN),
-							 errmsg("column \"%s\" specified in USING clause does not exist in left table",
-									u_colname)));
-				l_colnos = lappend_int(l_colnos, l_index + 1);
-
-				/* Find it in right input */
-				ndx = 0;
-				foreach(col, r_colnames)
-				{
-					char	   *r_colname = strVal(lfirst(col));
-
-					if (strcmp(r_colname, u_colname) == 0)
-					{
-						if (r_index >= 0)
-							ereport(ERROR,
-									(errcode(ERRCODE_AMBIGUOUS_COLUMN),
-									 errmsg("common column name \"%s\" appears more than once in right table",
-											u_colname)));
-						r_index = ndx;
-					}
-					ndx++;
-				}
-				if (r_index < 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_UNDEFINED_COLUMN),
-							 errmsg("column \"%s\" specified in USING clause does not exist in right table",
-									u_colname)));
-				r_colnos = lappend_int(r_colnos, r_index + 1);
-
-				l_colvar = buildVarFromNSColumn(l_nscolumns + l_index);
-				l_usingvars = lappend(l_usingvars, l_colvar);
-				r_colvar = buildVarFromNSColumn(r_nscolumns + r_index);
-				r_usingvars = lappend(r_usingvars, r_colvar);
-
-				res_colnames = lappend(res_colnames, lfirst(ucol));
-				u_colvar = buildMergedJoinVar(pstate,
-											  j->jointype,
-											  l_colvar,
-											  r_colvar);
-				res_colvars = lappend(res_colvars, u_colvar);
-				res_nscolumn = res_nscolumns + res_colindex;
-				res_colindex++;
-				if (u_colvar == (Node *) l_colvar)
-				{
-					/* Merged column is equivalent to left input */
-					*res_nscolumn = l_nscolumns[l_index];
-				}
-				else if (u_colvar == (Node *) r_colvar)
-				{
-					/* Merged column is equivalent to right input */
-					*res_nscolumn = r_nscolumns[r_index];
-				}
-				else
-				{
-					/*
-					 * Merged column is not semantically equivalent to either
-					 * input, so it needs to be referenced as the join output
-					 * column.  We don't know the join's varno yet, so we'll
-					 * replace these zeroes below.
-					 */
-					res_nscolumn->p_varno = 0;
-					res_nscolumn->p_varattno = res_colindex;
-					res_nscolumn->p_vartype = exprType(u_colvar);
-					res_nscolumn->p_vartypmod = exprTypmod(u_colvar);
-					res_nscolumn->p_varcollid = exprCollation(u_colvar);
-					res_nscolumn->p_varnosyn = 0;
-					res_nscolumn->p_varattnosyn = res_colindex;
-				}
-			}
-
-			j->quals = transformJoinUsingClause(pstate,
-												l_usingvars,
-												r_usingvars);
-		}
-		else if (j->quals)
-		{
-			/* User-written ON-condition; transform it */
-			j->quals = transformJoinOnClause(pstate, j, my_namespace);
-		}
-		else
-		{
-			/* CROSS JOIN: no quals */
-		}
-
-		/* Add remaining columns from each side to the output columns */
-		res_colindex +=
-			extractRemainingColumns(l_nscolumns, l_colnames, &l_colnos,
-									&res_colnames, &res_colvars,
-									res_nscolumns + res_colindex);
-		res_colindex +=
-			extractRemainingColumns(r_nscolumns, r_colnames, &r_colnos,
-									&res_colnames, &res_colvars,
-									res_nscolumns + res_colindex);
-
-		/*
-		 * Now build an RTE and nsitem for the result of the join.
-		 * res_nscolumns isn't totally done yet, but that's OK because
-		 * addRangeTableEntryForJoin doesn't examine it, only store a pointer.
-		 */
-		nsitem = addRangeTableEntryForJoin(pstate,
-										   res_colnames,
-										   res_nscolumns,
-										   j->jointype,
-										   list_length(j->usingClause),
-										   res_colvars,
-										   l_colnos,
-										   r_colnos,
-										   j->join_using_alias,
-										   j->alias,
-										   true);
-
-		j->rtindex = nsitem->p_rtindex;
-
-		/*
-		 * Now that we know the join RTE's rangetable index, we can fix up the
-		 * res_nscolumns data in places where it should contain that.
-		 */
-		Assert(res_colindex == list_length(nsitem->p_names->colnames));
-		for (k = 0; k < res_colindex; k++)
-		{
-			ParseNamespaceColumn *nscol = res_nscolumns + k;
-
-			/* fill in join RTI for merged columns */
-			if (nscol->p_varno == 0)
-				nscol->p_varno = j->rtindex;
-			if (nscol->p_varnosyn == 0)
-				nscol->p_varnosyn = j->rtindex;
-			/* if join has an alias, it syntactically hides all inputs */
-			if (j->alias)
-			{
-				nscol->p_varnosyn = j->rtindex;
-				nscol->p_varattnosyn = k + 1;
-			}
-		}
-
-		/* make a matching link to the JoinExpr for later use */
-		for (k = list_length(pstate->p_joinexprs) + 1; k < j->rtindex; k++)
-			pstate->p_joinexprs = lappend(pstate->p_joinexprs, NULL);
-		pstate->p_joinexprs = lappend(pstate->p_joinexprs, j);
-		Assert(list_length(pstate->p_joinexprs) == j->rtindex);
-
-		/*
-		 * If the join has a USING alias, build a ParseNamespaceItem for that
-		 * and add it to the list of nsitems in the join's input.
-		 */
-		if (j->join_using_alias)
-		{
-			ParseNamespaceItem *jnsitem;
-
-			jnsitem = (ParseNamespaceItem *) palloc(sizeof(ParseNamespaceItem));
-			jnsitem->p_names = j->join_using_alias;
-			jnsitem->p_rte = nsitem->p_rte;
-			jnsitem->p_rtindex = nsitem->p_rtindex;
-			/* no need to copy the first N columns, just use res_nscolumns */
-			jnsitem->p_nscolumns = res_nscolumns;
-			/* set default visibility flags; might get changed later */
-			jnsitem->p_rel_visible = true;
-			jnsitem->p_cols_visible = true;
-			jnsitem->p_lateral_only = false;
-			jnsitem->p_lateral_ok = true;
-			/* Per SQL, we must check for alias conflicts */
-			checkNameSpaceConflicts(pstate, list_make1(jnsitem), my_namespace);
-			my_namespace = lappend(my_namespace, jnsitem);
-		}
-
-		/*
-		 * Prepare returned namespace list.  If the JOIN has an alias then it
-		 * hides the contained RTEs completely; otherwise, the contained RTEs
-		 * are still visible as table names, but are not visible for
-		 * unqualified column-name access.
-		 *
-		 * Note: if there are nested alias-less JOINs, the lower-level ones
-		 * will remain in the list although they have neither p_rel_visible
-		 * nor p_cols_visible set.  We could delete such list items, but it's
-		 * unclear that it's worth expending cycles to do so.
-		 */
-		if (j->alias != NULL)
-			my_namespace = NIL;
-		else
-			setNamespaceColumnVisibility(my_namespace, false);
-
-		/*
-		 * The join RTE itself is always made visible for unqualified column
-		 * names.  It's visible as a relation name only if it has an alias.
-		 */
-		nsitem->p_rel_visible = (j->alias != NULL);
-		nsitem->p_cols_visible = true;
-		nsitem->p_lateral_only = false;
-		nsitem->p_lateral_ok = true;
-
-		*top_nsitem = nsitem;
-		*namespace = lappend(my_namespace, nsitem);
-
-		return (Node *) j;
-	}
-	else
-		elog(ERROR, "unrecognized node type: %d", (int) nodeTag(n));
-	return NULL;				/* can't get here, keep compiler quiet */
 }

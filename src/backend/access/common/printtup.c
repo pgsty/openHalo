@@ -5,7 +5,7 @@
  *	  clients and standalone backends are supported here).
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,22 +15,18 @@
  */
 #include "postgres.h"
 
-#include "miscadmin.h"
-//#include "access/printtup.h"
-#include "libpq/libpq.h"
+#include "access/printtup.h"
 #include "libpq/pqformat.h"
+#include "libpq/protocol.h"
 #include "tcop/pquery.h"
 #include "utils/lsyscache.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
-#include "access/printtup.h"
 
 
 static void printtup_startup(DestReceiver *self, int operation,
-							 TupleDesc typeinfo, 
-                             CommandTag  commandTag);
-static bool printtup(TupleTableSlot *slot, DestReceiver *self, 
-                     CommandTag  commandTag);
+							 TupleDesc typeinfo);
+static bool printtup(TupleTableSlot *slot, DestReceiver *self);
 static void printtup_shutdown(DestReceiver *self);
 static void printtup_destroy(DestReceiver *self);
 
@@ -46,26 +42,26 @@ static void printtup_destroy(DestReceiver *self);
  * we are using for this column.
  * ----------------
  */
-//typedef struct
-//{								/* Per-attribute information */
-//	Oid			typoutput;		/* Oid for the type's text output fn */
-//	Oid			typsend;		/* Oid for the type's binary output fn */
-//	bool		typisvarlena;	/* is it varlena (ie possibly toastable)? */
-//	int16		format;			/* format code for this column */
-//	FmgrInfo	finfo;			/* Precomputed call info for output fn */
-//} PrinttupAttrInfo;
-//
-//typedef struct
-//{
-//	DestReceiver pub;			/* publicly-known function pointers */
-//	Portal		portal;			/* the Portal we are printing from */
-//	bool		sendDescrip;	/* send RowDescription at startup? */
-//	TupleDesc	attrinfo;		/* The attr info we are set up for */
-//	int			nattrs;
-//	PrinttupAttrInfo *myinfo;	/* Cached info about each attr */
-//	StringInfoData buf;			/* output buffer (*not* in tmpcontext) */
-//	MemoryContext tmpcontext;	/* Memory context for per-row workspace */
-//} DR_printtup;
+typedef struct
+{								/* Per-attribute information */
+	Oid			typoutput;		/* Oid for the type's text output fn */
+	Oid			typsend;		/* Oid for the type's binary output fn */
+	bool		typisvarlena;	/* is it varlena (ie possibly toastable)? */
+	int16		format;			/* format code for this column */
+	FmgrInfo	finfo;			/* Precomputed call info for output fn */
+} PrinttupAttrInfo;
+
+typedef struct
+{
+	DestReceiver pub;			/* publicly-known function pointers */
+	Portal		portal;			/* the Portal we are printing from */
+	bool		sendDescrip;	/* send RowDescription at startup? */
+	TupleDesc	attrinfo;		/* The attr info we are set up for */
+	int			nattrs;
+	PrinttupAttrInfo *myinfo;	/* Cached info about each attr */
+	StringInfoData buf;			/* output buffer (*not* in tmpcontext) */
+	MemoryContext tmpcontext;	/* Memory context for per-row workspace */
+} DR_printtup;
 
 /* ----------------
  *		Initialize: create a DestReceiver for printtup
@@ -76,24 +72,11 @@ printtup_create_DR(CommandDest dest)
 {
 	DR_printtup *self = (DR_printtup *) palloc0(sizeof(DR_printtup));
 
-	
-	if (MyProcPort && MyProcPort->protocol_handler->printtup)
-	{
-		self->pub.receiveSlot = MyProcPort->protocol_handler->printtup;
-		self->pub.rStartup = MyProcPort->protocol_handler->printtup_startup;
-		self->pub.rShutdown = MyProcPort->protocol_handler->printtup_shutdown;
-		self->pub.rDestroy = MyProcPort->protocol_handler->printtup_destroy;
-		self->pub.mydest = dest;
-	}
-	else
-	{
-		self->pub.receiveSlot = printtup;	/* might get changed later */
-		self->pub.rStartup = printtup_startup;
-		self->pub.rShutdown = printtup_shutdown;
-		self->pub.rDestroy = printtup_destroy;
-		self->pub.mydest = dest;
-	}
-	
+	self->pub.receiveSlot = printtup;	/* might get changed later */
+	self->pub.rStartup = printtup_startup;
+	self->pub.rShutdown = printtup_shutdown;
+	self->pub.rDestroy = printtup_destroy;
+	self->pub.mydest = dest;
 
 	/*
 	 * Send T message automatically if DestRemote, but not if
@@ -125,7 +108,7 @@ SetRemoteDestReceiverParams(DestReceiver *self, Portal portal)
 }
 
 static void
-printtup_startup(DestReceiver *self, int operation, TupleDesc typeinfo, CommandTag commandTag)
+printtup_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
 	DR_printtup *myState = (DR_printtup *) self;
 	Portal		portal = myState->portal;
@@ -188,7 +171,7 @@ SendRowDescriptionMessage(StringInfo buf, TupleDesc typeinfo,
 	ListCell   *tlist_item = list_head(targetlist);
 
 	/* tuple descriptor message type */
-	pq_beginmessage_reuse(buf, 'T');
+	pq_beginmessage_reuse(buf, PqMsg_RowDescription);
 	/* # of attrs in tuples */
 	pq_sendint16(buf, natts);
 
@@ -312,10 +295,13 @@ printtup_prepare_info(DR_printtup *myState, TupleDesc typeinfo, int numAttrs)
 
 /* ----------------
  *		printtup --- send a tuple to the client
+ *
+ * Note: if you change this function, see also serializeAnalyzeReceive
+ * in explain.c, which is meant to replicate the computations done here.
  * ----------------
  */
 static bool
-printtup(TupleTableSlot *slot, DestReceiver *self, CommandTag  commandTag)
+printtup(TupleTableSlot *slot, DestReceiver *self)
 {
 	TupleDesc	typeinfo = slot->tts_tupleDescriptor;
 	DR_printtup *myState = (DR_printtup *) self;
@@ -335,9 +321,9 @@ printtup(TupleTableSlot *slot, DestReceiver *self, CommandTag  commandTag)
 	oldcontext = MemoryContextSwitchTo(myState->tmpcontext);
 
 	/*
-	 * Prepare a DataRow message (note buffer is in per-row context)
+	 * Prepare a DataRow message (note buffer is in per-query context)
 	 */
-	pq_beginmessage_reuse(buf, 'D');
+	pq_beginmessage_reuse(buf, PqMsg_DataRow);
 
 	pq_sendint16(buf, natts);
 
@@ -372,7 +358,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self, CommandTag  commandTag)
 			char	   *outputstr;
 
 			outputstr = OutputFunctionCall(&thisState->finfo, attr);
-			pq_sendcountedtext(buf, outputstr, strlen(outputstr), false);
+			pq_sendcountedtext(buf, outputstr, strlen(outputstr));
 		}
 		else
 		{
@@ -455,7 +441,7 @@ printatt(unsigned attributeId,
  * ----------------
  */
 void
-debugStartup(DestReceiver *self, int operation, TupleDesc typeinfo, CommandTag commandTag)
+debugStartup(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
 	int			natts = typeinfo->natts;
 	int			i;
@@ -473,7 +459,7 @@ debugStartup(DestReceiver *self, int operation, TupleDesc typeinfo, CommandTag c
  * ----------------
  */
 bool
-debugtup(TupleTableSlot *slot, DestReceiver *self, CommandTag commandTag)
+debugtup(TupleTableSlot *slot, DestReceiver *self)
 {
 	TupleDesc	typeinfo = slot->tts_tupleDescriptor;
 	int			natts = typeinfo->natts;

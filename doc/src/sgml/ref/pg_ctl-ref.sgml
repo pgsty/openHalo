@@ -186,11 +186,11 @@ PostgreSQL documentation
    the specified data directory.  Three different
    shutdown methods can be selected with the <option>-m</option>
    option.  <quote>Smart</quote> mode disallows new connections, then waits
-   for all existing clients to disconnect and any online backup to finish.
+   for all existing clients to disconnect.
    If the server is in hot standby, recovery and streaming replication
    will be terminated once all clients have disconnected.
-   <quote>Fast</quote> mode (the default) does not wait for clients to disconnect and
-   will terminate an online backup in progress.  All active transactions are
+   <quote>Fast</quote> mode (the default) does not wait for clients to disconnect.
+   All active transactions are
    rolled back and clients are forcibly disconnected, then the
    server is shut down.  <quote>Immediate</quote> mode will abort
    all server processes immediately, without a clean shutdown.  This choice
@@ -299,8 +299,9 @@ PostgreSQL documentation
        <para>
         Append the server log output to
         <replaceable>filename</replaceable>.  If the file does not
-        exist, it is created.  The <systemitem>umask</systemitem> is set to 077,
-        so access to the log file is disallowed to other users by default.
+        exist, it is created.  By default, only the cluster owner can
+        access the log file.  If group access is enabled in the cluster,
+        users in the same group as the cluster owner can also read it.
        </para>
       </listitem>
      </varlistentry>
@@ -576,13 +577,6 @@ PostgreSQL documentation
    Most <command>pg_ctl</command> modes require knowing the data directory
    location; therefore, the <option>-D</option> option is required
    unless <envar>PGDATA</envar> is set.
-  </para>
-
-  <para>
-   <command>pg_ctl</command>, like most other <productname>PostgreSQL</productname>
-   utilities,
-   also uses the environment variables supported by <application>libpq</application>
-   (see <xref linkend="libpq-envars"/>).
   </para>
 
   <para>

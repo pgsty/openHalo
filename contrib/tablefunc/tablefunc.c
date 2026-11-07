@@ -10,7 +10,7 @@
  * And contributors:
  * Nabil Sayegh <postgresql@e-trolley.de>
  *
- * Copyright (c) 2002-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2025, PostgreSQL Global Development Group
  *
  * Permission to use, copy, modify, and distribute this software and its
  * documentation for any purpose, without fee, and without a written agreement
@@ -36,39 +36,31 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
+#include "common/pg_prng.h"
 #include "executor/spi.h"
+#include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
-#include "tablefunc.h"
 #include "utils/builtins.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "tablefunc",
+					.version = PG_VERSION
+);
 
 static HTAB *load_categories_hash(char *cats_sql, MemoryContext per_query_ctx);
 static Tuplestorestate *get_crosstab_tuplestore(char *sql,
 												HTAB *crosstab_hash,
 												TupleDesc tupdesc,
 												bool randomAccess);
-static void validateConnectbyTupleDesc(TupleDesc tupdesc, bool show_branch, bool show_serial);
-static bool compatCrosstabTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2);
-static void compatConnectbyTupleDescs(TupleDesc tupdesc1, TupleDesc tupdesc2);
+static void validateConnectbyTupleDesc(TupleDesc td, bool show_branch, bool show_serial);
+static void compatCrosstabTupleDescs(TupleDesc ret_tupdesc, TupleDesc sql_tupdesc);
+static void compatConnectbyTupleDescs(TupleDesc ret_tupdesc, TupleDesc sql_tupdesc);
 static void get_normal_pair(float8 *x1, float8 *x2);
 static Tuplestorestate *connectby(char *relname,
 								  char *key_fld,
 								  char *parent_key_fld,
-								  char *orderby_fld,
-								  char *branch_delim,
-								  char *start_with,
-								  int max_depth,
-								  bool show_branch,
-								  bool show_serial,
-								  MemoryContext per_query_ctx,
-								  bool randomAccess,
-								  AttInMetadata *attinmeta);
-static Tuplestorestate *connectbytest(char *relname,
-								  char *targetclause,
-								  char *connectbyclause,
 								  char *orderby_fld,
 								  char *branch_delim,
 								  char *start_with,
@@ -93,54 +85,6 @@ static void build_tuplestore_recursively(char *key_fld,
 										 MemoryContext per_query_ctx,
 										 AttInMetadata *attinmeta,
 										 Tuplestorestate *tupstore);
-
-static void build_tuplestore_recursively2(char *key_fld,
-											char *parent_key_fld,
-											char *relname,
-											char *orderby_fld,
-											char *branch_delim,
-											char *start_with,
-											char *branch,
-											int level,
-											int *serial,
-											int max_depth,
-											bool show_branch,
-											bool show_serial,
-											MemoryContext per_query_ctx,
-											AttInMetadata *attinmeta,
-											Tuplestorestate *tupstore);
-
-static void build_tuplestore_recursively_test(char *key_fld,
-							 char *parent_key_fld,
-							 char *relname,
-							 char *orderby_fld,
-							 char *branch_delim,
-							 char *start_with,
-							 char *branch,
-							 int level,
-							 int *serial,
-							 int max_depth,
-							 bool show_branch,
-							 bool show_serial,
-							 MemoryContext per_query_ctx,
-							 AttInMetadata *attinmeta,
-							 Tuplestorestate *tupstore,
-							 HeapTuple priortuple);
-static void build_tuplestore_recursively_testroot(char *key_fld,
-							 char *parent_key_fld,
-							 char *relname,
-							 char *orderby_fld,
-							 char *branch_delim,
-							 char *start_with,
-							 char *branch,
-							 int level,
-							 int *serial,
-							 int max_depth,
-							 bool show_branch,
-							 bool show_serial,
-							 MemoryContext per_query_ctx,
-							 AttInMetadata *attinmeta,
-							 Tuplestorestate *tupstore);
 
 typedef struct
 {
@@ -350,8 +294,8 @@ get_normal_pair(float8 *x1, float8 *x2)
 
 	do
 	{
-		u1 = (float8) random() / (float8) MAX_RANDOM_VALUE;
-		u2 = (float8) random() / (float8) MAX_RANDOM_VALUE;
+		u1 = pg_prng_double(&pg_global_prng_state);
+		u2 = pg_prng_double(&pg_global_prng_state);
 
 		v1 = (2.0 * u1) - 1.0;
 		v2 = (2.0 * u2) - 1.0;
@@ -444,9 +388,7 @@ crosstab(PG_FUNCTION_ARGS)
 	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
 
 	/* Connect to SPI manager */
-	if ((ret = SPI_connect()) < 0)
-		/* internal error */
-		elog(ERROR, "crosstab: SPI_connect returned %d", ret);
+	SPI_connect();
 
 	/* Retrieve the desired rows */
 	ret = SPI_execute(sql, true, 0);
@@ -477,9 +419,8 @@ crosstab(PG_FUNCTION_ARGS)
 	if (spi_tupdesc->natts != 3)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid source data SQL statement"),
-				 errdetail("The provided SQL must return 3 "
-						   "columns: rowid, category, and values.")));
+				 errmsg("invalid crosstab source data query"),
+				 errdetail("The query must return 3 columns: row_name, category, and value.")));
 
 	/* get a tuple descriptor for our result type */
 	switch (get_call_result_type(fcinfo, NULL, &tupdesc))
@@ -506,11 +447,7 @@ crosstab(PG_FUNCTION_ARGS)
 	 * Check that return tupdesc is compatible with the data we got from SPI,
 	 * at least based on number and type of attributes
 	 */
-	if (!compatCrosstabTupleDescs(tupdesc, spi_tupdesc))
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("return and sql tuple descriptions are " \
-						"incompatible")));
+	compatCrosstabTupleDescs(tupdesc, spi_tupdesc);
 
 	/*
 	 * switch to long-lived memory context
@@ -732,9 +669,9 @@ crosstab_hash(PG_FUNCTION_ARGS)
 	 */
 	if (tupdesc->natts < 2)
 		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("query-specified return tuple and " \
-						"crosstab function are not compatible")));
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("invalid crosstab return type"),
+				 errdetail("Return row must have at least two columns.")));
 
 	/* load up the categories hash table */
 	crosstab_hash = load_categories_hash(cats_sql, per_query_ctx);
@@ -788,9 +725,7 @@ load_categories_hash(char *cats_sql, MemoryContext per_query_ctx)
 								HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
 
 	/* Connect to SPI manager */
-	if ((ret = SPI_connect()) < 0)
-		/* internal error */
-		elog(ERROR, "load_categories_hash: SPI_connect returned %d", ret);
+	SPI_connect();
 
 	/* Retrieve the category name rows */
 	ret = SPI_execute(cats_sql, true, 0);
@@ -809,9 +744,9 @@ load_categories_hash(char *cats_sql, MemoryContext per_query_ctx)
 		 */
 		if (spi_tupdesc->natts != 1)
 			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("provided \"categories\" SQL must " \
-							"return 1 column of at least one row")));
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid crosstab categories query"),
+					 errdetail("The query must return one column.")));
 
 		for (i = 0; i < proc; i++)
 		{
@@ -826,9 +761,8 @@ load_categories_hash(char *cats_sql, MemoryContext per_query_ctx)
 			catname = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
 			if (catname == NULL)
 				ereport(ERROR,
-						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("provided \"categories\" SQL must " \
-								"not return NULL values")));
+						(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+						 errmsg("crosstab category value must not be null")));
 
 			SPIcontext = MemoryContextSwitchTo(per_query_ctx);
 
@@ -871,9 +805,7 @@ get_crosstab_tuplestore(char *sql,
 	tupstore = tuplestore_begin_heap(randomAccess, false, work_mem);
 
 	/* Connect to SPI manager */
-	if ((ret = SPI_connect()) < 0)
-		/* internal error */
-		elog(ERROR, "get_crosstab_tuplestore: SPI_connect returned %d", ret);
+	SPI_connect();
 
 	/* Now retrieve the crosstab source rows */
 	ret = SPI_execute(sql, true, 0);
@@ -896,9 +828,8 @@ get_crosstab_tuplestore(char *sql,
 		{
 			/* no qualifying category tuples */
 			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("provided \"categories\" SQL must " \
-							"return 1 column of at least one row")));
+					(errcode(ERRCODE_CARDINALITY_VIOLATION),
+					 errmsg("crosstab categories query must return at least one row")));
 		}
 
 		/*
@@ -917,20 +848,18 @@ get_crosstab_tuplestore(char *sql,
 		if (ncols < 3)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid source data SQL statement"),
-					 errdetail("The provided SQL must return 3 " \
-							   " columns; rowid, category, and values.")));
+					 errmsg("invalid crosstab source data query"),
+					 errdetail("The query must return at least 3 columns: row_name, category, and value.")));
 
 		result_ncols = (ncols - 2) + num_categories;
 
-		/* Recheck to make sure we tuple descriptor still looks reasonable */
+		/* Recheck to make sure output tuple descriptor looks reasonable */
 		if (tupdesc->natts != result_ncols)
 			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("invalid return type"),
-					 errdetail("Query-specified return " \
-							   "tuple has %d columns but crosstab " \
-							   "returns %d.", tupdesc->natts, result_ncols)));
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("invalid crosstab return type"),
+					 errdetail("Return row must have %d columns, not %d.",
+							   result_ncols, tupdesc->natts)));
 
 		/* allocate space and make sure it's clear */
 		values = (char **) palloc0(result_ncols * sizeof(char *));
@@ -1001,8 +930,6 @@ get_crosstab_tuplestore(char *sql,
 	if (SPI_finish() != SPI_OK_FINISH)
 		/* internal error */
 		elog(ERROR, "get_crosstab_tuplestore: SPI_finish() failed");
-
-	tuplestore_donestoring(tupstore);
 
 	return tupstore;
 }
@@ -1202,150 +1129,6 @@ connectby_text_serial(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-PG_FUNCTION_INFO_V1(connectby_test);
-Datum
-connectby_test(PG_FUNCTION_ARGS)
-{
-	char	   *relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *key_fld = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	char	   *parent_key_fld = text_to_cstring(PG_GETARG_TEXT_PP(2));
-	char	   *orderby_fld = text_to_cstring(PG_GETARG_TEXT_PP(3));
-	char	   *start_with = text_to_cstring(PG_GETARG_TEXT_PP(4));
-	int			max_depth = PG_GETARG_INT32(5);	
-	char	   *branch_delim = text_to_cstring(PG_GETARG_TEXT_PP(6));
-	char	   *show_branchcolumn = text_to_cstring(PG_GETARG_TEXT_PP(7));
-	//bool       checkconnect_by_root = PG_GETARG_BOOL(8);
-	//bool       checkconnect_by_isleaf = PG_GETARG_BOOL(9);
-	//bool       checkconnect_by_iscycle =PG_GETARG_BOOL(10);
-	//char       *priorcolumn = text_to_cstring(PG_GETARG_TEXT_PP(11));
-	
-	bool		show_branch = false;
-	bool		show_serial = true;
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	AttInMetadata *attinmeta;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
-
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize) ||
-		rsinfo->expectedDesc == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	if (show_branchcolumn != NULL)
-	{
-		branch_delim = text_to_cstring(PG_GETARG_TEXT_PP(6));
-		show_branch = true;
-	}
-	
-	/* default is no show, tilde for the delimiter */
-	if(branch_delim != NULL)
-		branch_delim = pstrdup("~");
-
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	/* get the requested return tuple description */
-	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
-
-	/* does it meet our needs */
-	validateConnectbyTupleDesc(tupdesc, show_branch, show_serial);
-
-	/* OK, use it then */
-	attinmeta = TupleDescGetAttInMetadata(tupdesc);
-
-	/* OK, go to work */
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = connectbytest(relname,
-								  key_fld,
-								  parent_key_fld,
-								  orderby_fld,
-								  branch_delim,
-								  start_with,
-								  max_depth,
-								  show_branch,
-								  show_serial,
-								  per_query_ctx,
-								  rsinfo->allowedModes & SFRM_Materialize_Random,
-								  attinmeta);
-	rsinfo->setDesc = tupdesc;
-
-	MemoryContextSwitchTo(oldcontext);
-
-	/*
-	 * SFRM_Materialize mode expects us to return a NULL Datum. The actual
-	 * tuples are in our tuplestore and passed back through rsinfo->setResult.
-	 * rsinfo->setDesc is set to the tuple description that we actually used
-	 * to build our tuples with, so the caller can verify we did what it was
-	 * expecting.
-	 */
-	return (Datum) 0;
-}
-
-
-/*
- * connectby - does the real work for connectby_text()
- */
-static Tuplestorestate *
-connectbytest(char *relname,
-		  char *key_fld,
-		  char *parent_key_fld,
-		  char *orderby_fld,
-		  char *branch_delim,
-		  char *start_with,
-		  int max_depth,
-		  bool show_branch,
-		  bool show_serial,
-		  MemoryContext per_query_ctx,
-		  bool randomAccess,
-		  AttInMetadata *attinmeta)
-{
-	Tuplestorestate *tupstore = NULL;
-	int			ret;
-	MemoryContext oldcontext;
-
-	int			serial = 1;
-
-	/* Connect to SPI manager */
-	if ((ret = SPI_connect()) < 0)
-		/* internal error */
-		elog(ERROR, "connectby: SPI_connect returned %d", ret);
-
-	/* switch to longer term context to create the tuple store */
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	/* initialize our tuplestore */
-	tupstore = tuplestore_begin_heap(randomAccess, false, work_mem);
-
-	MemoryContextSwitchTo(oldcontext);
-
-	/* now go get the whole tree */
-	build_tuplestore_recursively_testroot(key_fld,
-								 parent_key_fld,
-								 relname,
-								 orderby_fld,
-								 branch_delim,
-								 start_with,
-								 start_with,	/* current_branch */
-								 1, /* initial level is 0 */
-								 &serial,	/* initial serial is 1 */
-								 max_depth,
-								 show_branch,
-								 show_serial,
-								 per_query_ctx,
-								 attinmeta,
-								 tupstore);
-
-	SPI_finish();
-
-	return tupstore;
-}
 
 /*
  * connectby - does the real work for connectby_text()
@@ -1365,15 +1148,11 @@ connectby(char *relname,
 		  AttInMetadata *attinmeta)
 {
 	Tuplestorestate *tupstore = NULL;
-	int			ret;
 	MemoryContext oldcontext;
-
 	int			serial = 1;
 
 	/* Connect to SPI manager */
-	if ((ret = SPI_connect()) < 0)
-		/* internal error */
-		elog(ERROR, "connectby: SPI_connect returned %d", ret);
+	SPI_connect();
 
 	/* switch to longer term context to create the tuple store */
 	oldcontext = MemoryContextSwitchTo(per_query_ctx);
@@ -1384,14 +1163,14 @@ connectby(char *relname,
 	MemoryContextSwitchTo(oldcontext);
 
 	/* now go get the whole tree */
-	build_tuplestore_recursively2(key_fld,
+	build_tuplestore_recursively(key_fld,
 								 parent_key_fld,
 								 relname,
 								 orderby_fld,
 								 branch_delim,
 								 start_with,
 								 start_with,	/* current_branch */
-								 1, /* initial level is 0 */
+								 0, /* initial level is 0 */
 								 &serial,	/* initial serial is 1 */
 								 max_depth,
 								 show_branch,
@@ -1407,442 +1186,6 @@ connectby(char *relname,
 
 static void
 build_tuplestore_recursively(char *key_fld,
-							 char *parent_key_fld,
-							 char *relname,
-							 char *orderby_fld,
-							 char *branch_delim,
-							 char *start_with,
-							 char *branch,
-							 int level,
-							 int *serial,
-							 int max_depth,
-							 bool show_branch,
-							 bool show_serial,
-							 MemoryContext per_query_ctx,
-							 AttInMetadata *attinmeta,
-							 Tuplestorestate *tupstore
-							 )
-{
-	TupleDesc	tupdesc = attinmeta->tupdesc;
-	int			ret;
-	uint64		proc;
-	int			serial_column;
-	StringInfoData sql;
-	char	  **values;
-	char	   *current_key;
-	char	   *current_key_parent;
-	char		current_level[INT32_STRLEN];
-	char		serial_str[INT32_STRLEN];
-	char	   *current_branch;
-	HeapTuple	tuple;
-
-	if (max_depth > 0 && level > max_depth)
-		return;
-
-	initStringInfo(&sql);
-
-	/* Build initial sql statement */
-	if (!show_serial)
-	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s = %s AND %s IS NOT NULL AND %s <> %s",
-						 key_fld,
-						 parent_key_fld,
-						 relname,
-						 parent_key_fld,
-						 quote_literal_cstr(start_with),
-						 key_fld, key_fld, parent_key_fld);
-		serial_column = 0;
-	}
-	else
-	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s = %s AND %s IS NOT NULL AND %s <> %s ORDER BY %s",
-						 key_fld,
-						 parent_key_fld,
-						 relname,
-						 parent_key_fld,
-						 quote_literal_cstr(start_with),
-						 key_fld, key_fld, parent_key_fld,
-						 orderby_fld);
-		serial_column = 1;
-	}
-
-	if (show_branch)
-		values = (char **) palloc((CONNECTBY_NCOLS + serial_column) * sizeof(char *));
-	else
-		values = (char **) palloc((CONNECTBY_NCOLS_NOBRANCH + serial_column) * sizeof(char *));
-
-	/* First time through, do a little setup */
-	if (level == 0)
-	{
-		/* root value is the one we initially start with */
-		values[0] = start_with;
-
-		/* root value has no parent */
-		values[1] = NULL;
-
-		/* root level is 0 */
-		sprintf(current_level, "%d", level);
-		values[2] = current_level;
-
-		/* root branch is just starting root value */
-		if (show_branch)
-			values[3] = start_with;
-
-		/* root starts the serial with 1 */
-		if (show_serial)
-		{
-			sprintf(serial_str, "%d", (*serial)++);
-			if (show_branch)
-				values[4] = serial_str;
-			else
-				values[3] = serial_str;
-		}
-
-		/* construct the tuple */
-		tuple = BuildTupleFromCStrings(attinmeta, values);
-
-		/* now store it */
-		tuplestore_puttuple(tupstore, tuple);
-
-		/* increment level */
-		level++;
-	}
-
-	/* Retrieve the desired rows */
-	ret = SPI_execute(sql.data, true, 0);
-	proc = SPI_processed;
-
-	/* Check for qualifying tuples */
-	if ((ret == SPI_OK_SELECT) && (proc > 0))
-	{
-		HeapTuple	spi_tuple;
-		SPITupleTable *tuptable = SPI_tuptable;
-		TupleDesc	spi_tupdesc = tuptable->tupdesc;
-		uint64		i;
-		StringInfoData branchstr;
-		StringInfoData chk_branchstr;
-		StringInfoData chk_current_key;
-
-		/*
-		 * Check that return tupdesc is compatible with the one we got from
-		 * the query.
-		 */
-		compatConnectbyTupleDescs(tupdesc, spi_tupdesc);
-
-		initStringInfo(&branchstr);
-		initStringInfo(&chk_branchstr);
-		initStringInfo(&chk_current_key);
-
-		for (i = 0; i < proc; i++)
-		{
-			/* initialize branch for this pass */
-			appendStringInfoString(&branchstr, branch);
-			appendStringInfo(&chk_branchstr, "%s%s%s", branch_delim, branch, branch_delim);
-
-			/* get the next sql result tuple */
-			spi_tuple = tuptable->vals[i];
-
-			/* get the current key (might be NULL) */
-			current_key = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
-
-			/* get the parent key (might be NULL) */
-			current_key_parent = SPI_getvalue(spi_tuple, spi_tupdesc, 2);
-
-			/* get the current level */
-			sprintf(current_level, "%d", level);
-
-			/* check to see if this key is also an ancestor */
-			if (current_key)
-			{
-				appendStringInfo(&chk_current_key, "%s%s%s",
-								 branch_delim, current_key, branch_delim);
-				if (strstr(chk_branchstr.data, chk_current_key.data))
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_RECURSION),
-							 errmsg("infinite recursion detected")));
-			}
-
-			/* OK, extend the branch */
-			if (current_key)
-				appendStringInfo(&branchstr, "%s%s", branch_delim, current_key);
-			current_branch = branchstr.data;
-
-			/* build a tuple */
-			values[0] = current_key;
-			values[1] = current_key_parent;
-			values[2] = current_level;
-			if (show_branch)
-				values[3] = current_branch;
-			if (show_serial)
-			{
-				sprintf(serial_str, "%d", (*serial)++);
-				if (show_branch)
-					values[4] = serial_str;
-				else
-					values[3] = serial_str;
-			}
-
-			tuple = BuildTupleFromCStrings(attinmeta, values);
-
-			/* store the tuple for later use */
-			tuplestore_puttuple(tupstore, tuple);
-
-			heap_freetuple(tuple);
-
-			/* recurse using current_key as the new start_with */
-			if (current_key)
-				build_tuplestore_recursively(key_fld,
-											 parent_key_fld,
-											 relname,
-											 orderby_fld,
-											 branch_delim,
-											 current_key,
-											 current_branch,
-											 level + 1,
-											 serial,
-											 max_depth,
-											 show_branch,
-											 show_serial,
-											 per_query_ctx,
-											 attinmeta,
-											 tupstore);
-
-			xpfree(current_key);
-			xpfree(current_key_parent);
-
-			/* reset branch for next pass */
-			resetStringInfo(&branchstr);
-			resetStringInfo(&chk_branchstr);
-			resetStringInfo(&chk_current_key);
-		}
-
-		xpfree(branchstr.data);
-		xpfree(chk_branchstr.data);
-		xpfree(chk_current_key.data);
-	}
-}
-
-static void
-build_tuplestore_recursively_test(char *key_fld,
-							 char *parent_key_fld,
-							 char *relname,
-							 char *orderby_fld,
-							 char *branch_delim,
-							 char *start_with,
-							 char *branch,
-							 int level,
-							 int *serial,
-							 int max_depth,
-							 bool show_branch,
-							 bool show_serial,
-							 MemoryContext per_query_ctx,
-							 AttInMetadata *attinmeta,
-							 Tuplestorestate *tupstore,
-							 HeapTuple priortuple)
-{
-	TupleDesc	tupdesc = attinmeta->tupdesc;
-	int			ret;
-	uint64		proc;
-	int			serial_column;
-	StringInfoData sql;
-	char	  **values;
-	char	   *current_key;
-	char	   *current_key_parent;
-	char		current_level[INT32_STRLEN];
-	char		serial_str[INT32_STRLEN];
-	char	   *current_branch;
-	HeapTuple	tuple;
-
-	if (max_depth > 0 && level > max_depth)
-		return;
-
-	initStringInfo(&sql);
-
-	/* Build initial sql statement */
-	if (!show_serial)
-	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s = %s AND %s IS NOT NULL AND %s <> %s",
-						 key_fld,
-						 parent_key_fld,
-						 relname,
-						 parent_key_fld,
-						 quote_literal_cstr(start_with),
-						 key_fld, key_fld, parent_key_fld);
-		serial_column = 0;
-	}
-	else
-	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s = %s AND %s IS NOT NULL AND %s <> %s ORDER BY %s",
-						 key_fld,
-						 parent_key_fld,
-						 relname,
-						 parent_key_fld,
-						 quote_literal_cstr(start_with),
-						 key_fld, key_fld, parent_key_fld,
-						 orderby_fld);
-		serial_column = 1;
-	}
-
-	if (show_branch)
-		values = (char **) palloc((CONNECTBY_NCOLS + serial_column) * sizeof(char *));
-	else
-		values = (char **) palloc((CONNECTBY_NCOLS_NOBRANCH + serial_column) * sizeof(char *));
-
-	/* First time through, do a little setup */
-	if (level == 0)
-	{
-		/* root value is the one we initially start with */
-		values[0] = start_with;
-
-		/* root value has no parent */
-		values[1] = NULL;
-
-		/* root level is 0 */
-		sprintf(current_level, "%d", level);
-		values[2] = current_level;
-
-		/* root branch is just starting root value */
-		if (show_branch)
-			values[3] = start_with;
-
-		/* root starts the serial with 1 */
-		if (show_serial)
-		{
-			sprintf(serial_str, "%d", (*serial)++);
-			if (show_branch)
-				values[4] = serial_str;
-			else
-				values[3] = serial_str;
-		}
-
-		/* construct the tuple */
-		tuple = BuildTupleFromCStrings(attinmeta, values);
-
-		/* now store it */
-		tuplestore_puttuple(tupstore, tuple);
-
-		/* increment level */
-		level++;
-	}
-
-	/* Retrieve the desired rows */
-	ret = SPI_execute(sql.data, true, 0);
-	proc = SPI_processed;
-
-	/* Check for qualifying tuples */
-	if ((ret == SPI_OK_SELECT) && (proc > 0))
-	{
-		HeapTuple	spi_tuple;
-		SPITupleTable *tuptable = SPI_tuptable;
-		TupleDesc	spi_tupdesc = tuptable->tupdesc;
-		uint64		i;
-		StringInfoData branchstr;
-		StringInfoData chk_branchstr;
-		StringInfoData chk_current_key;
-
-		/*
-		 * Check that return tupdesc is compatible with the one we got from
-		 * the query.
-		 */
-		compatConnectbyTupleDescs(tupdesc, spi_tupdesc);
-
-		initStringInfo(&branchstr);
-		initStringInfo(&chk_branchstr);
-		initStringInfo(&chk_current_key);
-
-		for (i = 0; i < proc; i++)
-		{
-			/* initialize branch for this pass */
-			appendStringInfoString(&branchstr, branch);
-			appendStringInfo(&chk_branchstr, "%s%s%s", branch_delim, branch, branch_delim);
-
-			/* get the next sql result tuple */
-			spi_tuple = tuptable->vals[i];
-
-			/* get the current key (might be NULL) */
-			current_key = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
-
-			/* get the parent key (might be NULL) */
-			current_key_parent = SPI_getvalue(spi_tuple, spi_tupdesc, 2);
-
-			/* get the current level */
-			sprintf(current_level, "%d", level);
-
-			/* check to see if this key is also an ancestor */
-			if (current_key)
-			{
-				appendStringInfo(&chk_current_key, "%s%s%s",
-								 branch_delim, current_key, branch_delim);
-				if (strstr(chk_branchstr.data, chk_current_key.data))
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_RECURSION),
-							 errmsg("infinite recursion detected")));
-			}
-
-			/* OK, extend the branch */
-			if (current_key)
-				appendStringInfo(&branchstr, "%s%s", branch_delim, current_key);
-			current_branch = branchstr.data;
-
-			/* build a tuple */
-			values[0] = current_key;
-			values[1] = current_key_parent;
-			values[2] = current_level;
-			if (show_branch)
-				values[3] = current_branch;
-			if (show_serial)
-			{
-				sprintf(serial_str, "%d", (*serial)++);
-				if (show_branch)
-					values[4] = serial_str;
-				else
-					values[3] = serial_str;
-			}
-
-			tuple = BuildTupleFromCStrings(attinmeta, values);
-
-			/* store the tuple for later use */
-			tuplestore_puttuple(tupstore, tuple);
-
-			heap_freetuple(tuple);
-
-			/* recurse using current_key as the new start_with */
-			if (current_key)
-				build_tuplestore_recursively_test(key_fld,
-											 parent_key_fld,
-											 relname,
-											 orderby_fld,
-											 branch_delim,
-											 current_key,
-											 current_branch,
-											 level + 1,
-											 serial,
-											 max_depth,
-											 show_branch,
-											 show_serial,
-											 per_query_ctx,
-											 attinmeta,
-											 tupstore,
-											 spi_tuple);
-
-			xpfree(current_key);
-			xpfree(current_key_parent);
-
-			/* reset branch for next pass */
-			resetStringInfo(&branchstr);
-			resetStringInfo(&chk_branchstr);
-			resetStringInfo(&chk_current_key);
-		}
-
-		xpfree(branchstr.data);
-		xpfree(chk_branchstr.data);
-		xpfree(chk_current_key.data);
-	}
-}
-
-/*start with*/
-static void
-build_tuplestore_recursively2(char *key_fld,
 							 char *parent_key_fld,
 							 char *relname,
 							 char *orderby_fld,
@@ -1879,20 +1222,25 @@ build_tuplestore_recursively2(char *key_fld,
 	/* Build initial sql statement */
 	if (!show_serial)
 	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s",
-						key_fld,
-						parent_key_fld,
-						relname,
-						start_with);
+		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s = %s AND %s IS NOT NULL AND %s <> %s",
+						 key_fld,
+						 parent_key_fld,
+						 relname,
+						 parent_key_fld,
+						 quote_literal_cstr(start_with),
+						 key_fld, key_fld, parent_key_fld);
 		serial_column = 0;
 	}
 	else
 	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s",
-						key_fld,
-						parent_key_fld,
-						relname,
-						start_with);
+		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s = %s AND %s IS NOT NULL AND %s <> %s ORDER BY %s",
+						 key_fld,
+						 parent_key_fld,
+						 relname,
+						 parent_key_fld,
+						 quote_literal_cstr(start_with),
+						 key_fld, key_fld, parent_key_fld,
+						 orderby_fld);
 		serial_column = 1;
 	}
 
@@ -1900,6 +1248,43 @@ build_tuplestore_recursively2(char *key_fld,
 		values = (char **) palloc((CONNECTBY_NCOLS + serial_column) * sizeof(char *));
 	else
 		values = (char **) palloc((CONNECTBY_NCOLS_NOBRANCH + serial_column) * sizeof(char *));
+
+	/* First time through, do a little setup */
+	if (level == 0)
+	{
+		/* root value is the one we initially start with */
+		values[0] = start_with;
+
+		/* root value has no parent */
+		values[1] = NULL;
+
+		/* root level is 0 */
+		sprintf(current_level, "%d", level);
+		values[2] = current_level;
+
+		/* root branch is just starting root value */
+		if (show_branch)
+			values[3] = start_with;
+
+		/* root starts the serial with 1 */
+		if (show_serial)
+		{
+			sprintf(serial_str, "%d", (*serial)++);
+			if (show_branch)
+				values[4] = serial_str;
+			else
+				values[3] = serial_str;
+		}
+
+		/* construct the tuple */
+		tuple = BuildTupleFromCStrings(attinmeta, values);
+
+		/* now store it */
+		tuplestore_puttuple(tupstore, tuple);
+
+		/* increment level */
+		level++;
+	}
 
 	/* Retrieve the desired rows */
 	ret = SPI_execute(sql.data, true, 0);
@@ -1929,11 +1314,8 @@ build_tuplestore_recursively2(char *key_fld,
 		for (i = 0; i < proc; i++)
 		{
 			/* initialize branch for this pass */
-			if(level != 1)
-			{
-				appendStringInfoString(&branchstr, branch);
-				appendStringInfo(&chk_branchstr, "%s%s%s", branch_delim, branch, branch_delim);
-			}
+			appendStringInfoString(&branchstr, branch);
+			appendStringInfo(&chk_branchstr, "%s%s%s", branch_delim, branch, branch_delim);
 
 			/* get the next sql result tuple */
 			spi_tuple = tuptable->vals[i];
@@ -1947,9 +1329,20 @@ build_tuplestore_recursively2(char *key_fld,
 			/* get the current level */
 			sprintf(current_level, "%d", level);
 
+			/* check to see if this key is also an ancestor */
+			if (current_key)
+			{
+				appendStringInfo(&chk_current_key, "%s%s%s",
+								 branch_delim, current_key, branch_delim);
+				if (strstr(chk_branchstr.data, chk_current_key.data))
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_RECURSION),
+							 errmsg("infinite recursion detected")));
+			}
+
 			/* OK, extend the branch */
 			if (current_key)
-				appendStringInfo(&branchstr, "%s", current_key);	
+				appendStringInfo(&branchstr, "%s%s", branch_delim, current_key);
 			current_branch = branchstr.data;
 
 			/* build a tuple */
@@ -2007,251 +1400,68 @@ build_tuplestore_recursively2(char *key_fld,
 	}
 }
 
-/*connect by*/
-static void
-build_tuplestore_recursively_testroot(char *key_fld,
-							 char *parent_key_fld,
-							 char *relname,
-							 char *orderby_fld,
-							 char *branch_delim,
-							 char *start_with,
-							 char *branch,
-							 int level,
-							 int *serial,
-							 int max_depth,
-							 bool show_branch,
-							 bool show_serial,
-							 MemoryContext per_query_ctx,
-							 AttInMetadata *attinmeta,
-							 Tuplestorestate *tupstore
-							 )
-{
-	TupleDesc	tupdesc = attinmeta->tupdesc;
-	int			ret;
-	uint64		proc;
-	int			serial_column;
-	StringInfoData sql;
-	char	  **values;
-	char	   *current_key;
-	char	   *current_key_parent;
-	char		current_level[INT32_STRLEN];
-	char		serial_str[INT32_STRLEN];
-	char	   *current_branch;
-	HeapTuple	tuple;
-
-	if (max_depth > 0 && level > max_depth)
-		return;
-
-	initStringInfo(&sql);
-
-	/* Build initial sql statement */
-	if (!show_serial)
-	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s",
-						key_fld,
-						parent_key_fld,
-						relname,
-						start_with);
-		serial_column = 0;
-	}
-	else
-	{
-		appendStringInfo(&sql, "SELECT %s, %s FROM %s WHERE %s",
-						key_fld,
-						parent_key_fld,
-						relname,
-						start_with);
-		serial_column = 1;
-	}
-
-	if (show_branch)
-		values = (char **) palloc((CONNECTBY_NCOLS + serial_column) * sizeof(char *));
-	else
-		values = (char **) palloc((CONNECTBY_NCOLS_NOBRANCH + serial_column) * sizeof(char *));
-
-	/* Retrieve the desired rows */
-	ret = SPI_execute(sql.data, true, 0);
-	proc = SPI_processed;
-
-	/* Check for qualifying tuples */
-	if ((ret == SPI_OK_SELECT) && (proc > 0))
-	{
-		HeapTuple	spi_tuple;
-		SPITupleTable *tuptable = SPI_tuptable;
-		TupleDesc	spi_tupdesc = tuptable->tupdesc;
-		uint64		i;
-		StringInfoData branchstr;
-		StringInfoData chk_branchstr;
-		StringInfoData chk_current_key;
-
-		/*
-		 * Check that return tupdesc is compatible with the one we got from
-		 * the query.
-		 */
-		compatConnectbyTupleDescs(tupdesc, spi_tupdesc);
-
-		initStringInfo(&branchstr);
-		initStringInfo(&chk_branchstr);
-		initStringInfo(&chk_current_key);
-
-		for (i = 0; i < proc; i++)
-		{
-			/* initialize branch for this pass */
-			if(level != 1)
-			{
-				appendStringInfoString(&branchstr, branch);
-				appendStringInfo(&chk_branchstr, "%s%s%s", branch_delim, branch, branch_delim);
-			}
-
-			/* get the next sql result tuple */
-			spi_tuple = tuptable->vals[i];
-
-			/* get the current key (might be NULL) */
-			current_key = SPI_getvalue(spi_tuple, spi_tupdesc, 1);
-
-			/* get the parent key (might be NULL) */
-			current_key_parent = SPI_getvalue(spi_tuple, spi_tupdesc, 2);
-
-			/* get the current level */
-			sprintf(current_level, "%d", level);
-
-			/* OK, extend the branch */
-			if (current_key)
-				appendStringInfo(&branchstr, "%s", current_key);	
-			current_branch = branchstr.data;
-
-			/* build a tuple */
-			values[0] = current_key;
-			values[1] = current_key_parent;
-			values[2] = current_level;
-			if (show_branch)
-				values[3] = current_branch;
-			if (show_serial)
-			{
-				sprintf(serial_str, "%d", (*serial)++);
-				if (show_branch)
-					values[4] = serial_str;
-				else
-					values[3] = serial_str;
-			}
-
-			tuple = BuildTupleFromCStrings(attinmeta, values);
-
-			/* store the tuple for later use */
-			tuplestore_puttuple(tupstore, tuple);
-
-			heap_freetuple(tuple);
-
-			/* recurse using current_key as the new start_with */
-			if (current_key)
-				build_tuplestore_recursively_test(key_fld,
-											 parent_key_fld,
-											 relname,
-											 orderby_fld,
-											 branch_delim,
-											 current_key,
-											 current_branch,
-											 level + 1,
-											 serial,
-											 max_depth,
-											 show_branch,
-											 show_serial,
-											 per_query_ctx,
-											 attinmeta,
-											 tupstore,
-											 spi_tuple);
-
-			xpfree(current_key);
-			xpfree(current_key_parent);
-
-			/* reset branch for next pass */
-			resetStringInfo(&branchstr);
-			resetStringInfo(&chk_branchstr);
-			resetStringInfo(&chk_current_key);
-		}
-
-		xpfree(branchstr.data);
-		xpfree(chk_branchstr.data);
-		xpfree(chk_current_key.data);
-	}
-}
 /*
  * Check expected (query runtime) tupdesc suitable for Connectby
  */
 static void
 validateConnectbyTupleDesc(TupleDesc td, bool show_branch, bool show_serial)
 {
-	int			serial_column = 0;
-
-	if (show_serial)
-		serial_column = 1;
+	int			expected_cols;
 
 	/* are there the correct number of columns */
 	if (show_branch)
-	{
-		if (td->natts != (CONNECTBY_NCOLS + serial_column))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("invalid return type"),
-					 errdetail("Query-specified return tuple has " \
-							   "wrong number of columns.")));
-	}
+		expected_cols = CONNECTBY_NCOLS;
 	else
-	{
-		if (td->natts != CONNECTBY_NCOLS_NOBRANCH + serial_column)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("invalid return type"),
-					 errdetail("Query-specified return tuple has " \
-							   "wrong number of columns.")));
-	}
+		expected_cols = CONNECTBY_NCOLS_NOBRANCH;
+	if (show_serial)
+		expected_cols++;
 
-	/* check that the types of the first two columns match */
-	if (TupleDescAttr(td, 0)->atttypid != TupleDescAttr(td, 1)->atttypid)
+	if (td->natts != expected_cols)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("invalid return type"),
-				 errdetail("First two columns must be the same type.")));
+				 errmsg("invalid connectby return type"),
+				 errdetail("Return row must have %d columns, not %d.",
+						   expected_cols, td->natts)));
+
+	/* the first two columns will be checked against the input tuples later */
 
 	/* check that the type of the third column is INT4 */
 	if (TupleDescAttr(td, 2)->atttypid != INT4OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("invalid return type"),
-				 errdetail("Third column must be type %s.",
+				 errmsg("invalid connectby return type"),
+				 errdetail("Third return column (depth) must be type %s.",
 						   format_type_be(INT4OID))));
 
-	/* check that the type of the fourth column is TEXT if applicable */
+	/* check that the type of the branch column is TEXT if applicable */
 	if (show_branch && TupleDescAttr(td, 3)->atttypid != TEXTOID)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("invalid return type"),
-				 errdetail("Fourth column must be type %s.",
+				 errmsg("invalid connectby return type"),
+				 errdetail("Fourth return column (branch) must be type %s.",
 						   format_type_be(TEXTOID))));
 
-	/* check that the type of the fifth column is INT4 */
+	/* check that the type of the serial column is INT4 if applicable */
 	if (show_branch && show_serial &&
 		TupleDescAttr(td, 4)->atttypid != INT4OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("query-specified return tuple not valid for Connectby: "
-						"fifth column must be type %s",
-						format_type_be(INT4OID))));
-
-	/* check that the type of the fifth column is INT4 */
+				 errmsg("invalid connectby return type"),
+				 errdetail("Fifth return column (serial) must be type %s.",
+						   format_type_be(INT4OID))));
 	if (!show_branch && show_serial &&
 		TupleDescAttr(td, 3)->atttypid != INT4OID)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("query-specified return tuple not valid for Connectby: "
-						"fourth column must be type %s",
-						format_type_be(INT4OID))));
+				 errmsg("invalid connectby return type"),
+				 errdetail("Fourth return column (serial) must be type %s.",
+						   format_type_be(INT4OID))));
 
 	/* OK, the tupdesc is valid for our purposes */
 }
 
 /*
- * Check if spi sql tupdesc and return tupdesc are compatible
+ * Check if output tupdesc and SQL query's tupdesc are compatible
  */
 static void
 compatConnectbyTupleDescs(TupleDesc ret_tupdesc, TupleDesc sql_tupdesc)
@@ -2262,13 +1472,13 @@ compatConnectbyTupleDescs(TupleDesc ret_tupdesc, TupleDesc sql_tupdesc)
 	int32		sql_atttypmod;
 
 	/*
-	 * Result must have at least 2 columns.
+	 * Query result must have at least 2 columns.
 	 */
 	if (sql_tupdesc->natts < 2)
 		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("invalid return type"),
-				 errdetail("Query must return at least two columns.")));
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid connectby source data query"),
+				 errdetail("The query must return at least two columns.")));
 
 	/*
 	 * These columns must match the result type indicated by the calling
@@ -2282,11 +1492,10 @@ compatConnectbyTupleDescs(TupleDesc ret_tupdesc, TupleDesc sql_tupdesc)
 		(ret_atttypmod >= 0 && ret_atttypmod != sql_atttypmod))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("invalid return type"),
-				 errdetail("SQL key field type %s does " \
-						   "not match return key field type %s.",
-						   format_type_with_typemod(ret_atttypid, ret_atttypmod),
-						   format_type_with_typemod(sql_atttypid, sql_atttypmod))));
+				 errmsg("invalid connectby return type"),
+				 errdetail("Source key type %s does not match return key type %s.",
+						   format_type_with_typemod(sql_atttypid, sql_atttypmod),
+						   format_type_with_typemod(ret_atttypid, ret_atttypmod))));
 
 	ret_atttypid = TupleDescAttr(ret_tupdesc, 1)->atttypid;
 	sql_atttypid = TupleDescAttr(sql_tupdesc, 1)->atttypid;
@@ -2296,55 +1505,69 @@ compatConnectbyTupleDescs(TupleDesc ret_tupdesc, TupleDesc sql_tupdesc)
 		(ret_atttypmod >= 0 && ret_atttypmod != sql_atttypmod))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("invalid return type"),
-				 errdetail("SQL parent key field type %s does " \
-						   "not match return parent key field type %s.",
-						   format_type_with_typemod(ret_atttypid, ret_atttypmod),
-						   format_type_with_typemod(sql_atttypid, sql_atttypmod))));
+				 errmsg("invalid connectby return type"),
+				 errdetail("Source parent key type %s does not match return parent key type %s.",
+						   format_type_with_typemod(sql_atttypid, sql_atttypmod),
+						   format_type_with_typemod(ret_atttypid, ret_atttypmod))));
 
 	/* OK, the two tupdescs are compatible for our purposes */
 }
 
 /*
- * Check if two tupdescs match in type of attributes
+ * Check if crosstab output tupdesc agrees with input tupdesc
  */
-static bool
+static void
 compatCrosstabTupleDescs(TupleDesc ret_tupdesc, TupleDesc sql_tupdesc)
 {
 	int			i;
-	Form_pg_attribute ret_attr;
 	Oid			ret_atttypid;
-	Form_pg_attribute sql_attr;
 	Oid			sql_atttypid;
+	int32		ret_atttypmod;
+	int32		sql_atttypmod;
 
-	if (ret_tupdesc->natts < 2 ||
-		sql_tupdesc->natts < 3)
-		return false;
-
-	/* check the rowid types match */
-	ret_atttypid = TupleDescAttr(ret_tupdesc, 0)->atttypid;
-	sql_atttypid = TupleDescAttr(sql_tupdesc, 0)->atttypid;
-	if (ret_atttypid != sql_atttypid)
+	if (ret_tupdesc->natts < 2)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("invalid return type"),
-				 errdetail("SQL rowid datatype does not match " \
-						   "return rowid datatype.")));
+				 errmsg("invalid crosstab return type"),
+				 errdetail("Return row must have at least two columns.")));
+	Assert(sql_tupdesc->natts == 3);	/* already checked by caller */
+
+	/* check the row_name types match */
+	ret_atttypid = TupleDescAttr(ret_tupdesc, 0)->atttypid;
+	sql_atttypid = TupleDescAttr(sql_tupdesc, 0)->atttypid;
+	ret_atttypmod = TupleDescAttr(ret_tupdesc, 0)->atttypmod;
+	sql_atttypmod = TupleDescAttr(sql_tupdesc, 0)->atttypmod;
+	if (ret_atttypid != sql_atttypid ||
+		(ret_atttypmod >= 0 && ret_atttypmod != sql_atttypmod))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("invalid crosstab return type"),
+				 errdetail("Source row_name datatype %s does not match return row_name datatype %s.",
+						   format_type_with_typemod(sql_atttypid, sql_atttypmod),
+						   format_type_with_typemod(ret_atttypid, ret_atttypmod))));
 
 	/*
-	 * - attribute [1] of the sql tuple is the category; no need to check it -
-	 * attribute [2] of the sql tuple should match attributes [1] to [natts]
+	 * attribute [1] of sql tuple is the category; no need to check it
+	 * attribute [2] of sql tuple should match attributes [1] to [natts - 1]
 	 * of the return tuple
 	 */
-	sql_attr = TupleDescAttr(sql_tupdesc, 2);
+	sql_atttypid = TupleDescAttr(sql_tupdesc, 2)->atttypid;
+	sql_atttypmod = TupleDescAttr(sql_tupdesc, 2)->atttypmod;
 	for (i = 1; i < ret_tupdesc->natts; i++)
 	{
-		ret_attr = TupleDescAttr(ret_tupdesc, i);
+		ret_atttypid = TupleDescAttr(ret_tupdesc, i)->atttypid;
+		ret_atttypmod = TupleDescAttr(ret_tupdesc, i)->atttypmod;
 
-		if (ret_attr->atttypid != sql_attr->atttypid)
-			return false;
+		if (ret_atttypid != sql_atttypid ||
+			(ret_atttypmod >= 0 && ret_atttypmod != sql_atttypmod))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("invalid crosstab return type"),
+					 errdetail("Source value datatype %s does not match return value datatype %s in column %d.",
+							   format_type_with_typemod(sql_atttypid, sql_atttypmod),
+							   format_type_with_typemod(ret_atttypid, ret_atttypmod),
+							   i + 1)));
 	}
 
 	/* OK, the two tupdescs are compatible for our purposes */
-	return true;
 }

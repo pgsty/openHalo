@@ -4,7 +4,7 @@
  *	   routines for accessing the system catalogs
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,19 +30,19 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_statistic_ext.h"
+#include "catalog/pg_statistic_ext_data.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
-#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
-#include "optimizer/prep.h"
 #include "parser/parse_relation.h"
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
+#include "rewrite/rewriteHandler.h"
 #include "rewrite/rewriteManip.h"
 #include "statistics/statistics.h"
 #include "storage/bufmgr.h"
@@ -75,7 +75,8 @@ static List *build_index_tlist(PlannerInfo *root, IndexOptInfo *index,
 static List *get_relation_statistics(RelOptInfo *rel, Relation relation);
 static void set_relation_partition_info(PlannerInfo *root, RelOptInfo *rel,
 										Relation relation);
-static PartitionScheme find_partition_scheme(PlannerInfo *root, Relation rel);
+static PartitionScheme find_partition_scheme(PlannerInfo *root,
+											 Relation relation);
 static void set_baserel_partition_key_exprs(Relation relation,
 											RelOptInfo *rel);
 static void set_baserel_partition_constraint(Relation relation,
@@ -108,7 +109,9 @@ static void set_baserel_partition_constraint(Relation relation,
  * If inhparent is true, all we need to do is set up the attr arrays:
  * the RelOptInfo actually represents the appendrel formed by an inheritance
  * tree, and so the parent rel's physical size and index information isn't
- * important for it.
+ * important for it, however, for partitioned tables, we do populate the
+ * indexlist as the planner uses unique indexes as unique proofs for certain
+ * optimizations.
  */
 void
 get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
@@ -130,7 +133,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	 * Relations without a table AM can be used in a query only if they are of
 	 * special-cased relkinds.  This check prevents us from crashing later if,
 	 * for example, a view's ON SELECT rule has gone missing.  Note that
-	 * table_open() already rejected indexes and composite types.
+	 * table_open() already rejected indexes and composite types; spell the
+	 * error the same way it does.
 	 */
 	if (!relation->rd_tableam)
 	{
@@ -139,7 +143,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot open relation \"%s\"",
-							RelationGetRelationName(relation))));
+							RelationGetRelationName(relation)),
+					 errdetail_relkind_not_supported(relation->rd_rel->relkind)));
 	}
 
 	/* Temporary and unlogged relations are inaccessible during recovery. */
@@ -159,6 +164,38 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 		palloc0((rel->max_attr - rel->min_attr + 1) * sizeof(int32));
 
 	/*
+	 * Record which columns are defined as NOT NULL.  We leave this
+	 * unpopulated for non-partitioned inheritance parent relations as it's
+	 * ambiguous as to what it means.  Some child tables may have a NOT NULL
+	 * constraint for a column while others may not.  We could work harder and
+	 * build a unioned set of all child relations notnullattnums, but there's
+	 * currently no need.  The RelOptInfo corresponding to the !inh
+	 * RangeTblEntry does get populated.
+	 */
+	if (!inhparent || relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		for (int i = 0; i < relation->rd_att->natts; i++)
+		{
+			CompactAttribute *attr = TupleDescCompactAttr(relation->rd_att, i);
+
+			Assert(attr->attnullability != ATTNULLABLE_UNKNOWN);
+
+			if (attr->attnullability == ATTNULLABLE_VALID)
+			{
+				rel->notnullattnums = bms_add_member(rel->notnullattnums,
+													 i + 1);
+
+				/*
+				 * Per RemoveAttributeById(), dropped columns will have their
+				 * attnotnull unset, so we needn't check for dropped columns
+				 * in the above condition.
+				 */
+				Assert(!attr->attisdropped);
+			}
+		}
+	}
+
+	/*
 	 * Estimate relation size --- unless it's an inheritance parent, in which
 	 * case the size we want is not the rel's own size but the size of its
 	 * inheritance tree.  That will be computed in set_append_rel_size().
@@ -172,10 +209,14 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 
 	/*
 	 * Make list of indexes.  Ignore indexes on system catalogs if told to.
-	 * Don't bother with indexes for an inheritance parent, either.
+	 * Don't bother with indexes from traditional inheritance parents.  For
+	 * partitioned tables, we need a list of at least unique indexes as these
+	 * serve as unique proofs for certain planner optimizations.  However,
+	 * let's not discriminate here and just record all partitioned indexes
+	 * whether they're unique indexes or not.
 	 */
-	if (inhparent ||
-		(IgnoreSystemIndexes && IsSystemRelation(relation)))
+	if ((inhparent && relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		|| (IgnoreSystemIndexes && IsSystemRelation(relation)))
 		hasindex = false;
 	else
 		hasindex = relation->rd_rel->relhasindex;
@@ -203,7 +244,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			Oid			indexoid = lfirst_oid(l);
 			Relation	indexRelation;
 			Form_pg_index index;
-			IndexAmRoutine *amroutine;
+			IndexAmRoutine *amroutine = NULL;
 			IndexOptInfo *info;
 			int			ncolumns,
 						nkeycolumns;
@@ -223,16 +264,6 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * indisready.
 			 */
 			if (!index->indisvalid)
-			{
-				index_close(indexRelation, NoLock);
-				continue;
-			}
-
-			/*
-			 * Ignore partitioned indexes, since they are not usable for
-			 * queries.
-			 */
-			if (indexRelation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
 			{
 				index_close(indexRelation, NoLock);
 				continue;
@@ -282,105 +313,125 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 
 			info->relam = indexRelation->rd_rel->relam;
 
-			/* We copy just the fields we need, not all of rd_indam */
-			amroutine = indexRelation->rd_indam;
-			info->amcanorderbyop = amroutine->amcanorderbyop;
-			info->amoptionalkey = amroutine->amoptionalkey;
-			info->amsearcharray = amroutine->amsearcharray;
-			info->amsearchnulls = amroutine->amsearchnulls;
-			info->amcanparallel = amroutine->amcanparallel;
-			info->amhasgettuple = (amroutine->amgettuple != NULL);
-			info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
-				relation->rd_tableam->scan_bitmap_next_block != NULL;
-			info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
-								  amroutine->amrestrpos != NULL);
-			info->amcostestimate = amroutine->amcostestimate;
-			Assert(info->amcostestimate != NULL);
-
-			/* Fetch index opclass options */
-			info->opclassoptions = RelationGetIndexAttOptions(indexRelation, true);
-
 			/*
-			 * Fetch the ordering information for the index, if any.
+			 * We don't have an AM for partitioned indexes, so we'll just
+			 * NULLify the AM related fields for those.
 			 */
-			if (info->relam == BTREE_AM_OID)
+			if (indexRelation->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
 			{
+				/* We copy just the fields we need, not all of rd_indam */
+				amroutine = indexRelation->rd_indam;
+				info->amcanorderbyop = amroutine->amcanorderbyop;
+				info->amoptionalkey = amroutine->amoptionalkey;
+				info->amsearcharray = amroutine->amsearcharray;
+				info->amsearchnulls = amroutine->amsearchnulls;
+				info->amcanparallel = amroutine->amcanparallel;
+				info->amhasgettuple = (amroutine->amgettuple != NULL);
+				info->amhasgetbitmap = amroutine->amgetbitmap != NULL &&
+					relation->rd_tableam->scan_bitmap_next_tuple != NULL;
+				info->amcanmarkpos = (amroutine->ammarkpos != NULL &&
+									  amroutine->amrestrpos != NULL);
+				info->amcostestimate = amroutine->amcostestimate;
+				Assert(info->amcostestimate != NULL);
+
+				/* Fetch index opclass options */
+				info->opclassoptions = RelationGetIndexAttOptions(indexRelation, true);
+
 				/*
-				 * If it's a btree index, we can use its opfamily OIDs
-				 * directly as the sort ordering opfamily OIDs.
+				 * Fetch the ordering information for the index, if any.
 				 */
-				Assert(amroutine->amcanorder);
-
-				info->sortopfamily = info->opfamily;
-				info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
-				info->nulls_first = (bool *) palloc(sizeof(bool) * nkeycolumns);
-
-				for (i = 0; i < nkeycolumns; i++)
+				if (info->relam == BTREE_AM_OID)
 				{
-					int16		opt = indexRelation->rd_indoption[i];
+					/*
+					 * If it's a btree index, we can use its opfamily OIDs
+					 * directly as the sort ordering opfamily OIDs.
+					 */
+					Assert(amroutine->amcanorder);
 
-					info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
-					info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+					info->sortopfamily = info->opfamily;
+					info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
+					info->nulls_first = (bool *) palloc(sizeof(bool) * nkeycolumns);
+
+					for (i = 0; i < nkeycolumns; i++)
+					{
+						int16		opt = indexRelation->rd_indoption[i];
+
+						info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
+						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+					}
 				}
-			}
-			else if (amroutine->amcanorder)
-			{
-				/*
-				 * Otherwise, identify the corresponding btree opfamilies by
-				 * trying to map this index's "<" operators into btree.  Since
-				 * "<" uniquely defines the behavior of a sort order, this is
-				 * a sufficient test.
-				 *
-				 * XXX This method is rather slow and also requires the
-				 * undesirable assumption that the other index AM numbers its
-				 * strategies the same as btree.  It'd be better to have a way
-				 * to explicitly declare the corresponding btree opfamily for
-				 * each opfamily of the other index type.  But given the lack
-				 * of current or foreseeable amcanorder index types, it's not
-				 * worth expending more effort on now.
-				 */
-				info->sortopfamily = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
-				info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
-				info->nulls_first = (bool *) palloc(sizeof(bool) * nkeycolumns);
-
-				for (i = 0; i < nkeycolumns; i++)
+				else if (amroutine->amcanorder)
 				{
-					int16		opt = indexRelation->rd_indoption[i];
-					Oid			ltopr;
-					Oid			btopfamily;
-					Oid			btopcintype;
-					int16		btstrategy;
+					/*
+					 * Otherwise, identify the corresponding btree opfamilies
+					 * by trying to map this index's "<" operators into btree.
+					 * Since "<" uniquely defines the behavior of a sort
+					 * order, this is a sufficient test.
+					 *
+					 * XXX This method is rather slow and complicated.  It'd
+					 * be better to have a way to explicitly declare the
+					 * corresponding btree opfamily for each opfamily of the
+					 * other index type.
+					 */
+					info->sortopfamily = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
+					info->reverse_sort = (bool *) palloc(sizeof(bool) * nkeycolumns);
+					info->nulls_first = (bool *) palloc(sizeof(bool) * nkeycolumns);
 
-					info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
-					info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+					for (i = 0; i < nkeycolumns; i++)
+					{
+						int16		opt = indexRelation->rd_indoption[i];
+						Oid			ltopr;
+						Oid			opfamily;
+						Oid			opcintype;
+						CompareType cmptype;
 
-					ltopr = get_opfamily_member(info->opfamily[i],
-												info->opcintype[i],
-												info->opcintype[i],
-												BTLessStrategyNumber);
-					if (OidIsValid(ltopr) &&
-						get_ordering_op_properties(ltopr,
-												   &btopfamily,
-												   &btopcintype,
-												   &btstrategy) &&
-						btopcintype == info->opcintype[i] &&
-						btstrategy == BTLessStrategyNumber)
-					{
-						/* Successful mapping */
-						info->sortopfamily[i] = btopfamily;
+						info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
+						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+
+						ltopr = get_opfamily_member_for_cmptype(info->opfamily[i],
+																info->opcintype[i],
+																info->opcintype[i],
+																COMPARE_LT);
+						if (OidIsValid(ltopr) &&
+							get_ordering_op_properties(ltopr,
+													   &opfamily,
+													   &opcintype,
+													   &cmptype) &&
+							opcintype == info->opcintype[i] &&
+							cmptype == COMPARE_LT)
+						{
+							/* Successful mapping */
+							info->sortopfamily[i] = opfamily;
+						}
+						else
+						{
+							/* Fail ... quietly treat index as unordered */
+							info->sortopfamily = NULL;
+							info->reverse_sort = NULL;
+							info->nulls_first = NULL;
+							break;
+						}
 					}
-					else
-					{
-						/* Fail ... quietly treat index as unordered */
-						info->sortopfamily = NULL;
-						info->reverse_sort = NULL;
-						info->nulls_first = NULL;
-						break;
-					}
+				}
+				else
+				{
+					info->sortopfamily = NULL;
+					info->reverse_sort = NULL;
+					info->nulls_first = NULL;
 				}
 			}
 			else
 			{
+				info->amcanorderbyop = false;
+				info->amoptionalkey = false;
+				info->amsearcharray = false;
+				info->amsearchnulls = false;
+				info->amcanparallel = false;
+				info->amhasgettuple = false;
+				info->amhasgetbitmap = false;
+				info->amcanmarkpos = false;
+				info->amcostestimate = NULL;
+
 				info->sortopfamily = NULL;
 				info->reverse_sort = NULL;
 				info->nulls_first = NULL;
@@ -405,6 +456,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->indrestrictinfo = NIL;	/* set later, in indxpath.c */
 			info->predOK = false;	/* set later, in indxpath.c */
 			info->unique = index->indisunique;
+			info->nullsnotdistinct = index->indnullsnotdistinct;
 			info->immediate = index->indimmediate;
 			info->hypothetical = false;
 
@@ -413,31 +465,44 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * the number-of-tuples estimate to equal the parent table; if it
 			 * is partial then we have to use the same methods as we would for
 			 * a table, except we can be sure that the index is not larger
-			 * than the table.
+			 * than the table.  We must ignore partitioned indexes here as
+			 * there are not physical indexes.
 			 */
-			if (info->indpred == NIL)
+			if (indexRelation->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
 			{
-				info->pages = RelationGetNumberOfBlocks(indexRelation);
-				info->tuples = rel->tuples;
-			}
-			else
-			{
-				double		allvisfrac; /* dummy */
-
-				estimate_rel_size(indexRelation, NULL,
-								  &info->pages, &info->tuples, &allvisfrac);
-				if (info->tuples > rel->tuples)
+				if (info->indpred == NIL)
+				{
+					info->pages = RelationGetNumberOfBlocks(indexRelation);
 					info->tuples = rel->tuples;
-			}
+				}
+				else
+				{
+					double		allvisfrac; /* dummy */
 
-			if (info->relam == BTREE_AM_OID)
-			{
-				/* For btrees, get tree height while we have the index open */
-				info->tree_height = _bt_getrootheight(indexRelation);
+					estimate_rel_size(indexRelation, NULL,
+									  &info->pages, &info->tuples, &allvisfrac);
+					if (info->tuples > rel->tuples)
+						info->tuples = rel->tuples;
+				}
+
+				/*
+				 * Get tree height while we have the index open
+				 */
+				if (amroutine->amgettreeheight)
+				{
+					info->tree_height = amroutine->amgettreeheight(indexRelation);
+				}
+				else
+				{
+					/* For other index types, just set it to "unknown" for now */
+					info->tree_height = -1;
+				}
 			}
 			else
 			{
-				/* For other index types, just set it to "unknown" for now */
+				/* Zero these out for partitioned indexes */
+				info->pages = 0;
+				info->tuples = 0.0;
 				info->tree_height = -1;
 			}
 
@@ -574,6 +639,10 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
 		/* conrelid should always be that of the table we're considering */
 		Assert(cachedfk->conrelid == RelationGetRelid(relation));
 
+		/* skip constraints currently not enforced */
+		if (!cachedfk->conenforced)
+			continue;
+
 		/* Scan to find other RTEs matching confrelid */
 		rti = 0;
 		foreach(lc2, rtable)
@@ -634,6 +703,11 @@ get_relation_foreign_keys(PlannerInfo *root, RelOptInfo *rel,
  * the purposes of inference.  If no opclass (or collation) is specified, then
  * all matching indexes (that may or may not match the default in terms of
  * each attribute opclass/collation) are used for inference.
+ *
+ * Note: during index CONCURRENTLY operations, different transactions may
+ * reference different sets of arbiter indexes. This can lead to false unique
+ * constraint violations that wouldn't occur during normal operations.  For
+ * more information, see insert.sgml.
  */
 List *
 infer_arbiter_indexes(PlannerInfo *root)
@@ -763,7 +837,7 @@ infer_arbiter_indexes(PlannerInfo *root)
 		 */
 		if (indexOidFromConstraint == idxForm->indexrelid)
 		{
-			if (!idxForm->indisunique && onconflict->action == ONCONFLICT_UPDATE)
+			if (idxForm->indisexclusion && onconflict->action == ONCONFLICT_UPDATE)
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("ON CONFLICT DO UPDATE not supported with exclusion constraints")));
@@ -786,6 +860,13 @@ infer_arbiter_indexes(PlannerInfo *root)
 		 * skipped if it's not unique
 		 */
 		if (!idxForm->indisunique)
+			goto next;
+
+		/*
+		 * So-called unique constraints with WITHOUT OVERLAPS are really
+		 * exclusion constraints, so skip those too.
+		 */
+		if (idxForm->indisexclusion)
 			goto next;
 
 		/* Build BMS representation of plain (non expression) index attrs */
@@ -1000,117 +1081,104 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	BlockNumber relallvisible;
 	double		density;
 
-	switch (rel->rd_rel->relkind)
+	if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
 	{
-		case RELKIND_RELATION:
-		case RELKIND_MATVIEW:
-		case RELKIND_TOASTVALUE:
-			table_relation_estimate_size(rel, attr_widths, pages, tuples,
-										 allvisfrac);
-			break;
+		table_relation_estimate_size(rel, attr_widths, pages, tuples,
+									 allvisfrac);
+	}
+	else if (rel->rd_rel->relkind == RELKIND_INDEX)
+	{
+		/*
+		 * XXX: It'd probably be good to move this into a callback, individual
+		 * index types e.g. know if they have a metapage.
+		 */
 
-		case RELKIND_INDEX:
+		/* it has storage, ok to call the smgr */
+		curpages = RelationGetNumberOfBlocks(rel);
 
-			/*
-			 * XXX: It'd probably be good to move this into a callback,
-			 * individual index types e.g. know if they have a metapage.
-			 */
-
-			/* it has storage, ok to call the smgr */
-			curpages = RelationGetNumberOfBlocks(rel);
-
-			/* report estimated # pages */
-			*pages = curpages;
-			/* quick exit if rel is clearly empty */
-			if (curpages == 0)
-			{
-				*tuples = 0;
-				*allvisfrac = 0;
-				break;
-			}
-
-			/* coerce values in pg_class to more desirable types */
-			relpages = (BlockNumber) rel->rd_rel->relpages;
-			reltuples = (double) rel->rd_rel->reltuples;
-			relallvisible = (BlockNumber) rel->rd_rel->relallvisible;
-
-			/*
-			 * Discount the metapage while estimating the number of tuples.
-			 * This is a kluge because it assumes more than it ought to about
-			 * index structure.  Currently it's OK for btree, hash, and GIN
-			 * indexes but suspect for GiST indexes.
-			 */
-			if (relpages > 0)
-			{
-				curpages--;
-				relpages--;
-			}
-
-			/* estimate number of tuples from previous tuple density */
-			if (reltuples >= 0 && relpages > 0)
-				density = reltuples / (double) relpages;
-			else
-			{
-				/*
-				 * If we have no data because the relation was never vacuumed,
-				 * estimate tuple width from attribute datatypes.  We assume
-				 * here that the pages are completely full, which is OK for
-				 * tables (since they've presumably not been VACUUMed yet) but
-				 * is probably an overestimate for indexes.  Fortunately
-				 * get_relation_info() can clamp the overestimate to the
-				 * parent table's size.
-				 *
-				 * Note: this code intentionally disregards alignment
-				 * considerations, because (a) that would be gilding the lily
-				 * considering how crude the estimate is, and (b) it creates
-				 * platform dependencies in the default plans which are kind
-				 * of a headache for regression testing.
-				 *
-				 * XXX: Should this logic be more index specific?
-				 */
-				int32		tuple_width;
-
-				tuple_width = get_rel_data_width(rel, attr_widths);
-				tuple_width += MAXALIGN(SizeofHeapTupleHeader);
-				tuple_width += sizeof(ItemIdData);
-				/* note: integer division is intentional here */
-				density = (BLCKSZ - SizeOfPageHeaderData) / tuple_width;
-			}
-			*tuples = rint(density * (double) curpages);
-
-			/*
-			 * We use relallvisible as-is, rather than scaling it up like we
-			 * do for the pages and tuples counts, on the theory that any
-			 * pages added since the last VACUUM are most likely not marked
-			 * all-visible.  But costsize.c wants it converted to a fraction.
-			 */
-			if (relallvisible == 0 || curpages <= 0)
-				*allvisfrac = 0;
-			else if ((double) relallvisible >= curpages)
-				*allvisfrac = 1;
-			else
-				*allvisfrac = (double) relallvisible / curpages;
-			break;
-
-		case RELKIND_SEQUENCE:
-			/* Sequences always have a known size */
-			*pages = 1;
-			*tuples = 1;
-			*allvisfrac = 0;
-			break;
-		case RELKIND_FOREIGN_TABLE:
-			/* Just use whatever's in pg_class */
-			/* Note that FDW must cope if reltuples is -1! */
-			*pages = rel->rd_rel->relpages;
-			*tuples = rel->rd_rel->reltuples;
-			*allvisfrac = 0;
-			break;
-		default:
-			/* else it has no disk storage; probably shouldn't get here? */
-			*pages = 0;
+		/* report estimated # pages */
+		*pages = curpages;
+		/* quick exit if rel is clearly empty */
+		if (curpages == 0)
+		{
 			*tuples = 0;
 			*allvisfrac = 0;
-			break;
+			return;
+		}
+
+		/* coerce values in pg_class to more desirable types */
+		relpages = (BlockNumber) rel->rd_rel->relpages;
+		reltuples = (double) rel->rd_rel->reltuples;
+		relallvisible = (BlockNumber) rel->rd_rel->relallvisible;
+
+		/*
+		 * Discount the metapage while estimating the number of tuples. This
+		 * is a kluge because it assumes more than it ought to about index
+		 * structure.  Currently it's OK for btree, hash, and GIN indexes but
+		 * suspect for GiST indexes.
+		 */
+		if (relpages > 0)
+		{
+			curpages--;
+			relpages--;
+		}
+
+		/* estimate number of tuples from previous tuple density */
+		if (reltuples >= 0 && relpages > 0)
+			density = reltuples / (double) relpages;
+		else
+		{
+			/*
+			 * If we have no data because the relation was never vacuumed,
+			 * estimate tuple width from attribute datatypes.  We assume here
+			 * that the pages are completely full, which is OK for tables
+			 * (since they've presumably not been VACUUMed yet) but is
+			 * probably an overestimate for indexes.  Fortunately
+			 * get_relation_info() can clamp the overestimate to the parent
+			 * table's size.
+			 *
+			 * Note: this code intentionally disregards alignment
+			 * considerations, because (a) that would be gilding the lily
+			 * considering how crude the estimate is, and (b) it creates
+			 * platform dependencies in the default plans which are kind of a
+			 * headache for regression testing.
+			 *
+			 * XXX: Should this logic be more index specific?
+			 */
+			int32		tuple_width;
+
+			tuple_width = get_rel_data_width(rel, attr_widths);
+			tuple_width += MAXALIGN(SizeofHeapTupleHeader);
+			tuple_width += sizeof(ItemIdData);
+			/* note: integer division is intentional here */
+			density = (BLCKSZ - SizeOfPageHeaderData) / tuple_width;
+		}
+		*tuples = rint(density * (double) curpages);
+
+		/*
+		 * We use relallvisible as-is, rather than scaling it up like we do
+		 * for the pages and tuples counts, on the theory that any pages added
+		 * since the last VACUUM are most likely not marked all-visible.  But
+		 * costsize.c wants it converted to a fraction.
+		 */
+		if (relallvisible == 0 || curpages <= 0)
+			*allvisfrac = 0;
+		else if ((double) relallvisible >= curpages)
+			*allvisfrac = 1;
+		else
+			*allvisfrac = (double) relallvisible / curpages;
+	}
+	else
+	{
+		/*
+		 * Just use whatever's in pg_class.  This covers foreign tables,
+		 * sequences, and also relkinds without storage (shouldn't get here?);
+		 * see initializations in AddNewRelationTuple().  Note that FDW must
+		 * cope if reltuples is -1!
+		 */
+		*pages = rel->rd_rel->relpages;
+		*tuples = rel->rd_rel->reltuples;
+		*allvisfrac = 0;
 	}
 }
 
@@ -1131,7 +1199,7 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 int32
 get_rel_data_width(Relation rel, int32 *attr_widths)
 {
-	int32		tuple_width = 0;
+	int64		tuple_width = 0;
 	int			i;
 
 	for (i = 1; i <= RelationGetNumberOfAttributes(rel); i++)
@@ -1161,7 +1229,7 @@ get_rel_data_width(Relation rel, int32 *attr_widths)
 		tuple_width += item_width;
 	}
 
-	return tuple_width;
+	return clamp_width_est(tuple_width);
 }
 
 /*
@@ -1191,6 +1259,7 @@ get_relation_data_width(Oid relid, int32 *attr_widths)
  * get_relation_constraints
  *
  * Retrieve the applicable constraint expressions of the given relation.
+ * Only constraints that have been validated are considered.
  *
  * Returns a List (possibly empty) of constraint expressions.  Each one
  * has been canonicalized, and its Vars are changed to have the varno
@@ -1239,11 +1308,20 @@ get_relation_constraints(PlannerInfo *root,
 
 			/*
 			 * If this constraint hasn't been fully validated yet, we must
-			 * ignore it here.  Also ignore if NO INHERIT and we weren't told
-			 * that that's safe.
+			 * ignore it here.
 			 */
 			if (!constr->check[i].ccvalid)
 				continue;
+
+			/*
+			 * NOT ENFORCED constraints are always marked as invalid, which
+			 * should have been ignored.
+			 */
+			Assert(constr->check[i].ccenforced);
+
+			/*
+			 * Also ignore if NO INHERIT and we weren't told that that's safe.
+			 */
 			if (constr->check[i].ccnoinherit && !include_noinherit)
 				continue;
 
@@ -1282,17 +1360,18 @@ get_relation_constraints(PlannerInfo *root,
 
 			for (i = 1; i <= natts; i++)
 			{
-				Form_pg_attribute att = TupleDescAttr(relation->rd_att, i - 1);
+				CompactAttribute *att = TupleDescCompactAttr(relation->rd_att, i - 1);
 
-				if (att->attnotnull && !att->attisdropped)
+				if (att->attnullability == ATTNULLABLE_VALID && !att->attisdropped)
 				{
+					Form_pg_attribute wholeatt = TupleDescAttr(relation->rd_att, i - 1);
 					NullTest   *ntest = makeNode(NullTest);
 
 					ntest->arg = (Expr *) makeVar(varno,
 												  i,
-												  att->atttypid,
-												  att->atttypmod,
-												  att->attcollation,
+												  wholeatt->atttypid,
+												  wholeatt->atttypmod,
+												  wholeatt->attcollation,
 												  0);
 					ntest->nulltesttype = IS_NOT_NULL;
 
@@ -1319,9 +1398,98 @@ get_relation_constraints(PlannerInfo *root,
 		result = list_concat(result, rel->partition_qual);
 	}
 
+	/*
+	 * Expand virtual generated columns in the constraint expressions.
+	 */
+	if (result)
+		result = (List *) expand_generated_columns_in_expr((Node *) result,
+														   relation,
+														   varno);
+
 	table_close(relation, NoLock);
 
 	return result;
+}
+
+/*
+ * Try loading data for the statistics object.
+ *
+ * We don't know if the data (specified by statOid and inh value) exist.
+ * The result is stored in stainfos list.
+ */
+static void
+get_relation_statistics_worker(List **stainfos, RelOptInfo *rel,
+							   Oid statOid, bool inh,
+							   Bitmapset *keys, List *exprs)
+{
+	Form_pg_statistic_ext_data dataForm;
+	HeapTuple	dtup;
+
+	dtup = SearchSysCache2(STATEXTDATASTXOID,
+						   ObjectIdGetDatum(statOid), BoolGetDatum(inh));
+	if (!HeapTupleIsValid(dtup))
+		return;
+
+	dataForm = (Form_pg_statistic_ext_data) GETSTRUCT(dtup);
+
+	/* add one StatisticExtInfo for each kind built */
+	if (statext_is_kind_built(dtup, STATS_EXT_NDISTINCT))
+	{
+		StatisticExtInfo *info = makeNode(StatisticExtInfo);
+
+		info->statOid = statOid;
+		info->inherit = dataForm->stxdinherit;
+		info->rel = rel;
+		info->kind = STATS_EXT_NDISTINCT;
+		info->keys = bms_copy(keys);
+		info->exprs = exprs;
+
+		*stainfos = lappend(*stainfos, info);
+	}
+
+	if (statext_is_kind_built(dtup, STATS_EXT_DEPENDENCIES))
+	{
+		StatisticExtInfo *info = makeNode(StatisticExtInfo);
+
+		info->statOid = statOid;
+		info->inherit = dataForm->stxdinherit;
+		info->rel = rel;
+		info->kind = STATS_EXT_DEPENDENCIES;
+		info->keys = bms_copy(keys);
+		info->exprs = exprs;
+
+		*stainfos = lappend(*stainfos, info);
+	}
+
+	if (statext_is_kind_built(dtup, STATS_EXT_MCV))
+	{
+		StatisticExtInfo *info = makeNode(StatisticExtInfo);
+
+		info->statOid = statOid;
+		info->inherit = dataForm->stxdinherit;
+		info->rel = rel;
+		info->kind = STATS_EXT_MCV;
+		info->keys = bms_copy(keys);
+		info->exprs = exprs;
+
+		*stainfos = lappend(*stainfos, info);
+	}
+
+	if (statext_is_kind_built(dtup, STATS_EXT_EXPRESSIONS))
+	{
+		StatisticExtInfo *info = makeNode(StatisticExtInfo);
+
+		info->statOid = statOid;
+		info->inherit = dataForm->stxdinherit;
+		info->rel = rel;
+		info->kind = STATS_EXT_EXPRESSIONS;
+		info->keys = bms_copy(keys);
+		info->exprs = exprs;
+
+		*stainfos = lappend(*stainfos, info);
+	}
+
+	ReleaseSysCache(dtup);
 }
 
 /*
@@ -1347,7 +1515,6 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 		Oid			statOid = lfirst_oid(l);
 		Form_pg_statistic_ext staForm;
 		HeapTuple	htup;
-		HeapTuple	dtup;
 		Bitmapset  *keys = NULL;
 		List	   *exprs = NIL;
 		int			i;
@@ -1356,10 +1523,6 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 		if (!HeapTupleIsValid(htup))
 			elog(ERROR, "cache lookup failed for statistics object %u", statOid);
 		staForm = (Form_pg_statistic_ext) GETSTRUCT(htup);
-
-		dtup = SearchSysCache1(STATEXTDATASTXOID, ObjectIdGetDatum(statOid));
-		if (!HeapTupleIsValid(dtup))
-			elog(ERROR, "cache lookup failed for statistics object %u", statOid);
 
 		/*
 		 * First, build the array of columns covered.  This is ultimately
@@ -1372,6 +1535,11 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 		/*
 		 * Preprocess expressions (if any). We read the expressions, run them
 		 * through eval_const_expressions, and fix the varnos.
+		 *
+		 * XXX We don't know yet if there are any data for this stats object,
+		 * with either stxdinherit value. But it's reasonable to assume there
+		 * is at least one of those, possibly both. So it's better to process
+		 * keys and expressions here.
 		 */
 		{
 			bool		isnull;
@@ -1412,61 +1580,13 @@ get_relation_statistics(RelOptInfo *rel, Relation relation)
 			}
 		}
 
-		/* add one StatisticExtInfo for each kind built */
-		if (statext_is_kind_built(dtup, STATS_EXT_NDISTINCT))
-		{
-			StatisticExtInfo *info = makeNode(StatisticExtInfo);
+		/* extract statistics for possible values of stxdinherit flag */
 
-			info->statOid = statOid;
-			info->rel = rel;
-			info->kind = STATS_EXT_NDISTINCT;
-			info->keys = bms_copy(keys);
-			info->exprs = exprs;
+		get_relation_statistics_worker(&stainfos, rel, statOid, true, keys, exprs);
 
-			stainfos = lappend(stainfos, info);
-		}
-
-		if (statext_is_kind_built(dtup, STATS_EXT_DEPENDENCIES))
-		{
-			StatisticExtInfo *info = makeNode(StatisticExtInfo);
-
-			info->statOid = statOid;
-			info->rel = rel;
-			info->kind = STATS_EXT_DEPENDENCIES;
-			info->keys = bms_copy(keys);
-			info->exprs = exprs;
-
-			stainfos = lappend(stainfos, info);
-		}
-
-		if (statext_is_kind_built(dtup, STATS_EXT_MCV))
-		{
-			StatisticExtInfo *info = makeNode(StatisticExtInfo);
-
-			info->statOid = statOid;
-			info->rel = rel;
-			info->kind = STATS_EXT_MCV;
-			info->keys = bms_copy(keys);
-			info->exprs = exprs;
-
-			stainfos = lappend(stainfos, info);
-		}
-
-		if (statext_is_kind_built(dtup, STATS_EXT_EXPRESSIONS))
-		{
-			StatisticExtInfo *info = makeNode(StatisticExtInfo);
-
-			info->statOid = statOid;
-			info->rel = rel;
-			info->kind = STATS_EXT_EXPRESSIONS;
-			info->keys = bms_copy(keys);
-			info->exprs = exprs;
-
-			stainfos = lappend(stainfos, info);
-		}
+		get_relation_statistics_worker(&stainfos, rel, statOid, false, keys, exprs);
 
 		ReleaseSysCache(htup);
-		ReleaseSysCache(dtup);
 		bms_free(keys);
 	}
 
@@ -1510,16 +1630,17 @@ relation_excluded_by_constraints(PlannerInfo *root,
 
 	/*
 	 * Regardless of the setting of constraint_exclusion, detect
-	 * constant-FALSE-or-NULL restriction clauses.  Because const-folding will
-	 * reduce "anything AND FALSE" to just "FALSE", any such case should
-	 * result in exactly one baserestrictinfo entry.  This doesn't fire very
-	 * often, but it seems cheap enough to be worth doing anyway.  (Without
-	 * this, we'd miss some optimizations that 9.5 and earlier found via much
-	 * more roundabout methods.)
+	 * constant-FALSE-or-NULL restriction clauses.  Although const-folding
+	 * will reduce "anything AND FALSE" to just "FALSE", the baserestrictinfo
+	 * list can still have other members besides the FALSE constant, due to
+	 * qual pushdown and other mechanisms; so check them all.  This doesn't
+	 * fire very often, but it seems cheap enough to be worth doing anyway.
+	 * (Without this, we'd miss some optimizations that 9.5 and earlier found
+	 * via much more roundabout methods.)
 	 */
-	if (list_length(rel->baserestrictinfo) == 1)
+	foreach(lc, rel->baserestrictinfo)
 	{
-		RestrictInfo *rinfo = (RestrictInfo *) linitial(rel->baserestrictinfo);
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 		Expr	   *clause = rinfo->clause;
 
 		if (clause && IsA(clause, Const) &&
@@ -1605,6 +1726,8 @@ relation_excluded_by_constraints(PlannerInfo *root,
 	 * Currently, attnotnull constraints must be treated as NO INHERIT unless
 	 * this is a partitioned table.  In future we might track their
 	 * inheritance status more accurately, allowing this to be refined.
+	 *
+	 * XXX do we need/want to change this?
 	 */
 	include_notnull = (!rte->inh || rte->relkind == RELKIND_PARTITIONED_TABLE);
 
@@ -1750,8 +1873,8 @@ build_physical_tlist(PlannerInfo *root, RelOptInfo *rel)
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
 			/* Not all of these can have dropped cols, but share code anyway */
-			expandRTE(rte, varno, 0, -1, true /* include dropped */ ,
-					  NULL, &colvars);
+			expandRTE(rte, varno, 0, VAR_RETURNING_DEFAULT, -1,
+					  true /* include dropped */ , NULL, &colvars);
 			foreach(l, colvars)
 			{
 				var = (Var *) lfirst(l);
@@ -2180,6 +2303,64 @@ has_row_triggers(PlannerInfo *root, Index rti, CmdType event)
 				(trigDesc->trig_delete_after_row ||
 				 trigDesc->trig_delete_before_row))
 				result = true;
+			break;
+			/* There is no separate event for MERGE, only INSERT/UPDATE/DELETE */
+		case CMD_MERGE:
+			result = false;
+			break;
+		default:
+			elog(ERROR, "unrecognized CmdType: %d", (int) event);
+			break;
+	}
+
+	table_close(relation, NoLock);
+	return result;
+}
+
+/*
+ * has_transition_tables
+ *
+ * Detect whether the specified relation has any transition tables for event.
+ */
+bool
+has_transition_tables(PlannerInfo *root, Index rti, CmdType event)
+{
+	RangeTblEntry *rte = planner_rt_fetch(rti, root);
+	Relation	relation;
+	TriggerDesc *trigDesc;
+	bool		result = false;
+
+	Assert(rte->rtekind == RTE_RELATION);
+
+	/* Currently foreign tables cannot have transition tables */
+	if (rte->relkind == RELKIND_FOREIGN_TABLE)
+		return result;
+
+	/* Assume we already have adequate lock */
+	relation = table_open(rte->relid, NoLock);
+
+	trigDesc = relation->trigdesc;
+	switch (event)
+	{
+		case CMD_INSERT:
+			if (trigDesc &&
+				trigDesc->trig_insert_new_table)
+				result = true;
+			break;
+		case CMD_UPDATE:
+			if (trigDesc &&
+				(trigDesc->trig_update_old_table ||
+				 trigDesc->trig_update_new_table))
+				result = true;
+			break;
+		case CMD_DELETE:
+			if (trigDesc &&
+				trigDesc->trig_delete_old_table)
+				result = true;
+			break;
+			/* There is no separate event for MERGE, only INSERT/UPDATE/DELETE */
+		case CMD_MERGE:
+			result = false;
 			break;
 		default:
 			elog(ERROR, "unrecognized CmdType: %d", (int) event);

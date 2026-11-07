@@ -7,18 +7,15 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "access/transam.h"
-#include "funcapi.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "funcapi.h"
 #include "plpy_elog.h"
 #include "plpy_main.h"
 #include "plpy_procedure.h"
-#include "plpython.h"
+#include "plpy_util.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
-#include "utils/inval.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
@@ -325,10 +322,8 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 		/*
 		 * get the text of the function.
 		 */
-		prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
-									  Anum_pg_proc_prosrc, &isnull);
-		if (isnull)
-			elog(ERROR, "null prosrc");
+		prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup,
+											 Anum_pg_proc_prosrc);
 		procSource = TextDatumGetCString(prosrcdatum);
 
 		PLy_procedure_compile(proc, procSource);
@@ -355,6 +350,7 @@ PLy_procedure_compile(PLyProcedure *proc, const char *src)
 {
 	PyObject   *crv = NULL;
 	char	   *msrc;
+	PyObject   *code0;
 
 	proc->globals = PyDict_Copy(PLy_interp_globals);
 
@@ -373,7 +369,9 @@ PLy_procedure_compile(PLyProcedure *proc, const char *src)
 	msrc = PLy_procedure_munge_source(proc->pyname, src);
 	/* Save the mangled source for later inclusion in tracebacks */
 	proc->src = MemoryContextStrdup(proc->mcxt, msrc);
-	crv = PyRun_String(msrc, Py_file_input, proc->globals, NULL);
+	code0 = Py_CompileString(msrc, "<string>", Py_file_input);
+	if (code0)
+		crv = PyEval_EvalCode(code0, proc->globals, NULL);
 	pfree(msrc);
 
 	if (crv != NULL)

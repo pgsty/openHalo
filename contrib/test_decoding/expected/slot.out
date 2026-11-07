@@ -30,8 +30,11 @@ SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot_t2', 'tes
  init
 (1 row)
 
+BEGIN;
+SET LOCAL output_plugin_libraries = nonexistent;
 SELECT pg_create_logical_replication_slot('foo', 'nonexistent');
 ERROR:  could not access file "nonexistent": No such file or directory
+ROLLBACK;
 -- here we want to start a new session and wait till old one is gone
 select pg_backend_pid() as oldpid \gset
 \c -
@@ -48,6 +51,27 @@ SELECT pg_drop_replication_slot('regression_slot_t');
 ERROR:  replication slot "regression_slot_t" does not exist
 SELECT pg_drop_replication_slot('regression_slot_t2');
 ERROR:  replication slot "regression_slot_t2" does not exist
+-- monitoring functions for slot directories
+SELECT count(*) >= 0 AS ok FROM pg_ls_logicalmapdir();
+ ok 
+----
+ t
+(1 row)
+
+SELECT count(*) >= 0 AS ok FROM pg_ls_logicalsnapdir();
+ ok 
+----
+ t
+(1 row)
+
+SELECT count(*) >= 0 AS ok FROM pg_ls_replslotdir('regression_slot_p');
+ ok 
+----
+ t
+(1 row)
+
+SELECT count(*) >= 0 AS ok FROM pg_ls_replslotdir('not_existing_slot'); -- fails
+ERROR:  replication slot "not_existing_slot" does not exist
 -- permanent slot has survived
 SELECT pg_drop_replication_slot('regression_slot_p');
  pg_drop_replication_slot 
@@ -199,7 +223,7 @@ ORDER BY o.slot_name, c.slot_name;
 -- released even when raise error during creating the target slot.
 SELECT 'copy' FROM pg_copy_logical_replication_slot('orig_slot1', 'failed'); -- error
 ERROR:  all replication slots are in use
-HINT:  Free one or increase max_replication_slots.
+HINT:  Free one or increase "max_replication_slots".
 -- temporary slots were dropped automatically
 SELECT pg_drop_replication_slot('orig_slot1');
  pg_drop_replication_slot 
@@ -380,6 +404,66 @@ SELECT pg_drop_replication_slot('copied_slot2_no_change');
 (1 row)
 
 SELECT pg_drop_replication_slot('copied_slot2_notemp');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+-- Test failover option of slots.
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_true_slot', 'test_decoding', false, false, true);
+ ?column? 
+----------
+ init
+(1 row)
+
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_false_slot', 'test_decoding', false, false, false);
+ ?column? 
+----------
+ init
+(1 row)
+
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_default_slot', 'test_decoding', false, false);
+ ?column? 
+----------
+ init
+(1 row)
+
+SELECT 'init' FROM pg_create_logical_replication_slot('failover_true_temp_slot', 'test_decoding', true, false, true);
+ERROR:  cannot enable failover for a temporary replication slot
+SELECT 'init' FROM pg_create_physical_replication_slot('physical_slot');
+ ?column? 
+----------
+ init
+(1 row)
+
+SELECT slot_name, slot_type, failover FROM pg_replication_slots;
+       slot_name       | slot_type | failover 
+-----------------------+-----------+----------
+ failover_true_slot    | logical   | t
+ failover_false_slot   | logical   | f
+ failover_default_slot | logical   | f
+ physical_slot         | physical  | f
+(4 rows)
+
+SELECT pg_drop_replication_slot('failover_true_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_drop_replication_slot('failover_false_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_drop_replication_slot('failover_default_slot');
+ pg_drop_replication_slot 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_drop_replication_slot('physical_slot');
  pg_drop_replication_slot 
 --------------------------
  

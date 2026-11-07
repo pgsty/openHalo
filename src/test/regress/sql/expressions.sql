@@ -3,7 +3,7 @@
 --
 
 --
--- Tests for SQLVAlueFunction
+-- Tests for SQLValueFunction
 --
 
 
@@ -17,12 +17,17 @@ SELECT now()::timetz(4)::text = current_time(4)::text;
 SELECT now()::time::text = localtime::text;
 SELECT now()::time(3)::text = localtime(3)::text;
 
--- current_timestamp / localtimestamp (always matches because of transactional behaviour)
+-- current_time[stamp]/ localtime[stamp] (always matches because of transactional behaviour)
 SELECT current_timestamp = NOW();
 -- precision
 SELECT length(current_timestamp::text) >= length(current_timestamp(0)::text);
 -- localtimestamp
 SELECT now()::timestamp::text = localtimestamp::text;
+-- precision overflow
+SELECT current_time = current_time(7);
+SELECT current_timestamp = current_timestamp(7);
+SELECT localtime = localtime(7);
+SELECT localtimestamp = localtimestamp(7);
 
 -- current_role/user/user is tested in rolenames.sql
 
@@ -36,35 +41,6 @@ SELECT current_schema;
 SET search_path = 'pg_catalog';
 SELECT current_schema;
 RESET search_path;
-
-
---
--- Tests for BETWEEN
---
-
-explain (costs off)
-select count(*) from date_tbl
-  where f1 between '1997-01-01' and '1998-01-01';
-select count(*) from date_tbl
-  where f1 between '1997-01-01' and '1998-01-01';
-
-explain (costs off)
-select count(*) from date_tbl
-  where f1 not between '1997-01-01' and '1998-01-01';
-select count(*) from date_tbl
-  where f1 not between '1997-01-01' and '1998-01-01';
-
-explain (costs off)
-select count(*) from date_tbl
-  where f1 between symmetric '1997-01-01' and '1998-01-01';
-select count(*) from date_tbl
-  where f1 between symmetric '1997-01-01' and '1998-01-01';
-
-explain (costs off)
-select count(*) from date_tbl
-  where f1 not between symmetric '1997-01-01' and '1998-01-01';
-select count(*) from date_tbl
-  where f1 not between symmetric '1997-01-01' and '1998-01-01';
 
 
 --
@@ -146,6 +122,15 @@ select return_int_input(1) in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1, null);
 select return_int_input(null::int) in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1);
 select return_int_input(null::int) in (10, 9, 2, 8, 3, 7, 4, 6, 5, null);
 select return_text_input('a') in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j');
+-- NOT IN
+select return_int_input(1) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1);
+select return_int_input(1) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, 0);
+select return_int_input(1) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, 2, null);
+select return_int_input(1) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1, null);
+select return_int_input(1) not in (null, null, null, null, null, null, null, null, null, null, null);
+select return_int_input(null::int) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1);
+select return_int_input(null::int) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, null);
+select return_text_input('a') not in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j');
 
 rollback;
 
@@ -177,6 +162,12 @@ begin
 end;
 $$ language plpgsql immutable;
 
+create function myintne(myint, myint) returns bool as $$
+begin
+  return not myinteq($1, $2);
+end;
+$$ language plpgsql immutable;
+
 create operator = (
   leftarg    = myint,
   rightarg   = myint,
@@ -188,18 +179,125 @@ create operator = (
   merges
 );
 
+create operator <> (
+  leftarg    = myint,
+  rightarg   = myint,
+  commutator = <>,
+  negator    = =,
+  procedure  = myintne,
+  restrict   = eqsel,
+  join       = eqjoinsel,
+  merges
+);
+
 create operator class myint_ops
 default for type myint using hash as
   operator    1   =  (myint, myint),
   function    1   myinthash(myint);
 
 create table inttest (a myint);
-insert into inttest values(1::myint),(null);
+insert into inttest values (null), (0::myint), (1::myint);
 
--- try an array with enough elements to cause hashing
-select * from inttest where a in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint,9::myint, null);
--- ensure the result matched with the non-hashed version.  We simply remove
--- some array elements so that we don't reach the hashing threshold.
-select * from inttest where a in (1::myint,2::myint,3::myint,4::myint,5::myint, null);
+-- Test EEOP_HASHED_SCALARARRAYOP against EEOP_SCALARARRAYOP.  Ensure the
+-- result of non-hashed vs hashed is the same.
+select
+  a,
+  a in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as not_hashed,
+  a in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint,9::myint) as hashed
+from inttest;
+
+select
+  a,
+  a in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed,
+  a in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed
+ from inttest;
+
+select
+  a,
+  a not in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as not_hashed,
+  a not in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint,9::myint) as hashed
+from inttest;
+
+select
+  a,
+  a not in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed,
+  a not in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed
+from inttest;
+
+-- Now make the equal function return false when given two NULLs
+create or replace function myinteq(myint, myint) returns bool as $$
+begin
+  if $1 is null and $2 is null then
+    return false;
+  else
+    return $1::int = $2::int;
+  end if;
+end;
+$$ language plpgsql immutable;
+
+-- And try the same again to ensure EEOP_HASHED_SCALARARRAYOP does the same
+-- thing as EEOP_SCALARARRAYOP.
+select
+  a,
+  a in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as not_hashed,
+  a in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint,9::myint) as hashed
+from inttest;
+
+select
+  a,
+  a in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed,
+  a in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed
+ from inttest;
+
+select
+  a,
+  a not in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as not_hashed,
+  a not in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint,9::myint) as hashed
+from inttest;
+
+select
+  a,
+  a not in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed,
+  a not in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed
+from inttest;
+
+-- Try again with an equality function that treats NULLs as equal to 0.
+create or replace function myinteq(myint, myint) returns bool as $$
+begin
+  if $1 is null and $2 is null then
+    return false;
+  else
+    return coalesce($1::int,0) = coalesce($2::int, 0);
+  end if;
+end;
+$$ language plpgsql immutable;
+
+select
+  a,
+  a in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as not_hashed,
+  a in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint,9::myint) as hashed,
+  a in (0::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed_zero,
+  a in (0::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed_zero
+from inttest;
+
+select
+  a,
+  a in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed,
+  a in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed
+ from inttest;
+
+select
+  a,
+  a not in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as not_hashed,
+  a not in (1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint,9::myint) as hashed,
+  a not in (0::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed_zero,
+  a not in (0::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed_zero
+from inttest;
+
+select
+  a,
+  a not in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint) as not_hashed,
+  a not in (null::myint,1::myint,2::myint,3::myint,4::myint,5::myint,6::myint,7::myint,8::myint) as hashed
+from inttest;
 
 rollback;

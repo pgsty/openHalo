@@ -77,13 +77,6 @@ OBJS = \
 	nodeWorktablescan.o \
 	spi.o \
 	tqueue.o \
-	tstoreReceiver.o \
-	executor_engine.o \
-	executor_ep.o \
-	mys_executor.o \
-	mys_execProcnode.o \
-	mys_execMain.o \
-	mys_execPartition.o \
-	mys_nodeModifyTable.o 
+	tstoreReceiver.o
 
 include $(top_srcdir)/src/backend/common.mk

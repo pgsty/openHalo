@@ -23,7 +23,7 @@
  * the result is validly encoded according to the destination encoding.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,13 +37,11 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "mb/pg_wchar.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "utils/memdebug.h"
 #include "utils/memutils.h"
-#include "utils/syscache.h"
-#include "miscadmin.h"
-#include "adapter/mysql/adapter.h"
-#include "libpq/libpq-be.h"
-
+#include "utils/relcache.h"
+#include "varatt.h"
 
 /*
  * We maintain a simple linked list caching the fmgr lookup info for the
@@ -99,6 +97,13 @@ static int	pending_client_encoding = PG_SQL_ASCII;
 static char *perform_default_encoding_conversion(const char *src,
 												 int len, bool is_client_to_server);
 static int	cliplen(const char *str, int len, int limit);
+
+pg_noreturn
+static void report_invalid_encoding_int(int encoding, const char *mbstr,
+										int mblen, int len);
+
+pg_noreturn
+static void report_invalid_encoding_db(const char *mbstr, int mblen, int len);
 
 
 /*
@@ -314,7 +319,7 @@ InitializeClientEncoding(void)
 	{
 		Oid			utf8_to_server_proc;
 
-		Assert(IsTransactionState());
+		AssertCouldGetRelation();
 		utf8_to_server_proc =
 			FindDefaultConversionProc(PG_UTF8,
 									  current_server_encoding);
@@ -413,8 +418,8 @@ pg_do_encoding_conversion(unsigned char *src, int len,
 	(void) OidFunctionCall6(proc,
 							Int32GetDatum(src_encoding),
 							Int32GetDatum(dest_encoding),
-							CStringGetDatum(src),
-							CStringGetDatum(result),
+							CStringGetDatum((char *) src),
+							CStringGetDatum((char *) result),
 							Int32GetDatum(len),
 							BoolGetDatum(false));
 
@@ -456,7 +461,7 @@ pg_do_encoding_conversion(unsigned char *src, int len,
  *
  * The output is null-terminated.
  *
- * If destlen < srclen * MAX_CONVERSION_LENGTH + 1, the converted output
+ * If destlen < srclen * MAX_CONVERSION_INPUT_LENGTH + 1, the converted output
  * wouldn't necessarily fit in the output buffer, and the function will not
  * convert the whole input.
  *
@@ -489,8 +494,8 @@ pg_do_encoding_conversion_buf(Oid proc,
 	result = OidFunctionCall6(proc,
 							  Int32GetDatum(src_encoding),
 							  Int32GetDatum(dest_encoding),
-							  CStringGetDatum(src),
-							  CStringGetDatum(dest),
+							  CStringGetDatum((char *) src),
+							  CStringGetDatum((char *) dest),
 							  Int32GetDatum(srclen),
 							  BoolGetDatum(noError));
 	return DatumGetInt32(result);
@@ -588,19 +593,19 @@ pg_convert(PG_FUNCTION_ARGS)
 												  src_encoding,
 												  dest_encoding);
 
-	/* update len if conversion actually happened */
-	if (dest_str != src_str)
-		len = strlen(dest_str);
+
+	/* return source string if no conversion happened */
+	if (dest_str == src_str)
+		PG_RETURN_BYTEA_P(string);
 
 	/*
 	 * build bytea data type structure.
 	 */
+	len = strlen(dest_str);
 	retval = (bytea *) palloc(len + VARHDRSZ);
 	SET_VARSIZE(retval, len + VARHDRSZ);
 	memcpy(VARDATA(retval), dest_str, len);
-
-	if (dest_str != src_str)
-		pfree(dest_str);
+	pfree(dest_str);
 
 	/* free memory if allocated by the toaster */
 	PG_FREE_IF_COPY(string, 0);
@@ -688,24 +693,7 @@ pg_any_to_server(const char *s, int len, int encoding)
 		/*
 		 * No conversion is needed, but we must still validate the data.
 		 */
-        
-        if ((MyProcPort != NULL) && 
-            (nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol))
-        {
-            if (!skipUtf8Verify)
-            {
-                (void) pg_verify_mbstr(DatabaseEncoding->encoding, s, len, false);
-            }
-            else 
-            {
-                // do nothing;
-            }
-        }
-        else 
-        {
-            (void) pg_verify_mbstr(DatabaseEncoding->encoding, s, len, false);
-        }
-        
+		(void) pg_verify_mbstr(DatabaseEncoding->encoding, s, len, false);
 		return unconstify(char *, s);
 	}
 
@@ -931,10 +919,67 @@ pg_unicode_to_server(pg_wchar c, unsigned char *s)
 	FunctionCall6(Utf8ToServerConvProc,
 				  Int32GetDatum(PG_UTF8),
 				  Int32GetDatum(server_encoding),
-				  CStringGetDatum(c_as_utf8),
-				  CStringGetDatum(s),
+				  CStringGetDatum((char *) c_as_utf8),
+				  CStringGetDatum((char *) s),
 				  Int32GetDatum(c_as_utf8_len),
 				  BoolGetDatum(false));
+}
+
+/*
+ * Convert a single Unicode code point into a string in the server encoding.
+ *
+ * Same as pg_unicode_to_server(), except that we don't throw errors,
+ * but simply return false on conversion failure.
+ */
+bool
+pg_unicode_to_server_noerror(pg_wchar c, unsigned char *s)
+{
+	unsigned char c_as_utf8[MAX_MULTIBYTE_CHAR_LEN + 1];
+	int			c_as_utf8_len;
+	int			converted_len;
+	int			server_encoding;
+
+	/* Fail if invalid Unicode code point */
+	if (!is_valid_unicode_codepoint(c))
+		return false;
+
+	/* Otherwise, if it's in ASCII range, conversion is trivial */
+	if (c <= 0x7F)
+	{
+		s[0] = (unsigned char) c;
+		s[1] = '\0';
+		return true;
+	}
+
+	/* If the server encoding is UTF-8, we just need to reformat the code */
+	server_encoding = GetDatabaseEncoding();
+	if (server_encoding == PG_UTF8)
+	{
+		unicode_to_utf8(c, s);
+		s[pg_utf_mblen(s)] = '\0';
+		return true;
+	}
+
+	/* For all other cases, we must have a conversion function available */
+	if (Utf8ToServerConvProc == NULL)
+		return false;
+
+	/* Construct UTF-8 source string */
+	unicode_to_utf8(c, c_as_utf8);
+	c_as_utf8_len = pg_utf_mblen(c_as_utf8);
+	c_as_utf8[c_as_utf8_len] = '\0';
+
+	/* Convert, but without throwing error if we can't */
+	converted_len = DatumGetInt32(FunctionCall6(Utf8ToServerConvProc,
+												Int32GetDatum(PG_UTF8),
+												Int32GetDatum(server_encoding),
+												CStringGetDatum((char *) c_as_utf8),
+												CStringGetDatum((char *) s),
+												Int32GetDatum(c_as_utf8_len),
+												BoolGetDatum(true)));
+
+	/* Conversion was successful iff it consumed the whole input */
+	return (converted_len == c_as_utf8_len);
 }
 
 
@@ -982,11 +1027,128 @@ pg_encoding_wchar2mb_with_len(int encoding,
 	return pg_wchar_table[encoding].wchar2mb_with_len(from, (unsigned char *) to, len);
 }
 
-/* returns the byte length of a multibyte character */
+/*
+ * Returns the byte length of a multibyte character sequence in a
+ * null-terminated string.  Raises an illegal byte sequence error if the
+ * sequence would hit a null terminator.
+ *
+ * The caller is expected to have checked for a terminator at *mbstr == 0
+ * before calling, but some callers want 1 in that case, so this function
+ * continues that tradition.
+ *
+ * This must only be used for strings that have a null-terminator to enable
+ * bounds detection.
+ */
+int
+pg_mblen_cstr(const char *mbstr)
+{
+	int			length = pg_wchar_table[DatabaseEncoding->encoding].mblen((const unsigned char *) mbstr);
+
+	/*
+	 * The .mblen functions return 1 when given a pointer to a terminator.
+	 * Some callers depend on that, so we tolerate it for now.  Well-behaved
+	 * callers check the leading byte for a terminator *before* calling.
+	 */
+	for (int i = 1; i < length; ++i)
+		if (unlikely(mbstr[i] == 0))
+			report_invalid_encoding_db(mbstr, length, i);
+
+	/*
+	 * String should be NUL-terminated, but checking that would make typical
+	 * callers O(N^2), tripling Valgrind check-world time.  Unless
+	 * VALGRIND_EXPENSIVE, check 1 byte after each actual character.  (If we
+	 * found a character, not a terminator, the next byte must be a terminator
+	 * or the start of the next character.)  If the caller iterates the whole
+	 * string, the last call will diagnose a missing terminator.
+	 */
+	if (mbstr[0] != '\0')
+	{
+#ifdef VALGRIND_EXPENSIVE
+		VALGRIND_CHECK_MEM_IS_DEFINED(mbstr, strlen(mbstr));
+#else
+		VALGRIND_CHECK_MEM_IS_DEFINED(mbstr + length, 1);
+#endif
+	}
+
+	return length;
+}
+
+/*
+ * Returns the byte length of a multibyte character sequence bounded by a range
+ * [mbstr, end) of at least one byte in size.  Raises an illegal byte sequence
+ * error if the sequence would exceed the range.
+ */
+int
+pg_mblen_range(const char *mbstr, const char *end)
+{
+	int			length = pg_wchar_table[DatabaseEncoding->encoding].mblen((const unsigned char *) mbstr);
+
+	Assert(end > mbstr);
+
+	if (unlikely(mbstr + length > end))
+		report_invalid_encoding_db(mbstr, length, end - mbstr);
+
+#ifdef VALGRIND_EXPENSIVE
+	VALGRIND_CHECK_MEM_IS_DEFINED(mbstr, end - mbstr);
+#else
+	VALGRIND_CHECK_MEM_IS_DEFINED(mbstr, length);
+#endif
+
+	return length;
+}
+
+/*
+ * Returns the byte length of a multibyte character sequence bounded by a range
+ * extending for 'limit' bytes, which must be at least one.  Raises an illegal
+ * byte sequence error if the sequence would exceed the range.
+ */
+int
+pg_mblen_with_len(const char *mbstr, int limit)
+{
+	int			length = pg_wchar_table[DatabaseEncoding->encoding].mblen((const unsigned char *) mbstr);
+
+	Assert(limit >= 1);
+
+	if (unlikely(length > limit))
+		report_invalid_encoding_db(mbstr, length, limit);
+
+#ifdef VALGRIND_EXPENSIVE
+	VALGRIND_CHECK_MEM_IS_DEFINED(mbstr, limit);
+#else
+	VALGRIND_CHECK_MEM_IS_DEFINED(mbstr, length);
+#endif
+
+	return length;
+}
+
+
+/*
+ * Returns the length of a multibyte character sequence, without any
+ * validation of bounds.
+ *
+ * PLEASE NOTE:  This function can only be used safely if the caller has
+ * already verified the input string, since otherwise there is a risk of
+ * overrunning the buffer if the string is invalid.  A prior call to a
+ * pg_mbstrlen* function suffices.
+ */
+int
+pg_mblen_unbounded(const char *mbstr)
+{
+	int			length = pg_wchar_table[DatabaseEncoding->encoding].mblen((const unsigned char *) mbstr);
+
+	VALGRIND_CHECK_MEM_IS_DEFINED(mbstr, length);
+
+	return length;
+}
+
+/*
+ * Historical name for pg_mblen_unbounded().  Should not be used and will be
+ * removed in a later version.
+ */
 int
 pg_mblen(const char *mbstr)
 {
-	return pg_wchar_table[DatabaseEncoding->encoding].mblen((const unsigned char *) mbstr);
+	return pg_mblen_unbounded(mbstr);
 }
 
 /* returns the display length of a multibyte character */
@@ -1008,14 +1170,14 @@ pg_mbstrlen(const char *mbstr)
 
 	while (*mbstr)
 	{
-		mbstr += pg_mblen(mbstr);
+		mbstr += pg_mblen_cstr(mbstr);
 		len++;
 	}
 	return len;
 }
 
 /* returns the length (counted in wchars) of a multibyte string
- * (not necessarily NULL terminated)
+ * (stops at the first of "limit" or a NUL)
  */
 int
 pg_mbstrlen_with_len(const char *mbstr, int limit)
@@ -1028,7 +1190,7 @@ pg_mbstrlen_with_len(const char *mbstr, int limit)
 
 	while (limit > 0 && *mbstr)
 	{
-		int			l = pg_mblen(mbstr);
+		int			l = pg_mblen_with_len(mbstr, limit);
 
 		limit -= l;
 		mbstr += l;
@@ -1098,7 +1260,7 @@ pg_mbcharcliplen(const char *mbstr, int len, int limit)
 
 	while (len > 0 && *mbstr)
 	{
-		l = pg_mblen(mbstr);
+		l = pg_mblen_with_len(mbstr, len);
 		nch++;
 		if (nch > limit)
 			break;
@@ -1151,24 +1313,18 @@ static bool
 raw_pg_bind_textdomain_codeset(const char *domainname, int encoding)
 {
 	bool		elog_ok = (CurrentMemoryContext != NULL);
-	int			i;
 
-	for (i = 0; pg_enc2gettext_tbl[i].name != NULL; i++)
-	{
-		if (pg_enc2gettext_tbl[i].encoding == encoding)
-		{
-			if (bind_textdomain_codeset(domainname,
-										pg_enc2gettext_tbl[i].name) != NULL)
-				return true;
+	if (!PG_VALID_ENCODING(encoding) || pg_enc2gettext_tbl[encoding] == NULL)
+		return false;
 
-			if (elog_ok)
-				elog(LOG, "bind_textdomain_codeset failed");
-			else
-				write_stderr("bind_textdomain_codeset failed");
+	if (bind_textdomain_codeset(domainname,
+								pg_enc2gettext_tbl[encoding]) != NULL)
+		return true;
 
-			break;
-		}
-	}
+	if (elog_ok)
+		elog(LOG, "bind_textdomain_codeset failed");
+	else
+		write_stderr("bind_textdomain_codeset failed");
 
 	return false;
 }
@@ -1542,17 +1698,6 @@ pg_verify_mbstr(int encoding, const char *mbstr, int len, bool noError)
 	oklen = pg_wchar_table[encoding].mbverifystr((const unsigned char *) mbstr, len);
 	if (oklen != len)
 	{
-        
-        if ((MyProcPort != NULL) && 
-            (nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol))
-        {
-            if ((oklen == (len - 1)) && (mbstr[oklen] == '\0'))
-            {
-                return true;
-            }
-        }
-        
-
 		if (noError)
 			return false;
 		report_invalid_encoding(encoding, mbstr + oklen, len - oklen);
@@ -1679,12 +1824,19 @@ void
 report_invalid_encoding(int encoding, const char *mbstr, int len)
 {
 	int			l = pg_encoding_mblen_or_incomplete(encoding, mbstr, len);
+
+	report_invalid_encoding_int(encoding, mbstr, l, len);
+}
+
+static void
+report_invalid_encoding_int(int encoding, const char *mbstr, int mblen, int len)
+{
 	char		buf[8 * 5 + 1];
 	char	   *p = buf;
 	int			j,
 				jlimit;
 
-	jlimit = Min(l, len);
+	jlimit = Min(mblen, len);
 	jlimit = Min(jlimit, 8);	/* prevent buffer overrun */
 
 	for (j = 0; j < jlimit; j++)
@@ -1699,6 +1851,12 @@ report_invalid_encoding(int encoding, const char *mbstr, int len)
 			 errmsg("invalid byte sequence for encoding \"%s\": %s",
 					pg_enc2name_tbl[encoding].name,
 					buf)));
+}
+
+static void
+report_invalid_encoding_db(const char *mbstr, int mblen, int len)
+{
+	report_invalid_encoding_int(GetDatabaseEncoding(), mbstr, mblen, len);
 }
 
 /*

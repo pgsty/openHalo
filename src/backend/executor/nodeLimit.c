@@ -3,7 +3,7 @@
  * nodeLimit.c
  *	  Routines to handle limiting of query results where appropriate
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,7 +24,6 @@
 #include "executor/executor.h"
 #include "executor/nodeLimit.h"
 #include "miscadmin.h"
-#include "nodes/nodeFuncs.h"
 
 static void recompute_limits(LimitState *node);
 static int64 compute_tuples_needed(LimitState *node);
@@ -534,7 +533,6 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 void
 ExecEndLimit(LimitState *node)
 {
-	ExecFreeExprContext(&node->ps);
 	ExecEndNode(outerPlanState(node));
 }
 
@@ -542,6 +540,8 @@ ExecEndLimit(LimitState *node)
 void
 ExecReScanLimit(LimitState *node)
 {
+	PlanState  *outerPlan = outerPlanState(node);
+
 	/*
 	 * Recompute limit/offset in case parameters changed, and reset the state
 	 * machine.  We must do this before rescanning our child node, in case
@@ -553,6 +553,6 @@ ExecReScanLimit(LimitState *node)
 	 * if chgParam of subnode is not null then plan will be re-scanned by
 	 * first ExecProcNode.
 	 */
-	if (node->ps.lefttree->chgParam == NULL)
-		ExecReScan(node->ps.lefttree);
+	if (outerPlan->chgParam == NULL)
+		ExecReScan(outerPlan);
 }

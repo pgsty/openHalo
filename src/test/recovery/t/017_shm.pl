@@ -1,17 +1,16 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 #
 # Tests of pg_shmem.h functions
 #
 use strict;
-use warnings;
-use Config;
+use warnings FATAL => 'all';
 use File::stat qw(stat);
 use IPC::Run 'run';
-use PostgresNode;
+use PostgreSQL::Test::Cluster;
 use Test::More;
-use TestLib;
+use PostgreSQL::Test::Utils;
 use Time::HiRes qw(usleep);
 
 # If we don't have shmem support, skip the whole thing
@@ -25,25 +24,21 @@ if ($@ || $windows_os)
 {
 	plan skip_all => 'SysV shared memory not supported by this platform';
 }
-else
-{
-	plan tests => 4;
-}
 
-my $tempdir = TestLib::tempdir;
+my $tempdir = PostgreSQL::Test::Utils::tempdir;
 
 # Log "ipcs" diffs on a best-effort basis, swallowing any error.
 my $ipcs_before = "$tempdir/ipcs_before";
-eval { run_log [ 'ipcs', '-am' ], '>', $ipcs_before; };
+eval { run_log [ 'ipcs', '-am' ], '>' => $ipcs_before; };
 
 sub log_ipcs
 {
-	eval { run_log [ 'ipcs', '-am' ], '|', [ 'diff', $ipcs_before, '-' ] };
+	eval { run_log [ 'ipcs', '-am' ], '|' => [ 'diff', $ipcs_before, '-' ] };
 	return;
 }
 
 # Node setup.
-my $gnat = PostgresNode->get_new_node('gnat');
+my $gnat = PostgreSQL::Test::Cluster->new('gnat');
 $gnat->init;
 
 # Create a shmem segment that will conflict with gnat's first choice
@@ -127,16 +122,14 @@ my $slow_query = 'SELECT wait_pid(pg_backend_pid())';
 my ($stdout, $stderr);
 my $slow_client = IPC::Run::start(
 	[
-		'psql', '-X', '-qAt', '-d', $gnat->connstr('postgres'),
-		'-c', $slow_query
+		'psql', '--no-psqlrc', '--quiet', '--no-align', '--tuples-only',
+		'--dbname' => $gnat->connstr('postgres'),
+		'--command' => $slow_query
 	],
-	'<',
-	\undef,
-	'>',
-	\$stdout,
-	'2>',
-	\$stderr,
-	IPC::Run::timeout(5 * $TestLib::timeout_default));
+	'<' => \undef,
+	'>' => \$stdout,
+	'2>' => \$stderr,
+	IPC::Run::timeout(5 * $PostgreSQL::Test::Utils::timeout_default));
 ok( $gnat->poll_query_until(
 		'postgres',
 		"SELECT 1 FROM pg_stat_activity WHERE query = '$slow_query'", '1'),
@@ -148,11 +141,11 @@ unlink($gnat->data_dir . '/postmaster.pid');
 $gnat->rotate_logfile;    # on Windows, can't open old log for writing
 log_ipcs();
 # Reject ordinary startup.  Retry for the same reasons poll_start() does,
-# every 0.1s for at least $TestLib::timeout_default seconds.
+# every 0.1s for at least $PostgreSQL::Test::Utils::timeout_default seconds.
 my $pre_existing_msg = qr/pre-existing shared memory block/;
 {
-	my $max_attempts = 10 * $TestLib::timeout_default;
-	my $attempts     = 0;
+	my $max_attempts = 10 * $PostgreSQL::Test::Utils::timeout_default;
+	my $attempts = 0;
 	while ($attempts < $max_attempts)
 	{
 		last
@@ -165,18 +158,18 @@ my $pre_existing_msg = qr/pre-existing shared memory block/;
 like(slurp_file($gnat->logfile),
 	$pre_existing_msg, 'detected live backend via shared memory');
 # Reject single-user startup.
-my $single_stderr;
-ok( !run_log(
-		[ 'postgres', '--single', '-D', $gnat->data_dir, 'template1' ],
-		'<', \undef, '2>', \$single_stderr),
-	'live query blocks --single');
-print STDERR $single_stderr;
-like($single_stderr, $pre_existing_msg,
+command_fails_like(
+	[
+		'postgres', '--single',
+		'-D' => $gnat->data_dir,
+		'template1'
+	],
+	$pre_existing_msg,
 	'single-user mode detected live backend via shared memory');
 log_ipcs();
 
 # cleanup slow backend
-TestLib::system_log('pg_ctl', 'kill', 'QUIT', $slow_pid);
+PostgreSQL::Test::Utils::system_log('pg_ctl', 'kill', 'QUIT', $slow_pid);
 $slow_client->finish;    # client has detected backend termination
 log_ipcs();
 
@@ -198,8 +191,8 @@ sub poll_start
 {
 	my ($node) = @_;
 
-	my $max_attempts = 10 * $TestLib::timeout_default;
-	my $attempts     = 0;
+	my $max_attempts = 10 * $PostgreSQL::Test::Utils::timeout_default;
+	my $attempts = 0;
 
 	while ($attempts < $max_attempts)
 	{
@@ -219,3 +212,5 @@ sub poll_start
 	$node->start && return 1;
 	return 0;
 }
+
+done_testing();

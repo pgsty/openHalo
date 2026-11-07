@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * pg_regress.h --- regression test driver
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/pg_regress.h
@@ -17,8 +17,6 @@
 #define PID_TYPE HANDLE
 #define INVALID_PID INVALID_HANDLE_VALUE
 #endif
-
-struct StringInfoData;			/* avoid including stringinfo.h here */
 
 /* simple list of strings */
 typedef struct _stringlist
@@ -53,6 +51,7 @@ extern _stringlist *dblist;
 extern bool debug;
 extern char *inputdir;
 extern char *outputdir;
+extern char *expecteddir;
 extern char *launcher;
 
 extern const char *basic_diff_opts;
@@ -65,6 +64,4 @@ int			regression_main(int argc, char *argv[],
 
 void		add_stringlist_item(_stringlist **listhead, const char *str);
 PID_TYPE	spawn_process(const char *cmdline);
-void		replace_string(struct StringInfoData *string,
-						   const char *replace, const char *replacement);
 bool		file_exists(const char *file);

@@ -11,11 +11,11 @@ top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
 
-override CPPFLAGS := -I. -I$(srcdir) $(TCL_INCLUDE_SPEC) $(CPPFLAGS)
+override CPPFLAGS := -I. -I$(srcdir) $(CPPFLAGS) $(TCL_INCLUDE_SPEC)
 
 # On Windows, we don't link directly with the Tcl library; see below
 ifneq ($(PORTNAME), win32)
-SHLIB_LINK = $(TCL_LIB_SPEC) $(TCL_LIBS) -lc
+SHLIB_LINK = $(TCL_LIB_SPEC) $(TCL_LIBS)
 endif
 
 PGFILEDESC = "PL/Tcl - procedural language"
@@ -63,8 +63,6 @@ pltcl.o: pltclerrcodes.h
 pltclerrcodes.h: $(top_srcdir)/src/backend/utils/errcodes.txt generate-pltclerrcodes.pl
 	$(PERL) $(srcdir)/generate-pltclerrcodes.pl $< > $@
 
-distprep: pltclerrcodes.h
-
 install: all install-lib install-data
 
 installdirs: installdirs-lib
@@ -91,13 +89,10 @@ installcheck: submake
 submake:
 	$(MAKE) -C $(top_builddir)/src/test/regress pg_regress$(X)
 
-# pltclerrcodes.h is in the distribution tarball, so don't clean it here.
 clean distclean: clean-lib
 	rm -f $(OBJS)
 	rm -rf $(pg_regress_clean_files)
 ifeq ($(PORTNAME), win32)
 	rm -f $(tclwithver).def
 endif
-
-maintainer-clean: distclean
 	rm -f pltclerrcodes.h

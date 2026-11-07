@@ -20,7 +20,7 @@
  * appropriate value for a free lock.  The meaning of the variable is up to
  * the caller, the lightweight lock code just assigns and compares it.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -60,7 +60,7 @@
  * The attentive reader might have noticed that naively doing the above has a
  * glaring race condition: We try to lock using the atomic operations and
  * notice that we have to wait. Unfortunately by the time we have finished
- * queuing, the former locker very well might have already finished it's
+ * queuing, the former locker very well might have already finished its
  * work. That's problematic because we're now stuck waiting inside the OS.
 
  * To mitigate those races we use a two phased attempt at locking:
@@ -79,12 +79,10 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
-#include "postmaster/postmaster.h"
-#include "replication/slot.h"
-#include "storage/ipc.h"
-#include "storage/predicate.h"
+#include "port/pg_bitutils.h"
 #include "storage/proc.h"
 #include "storage/proclist.h"
+#include "storage/procnumber.h"
 #include "storage/spin.h"
 #include "utils/memutils.h"
 
@@ -93,26 +91,36 @@
 #endif
 
 
-/* We use the ShmemLock spinlock to protect LWLockCounter */
-extern slock_t *ShmemLock;
+#define LW_FLAG_HAS_WAITERS			((uint32) 1 << 31)
+#define LW_FLAG_RELEASE_OK			((uint32) 1 << 30)
+#define LW_FLAG_LOCKED				((uint32) 1 << 29)
+#define LW_FLAG_BITS				3
+#define LW_FLAG_MASK				(((1<<LW_FLAG_BITS)-1)<<(32-LW_FLAG_BITS))
 
-#define LW_FLAG_HAS_WAITERS			((uint32) 1 << 30)
-#define LW_FLAG_RELEASE_OK			((uint32) 1 << 29)
-#define LW_FLAG_LOCKED				((uint32) 1 << 28)
-
-#define LW_VAL_EXCLUSIVE			((uint32) 1 << 24)
+/* assumes MAX_BACKENDS is a (power of 2) - 1, checked below */
+#define LW_VAL_EXCLUSIVE			(MAX_BACKENDS + 1)
 #define LW_VAL_SHARED				1
 
-#define LW_LOCK_MASK				((uint32) ((1 << 25)-1))
-/* Must be greater than MAX_BACKENDS - which is 2^23-1, so we're fine. */
-#define LW_SHARED_MASK				((uint32) ((1 << 24)-1))
+/* already (power of 2)-1, i.e. suitable for a mask */
+#define LW_SHARED_MASK				MAX_BACKENDS
+#define LW_LOCK_MASK				(MAX_BACKENDS | LW_VAL_EXCLUSIVE)
+
+
+StaticAssertDecl(((MAX_BACKENDS + 1) & MAX_BACKENDS) == 0,
+				 "MAX_BACKENDS + 1 needs to be a power of 2");
+
+StaticAssertDecl((MAX_BACKENDS & LW_FLAG_MASK) == 0,
+				 "MAX_BACKENDS and LW_FLAG_MASK overlap");
+
+StaticAssertDecl((LW_VAL_EXCLUSIVE & LW_FLAG_MASK) == 0,
+				 "LW_VAL_EXCLUSIVE and LW_FLAG_MASK overlap");
 
 /*
  * There are three sorts of LWLock "tranches":
  *
- * 1. The individually-named locks defined in lwlocknames.h each have their
- * own tranche.  The names of these tranches appear in IndividualLWLockNames[]
- * in lwlocknames.c.
+ * 1. The individually-named locks defined in lwlocklist.h each have their
+ * own tranche.  We absorb the names of these tranches from there into
+ * BuiltinTrancheNames here.
  *
  * 2. There are some predefined tranches for built-in groups of locks.
  * These are listed in enum BuiltinTrancheIds in lwlock.h, and their names
@@ -125,61 +133,55 @@ extern slock_t *ShmemLock;
  * All these names are user-visible as wait event names, so choose with care
  * ... and do not forget to update the documentation's list of wait events.
  */
-extern const char *const IndividualLWLockNames[];	/* in lwlocknames.c */
-
 static const char *const BuiltinTrancheNames[] = {
-	/* LWTRANCHE_XACT_BUFFER: */
-	"XactBuffer",
-	/* LWTRANCHE_COMMITTS_BUFFER: */
-	"CommitTsBuffer",
-	/* LWTRANCHE_SUBTRANS_BUFFER: */
-	"SubtransBuffer",
-	/* LWTRANCHE_MULTIXACTOFFSET_BUFFER: */
-	"MultiXactOffsetBuffer",
-	/* LWTRANCHE_MULTIXACTMEMBER_BUFFER: */
-	"MultiXactMemberBuffer",
-	/* LWTRANCHE_NOTIFY_BUFFER: */
-	"NotifyBuffer",
-	/* LWTRANCHE_SERIAL_BUFFER: */
-	"SerialBuffer",
-	/* LWTRANCHE_WAL_INSERT: */
-	"WALInsert",
-	/* LWTRANCHE_BUFFER_CONTENT: */
-	"BufferContent",
-	/* LWTRANCHE_REPLICATION_ORIGIN_STATE: */
-	"ReplicationOriginState",
-	/* LWTRANCHE_REPLICATION_SLOT_IO: */
-	"ReplicationSlotIO",
-	/* LWTRANCHE_LOCK_FASTPATH: */
-	"LockFastPath",
-	/* LWTRANCHE_BUFFER_MAPPING: */
-	"BufferMapping",
-	/* LWTRANCHE_LOCK_MANAGER: */
-	"LockManager",
-	/* LWTRANCHE_PREDICATE_LOCK_MANAGER: */
-	"PredicateLockManager",
-	/* LWTRANCHE_PARALLEL_HASH_JOIN: */
-	"ParallelHashJoin",
-	/* LWTRANCHE_PARALLEL_QUERY_DSA: */
-	"ParallelQueryDSA",
-	/* LWTRANCHE_PER_SESSION_DSA: */
-	"PerSessionDSA",
-	/* LWTRANCHE_PER_SESSION_RECORD_TYPE: */
-	"PerSessionRecordType",
-	/* LWTRANCHE_PER_SESSION_RECORD_TYPMOD: */
-	"PerSessionRecordTypmod",
-	/* LWTRANCHE_SHARED_TUPLESTORE: */
-	"SharedTupleStore",
-	/* LWTRANCHE_SHARED_TIDBITMAP: */
-	"SharedTidBitmap",
-	/* LWTRANCHE_PARALLEL_APPEND: */
-	"ParallelAppend",
-	/* LWTRANCHE_PER_XACT_PREDICATE_LIST: */
-	"PerXactPredicateList"
+#define PG_LWLOCK(id, lockname) [id] = CppAsString(lockname),
+#include "storage/lwlocklist.h"
+#undef PG_LWLOCK
+	[LWTRANCHE_XACT_BUFFER] = "XactBuffer",
+	[LWTRANCHE_COMMITTS_BUFFER] = "CommitTsBuffer",
+	[LWTRANCHE_SUBTRANS_BUFFER] = "SubtransBuffer",
+	[LWTRANCHE_MULTIXACTOFFSET_BUFFER] = "MultiXactOffsetBuffer",
+	[LWTRANCHE_MULTIXACTMEMBER_BUFFER] = "MultiXactMemberBuffer",
+	[LWTRANCHE_NOTIFY_BUFFER] = "NotifyBuffer",
+	[LWTRANCHE_SERIAL_BUFFER] = "SerialBuffer",
+	[LWTRANCHE_WAL_INSERT] = "WALInsert",
+	[LWTRANCHE_BUFFER_CONTENT] = "BufferContent",
+	[LWTRANCHE_REPLICATION_ORIGIN_STATE] = "ReplicationOriginState",
+	[LWTRANCHE_REPLICATION_SLOT_IO] = "ReplicationSlotIO",
+	[LWTRANCHE_LOCK_FASTPATH] = "LockFastPath",
+	[LWTRANCHE_BUFFER_MAPPING] = "BufferMapping",
+	[LWTRANCHE_LOCK_MANAGER] = "LockManager",
+	[LWTRANCHE_PREDICATE_LOCK_MANAGER] = "PredicateLockManager",
+	[LWTRANCHE_PARALLEL_HASH_JOIN] = "ParallelHashJoin",
+	[LWTRANCHE_PARALLEL_BTREE_SCAN] = "ParallelBtreeScan",
+	[LWTRANCHE_PARALLEL_QUERY_DSA] = "ParallelQueryDSA",
+	[LWTRANCHE_PER_SESSION_DSA] = "PerSessionDSA",
+	[LWTRANCHE_PER_SESSION_RECORD_TYPE] = "PerSessionRecordType",
+	[LWTRANCHE_PER_SESSION_RECORD_TYPMOD] = "PerSessionRecordTypmod",
+	[LWTRANCHE_SHARED_TUPLESTORE] = "SharedTupleStore",
+	[LWTRANCHE_SHARED_TIDBITMAP] = "SharedTidBitmap",
+	[LWTRANCHE_PARALLEL_APPEND] = "ParallelAppend",
+	[LWTRANCHE_PER_XACT_PREDICATE_LIST] = "PerXactPredicateList",
+	[LWTRANCHE_PGSTATS_DSA] = "PgStatsDSA",
+	[LWTRANCHE_PGSTATS_HASH] = "PgStatsHash",
+	[LWTRANCHE_PGSTATS_DATA] = "PgStatsData",
+	[LWTRANCHE_LAUNCHER_DSA] = "LogicalRepLauncherDSA",
+	[LWTRANCHE_LAUNCHER_HASH] = "LogicalRepLauncherHash",
+	[LWTRANCHE_DSM_REGISTRY_DSA] = "DSMRegistryDSA",
+	[LWTRANCHE_DSM_REGISTRY_HASH] = "DSMRegistryHash",
+	[LWTRANCHE_COMMITTS_SLRU] = "CommitTsSLRU",
+	[LWTRANCHE_MULTIXACTOFFSET_SLRU] = "MultiXactOffsetSLRU",
+	[LWTRANCHE_MULTIXACTMEMBER_SLRU] = "MultiXactMemberSLRU",
+	[LWTRANCHE_NOTIFY_SLRU] = "NotifySLRU",
+	[LWTRANCHE_SERIAL_SLRU] = "SerialSLRU",
+	[LWTRANCHE_SUBTRANS_SLRU] = "SubtransSLRU",
+	[LWTRANCHE_XACT_SLRU] = "XactSLRU",
+	[LWTRANCHE_PARALLEL_VACUUM_DSA] = "ParallelVacuumDSA",
+	[LWTRANCHE_AIO_URING_COMPLETION] = "AioUringCompletion",
 };
 
 StaticAssertDecl(lengthof(BuiltinTrancheNames) ==
-				 LWTRANCHE_FIRST_USER_DEFINED - NUM_INDIVIDUAL_LWLOCKS,
+				 LWTRANCHE_FIRST_USER_DEFINED,
 				 "missing entries in BuiltinTrancheNames[]");
 
 /*
@@ -235,8 +237,6 @@ int			NamedLWLockTrancheRequests = 0;
 
 /* points to data in shared memory: */
 NamedLWLockTranche *NamedLWLockTrancheArray = NULL;
-
-static bool lock_named_request_allowed = true;
 
 static void InitializeLWLocks(void);
 static inline void LWLockReportWaitStart(LWLock *lock);
@@ -451,9 +451,6 @@ LWLockShmemSize(void)
 	for (i = 0; i < NamedLWLockTrancheRequests; i++)
 		size = add_size(size, strlen(NamedLWLockTrancheRequestArray[i].tranche_name) + 1);
 
-	/* Disallow adding any more named tranches. */
-	lock_named_request_allowed = false;
-
 	return size;
 }
 
@@ -464,12 +461,6 @@ LWLockShmemSize(void)
 void
 CreateLWLocks(void)
 {
-	StaticAssertStmt(LW_VAL_EXCLUSIVE > (uint32) MAX_BACKENDS,
-					 "MAX_BACKENDS too big for lwlock.c");
-
-	StaticAssertStmt(sizeof(LWLock) <= LWLOCK_PADDED_SIZE,
-					 "Miscalculated LWLock padding");
-
 	if (!IsUnderPostmaster)
 	{
 		Size		spaceLocks = LWLockShmemSize();
@@ -627,6 +618,7 @@ LWLockNewTrancheId(void)
 	int		   *LWLockCounter;
 
 	LWLockCounter = (int *) ((char *) MainLWLockArray - sizeof(int));
+	/* We use the ShmemLock spinlock to protect LWLockCounter */
 	SpinLockAcquire(ShmemLock);
 	result = (*LWLockCounter)++;
 	SpinLockRelease(ShmemLock);
@@ -659,22 +651,15 @@ LWLockRegisterTranche(int tranche_id, const char *tranche_name)
 	{
 		int			newalloc;
 
-		newalloc = Max(LWLockTrancheNamesAllocated, 8);
-		while (newalloc <= tranche_id)
-			newalloc *= 2;
+		newalloc = pg_nextpower2_32(Max(8, tranche_id + 1));
 
 		if (LWLockTrancheNames == NULL)
 			LWLockTrancheNames = (const char **)
 				MemoryContextAllocZero(TopMemoryContext,
 									   newalloc * sizeof(char *));
 		else
-		{
-			LWLockTrancheNames = (const char **)
-				repalloc(LWLockTrancheNames, newalloc * sizeof(char *));
-			memset(LWLockTrancheNames + LWLockTrancheNamesAllocated,
-				   0,
-				   (newalloc - LWLockTrancheNamesAllocated) * sizeof(char *));
-		}
+			LWLockTrancheNames =
+				repalloc0_array(LWLockTrancheNames, const char *, LWLockTrancheNamesAllocated, newalloc);
 		LWLockTrancheNamesAllocated = newalloc;
 	}
 
@@ -686,12 +671,9 @@ LWLockRegisterTranche(int tranche_id, const char *tranche_name)
  *		Request that extra LWLocks be allocated during postmaster
  *		startup.
  *
- * This is only useful for extensions if called from the _PG_init hook
- * of a library that is loaded into the postmaster via
- * shared_preload_libraries.  Once shared memory has been allocated, calls
- * will be ignored.  (We could raise an error, but it seems better to make
- * it a no-op, so that libraries containing such calls can be reloaded if
- * needed.)
+ * This may only be called via the shmem_request_hook of a library that is
+ * loaded into the postmaster via shared_preload_libraries.  Calls from
+ * elsewhere will fail.
  *
  * The tranche name will be user-visible as a wait event name, so try to
  * use a name that fits the style for those.
@@ -701,8 +683,8 @@ RequestNamedLWLockTranche(const char *tranche_name, int num_lwlocks)
 {
 	NamedLWLockTrancheRequest *request;
 
-	if (IsUnderPostmaster || !lock_named_request_allowed)
-		return;					/* too late */
+	if (!process_shmem_requests_in_progress)
+		elog(FATAL, "cannot request additional LWLocks outside shmem_request_hook");
 
 	if (NamedLWLockTrancheRequestArray == NULL)
 	{
@@ -715,10 +697,7 @@ RequestNamedLWLockTranche(const char *tranche_name, int num_lwlocks)
 
 	if (NamedLWLockTrancheRequests >= NamedLWLockTrancheRequestsAllocated)
 	{
-		int			i = NamedLWLockTrancheRequestsAllocated;
-
-		while (i <= NamedLWLockTrancheRequests)
-			i *= 2;
+		int			i = pg_nextpower2_32(NamedLWLockTrancheRequests + 1);
 
 		NamedLWLockTrancheRequestArray = (NamedLWLockTrancheRequest *)
 			repalloc(NamedLWLockTrancheRequestArray,
@@ -775,13 +754,9 @@ LWLockReportWaitEnd(void)
 static const char *
 GetLWTrancheName(uint16 trancheId)
 {
-	/* Individual LWLock? */
-	if (trancheId < NUM_INDIVIDUAL_LWLOCKS)
-		return IndividualLWLockNames[trancheId];
-
-	/* Built-in tranche? */
+	/* Built-in tranche or individual LWLock? */
 	if (trancheId < LWTRANCHE_FIRST_USER_DEFINED)
-		return BuiltinTrancheNames[trancheId - NUM_INDIVIDUAL_LWLOCKS];
+		return BuiltinTrancheNames[trancheId];
 
 	/*
 	 * It's an extension tranche, so look in LWLockTrancheNames[].  However,
@@ -813,7 +788,7 @@ GetLWLockIdentifier(uint32 classId, uint16 eventId)
  * in mode.
  *
  * This function will not block waiting for a lock to become free - that's the
- * callers job.
+ * caller's job.
  *
  * Returns true if the lock isn't free and we need to wait.
  */
@@ -822,7 +797,7 @@ LWLockAttemptLock(LWLock *lock, LWLockMode mode)
 {
 	uint32		old_state;
 
-	AssertArg(mode == LW_EXCLUSIVE || mode == LW_SHARED);
+	Assert(mode == LW_EXCLUSIVE || mode == LW_SHARED);
 
 	/*
 	 * Read once outside the loop, later iterations will get the newer value
@@ -1029,7 +1004,7 @@ LWLockWakeup(LWLock *lock)
 			else
 				desired_state &= ~LW_FLAG_RELEASE_OK;
 
-			if (proclist_is_empty(&wakeup))
+			if (proclist_is_empty(&lock->waiters))
 				desired_state &= ~LW_FLAG_HAS_WAITERS;
 
 			desired_state &= ~LW_FLAG_LOCKED;	/* release lock */
@@ -1093,9 +1068,9 @@ LWLockQueueSelf(LWLock *lock, LWLockMode mode)
 
 	/* LW_WAIT_UNTIL_FREE waiters are always at the front of the queue */
 	if (mode == LW_WAIT_UNTIL_FREE)
-		proclist_push_head(&lock->waiters, MyProc->pgprocno, lwWaitLink);
+		proclist_push_head(&lock->waiters, MyProcNumber, lwWaitLink);
 	else
-		proclist_push_tail(&lock->waiters, MyProc->pgprocno, lwWaitLink);
+		proclist_push_tail(&lock->waiters, MyProcNumber, lwWaitLink);
 
 	/* Can release the mutex now */
 	LWLockWaitListUnlock(lock);
@@ -1103,7 +1078,6 @@ LWLockQueueSelf(LWLock *lock, LWLockMode mode)
 #ifdef LOCK_DEBUG
 	pg_atomic_fetch_add_u32(&lock->nwaiters, 1);
 #endif
-
 }
 
 /*
@@ -1129,13 +1103,13 @@ LWLockDequeueSelf(LWLock *lock)
 	LWLockWaitListLock(lock);
 
 	/*
-	 * Remove ourselves from the waitlist, unless we've already been
-	 * removed. The removal happens with the wait list lock held, so there's
-	 * no race in this check.
+	 * Remove ourselves from the waitlist, unless we've already been removed.
+	 * The removal happens with the wait list lock held, so there's no race in
+	 * this check.
 	 */
 	on_waitlist = MyProc->lwWaiting == LW_WS_WAITING;
 	if (on_waitlist)
-		proclist_delete(&lock->waiters, MyProc->pgprocno, lwWaitLink);
+		proclist_delete(&lock->waiters, MyProcNumber, lwWaitLink);
 
 	if (proclist_is_empty(&lock->waiters) &&
 		(pg_atomic_read_u32(&lock->state) & LW_FLAG_HAS_WAITERS) != 0)
@@ -1214,7 +1188,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	lwstats = get_lwlock_stats_entry(lock);
 #endif
 
-	AssertArg(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
 	PRINT_LWDEBUG("LWLockAcquire", lock, mode);
 
@@ -1378,7 +1352,7 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
 	bool		mustwait;
 
-	AssertArg(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
 	PRINT_LWDEBUG("LWLockConditionalAcquire", lock, mode);
 
@@ -1558,9 +1532,8 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
  * *result is set to true if the lock was free, and false otherwise.
  */
 static bool
-LWLockConflictsWithVar(LWLock *lock,
-					   uint64 *valptr, uint64 oldval, uint64 *newval,
-					   bool *result)
+LWLockConflictsWithVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 oldval,
+					   uint64 *newval, bool *result)
 {
 	bool		mustwait;
 	uint64		value;
@@ -1568,9 +1541,10 @@ LWLockConflictsWithVar(LWLock *lock,
 	/*
 	 * Test first to see if it the slot is free right now.
 	 *
-	 * XXX: the caller uses a spinlock before this, so we don't need a memory
-	 * barrier here as far as the current usage is concerned.  But that might
-	 * not be safe in general.
+	 * XXX: the unique caller of this routine, WaitXLogInsertionsToFinish()
+	 * via LWLockWaitForVar(), uses an implied barrier with a spinlock before
+	 * this, so we don't need a memory barrier here as far as the current
+	 * usage is concerned.  But that might not be safe in general.
 	 */
 	mustwait = (pg_atomic_read_u32(&lock->state) & LW_VAL_EXCLUSIVE) != 0;
 
@@ -1583,13 +1557,10 @@ LWLockConflictsWithVar(LWLock *lock,
 	*result = false;
 
 	/*
-	 * Read value using the lwlock's wait list lock, as we can't generally
-	 * rely on atomic 64 bit reads/stores.  TODO: On platforms with a way to
-	 * do atomic 64 bit reads/writes the spinlock should be optimized away.
+	 * Reading this value atomically is safe even on platforms where uint64
+	 * cannot be read without observing a torn value.
 	 */
-	LWLockWaitListLock(lock);
-	value = *valptr;
-	LWLockWaitListUnlock(lock);
+	value = pg_atomic_read_u64(valptr);
 
 	if (value != oldval)
 	{
@@ -1616,9 +1587,14 @@ LWLockConflictsWithVar(LWLock *lock,
  *
  * Note: this function ignores shared lock holders; if the lock is held
  * in shared mode, returns 'true'.
+ *
+ * Be aware that LWLockConflictsWithVar() does not include a memory barrier,
+ * hence the caller of this function may want to rely on an explicit barrier or
+ * an implied barrier via spinlock or LWLock to avoid memory ordering issues.
  */
 bool
-LWLockWaitForVar(LWLock *lock, uint64 *valptr, uint64 oldval, uint64 *newval)
+LWLockWaitForVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 oldval,
+				 uint64 *newval)
 {
 	PGPROC	   *proc = MyProc;
 	int			extraWaits = 0;
@@ -1746,28 +1722,31 @@ LWLockWaitForVar(LWLock *lock, uint64 *valptr, uint64 oldval, uint64 *newval)
  * LWLockUpdateVar - Update a variable and wake up waiters atomically
  *
  * Sets *valptr to 'val', and wakes up all processes waiting for us with
- * LWLockWaitForVar().  Setting the value and waking up the processes happen
- * atomically so that any process calling LWLockWaitForVar() on the same lock
- * is guaranteed to see the new value, and act accordingly.
+ * LWLockWaitForVar().  It first sets the value atomically and then wakes up
+ * waiting processes so that any process calling LWLockWaitForVar() on the same
+ * lock is guaranteed to see the new value, and act accordingly.
  *
  * The caller must be holding the lock in exclusive mode.
  */
 void
-LWLockUpdateVar(LWLock *lock, uint64 *valptr, uint64 val)
+LWLockUpdateVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 val)
 {
 	proclist_head wakeup;
 	proclist_mutable_iter iter;
 
 	PRINT_LWDEBUG("LWLockUpdateVar", lock, LW_EXCLUSIVE);
 
+	/*
+	 * Note that pg_atomic_exchange_u64 is a full barrier, so we're guaranteed
+	 * that the variable is updated before waking up waiters.
+	 */
+	pg_atomic_exchange_u64(valptr, val);
+
 	proclist_init(&wakeup);
 
 	LWLockWaitListLock(lock);
 
 	Assert(pg_atomic_read_u32(&lock->state) & LW_VAL_EXCLUSIVE);
-
-	/* Update the lock's value */
-	*valptr = val;
 
 	/*
 	 * See if there are any LW_WAIT_UNTIL_FREE waiters that need to be woken
@@ -1808,14 +1787,25 @@ LWLockUpdateVar(LWLock *lock, uint64 *valptr, uint64 val)
 
 
 /*
- * LWLockRelease - release a previously acquired lock
+ * Stop treating lock as held by current backend.
+ *
+ * This is the code that can be shared between actually releasing a lock
+ * (LWLockRelease()) and just not tracking ownership of the lock anymore
+ * without releasing the lock (LWLockDisown()).
+ *
+ * Returns the mode in which the lock was held by the current backend.
+ *
+ * NB: This does not call RESUME_INTERRUPTS(), but leaves that responsibility
+ * of the caller.
+ *
+ * NB: This will leave lock->owner pointing to the current backend (if
+ * LOCK_DEBUG is set). This is somewhat intentional, as it makes it easier to
+ * debug cases of missing wakeups during lock release.
  */
-void
-LWLockRelease(LWLock *lock)
+static inline LWLockMode
+LWLockDisownInternal(LWLock *lock)
 {
 	LWLockMode	mode;
-	uint32		oldstate;
-	bool		check_waiters;
 	int			i;
 
 	/*
@@ -1835,7 +1825,18 @@ LWLockRelease(LWLock *lock)
 	for (; i < num_held_lwlocks; i++)
 		held_lwlocks[i] = held_lwlocks[i + 1];
 
-	PRINT_LWDEBUG("LWLockRelease", lock, mode);
+	return mode;
+}
+
+/*
+ * Helper function to release lock, shared between LWLockRelease() and
+ * LWLockReleaseDisowned().
+ */
+static void
+LWLockReleaseInternal(LWLock *lock, LWLockMode mode)
+{
+	uint32		oldstate;
+	bool		check_waiters;
 
 	/*
 	 * Release my hold on lock, after that it can immediately be acquired by
@@ -1873,6 +1874,38 @@ LWLockRelease(LWLock *lock)
 		LOG_LWDEBUG("LWLockRelease", lock, "releasing waiters");
 		LWLockWakeup(lock);
 	}
+}
+
+
+/*
+ * Stop treating lock as held by current backend.
+ *
+ * After calling this function it's the callers responsibility to ensure that
+ * the lock gets released (via LWLockReleaseDisowned()), even in case of an
+ * error. This only is desirable if the lock is going to be released in a
+ * different process than the process that acquired it.
+ */
+void
+LWLockDisown(LWLock *lock)
+{
+	LWLockDisownInternal(lock);
+
+	RESUME_INTERRUPTS();
+}
+
+/*
+ * LWLockRelease - release a previously acquired lock
+ */
+void
+LWLockRelease(LWLock *lock)
+{
+	LWLockMode	mode;
+
+	mode = LWLockDisownInternal(lock);
+
+	PRINT_LWDEBUG("LWLockRelease", lock, mode);
+
+	LWLockReleaseInternal(lock, mode);
 
 	/*
 	 * Now okay to allow cancel/die interrupts.
@@ -1881,20 +1914,25 @@ LWLockRelease(LWLock *lock)
 }
 
 /*
+ * Release lock previously disowned with LWLockDisown().
+ */
+void
+LWLockReleaseDisowned(LWLock *lock, LWLockMode mode)
+{
+	LWLockReleaseInternal(lock, mode);
+}
+
+/*
  * LWLockReleaseClearVar - release a previously acquired lock, reset variable
  */
 void
-LWLockReleaseClearVar(LWLock *lock, uint64 *valptr, uint64 val)
+LWLockReleaseClearVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 val)
 {
-	LWLockWaitListLock(lock);
-
 	/*
-	 * Set the variable's value before releasing the lock, that prevents race
-	 * a race condition wherein a new locker acquires the lock, but hasn't yet
-	 * set the variables value.
+	 * Note that pg_atomic_exchange_u64 is a full barrier, so we're guaranteed
+	 * that the variable is updated before releasing the lock.
 	 */
-	*valptr = val;
-	LWLockWaitListUnlock(lock);
+	pg_atomic_exchange_u64(valptr, val);
 
 	LWLockRelease(lock);
 }
@@ -1908,6 +1946,10 @@ LWLockReleaseClearVar(LWLock *lock, uint64 *valptr, uint64 val)
  * unchanged by this operation.  This is necessary since InterruptHoldoffCount
  * has been set to an appropriate level earlier in error recovery. We could
  * decrement it below zero if we allow it to drop for each released lock!
+ *
+ * Note that this function must be safe to call even before the LWLock
+ * subsystem has been initialized (e.g., during early startup failures).
+ * In that case, num_held_lwlocks will be 0 and we do nothing.
  */
 void
 LWLockReleaseAll(void)
@@ -1918,8 +1960,25 @@ LWLockReleaseAll(void)
 
 		LWLockRelease(held_lwlocks[num_held_lwlocks - 1].lock);
 	}
+
+	Assert(num_held_lwlocks == 0);
 }
 
+
+/*
+ * ForEachLWLockHeldByMe - run a callback for each held lock
+ *
+ * This is meant as debug support only.
+ */
+void
+ForEachLWLockHeldByMe(void (*callback) (LWLock *, LWLockMode, void *),
+					  void *context)
+{
+	int			i;
+
+	for (i = 0; i < num_held_lwlocks; i++)
+		callback(held_lwlocks[i].lock, held_lwlocks[i].mode, context);
+}
 
 /*
  * LWLockHeldByMe - test whether my process holds a lock in any mode
@@ -1927,32 +1986,32 @@ LWLockReleaseAll(void)
  * This is meant as debug support only.
  */
 bool
-LWLockHeldByMe(LWLock *l)
+LWLockHeldByMe(LWLock *lock)
 {
 	int			i;
 
 	for (i = 0; i < num_held_lwlocks; i++)
 	{
-		if (held_lwlocks[i].lock == l)
+		if (held_lwlocks[i].lock == lock)
 			return true;
 	}
 	return false;
 }
 
 /*
- * LWLockHeldByMe - test whether my process holds any of an array of locks
+ * LWLockAnyHeldByMe - test whether my process holds any of an array of locks
  *
  * This is meant as debug support only.
  */
 bool
-LWLockAnyHeldByMe(LWLock *l, int nlocks, size_t stride)
+LWLockAnyHeldByMe(LWLock *lock, int nlocks, size_t stride)
 {
 	char	   *held_lock_addr;
 	char	   *begin;
 	char	   *end;
 	int			i;
 
-	begin = (char *) l;
+	begin = (char *) lock;
 	end = begin + nlocks * stride;
 	for (i = 0; i < num_held_lwlocks; i++)
 	{
@@ -1971,13 +2030,13 @@ LWLockAnyHeldByMe(LWLock *l, int nlocks, size_t stride)
  * This is meant as debug support only.
  */
 bool
-LWLockHeldByMeInMode(LWLock *l, LWLockMode mode)
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
 	int			i;
 
 	for (i = 0; i < num_held_lwlocks; i++)
 	{
-		if (held_lwlocks[i].lock == l && held_lwlocks[i].mode == mode)
+		if (held_lwlocks[i].lock == lock && held_lwlocks[i].mode == mode)
 			return true;
 	}
 	return false;

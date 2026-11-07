@@ -2,7 +2,7 @@
  *
  *	  EUC_TW, BIG5 and MULE_INTERNAL
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,9 +15,10 @@
 #include "fmgr.h"
 #include "mb/pg_wchar.h"
 
-#define ENCODING_GROWTH_RATE 4
-
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "euc_tw_and_big5",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(euc_tw_to_big5);
 PG_FUNCTION_INFO_V1(big5_to_euc_tw);
@@ -41,7 +42,7 @@ PG_FUNCTION_INFO_V1(mic_to_big5);
  */
 
 static int	euc_tw2big5(const unsigned char *euc, unsigned char *p, int len, bool noError);
-static int	big52euc_tw(const unsigned char *euc, unsigned char *p, int len, bool noError);
+static int	big52euc_tw(const unsigned char *big5, unsigned char *p, int len, bool noError);
 static int	big52mic(const unsigned char *big5, unsigned char *p, int len, bool noError);
 static int	mic2big5(const unsigned char *mic, unsigned char *p, int len, bool noError);
 static int	euc_tw2mic(const unsigned char *euc, unsigned char *p, int len, bool noError);

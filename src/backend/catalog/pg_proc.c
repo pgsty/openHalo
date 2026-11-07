@@ -3,7 +3,7 @@
  * pg_proc.c
  *	  routines to support manipulation of the pg_proc relation
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,30 +26,23 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type.h"
-
-#include "catalog/namespace.h"
-
-#include "commands/defrem.h"
 #include "executor/functions.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/analyze.h"
 #include "parser/parse_coerce.h"
-#include "parser/parse_type.h"
+#include "pgstat.h"
 #include "rewrite/rewriteHandler.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
-
-#include "utils/catcache.h"
-
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
 
 typedef struct
 {
@@ -66,6 +59,35 @@ static bool match_prosrc_to_literal(const char *prosrc, const char *literal,
 
 /* ----------------------------------------------------------------
  *		ProcedureCreate
+ *
+ *	procedureName: string name of routine (proname)
+ *	procNamespace: OID of namespace (pronamespace)
+ *	replace: true to allow replacement of an existing pg_proc entry
+ *	returnsSet: returns set? (proretset)
+ *	returnType: OID of result type (prorettype)
+ *	proowner: OID of owner role (proowner)
+ *	languageObjectId: OID of function language (prolang)
+ *	languageValidator: OID of validator function to apply, if any
+ *	prosrc: string form of function definition (prosrc)
+ *	probin: string form of binary reference, or NULL (probin)
+ *	prosqlbody: Node tree of pre-parsed SQL body, or NULL (prosqlbody)
+ *	prokind: function/aggregate/procedure/etc code (prokind)
+ *	security_definer: security definer? (prosecdef)
+ *	isLeakProof: leak proof? (proleakproof)
+ *	isStrict: strict? (proisstrict)
+ *	volatility: volatility code (provolatile)
+ *	parallel: parallel safety code (proparallel)
+ *	parameterTypes: input parameter types, as an oidvector (proargtypes)
+ *	allParameterTypes: all parameter types, as an OID array (proallargtypes)
+ *	parameterModes: parameter modes, as a "char" array (proargmodes)
+ *	parameterNames: parameter names, as a text array (proargnames)
+ *	parameterDefaults: defaults, as a List of Node trees (proargdefaults)
+ *	trftypes: transformable type OIDs, as an OID array (protrftypes)
+ *	trfoids: List of transform OIDs that routine should depend on
+ *	proconfig: GUC set clauses, as a text array (proconfig)
+ *	prosupport: OID of support function, if any (prosupport)
+ *	procost: cost factor (procost)
+ *	prorows: estimated output rows for a SRF (prorows)
  *
  * Note: allParameterTypes, parameterModes, parameterNames, trftypes, and proconfig
  * are either arrays of the proper types or NULL.  We declare them Datum,
@@ -90,13 +112,13 @@ ProcedureCreate(const char *procedureName,
 				bool isStrict,
 				char volatility,
 				char parallel,
-				char proaccess,
 				oidvector *parameterTypes,
 				Datum allParameterTypes,
 				Datum parameterModes,
 				Datum parameterNames,
 				List *parameterDefaults,
 				Datum trftypes,
+				List *trfoids,
 				Datum proconfig,
 				Oid prosupport,
 				float4 procost,
@@ -122,7 +144,6 @@ ProcedureCreate(const char *procedureName,
 				referenced;
 	char	   *detailmsg;
 	int			i;
-	Oid			trfid;
 	ObjectAddresses *addrs;
 
 	/*
@@ -323,9 +344,6 @@ ProcedureCreate(const char *procedureName,
 	values[Anum_pg_proc_pronargdefaults - 1] = UInt16GetDatum(list_length(parameterDefaults));
 	values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(returnType);
 	values[Anum_pg_proc_proargtypes - 1] = PointerGetDatum(parameterTypes);
-	
-	values[Anum_pg_proc_proaccess - 1] = CharGetDatum(proaccess);	
-	
 	if (allParameterTypes != PointerGetDatum(NULL))
 		values[Anum_pg_proc_proallargtypes - 1] = allParameterTypes;
 	else
@@ -383,7 +401,7 @@ ProcedureCreate(const char *procedureName,
 					(errcode(ERRCODE_DUPLICATE_FUNCTION),
 					 errmsg("function \"%s\" already exists with same argument types",
 							procedureName)));
-		if (!pg_proc_ownercheck(oldproc->oid, proowner))
+		if (!object_ownercheck(ProcedureRelationId, oldproc->oid, proowner))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION,
 						   procedureName);
 
@@ -447,7 +465,7 @@ ProcedureCreate(const char *procedureName,
 			if (olddesc == NULL && newdesc == NULL)
 				 /* ok, both are runtime-defined RECORDs */ ;
 			else if (olddesc == NULL || newdesc == NULL ||
-					 !equalTupleDescs(olddesc, newdesc))
+					 !equalRowTypes(olddesc, newdesc))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
 						 errmsg("cannot change return type of existing function"),
@@ -528,10 +546,8 @@ ProcedureCreate(const char *procedureName,
 								 dropcmd,
 								 format_procedure(oldproc->oid))));
 
-			proargdefaults = SysCacheGetAttr(PROCNAMEARGSNSP, oldtup,
-											 Anum_pg_proc_proargdefaults,
-											 &isnull);
-			Assert(!isnull);
+			proargdefaults = SysCacheGetAttrNotNull(PROCNAMEARGSNSP, oldtup,
+													Anum_pg_proc_proargdefaults);
 			oldDefaults = castNode(List, stringToNode(TextDatumGetCString(proargdefaults)));
 			Assert(list_length(oldDefaults) == oldproc->pronargdefaults);
 
@@ -621,25 +637,18 @@ ProcedureCreate(const char *procedureName,
 	ObjectAddressSet(referenced, TypeRelationId, returnType);
 	add_exact_object_address(&referenced, addrs);
 
-	/* dependency on transform used by return type, if any */
-	if ((trfid = get_transform_oid(returnType, languageObjectId, true)))
-	{
-		ObjectAddressSet(referenced, TransformRelationId, trfid);
-		add_exact_object_address(&referenced, addrs);
-	}
-
 	/* dependency on parameter types */
 	for (i = 0; i < allParamCount; i++)
 	{
 		ObjectAddressSet(referenced, TypeRelationId, allParams[i]);
 		add_exact_object_address(&referenced, addrs);
+	}
 
-		/* dependency on transform used by parameter type, if any */
-		if ((trfid = get_transform_oid(allParams[i], languageObjectId, true)))
-		{
-			ObjectAddressSet(referenced, TransformRelationId, trfid);
-			add_exact_object_address(&referenced, addrs);
-		}
+	/* dependency on transforms, if any */
+	foreach_oid(transformid, trfoids)
+	{
+		ObjectAddressSet(referenced, TransformRelationId, transformid);
+		add_exact_object_address(&referenced, addrs);
 	}
 
 	/* dependency on support function, if any */
@@ -654,12 +663,18 @@ ProcedureCreate(const char *procedureName,
 
 	/* dependency on SQL routine body */
 	if (languageObjectId == SQLlanguageId && prosqlbody)
+	{
+		CheckUsageOnTypesInExpr(prosqlbody, NIL, GetUserId());
 		recordDependencyOnExpr(&myself, prosqlbody, NIL, DEPENDENCY_NORMAL);
+	}
 
 	/* dependency on parameter default expressions */
 	if (parameterDefaults)
+	{
+		CheckUsageOnTypesInExpr((Node *) parameterDefaults, NIL, GetUserId());
 		recordDependencyOnExpr(&myself, (Node *) parameterDefaults,
 							   NIL, DEPENDENCY_NORMAL);
+	}
 
 	/* dependency on owner */
 	if (!is_update)
@@ -718,6 +733,10 @@ ProcedureCreate(const char *procedureName,
 			AtEOXact_GUC(true, save_nestlevel);
 	}
 
+	/* ensure that stats are dropped if transaction aborts */
+	if (!is_update)
+		pgstat_create_function(retval);
+
 	return myself;
 }
 
@@ -734,7 +753,6 @@ fmgr_internal_validator(PG_FUNCTION_ARGS)
 {
 	Oid			funcoid = PG_GETARG_OID(0);
 	HeapTuple	tuple;
-	bool		isnull;
 	Datum		tmp;
 	char	   *prosrc;
 
@@ -750,9 +768,7 @@ fmgr_internal_validator(PG_FUNCTION_ARGS)
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for function %u", funcoid);
 
-	tmp = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_prosrc, &isnull);
-	if (isnull)
-		elog(ERROR, "null prosrc");
+	tmp = SysCacheGetAttrNotNull(PROCOID, tuple, Anum_pg_proc_prosrc);
 	prosrc = TextDatumGetCString(tmp);
 
 	if (fmgr_internal_function(prosrc) == InvalidOid)
@@ -781,7 +797,6 @@ fmgr_c_validator(PG_FUNCTION_ARGS)
 	Oid			funcoid = PG_GETARG_OID(0);
 	void	   *libraryhandle;
 	HeapTuple	tuple;
-	bool		isnull;
 	Datum		tmp;
 	char	   *prosrc;
 	char	   *probin;
@@ -799,14 +814,10 @@ fmgr_c_validator(PG_FUNCTION_ARGS)
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for function %u", funcoid);
 
-	tmp = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_prosrc, &isnull);
-	if (isnull)
-		elog(ERROR, "null prosrc for C function %u", funcoid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, tuple, Anum_pg_proc_prosrc);
 	prosrc = TextDatumGetCString(tmp);
 
-	tmp = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_probin, &isnull);
-	if (isnull)
-		elog(ERROR, "null probin for C function %u", funcoid);
+	tmp = SysCacheGetAttrNotNull(PROCOID, tuple, Anum_pg_proc_probin);
 	probin = TextDatumGetCString(tmp);
 
 	(void) load_external_function(probin, prosrc, true, &libraryhandle);
@@ -879,10 +890,7 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 	/* Postpone body checks if !check_function_bodies */
 	if (check_function_bodies)
 	{
-		tmp = SysCacheGetAttr(PROCOID, tuple, Anum_pg_proc_prosrc, &isnull);
-		if (isnull)
-			elog(ERROR, "null prosrc");
-
+		tmp = SysCacheGetAttrNotNull(PROCOID, tuple, Anum_pg_proc_prosrc);
 		prosrc = TextDatumGetCString(tmp);
 
 		/*
@@ -892,7 +900,7 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 		callback_arg.prosrc = prosrc;
 
 		sqlerrcontext.callback = sql_function_parse_error_callback;
-		sqlerrcontext.arg = (void *) &callback_arg;
+		sqlerrcontext.arg = &callback_arg;
 		sqlerrcontext.previous = error_context_stack;
 		error_context_stack = &sqlerrcontext;
 
@@ -956,7 +964,7 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 					RawStmt    *parsetree = lfirst_node(RawStmt, lc);
 					List	   *querytree_sublist;
 
-					querytree_sublist = pg_analyze_and_rewrite_params(parsetree,
+					querytree_sublist = pg_analyze_and_rewrite_withcb(parsetree,
 																	  prosrc,
 																	  (ParserSetupHook) sql_fn_parser_setup,
 																	  pinfo,
@@ -976,10 +984,10 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 
 			(void) get_func_result_type(funcoid, &rettype, &rettupdesc);
 
-			(void) check_sql_fn_retval_ext(querytree_list,
-										   rettype, rettupdesc,
-										   proc->prokind,
-										   false, NULL);
+			(void) check_sql_fn_retval(querytree_list,
+									   rettype, rettupdesc,
+									   proc->prokind,
+									   false);
 		}
 
 		error_context_stack = sqlerrcontext.previous;
@@ -1179,7 +1187,7 @@ match_prosrc_to_literal(const char *prosrc, const char *literal,
 			if (cursorpos > 0)
 				newcp++;
 		}
-		chlen = pg_mblen(prosrc);
+		chlen = pg_mblen_cstr(prosrc);
 		if (strncmp(prosrc, literal, chlen) != 0)
 			goto fail;
 		prosrc += chlen;
@@ -1208,769 +1216,8 @@ oid_array_to_list(Datum datum)
 	int			i;
 	List	   *result = NIL;
 
-	deconstruct_array(array,
-					  OIDOID,
-					  sizeof(Oid), true, TYPALIGN_INT,
-					  &values, NULL, &nelems);
+	deconstruct_array_builtin(array, OIDOID, &values, NULL, &nelems);
 	for (i = 0; i < nelems; i++)
 		result = lappend_oid(result, values[i]);
 	return result;
 }
-
-
-/* ----------------------------------------------------------------
- *		ProcedureCreate
- *
- * Note: allParameterTypes, parameterModes, parameterNames, trftypes, and proconfig
- * are either arrays of the proper types or NULL.  We declare them Datum,
- * not "ArrayType *", to avoid importing array.h into pg_proc.h.
- * ----------------------------------------------------------------
- */
-ObjectAddress
-mys_ProcedureCreate(const char *procedureName,
-                    Oid procNamespace,
-                    bool replace,
-                    bool returnsSet,
-                    Oid returnType,
-                    Oid proowner,
-                    Oid languageObjectId,
-                    Oid languageValidator,
-                    const char *prosrc,
-                    const char *probin,
-                    Node *prosqlbody,
-                    char prokind,
-                    bool security_definer,
-                    bool isLeakProof,
-                    bool isStrict,
-                    char volatility,
-                    char parallel,
-                    char proaccess,
-                    oidvector *parameterTypes,
-                    Datum allParameterTypes,
-                    Datum parameterModes,
-                    Datum parameterNames,
-                    List *parameterDefaults,
-                    Datum trftypes,
-                    Datum proconfig,
-                    Oid prosupport,
-                    float4 procost,
-                    float4 prorows)
-{
-	Oid			retval;
-	int			parameterCount;
-	int			allParamCount;
-	Oid		   *allParams;
-	char	   *paramModes = NULL;
-	Oid			variadicType = InvalidOid;
-	Acl		   *proacl = NULL;
-	Relation	rel;
-	HeapTuple	tup;
-	HeapTuple	oldtup;
-	bool		nulls[Natts_pg_proc];
-	Datum		values[Natts_pg_proc];
-	bool		replaces[Natts_pg_proc];
-	NameData	procname;
-	TupleDesc	tupDesc;
-	bool		is_update;
-	ObjectAddress myself,
-				referenced;
-	char	   *detailmsg;
-	int			i;
-	Oid			trfid;
-	ObjectAddresses *addrs;
-
-	/*
-	 * sanity checks
-	 */
-	Assert(PointerIsValid(prosrc));
-
-	parameterCount = parameterTypes->dim1;
-	if (parameterCount < 0 || parameterCount > FUNC_MAX_ARGS)
-		ereport(ERROR,
-				(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
-				 errmsg_plural("functions cannot have more than %d argument",
-							   "functions cannot have more than %d arguments",
-							   FUNC_MAX_ARGS,
-							   FUNC_MAX_ARGS)));
-	/* note: the above is correct, we do NOT count output arguments */
-
-	/* Deconstruct array inputs */
-	if (allParameterTypes != PointerGetDatum(NULL))
-	{
-		/*
-		 * We expect the array to be a 1-D OID array; verify that. We don't
-		 * need to use deconstruct_array() since the array data is just going
-		 * to look like a C array of OID values.
-		 */
-		ArrayType  *allParamArray = (ArrayType *) DatumGetPointer(allParameterTypes);
-
-		allParamCount = ARR_DIMS(allParamArray)[0];
-		if (ARR_NDIM(allParamArray) != 1 ||
-			allParamCount <= 0 ||
-			ARR_HASNULL(allParamArray) ||
-			ARR_ELEMTYPE(allParamArray) != OIDOID)
-			elog(ERROR, "allParameterTypes is not a 1-D Oid array");
-		allParams = (Oid *) ARR_DATA_PTR(allParamArray);
-		Assert(allParamCount >= parameterCount);
-		/* we assume caller got the contents right */
-	}
-	else
-	{
-		allParamCount = parameterCount;
-		allParams = parameterTypes->values;
-	}
-
-	if (parameterModes != PointerGetDatum(NULL))
-	{
-		/*
-		 * We expect the array to be a 1-D CHAR array; verify that. We don't
-		 * need to use deconstruct_array() since the array data is just going
-		 * to look like a C array of char values.
-		 */
-		ArrayType  *modesArray = (ArrayType *) DatumGetPointer(parameterModes);
-
-		if (ARR_NDIM(modesArray) != 1 ||
-			ARR_DIMS(modesArray)[0] != allParamCount ||
-			ARR_HASNULL(modesArray) ||
-			ARR_ELEMTYPE(modesArray) != CHAROID)
-			elog(ERROR, "parameterModes is not a 1-D char array");
-		paramModes = (char *) ARR_DATA_PTR(modesArray);
-	}
-
-	/*
-	 * Do not allow polymorphic return type unless there is a polymorphic
-	 * input argument that we can use to deduce the actual return type.
-	 */
-	detailmsg = check_valid_polymorphic_signature(returnType,
-												  parameterTypes->values,
-												  parameterCount);
-	if (detailmsg)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("cannot determine result data type"),
-				 errdetail_internal("%s", detailmsg)));
-
-	/*
-	 * Also, do not allow return type INTERNAL unless at least one input
-	 * argument is INTERNAL.
-	 */
-	detailmsg = check_valid_internal_signature(returnType,
-											   parameterTypes->values,
-											   parameterCount);
-	if (detailmsg)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("unsafe use of pseudo-type \"internal\""),
-				 errdetail_internal("%s", detailmsg)));
-
-	/*
-	 * Apply the same tests to any OUT arguments.
-	 */
-	if (allParameterTypes != PointerGetDatum(NULL))
-	{
-		for (i = 0; i < allParamCount; i++)
-		{
-			if (paramModes == NULL ||
-				paramModes[i] == PROARGMODE_IN ||
-				paramModes[i] == PROARGMODE_VARIADIC)
-				continue;		/* ignore input-only params */
-
-			detailmsg = check_valid_polymorphic_signature(allParams[i],
-														  parameterTypes->values,
-														  parameterCount);
-			if (detailmsg)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("cannot determine result data type"),
-						 errdetail_internal("%s", detailmsg)));
-			detailmsg = check_valid_internal_signature(allParams[i],
-													   parameterTypes->values,
-													   parameterCount);
-			if (detailmsg)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("unsafe use of pseudo-type \"internal\""),
-						 errdetail_internal("%s", detailmsg)));
-		}
-	}
-
-	/* Identify variadic argument type, if any */
-	if (paramModes != NULL)
-	{
-		/*
-		 * Only the last input parameter can be variadic; if it is, save its
-		 * element type.  Errors here are just elog since caller should have
-		 * checked this already.
-		 */
-		for (i = 0; i < allParamCount; i++)
-		{
-			switch (paramModes[i])
-			{
-				case PROARGMODE_IN:
-				case PROARGMODE_INOUT:
-					if (OidIsValid(variadicType))
-						elog(ERROR, "variadic parameter must be last");
-					break;
-				case PROARGMODE_OUT:
-					if (OidIsValid(variadicType) && prokind == PROKIND_PROCEDURE)
-						elog(ERROR, "variadic parameter must be last");
-					break;
-				case PROARGMODE_TABLE:
-					/* okay */
-					break;
-				case PROARGMODE_VARIADIC:
-					if (OidIsValid(variadicType))
-						elog(ERROR, "variadic parameter must be last");
-					switch (allParams[i])
-					{
-						case ANYOID:
-							variadicType = ANYOID;
-							break;
-						case ANYARRAYOID:
-							variadicType = ANYELEMENTOID;
-							break;
-						case ANYCOMPATIBLEARRAYOID:
-							variadicType = ANYCOMPATIBLEOID;
-							break;
-						default:
-							variadicType = get_element_type(allParams[i]);
-							if (!OidIsValid(variadicType))
-								elog(ERROR, "variadic parameter is not an array");
-							break;
-					}
-					break;
-				default:
-					elog(ERROR, "invalid parameter mode '%c'", paramModes[i]);
-					break;
-			}
-		}
-	}
-
-	/*
-	 * All seems OK; prepare the data to be inserted into pg_proc.
-	 */
-
-	for (i = 0; i < Natts_pg_proc; ++i)
-	{
-		nulls[i] = false;
-		values[i] = (Datum) 0;
-		replaces[i] = true;
-	}
-
-	namestrcpy(&procname, procedureName);
-	values[Anum_pg_proc_proname - 1] = NameGetDatum(&procname);
-	values[Anum_pg_proc_pronamespace - 1] = ObjectIdGetDatum(procNamespace);
-	values[Anum_pg_proc_proowner - 1] = ObjectIdGetDatum(proowner);
-	values[Anum_pg_proc_prolang - 1] = ObjectIdGetDatum(languageObjectId);
-	values[Anum_pg_proc_procost - 1] = Float4GetDatum(procost);
-	values[Anum_pg_proc_prorows - 1] = Float4GetDatum(prorows);
-	values[Anum_pg_proc_provariadic - 1] = ObjectIdGetDatum(variadicType);
-	values[Anum_pg_proc_prosupport - 1] = ObjectIdGetDatum(prosupport);
-	values[Anum_pg_proc_prokind - 1] = CharGetDatum(prokind);
-	values[Anum_pg_proc_prosecdef - 1] = BoolGetDatum(security_definer);
-	values[Anum_pg_proc_proleakproof - 1] = BoolGetDatum(isLeakProof);
-	values[Anum_pg_proc_proisstrict - 1] = BoolGetDatum(isStrict);
-	values[Anum_pg_proc_proretset - 1] = BoolGetDatum(returnsSet);
-	values[Anum_pg_proc_provolatile - 1] = CharGetDatum(volatility);
-	values[Anum_pg_proc_proparallel - 1] = CharGetDatum(parallel);
-	values[Anum_pg_proc_pronargs - 1] = UInt16GetDatum(parameterCount);
-	values[Anum_pg_proc_pronargdefaults - 1] = UInt16GetDatum(list_length(parameterDefaults));
-	values[Anum_pg_proc_prorettype - 1] = ObjectIdGetDatum(returnType);
-	values[Anum_pg_proc_proargtypes - 1] = PointerGetDatum(parameterTypes);
-	
-	values[Anum_pg_proc_proaccess - 1] = CharGetDatum(proaccess);	
-	
-	if (allParameterTypes != PointerGetDatum(NULL))
-		values[Anum_pg_proc_proallargtypes - 1] = allParameterTypes;
-	else
-		nulls[Anum_pg_proc_proallargtypes - 1] = true;
-	if (parameterModes != PointerGetDatum(NULL))
-		values[Anum_pg_proc_proargmodes - 1] = parameterModes;
-	else
-		nulls[Anum_pg_proc_proargmodes - 1] = true;
-	if (parameterNames != PointerGetDatum(NULL))
-		values[Anum_pg_proc_proargnames - 1] = parameterNames;
-	else
-		nulls[Anum_pg_proc_proargnames - 1] = true;
-	if (parameterDefaults != NIL)
-		values[Anum_pg_proc_proargdefaults - 1] = CStringGetTextDatum(nodeToString(parameterDefaults));
-	else
-		nulls[Anum_pg_proc_proargdefaults - 1] = true;
-	if (trftypes != PointerGetDatum(NULL))
-		values[Anum_pg_proc_protrftypes - 1] = trftypes;
-	else
-		nulls[Anum_pg_proc_protrftypes - 1] = true;
-	values[Anum_pg_proc_prosrc - 1] = CStringGetTextDatum(prosrc);
-	if (probin)
-		values[Anum_pg_proc_probin - 1] = CStringGetTextDatum(probin);
-	else
-		nulls[Anum_pg_proc_probin - 1] = true;
-	if (prosqlbody)
-		values[Anum_pg_proc_prosqlbody - 1] = CStringGetTextDatum(nodeToString(prosqlbody));
-	else
-		nulls[Anum_pg_proc_prosqlbody - 1] = true;
-	if (proconfig != PointerGetDatum(NULL))
-		values[Anum_pg_proc_proconfig - 1] = proconfig;
-	else
-		nulls[Anum_pg_proc_proconfig - 1] = true;
-	/* proacl will be determined later */
-
-	rel = table_open(ProcedureRelationId, RowExclusiveLock);
-	tupDesc = RelationGetDescr(rel);
-
-	/* Check for pre-existing definition */
-	oldtup = SearchSysCache3(PROCNAMEARGSNSP,
-							 PointerGetDatum(procedureName),
-							 PointerGetDatum(parameterTypes),
-							 ObjectIdGetDatum(procNamespace));
-
-	if (HeapTupleIsValid(oldtup))
-	{
-		/* There is one; okay to replace it? */
-		Form_pg_proc oldproc = (Form_pg_proc) GETSTRUCT(oldtup);
-		Datum		proargnames;
-		bool		isnull;
-		const char *dropcmd;
-
-		if (!replace)
-			ereport(ERROR,
-					(errcode(ERRCODE_DUPLICATE_FUNCTION),
-					 errmsg("function \"%s\" already exists with same argument types",
-							procedureName)));
-		if (!pg_proc_ownercheck(oldproc->oid, proowner))
-			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION,
-						   procedureName);
-
-		/* Not okay to change routine kind */
-		if (oldproc->prokind != prokind)
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("cannot change routine kind"),
-					 (oldproc->prokind == PROKIND_AGGREGATE ?
-					  errdetail("\"%s\" is an aggregate function.", procedureName) :
-					  oldproc->prokind == PROKIND_FUNCTION ?
-					  errdetail("\"%s\" is a function.", procedureName) :
-					  oldproc->prokind == PROKIND_PROCEDURE ?
-					  errdetail("\"%s\" is a procedure.", procedureName) :
-					  oldproc->prokind == PROKIND_WINDOW ?
-					  errdetail("\"%s\" is a window function.", procedureName) :
-					  0)));
-
-		dropcmd = (prokind == PROKIND_PROCEDURE ? "DROP PROCEDURE" :
-				   prokind == PROKIND_AGGREGATE ? "DROP AGGREGATE" :
-				   "DROP FUNCTION");
-
-		/*
-		 * Not okay to change the return type of the existing proc, since
-		 * existing rules, views, etc may depend on the return type.
-		 *
-		 * In case of a procedure, a changing return type means that whether
-		 * the procedure has output parameters was changed.  Since there is no
-		 * user visible return type, we produce a more specific error message.
-		 */
-		if (returnType != oldproc->prorettype ||
-			returnsSet != oldproc->proretset)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-					 prokind == PROKIND_PROCEDURE
-					 ? errmsg("cannot change whether a procedure has output parameters")
-					 : errmsg("cannot change return type of existing function"),
-
-			/*
-			 * translator: first %s is DROP FUNCTION, DROP PROCEDURE, or DROP
-			 * AGGREGATE
-			 */
-					 errhint("Use %s %s first.",
-							 dropcmd,
-							 format_procedure(oldproc->oid))));
-
-		/*
-		 * If it returns RECORD, check for possible change of record type
-		 * implied by OUT parameters
-		 */
-		if (returnType == RECORDOID)
-		{
-			TupleDesc	olddesc;
-			TupleDesc	newdesc;
-
-			olddesc = build_function_result_tupdesc_t(oldtup);
-			newdesc = build_function_result_tupdesc_d(prokind,
-													  allParameterTypes,
-													  parameterModes,
-													  parameterNames);
-			if (olddesc == NULL && newdesc == NULL)
-				 /* ok, both are runtime-defined RECORDs */ ;
-			else if (olddesc == NULL || newdesc == NULL ||
-					 !equalTupleDescs(olddesc, newdesc))
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("cannot change return type of existing function"),
-						 errdetail("Row type defined by OUT parameters is different."),
-				/* translator: first %s is DROP FUNCTION or DROP PROCEDURE */
-						 errhint("Use %s %s first.",
-								 dropcmd,
-								 format_procedure(oldproc->oid))));
-		}
-
-		/*
-		 * If there were any named input parameters, check to make sure the
-		 * names have not been changed, as this could break existing calls. We
-		 * allow adding names to formerly unnamed parameters, though.
-		 */
-		proargnames = SysCacheGetAttr(PROCNAMEARGSNSP, oldtup,
-									  Anum_pg_proc_proargnames,
-									  &isnull);
-		if (!isnull)
-		{
-			Datum		proargmodes;
-			char	  **old_arg_names;
-			char	  **new_arg_names;
-			int			n_old_arg_names;
-			int			n_new_arg_names;
-			int			j;
-
-			proargmodes = SysCacheGetAttr(PROCNAMEARGSNSP, oldtup,
-										  Anum_pg_proc_proargmodes,
-										  &isnull);
-			if (isnull)
-				proargmodes = PointerGetDatum(NULL);	/* just to be sure */
-
-			n_old_arg_names = get_func_input_arg_names(proargnames,
-													   proargmodes,
-													   &old_arg_names);
-			n_new_arg_names = get_func_input_arg_names(parameterNames,
-													   parameterModes,
-													   &new_arg_names);
-			for (j = 0; j < n_old_arg_names; j++)
-			{
-				if (old_arg_names[j] == NULL)
-					continue;
-				if (j >= n_new_arg_names || new_arg_names[j] == NULL ||
-					strcmp(old_arg_names[j], new_arg_names[j]) != 0)
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-							 errmsg("cannot change name of input parameter \"%s\"",
-									old_arg_names[j]),
-					/* translator: first %s is DROP FUNCTION or DROP PROCEDURE */
-							 errhint("Use %s %s first.",
-									 dropcmd,
-									 format_procedure(oldproc->oid))));
-			}
-		}
-
-		/*
-		 * If there are existing defaults, check compatibility: redefinition
-		 * must not remove any defaults nor change their types.  (Removing a
-		 * default might cause a function to fail to satisfy an existing call.
-		 * Changing type would only be possible if the associated parameter is
-		 * polymorphic, and in such cases a change of default type might alter
-		 * the resolved output type of existing calls.)
-		 */
-		if (oldproc->pronargdefaults != 0)
-		{
-			Datum		proargdefaults;
-			List	   *oldDefaults;
-			ListCell   *oldlc;
-			ListCell   *newlc;
-
-			if (list_length(parameterDefaults) < oldproc->pronargdefaults)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("cannot remove parameter defaults from existing function"),
-				/* translator: first %s is DROP FUNCTION or DROP PROCEDURE */
-						 errhint("Use %s %s first.",
-								 dropcmd,
-								 format_procedure(oldproc->oid))));
-
-			proargdefaults = SysCacheGetAttr(PROCNAMEARGSNSP, oldtup,
-											 Anum_pg_proc_proargdefaults,
-											 &isnull);
-			Assert(!isnull);
-			oldDefaults = castNode(List, stringToNode(TextDatumGetCString(proargdefaults)));
-			Assert(list_length(oldDefaults) == oldproc->pronargdefaults);
-
-			/* new list can have more defaults than old, advance over 'em */
-			newlc = list_nth_cell(parameterDefaults,
-								  list_length(parameterDefaults) -
-								  oldproc->pronargdefaults);
-
-			foreach(oldlc, oldDefaults)
-			{
-				Node	   *oldDef = (Node *) lfirst(oldlc);
-				Node	   *newDef = (Node *) lfirst(newlc);
-
-				if (exprType(oldDef) != exprType(newDef))
-					ereport(ERROR,
-							(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-							 errmsg("cannot change data type of existing parameter default value"),
-					/* translator: first %s is DROP FUNCTION or DROP PROCEDURE */
-							 errhint("Use %s %s first.",
-									 dropcmd,
-									 format_procedure(oldproc->oid))));
-				newlc = lnext(parameterDefaults, newlc);
-			}
-		}
-
-		/*
-		 * Do not change existing oid, ownership or permissions, either.  Note
-		 * dependency-update code below has to agree with this decision.
-		 */
-		replaces[Anum_pg_proc_oid - 1] = false;
-		replaces[Anum_pg_proc_proowner - 1] = false;
-		replaces[Anum_pg_proc_proacl - 1] = false;
-
-		/* Okay, do it... */
-		tup = heap_modify_tuple(oldtup, tupDesc, values, nulls, replaces);
-		CatalogTupleUpdate(rel, &tup->t_self, tup);
-
-		ReleaseSysCache(oldtup);
-		is_update = true;
-	}
-	else
-	{
-        Oid	newOid;
-        CatCList *catlist = NULL;
-
-        catlist = SearchSysCacheList1(PROCNAMEARGSNSP, PointerGetDatum(procedureName));
-
-        if (catlist->n_members != 0)
-        {
-            /*
-             * 检查procedure 或 function 的参数信息，
-             * 确保同名function有相同的参数数量，不同的参数数据类型，
-             * 同名procedure有相同的参数数量与模式，in模式参数有不同的数据类型
-             */
-            for (int i = 0; i < catlist->n_members; i++)
-            {
-                HeapTuple proctup = &catlist->members[i]->tuple;
-                Form_pg_proc procform = (Form_pg_proc) GETSTRUCT(proctup);
-
-                if (procform->pronamespace != procNamespace ||
-                    procform->prokind != prokind)
-                {
-                    continue;
-                }
-
-                if (prokind == PROKIND_FUNCTION)
-                {
-                    if (procform->pronargs != allParamCount)
-                    {
-                        /* 调用者保证函数只有in模式的参数 */
-                        elog(ERROR, "The function(%s) with the same name must have the same parameter number", procedureName);
-                    }
-                }
-                else if (prokind == PROKIND_PROCEDURE)
-                {
-                    Datum proargmodes;
-                    bool isNull;
-                    int pronargs;
-
-                    proargmodes = SysCacheGetAttr(PROCOID, proctup,
-                                                  Anum_pg_proc_proargmodes,
-                                                  &isNull);
-                    if (!isNull)
-                    {
-                        /* 库中同名procedure有出参 */
-                        if (paramModes != NULL)
-                        {
-                            ArrayType  *arr = DatumGetArrayTypeP(proargmodes);
-
-                            pronargs = ARR_DIMS(arr)[0];
-                            if (ARR_NDIM(arr) != 1 ||
-                                pronargs < 0 ||
-                                ARR_HASNULL(arr) ||
-                                ARR_ELEMTYPE(arr) != CHAROID)
-                                elog(ERROR, "proargmodes is not a 1-D char array or it contains nulls");
-                            Assert(pronargs >= procform->pronargs);
-                            if (pronargs != allParamCount)
-                            {
-                                elog(ERROR, "The procedure(%s) with the same name must have the same parameter number", procedureName);
-                            }
-                            else
-                            {
-                                char *argmodes;
-
-                                argmodes = (char *) ARR_DATA_PTR(arr);
-                                if (memcmp(argmodes, paramModes, allParamCount) != 0)
-                                {
-                                    elog(ERROR, "The procedure(%s) with the same name must have the same parameter mode", procedureName);
-                                }
-                            }
-                        }
-                        else
-                        {
-                            elog(ERROR, "The procedure(%s) with the same name must have the same parameter mode", procedureName);
-                        }
-                    }
-                    else
-                    {
-                        /* 库中同名procedure无出参 */
-                        pronargs = procform->pronargs;
-                        if (paramModes != NULL)
-                        {
-                            elog(ERROR, "The procedure(%s) with the same name must have the same parameter mode", procedureName);
-                        }
-                        if (pronargs != allParamCount)
-                        {
-                            elog(ERROR, "The procedure(%s) with the same name must have the same parameter number", procedureName);
-                        }
-                    }
-                }
-                else
-                {
-                    elog(ERROR, "not supported prokind for %s", procedureName);
-                }
-            }
-
-        }
-        else
-        {
-            /* Noting to do */
-        }
-
-        ReleaseSysCacheList(catlist);
-
-        /* Creating a new procedure */
-
-        /* First, get default permissions and set up proacl */
-        proacl = get_user_default_acl(OBJECT_FUNCTION, proowner,
-                                    procNamespace);
-        if (proacl != NULL)
-            values[Anum_pg_proc_proacl - 1] = PointerGetDatum(proacl);
-        else
-            nulls[Anum_pg_proc_proacl - 1] = true;
-
-        newOid = GetNewOidWithIndex(rel, ProcedureOidIndexId,
-                                    Anum_pg_proc_oid);
-        values[Anum_pg_proc_oid - 1] = ObjectIdGetDatum(newOid);
-        tup = heap_form_tuple(tupDesc, values, nulls);
-        CatalogTupleInsert(rel, tup);
-        is_update = false;
-	}
-
-
-	retval = ((Form_pg_proc) GETSTRUCT(tup))->oid;
-
-	/*
-	 * Create dependencies for the new function.  If we are updating an
-	 * existing function, first delete any existing pg_depend entries.
-	 * (However, since we are not changing ownership or permissions, the
-	 * shared dependencies do *not* need to change, and we leave them alone.)
-	 */
-	if (is_update)
-		deleteDependencyRecordsFor(ProcedureRelationId, retval, true);
-
-	addrs = new_object_addresses();
-
-	ObjectAddressSet(myself, ProcedureRelationId, retval);
-
-	/* dependency on namespace */
-	ObjectAddressSet(referenced, NamespaceRelationId, procNamespace);
-	add_exact_object_address(&referenced, addrs);
-
-	/* dependency on implementation language */
-	ObjectAddressSet(referenced, LanguageRelationId, languageObjectId);
-	add_exact_object_address(&referenced, addrs);
-
-	/* dependency on return type */
-	ObjectAddressSet(referenced, TypeRelationId, returnType);
-	add_exact_object_address(&referenced, addrs);
-
-	/* dependency on transform used by return type, if any */
-	if ((trfid = get_transform_oid(returnType, languageObjectId, true)))
-	{
-		ObjectAddressSet(referenced, TransformRelationId, trfid);
-		add_exact_object_address(&referenced, addrs);
-	}
-
-	/* dependency on parameter types */
-	for (i = 0; i < allParamCount; i++)
-	{
-		ObjectAddressSet(referenced, TypeRelationId, allParams[i]);
-		add_exact_object_address(&referenced, addrs);
-
-		/* dependency on transform used by parameter type, if any */
-		if ((trfid = get_transform_oid(allParams[i], languageObjectId, true)))
-		{
-			ObjectAddressSet(referenced, TransformRelationId, trfid);
-			add_exact_object_address(&referenced, addrs);
-		}
-	}
-
-	/* dependency on support function, if any */
-	if (OidIsValid(prosupport))
-	{
-		ObjectAddressSet(referenced, ProcedureRelationId, prosupport);
-		add_exact_object_address(&referenced, addrs);
-	}
-
-	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
-	free_object_addresses(addrs);
-
-	/* dependency on SQL routine body */
-	if (languageObjectId == SQLlanguageId && prosqlbody)
-		recordDependencyOnExpr(&myself, prosqlbody, NIL, DEPENDENCY_NORMAL);
-
-	/* dependency on parameter default expressions */
-	if (parameterDefaults)
-		recordDependencyOnExpr(&myself, (Node *) parameterDefaults,
-							   NIL, DEPENDENCY_NORMAL);
-
-	/* dependency on owner */
-	if (!is_update)
-		recordDependencyOnOwner(ProcedureRelationId, retval, proowner);
-
-	/* dependency on any roles mentioned in ACL */
-	if (!is_update)
-		recordDependencyOnNewAcl(ProcedureRelationId, retval, 0,
-								 proowner, proacl);
-
-	/* dependency on extension */
-	recordDependencyOnCurrentExtension(&myself, is_update);
-
-	heap_freetuple(tup);
-
-	/* Post creation hook for new function */
-	InvokeObjectPostCreateHook(ProcedureRelationId, retval, 0);
-
-	table_close(rel, RowExclusiveLock);
-
-	/* Verify function body */
-	if (OidIsValid(languageValidator))
-	{
-		ArrayType  *set_items = NULL;
-		int			save_nestlevel = 0;
-
-		/* Advance command counter so new tuple can be seen by validator */
-		CommandCounterIncrement();
-
-		/*
-		 * Set per-function configuration parameters so that the validation is
-		 * done with the environment the function expects.  However, if
-		 * check_function_bodies is off, we don't do this, because that would
-		 * create dump ordering hazards that pg_dump doesn't know how to deal
-		 * with.  (For example, a SET clause might refer to a not-yet-created
-		 * text search configuration.)	This means that the validator
-		 * shouldn't complain about anything that might depend on a GUC
-		 * parameter when check_function_bodies is off.
-		 */
-		if (check_function_bodies)
-		{
-			set_items = (ArrayType *) DatumGetPointer(proconfig);
-			if (set_items)		/* Need a new GUC nesting level */
-			{
-				save_nestlevel = NewGUCNestLevel();
-				ProcessGUCArray(set_items,
-								(superuser() ? PGC_SUSET : PGC_USERSET),
-								PGC_S_SESSION,
-								GUC_ACTION_SAVE);
-			}
-		}
-
-		if (set_items)
-			AtEOXact_GUC(true, save_nestlevel);
-	}
-
-	return myself;
-}
-

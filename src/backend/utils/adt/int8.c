@@ -3,7 +3,7 @@
  * int8.c
  *	  Internal 64-bit integer operations
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -24,10 +24,7 @@
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "utils/builtins.h"
-#include "utils/int8.h"
-#include "miscadmin.h"
-#include "adapter/mysql/adapter.h"
-
+#include "utils/fmgroids.h"
 
 typedef struct
 {
@@ -47,114 +44,14 @@ typedef struct
  * Formatting and conversion routines.
  *---------------------------------------------------------*/
 
-/*
- * scanint8 --- try to parse a string into an int8.
- *
- * If errorOK is false, ereport a useful error message if the string is bad.
- * If errorOK is true, just return "false" for bad input.
- */
-bool
-scanint8(const char *str, bool errorOK, int64 *result)
-{
-	const char *ptr = str;
-	int64		tmp = 0;
-	bool		neg = false;
-
-	/*
-	 * Do our own scan, rather than relying on sscanf which might be broken
-	 * for long long.
-	 *
-	 * As INT64_MIN can't be stored as a positive 64 bit integer, accumulate
-	 * value as a negative number.
-	 */
-
-	/* skip leading spaces */
-	while (*ptr && isspace((unsigned char) *ptr))
-		ptr++;
-
-    
-    if (ptr[0] == '\0')
-    {
-        if ((MyProcPort != NULL) && 
-            (nodeTag(MyProcPort->protocol_handler) == T_MySQLProtocol))
-        {
-            if (!isStrictTransTablesOn)
-            {
-                *result = 0;
-                return true;
-            }
-        }
-    }
-    
-
-	/* handle sign */
-	if (*ptr == '-')
-	{
-		ptr++;
-		neg = true;
-	}
-	else if (*ptr == '+')
-		ptr++;
-
-	/* require at least one digit */
-	if (unlikely(!isdigit((unsigned char) *ptr)))
-		goto invalid_syntax;
-
-	/* process digits */
-	while (*ptr && isdigit((unsigned char) *ptr))
-	{
-		int8		digit = (*ptr++ - '0');
-
-		if (unlikely(pg_mul_s64_overflow(tmp, 10, &tmp)) ||
-			unlikely(pg_sub_s64_overflow(tmp, digit, &tmp)))
-			goto out_of_range;
-	}
-
-	/* allow trailing whitespace, but not other trailing chars */
-	while (*ptr != '\0' && isspace((unsigned char) *ptr))
-		ptr++;
-
-	if (unlikely(*ptr != '\0'))
-		goto invalid_syntax;
-
-	if (!neg)
-	{
-		/* could fail if input is most negative number */
-		if (unlikely(tmp == PG_INT64_MIN))
-			goto out_of_range;
-		tmp = -tmp;
-	}
-
-	*result = tmp;
-	return true;
-
-out_of_range:
-	if (!errorOK)
-		ereport(ERROR,
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("value \"%s\" is out of range for type %s",
-						str, "bigint")));
-	return false;
-
-invalid_syntax:
-	if (!errorOK)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for type %s: \"%s\"",
-						"bigint", str)));
-	return false;
-}
-
 /* int8in()
  */
 Datum
 int8in(PG_FUNCTION_ARGS)
 {
-	char	   *str = PG_GETARG_CSTRING(0);
-	int64		result;
+	char	   *num = PG_GETARG_CSTRING(0);
 
-	(void) scanint8(str, false, &result);
-	PG_RETURN_INT64(result);
+	PG_RETURN_INT64(pg_strtoint64_safe(num, fcinfo->context));
 }
 
 
@@ -919,6 +816,79 @@ Datum
 int8dec_any(PG_FUNCTION_ARGS)
 {
 	return int8dec(fcinfo);
+}
+
+/*
+ * int8inc_support
+ *		prosupport function for int8inc() and int8inc_any()
+ */
+Datum
+int8inc_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestWFuncMonotonic))
+	{
+		SupportRequestWFuncMonotonic *req = (SupportRequestWFuncMonotonic *) rawreq;
+		MonotonicFunction monotonic = MONOTONICFUNC_NONE;
+		int			frameOptions = req->window_clause->frameOptions;
+
+		/*
+		 * Because an EXCLUDE clauses in the window definition can exclude
+		 * rows that have previously been included in the aggregate result for
+		 * prior rows, this can break the monotonic properties that might
+		 * otherwise be guaranteed.  There's a narrow set of circumstances
+		 * that can be guaranteed, which we check for below.
+		 */
+		if (frameOptions & FRAMEOPTION_EXCLUSION)
+		{
+			WindowFunc *wfunc = req->window_func;
+
+			/*
+			 * To add handling for all valid monotonic cases with an EXCLUDE
+			 * clause is complex and likely not worth troubling over.  For
+			 * now, just bail unless we see EXCLUDE CURRENT ROW with COUNT(*)
+			 * and no FILTER.  Excluding the current row is fine when using
+			 * COUNT(*) as this always reduces the count by 1.  The same isn't
+			 * true for COUNY(ANY) as a NULL won't be counted, and a
+			 * subsequent non-NULL could make the count decrease.
+			 */
+			if ((frameOptions & FRAMEOPTION_EXCLUDE_CURRENT_ROW) == 0 ||
+				wfunc->winfnoid != F_COUNT_ ||
+				wfunc->aggfilter != NULL)
+			{
+				req->monotonic = MONOTONICFUNC_NONE;
+				PG_RETURN_POINTER(req);
+			}
+		}
+
+		/* No ORDER BY clause and RANGE mode means all rows are peers. */
+		if (req->window_clause->orderClause == NIL &&
+			(frameOptions & FRAMEOPTION_RANGE))
+			monotonic = MONOTONICFUNC_BOTH;
+		else
+		{
+			/*
+			 * Otherwise take into account the frame options.  When the frame
+			 * bound is the start of the window then the resulting value can
+			 * never decrease, therefore is monotonically increasing
+			 */
+			if (frameOptions & FRAMEOPTION_START_UNBOUNDED_PRECEDING)
+				monotonic |= MONOTONICFUNC_INCREASING;
+
+			/*
+			 * Likewise, if the frame bound is the end of the window then the
+			 * resulting value can never decrease.
+			 */
+			if (frameOptions & FRAMEOPTION_END_UNBOUNDED_FOLLOWING)
+				monotonic |= MONOTONICFUNC_DECREASING;
+		}
+
+		req->monotonic = monotonic;
+		PG_RETURN_POINTER(req);
+	}
+
+	PG_RETURN_POINTER(NULL);
 }
 
 

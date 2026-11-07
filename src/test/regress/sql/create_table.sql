@@ -2,255 +2,13 @@
 -- CREATE_TABLE
 --
 
---
--- CLASS DEFINITIONS
---
-CREATE TABLE hobbies_r (
-	name		text,
-	person 		text
-);
-
-CREATE TABLE equipment_r (
-	name 		text,
-	hobby		text
-);
-
-CREATE TABLE onek (
-	unique1		int4,
-	unique2		int4,
-	two			int4,
-	four		int4,
-	ten			int4,
-	twenty		int4,
-	hundred		int4,
-	thousand	int4,
-	twothousand	int4,
-	fivethous	int4,
-	tenthous	int4,
-	odd			int4,
-	even		int4,
-	stringu1	name,
-	stringu2	name,
-	string4		name
-);
-
-CREATE TABLE tenk1 (
-	unique1		int4,
-	unique2		int4,
-	two			int4,
-	four		int4,
-	ten			int4,
-	twenty		int4,
-	hundred		int4,
-	thousand	int4,
-	twothousand	int4,
-	fivethous	int4,
-	tenthous	int4,
-	odd			int4,
-	even		int4,
-	stringu1	name,
-	stringu2	name,
-	string4		name
-);
-
-CREATE TABLE tenk2 (
-	unique1 	int4,
-	unique2 	int4,
-	two 	 	int4,
-	four 		int4,
-	ten			int4,
-	twenty 		int4,
-	hundred 	int4,
-	thousand 	int4,
-	twothousand int4,
-	fivethous 	int4,
-	tenthous	int4,
-	odd			int4,
-	even		int4,
-	stringu1	name,
-	stringu2	name,
-	string4		name
-);
-
-
-CREATE TABLE person (
-	name 		text,
-	age			int4,
-	location 	point
-);
-
-
-CREATE TABLE emp (
-	salary 		int4,
-	manager 	name
-) INHERITS (person);
-
-
-CREATE TABLE student (
-	gpa 		float8
-) INHERITS (person);
-
-
-CREATE TABLE stud_emp (
-	percent 	int4
-) INHERITS (emp, student);
-
-
-CREATE TABLE city (
-	name		name,
-	location 	box,
-	budget 		city_budget
-);
-
-CREATE TABLE dept (
-	dname		name,
-	mgrname 	text
-);
-
-CREATE TABLE slow_emp4000 (
-	home_base	 box
-);
-
-CREATE TABLE fast_emp4000 (
-	home_base	 box
-);
-
-CREATE TABLE road (
-	name		text,
-	thepath 	path
-);
-
-CREATE TABLE ihighway () INHERITS (road);
-
-CREATE TABLE shighway (
-	surface		text
-) INHERITS (road);
-
-CREATE TABLE real_city (
-	pop			int4,
-	cname		text,
-	outline 	path
-);
-
---
--- test the "star" operators a bit more thoroughly -- this time,
--- throw in lots of NULL fields...
---
--- a is the type root
--- b and c inherit from a (one-level single inheritance)
--- d inherits from b and c (two-level multiple inheritance)
--- e inherits from c (two-level single inheritance)
--- f inherits from e (three-level single inheritance)
---
-CREATE TABLE a_star (
-	class		char,
-	a 			int4
-);
-
-CREATE TABLE b_star (
-	b 			text
-) INHERITS (a_star);
-
-CREATE TABLE c_star (
-	c 			name
-) INHERITS (a_star);
-
-CREATE TABLE d_star (
-	d 			float8
-) INHERITS (b_star, c_star);
-
-CREATE TABLE e_star (
-	e 			int2
-) INHERITS (c_star);
-
-CREATE TABLE f_star (
-	f 			polygon
-) INHERITS (e_star);
-
-CREATE TABLE aggtest (
-	a 			int2,
-	b			float4
-);
-
-CREATE TABLE hash_i4_heap (
-	seqno 		int4,
-	random 		int4
-);
-
-CREATE TABLE hash_name_heap (
-	seqno 		int4,
-	random 		name
-);
-
-CREATE TABLE hash_txt_heap (
-	seqno 		int4,
-	random 		text
-);
-
-CREATE TABLE hash_f8_heap (
-	seqno		int4,
-	random 		float8
-);
-
--- don't include the hash_ovfl_heap stuff in the distribution
--- the data set is too large for what it's worth
---
--- CREATE TABLE hash_ovfl_heap (
---	x			int4,
---	y			int4
--- );
-
-CREATE TABLE bt_i4_heap (
-	seqno 		int4,
-	random 		int4
-);
-
-CREATE TABLE bt_name_heap (
-	seqno 		name,
-	random 		int4
-);
-
-CREATE TABLE bt_txt_heap (
-	seqno 		text,
-	random 		int4
-);
-
-CREATE TABLE bt_f8_heap (
-	seqno 		float8,
-	random 		int4
-);
-
-CREATE TABLE array_op_test (
-	seqno		int4,
-	i			int4[],
-	t			text[]
-);
-
-CREATE TABLE array_index_op_test (
-	seqno		int4,
-	i			int4[],
-	t			text[]
-);
-
-CREATE TABLE testjsonb (
-       j jsonb
-);
-
+-- Error cases
 CREATE TABLE unknowntab (
 	u unknown    -- fail
 );
 
 CREATE TYPE unknown_comptype AS (
 	u unknown    -- fail
-);
-
-CREATE TABLE IF NOT EXISTS test_tsvector(
-	t text,
-	a tsvector
-);
-
-CREATE TABLE IF NOT EXISTS test_tsvector(
-	t text
 );
 
 -- invalid: non-lowercase quoted reloptions identifiers
@@ -271,6 +29,12 @@ CREATE TEMP TABLE explicitly_temp (a int primary key);			-- also OK
 CREATE TEMP TABLE pg_temp.doubly_temp (a int primary key);		-- also OK
 CREATE TEMP TABLE public.temp_to_perm (a int primary key);		-- not OK
 DROP TABLE unlogged1, public.unlogged2;
+
+CREATE UNLOGGED TABLE unlogged1 (a int) PARTITION BY RANGE (a); -- fail
+CREATE TABLE unlogged1 (a int) PARTITION BY RANGE (a); -- ok
+ALTER TABLE unlogged1 SET LOGGED; -- fails
+ALTER TABLE unlogged1 SET UNLOGGED; -- fails
+DROP TABLE unlogged1;
 
 CREATE TABLE as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
 CREATE TABLE as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
@@ -304,6 +68,14 @@ CREATE TABLE withoid() WITH (oids = true);
 CREATE TEMP TABLE withoutoid() WITHOUT OIDS; DROP TABLE withoutoid;
 CREATE TEMP TABLE withoutoid() WITH (oids = false); DROP TABLE withoutoid;
 
+-- temporary tables are ignored by pg_filenode_relation().
+CREATE TEMP TABLE relation_filenode_check(c1 int);
+SELECT relpersistence,
+  pg_filenode_relation (reltablespace, pg_relation_filenode(oid))
+  FROM pg_class
+  WHERE relname = 'relation_filenode_check';
+DROP TABLE relation_filenode_check;
+
 -- check restriction with default expressions
 -- invalid use of column reference in default expressions
 CREATE TABLE default_expr_column (id int DEFAULT (id));
@@ -333,6 +105,13 @@ SAVEPOINT q; DROP TABLE remember_node_subid; ROLLBACK TO q;
 COMMIT;
 DROP TABLE remember_node_subid;
 
+-- generated NOT NULL constraint names must not collide with explicitly named constraints
+CREATE TABLE two_not_null_constraints (
+   col integer NOT NULL,
+   CONSTRAINT two_not_null_constraints_col_not_null CHECK (col IS NOT NULL)
+);
+DROP TABLE two_not_null_constraints;
+
 --
 -- Partitioned tables
 --
@@ -347,12 +126,6 @@ CREATE TABLE partitioned (
 	a1 int,
 	a2 int
 ) PARTITION BY LIST (a1, a2);	-- fail
-
--- unsupported constraint type for partitioned tables
-CREATE TABLE partitioned (
-	a int,
-	EXCLUDE USING gist (a WITH &&)
-) PARTITION BY RANGE (a);
 
 -- prevent using prohibited expressions in the key
 CREATE FUNCTION retset (a int) RETURNS SETOF int AS $$ SELECT 1; $$ LANGUAGE SQL IMMUTABLE;
@@ -774,11 +547,11 @@ CREATE TABLE part_b PARTITION OF parted (
 	CONSTRAINT check_b CHECK (b >= 0)
 ) FOR VALUES IN ('b');
 -- conislocal should be false for any merged constraints, true otherwise
-SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY conislocal, coninhcount;
+SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
 
 -- Once check_b is added to the parent, it should be made non-local for part_b
 ALTER TABLE parted ADD CONSTRAINT check_b CHECK (b >= 0);
-SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass;
+SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
 
 -- Neither check_a nor check_b are droppable from part_b
 ALTER TABLE part_b DROP CONSTRAINT check_a;
@@ -788,7 +561,7 @@ ALTER TABLE part_b DROP CONSTRAINT check_b;
 -- traditional inheritance where they will be left behind, because they would
 -- be local constraints.
 ALTER TABLE parted DROP CONSTRAINT check_a, DROP CONSTRAINT check_b;
-SELECT conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass;
+SELECT conname, conislocal, coninhcount FROM pg_constraint WHERE conrelid = 'part_b'::regclass ORDER BY coninhcount DESC, conname;
 
 -- specify PARTITION BY for a partition
 CREATE TABLE fail_part_col_not_found PARTITION OF parted FOR VALUES IN ('c') PARTITION BY RANGE (c);
@@ -801,7 +574,7 @@ CREATE TABLE part_c_1_10 PARTITION OF part_c FOR VALUES FROM (1) TO (10);
 create table parted_notnull_inh_test (a int default 1, b int not null default 0) partition by list (a);
 create table parted_notnull_inh_test1 partition of parted_notnull_inh_test (a not null, b default 1) for values in (1);
 insert into parted_notnull_inh_test (b) values (null);
--- note that while b's default is overriden, a's default is preserved
+-- note that while b's default is overridden, a's default is preserved
 \d parted_notnull_inh_test1
 drop table parted_notnull_inh_test;
 
@@ -893,6 +666,9 @@ COMMENT ON COLUMN parted_col_comment.a IS 'Partition key';
 SELECT obj_description('parted_col_comment'::regclass);
 \d+ parted_col_comment
 DROP TABLE parted_col_comment;
+
+-- specifying storage parameters for partitioned tables is not supported
+CREATE TABLE parted_col_comment (a int, b text) PARTITION BY LIST (a) WITH (fillfactor=100);
 
 -- list partitioning on array type column
 CREATE TABLE arrlp (a int[]) PARTITION BY LIST (a);

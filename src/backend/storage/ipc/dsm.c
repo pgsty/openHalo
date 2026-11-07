@@ -14,7 +14,7 @@
  * hard postmaster crash, remaining segments will be removed, if they
  * still exist, at the next postmaster startup.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,17 +33,19 @@
 #endif
 #include <sys/stat.h>
 
+#include "common/pg_prng.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
 #include "storage/dsm.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/pg_shmem.h"
+#include "storage/shmem.h"
 #include "utils/freepage.h"
-#include "utils/guc.h"
 #include "utils/memutils.h"
-#include "utils/resowner_private.h"
+#include "utils/resowner.h"
 
 #define PG_DYNSHMEM_CONTROL_MAGIC		0x9a503d32
 
@@ -139,6 +141,32 @@ static dsm_control_header *dsm_control;
 static Size dsm_control_mapped_size = 0;
 static void *dsm_control_impl_private = NULL;
 
+
+/* ResourceOwner callbacks to hold DSM segments */
+static void ResOwnerReleaseDSM(Datum res);
+static char *ResOwnerPrintDSM(Datum res);
+
+static const ResourceOwnerDesc dsm_resowner_desc =
+{
+	.name = "dynamic shared memory segment",
+	.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+	.release_priority = RELEASE_PRIO_DSMS,
+	.ReleaseResource = ResOwnerReleaseDSM,
+	.DebugPrint = ResOwnerPrintDSM
+};
+
+/* Convenience wrappers over ResourceOwnerRemember/Forget */
+static inline void
+ResourceOwnerRememberDSM(ResourceOwner owner, dsm_segment *seg)
+{
+	ResourceOwnerRemember(owner, PointerGetDatum(seg), &dsm_resowner_desc);
+}
+static inline void
+ResourceOwnerForgetDSM(ResourceOwner owner, dsm_segment *seg)
+{
+	ResourceOwnerForget(owner, PointerGetDatum(seg), &dsm_resowner_desc);
+}
+
 /*
  * Start up the dynamic shared memory system.
  *
@@ -172,15 +200,15 @@ dsm_postmaster_startup(PGShmemHeader *shim)
 
 	/*
 	 * Loop until we find an unused identifier for the new control segment. We
-	 * sometimes use 0 as a sentinel value indicating that no control segment
-	 * is known to exist, so avoid using that value for a real control
-	 * segment.
+	 * sometimes use DSM_HANDLE_INVALID as a sentinel value indicating "no
+	 * control segment", so avoid generating that value for a real handle.
 	 */
 	for (;;)
 	{
 		Assert(dsm_control_address == NULL);
 		Assert(dsm_control_mapped_size == 0);
-		dsm_control_handle = random() << 1; /* Even numbers only */
+		/* Use even numbers only */
+		dsm_control_handle = pg_prng_uint32(&pg_global_prng_state) << 1;
 		if (dsm_control_handle == DSM_HANDLE_INVALID)
 			continue;
 		if (dsm_impl_op(DSM_OP_CREATE, dsm_control_handle, segsize,
@@ -395,6 +423,7 @@ static void
 dsm_backend_startup(void)
 {
 #ifdef EXEC_BACKEND
+	if (IsUnderPostmaster)
 	{
 		void	   *control_address = NULL;
 
@@ -494,8 +523,12 @@ dsm_create(Size size, int flags)
 	FreePageManager *dsm_main_space_fpm = dsm_main_space_begin;
 	bool		using_main_dsm_region = false;
 
-	/* Unsafe in postmaster (and pointless in a stand-alone backend). */
-	Assert(IsUnderPostmaster);
+	/*
+	 * Unsafe in postmaster. It might seem pointless to allow use of dsm in
+	 * single user mode, but otherwise some subsystems will need dedicated
+	 * single user mode code paths.
+	 */
+	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
 
 	if (!dsm_init_done)
 		dsm_backend_startup();
@@ -536,7 +569,8 @@ dsm_create(Size size, int flags)
 		for (;;)
 		{
 			Assert(seg->mapped_address == NULL && seg->mapped_size == 0);
-			seg->handle = random() << 1;	/* Even numbers only */
+			/* Use even numbers only */
+			seg->handle = pg_prng_uint32(&pg_global_prng_state) << 1;
 			if (seg->handle == DSM_HANDLE_INVALID)	/* Reserve sentinel */
 				continue;
 			if (dsm_impl_op(DSM_OP_CREATE, seg->handle, size, &seg->impl_private,
@@ -900,7 +934,7 @@ void
 dsm_unpin_mapping(dsm_segment *seg)
 {
 	Assert(seg->resowner == NULL);
-	ResourceOwnerEnlargeDSMs(CurrentResourceOwner);
+	ResourceOwnerEnlarge(CurrentResourceOwner);
 	seg->resowner = CurrentResourceOwner;
 	ResourceOwnerRememberDSM(seg->resowner, seg);
 }
@@ -1039,7 +1073,7 @@ dsm_unpin_segment(dsm_handle handle)
  * Find an existing mapping for a shared memory segment, if there is one.
  */
 dsm_segment *
-dsm_find_mapping(dsm_handle h)
+dsm_find_mapping(dsm_handle handle)
 {
 	dlist_iter	iter;
 	dsm_segment *seg;
@@ -1047,7 +1081,7 @@ dsm_find_mapping(dsm_handle h)
 	dlist_foreach(iter, &dsm_segment_list)
 	{
 		seg = dlist_container(dsm_segment, node, iter.cur);
-		if (seg->handle == h)
+		if (seg->handle == handle)
 			return seg;
 	}
 
@@ -1169,7 +1203,7 @@ dsm_create_descriptor(void)
 	dsm_segment *seg;
 
 	if (CurrentResourceOwner)
-		ResourceOwnerEnlargeDSMs(CurrentResourceOwner);
+		ResourceOwnerEnlarge(CurrentResourceOwner);
 
 	seg = MemoryContextAlloc(TopMemoryContext, sizeof(dsm_segment));
 	dlist_push_head(&dsm_segment_list, &seg->node);
@@ -1239,7 +1273,7 @@ make_main_region_dsm_handle(int slot)
 	 */
 	handle = 1;
 	handle |= slot << 1;
-	handle |= random() << (pg_leftmost_one_pos32(dsm_control->maxitems) + 1);
+	handle |= pg_prng_uint32(&pg_global_prng_state) << (pg_leftmost_one_pos32(dsm_control->maxitems) + 1);
 	return handle;
 }
 
@@ -1247,4 +1281,23 @@ static inline bool
 is_main_region_dsm_handle(dsm_handle handle)
 {
 	return handle & 1;
+}
+
+/* ResourceOwner callbacks */
+
+static void
+ResOwnerReleaseDSM(Datum res)
+{
+	dsm_segment *seg = (dsm_segment *) DatumGetPointer(res);
+
+	seg->resowner = NULL;
+	dsm_detach(seg);
+}
+static char *
+ResOwnerPrintDSM(Datum res)
+{
+	dsm_segment *seg = (dsm_segment *) DatumGetPointer(res);
+
+	return psprintf("dynamic shared memory segment %u",
+					dsm_segment_handle(seg));
 }

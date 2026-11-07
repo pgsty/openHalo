@@ -1,21 +1,21 @@
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # Test behavior with different schema on subscriber
 use strict;
-use warnings;
-use PostgresNode;
-use TestLib;
-use Test::More tests => 5;
+use warnings FATAL => 'all';
+use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::Utils;
+use Test::More;
 
 # Create publisher node
-my $node_publisher = get_new_node('publisher');
+my $node_publisher = PostgreSQL::Test::Cluster->new('publisher');
 $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
 # Create subscriber node
-my $node_subscriber = get_new_node('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
+$node_subscriber->init;
 $node_subscriber->start;
 
 # Create some preexisting content on publisher
@@ -48,7 +48,8 @@ is($result, qq(2|2|2), 'check initial data was copied to subscriber');
 
 # Update the rows on the publisher and check the additional columns on
 # subscriber didn't change
-$node_publisher->safe_psql('postgres', "UPDATE test_tab SET b = md5(b)");
+$node_publisher->safe_psql('postgres',
+	"UPDATE test_tab SET b = encode(sha256(b::bytea), 'hex')");
 
 $node_publisher->wait_for_catchup('tap_sub');
 
@@ -65,7 +66,7 @@ $node_subscriber->safe_psql('postgres',
 	"UPDATE test_tab SET c = 'epoch'::timestamptz + 987654321 * interval '1s'"
 );
 $node_publisher->safe_psql('postgres',
-	"UPDATE test_tab SET b = md5(a::text)");
+	"UPDATE test_tab SET b = encode(sha256(a::text::bytea), 'hex')");
 
 $node_publisher->wait_for_catchup('tap_sub');
 
@@ -117,6 +118,23 @@ is( $node_subscriber->safe_psql(
 	qq(1|1|1),
 	'check replicated inserts on subscriber');
 
+# Test if the expected error is reported when the subscriber table is missing
+# columns which were specified on the publisher table.
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE test_tab3 (a int, b int, c int)");
+$node_subscriber->safe_psql('postgres', "CREATE TABLE test_tab3 (a int)");
+
+my $offset = -s $node_subscriber->logfile;
+
+$node_subscriber->safe_psql('postgres',
+	"ALTER SUBSCRIPTION tap_sub REFRESH PUBLICATION");
+
+$node_subscriber->wait_for_log(
+	qr/ERROR: ( [A-Z0-9]+:)? logical replication target relation "public.test_tab3" is missing replicated columns: "b", "c"/,
+	$offset);
+
 
 $node_subscriber->stop;
 $node_publisher->stop;
+
+done_testing();

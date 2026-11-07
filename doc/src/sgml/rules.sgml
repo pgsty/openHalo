@@ -280,14 +280,16 @@
 
 <para>
     Views in <productname>PostgreSQL</productname> are implemented
-    using the rule system. In fact, there is essentially no difference
-    between:
+    using the rule system.  A view is basically an empty table (having no
+    actual storage) with an <literal>ON SELECT DO INSTEAD</literal> rule.
+    Conventionally, that rule is named <literal>_RETURN</literal>.
+    So a view like
 
 <programlisting>
 CREATE VIEW myview AS SELECT * FROM mytab;
 </programlisting>
 
-    compared against the two commands:
+    is very nearly the same thing as
 
 <programlisting>
 CREATE TABLE myview (<replaceable>same column list as mytab</replaceable>);
@@ -295,13 +297,17 @@ CREATE RULE "_RETURN" AS ON SELECT TO myview DO INSTEAD
     SELECT * FROM mytab;
 </programlisting>
 
-    because this is exactly what the <command>CREATE VIEW</command>
-    command does internally.  This has some side effects. One of them
-    is that the information about a view in the
-    <productname>PostgreSQL</productname> system catalogs is exactly
-    the same as it is for a table. So for the parser, there is
-    absolutely no difference between a table and a view. They are the
-    same thing: relations.
+    although you can't actually write that, because tables are not
+    allowed to have <literal>ON SELECT</literal> rules.
+</para>
+
+<para>
+    A view can also have other kinds of <literal>DO INSTEAD</literal>
+    rules, allowing <command>INSERT</command>, <command>UPDATE</command>,
+    or <command>DELETE</command> commands to be performed on the view
+    despite its lack of underlying storage.
+    This is discussed further below, in
+    <xref linkend="rules-views-update"/>.
 </para>
 
 <sect2 id="rules-select">
@@ -624,7 +630,7 @@ SELECT shoe_ready.shoename, shoe_ready.sh_avail,
          WHERE rsl.sl_color = rsh.slcolor
            AND rsl.sl_len_cm &gt;= rsh.slminlen_cm
            AND rsl.sl_len_cm &lt;= rsh.slmaxlen_cm) shoe_ready
- WHERE shoe_ready.total_avail &gt; 2;
+ WHERE shoe_ready.total_avail &gt;= 2;
 </programlisting>
    </para>
 
@@ -637,7 +643,7 @@ SELECT shoe_ready.shoename, shoe_ready.sh_avail,
    </para>
 </sect2>
 
-<sect2>
+<sect2 id="rules-views-non-select">
 <title>View Rules in Non-<command>SELECT</command> Statements</title>
 
 <para>
@@ -757,7 +763,7 @@ SELECT t1.a, t2.b, t1.ctid FROM t1, t2 WHERE t1.a = t2.a;
 </para>
 </sect2>
 
-<sect2>
+<sect2 id="rules-views-power">
 <title>The Power of Views in <productname>PostgreSQL</productname></title>
 
 <para>
@@ -791,9 +797,9 @@ SELECT t1.a, t2.b, t1.ctid FROM t1, t2 WHERE t1.a = t2.a;
 
 <para>
     What happens if a view is named as the target relation for an
-    <command>INSERT</command>, <command>UPDATE</command>, or
-    <command>DELETE</command>?  Doing the substitutions
-    described above would give a query tree in which the result
+    <command>INSERT</command>, <command>UPDATE</command>,
+    <command>DELETE</command>, or <command>MERGE</command>?  Doing the
+    substitutions described above would give a query tree in which the result
     relation points at a subquery range-table entry, which will not
     work.  There are several ways in which <productname>PostgreSQL</productname>
     can support the appearance of updating a view, however.
@@ -807,11 +813,12 @@ SELECT t1.a, t2.b, t1.ctid FROM t1, t2 WHERE t1.a = t2.a;
     If the subquery selects from a single base relation and is simple
     enough, the rewriter can automatically replace the subquery with the
     underlying base relation so that the <command>INSERT</command>,
-    <command>UPDATE</command>, or <command>DELETE</command> is applied to
-    the base relation in the appropriate way.  Views that are
-    <quote>simple enough</quote> for this are called <firstterm>automatically
-    updatable</firstterm>.  For detailed information on the kinds of view that can
-    be automatically updated, see <xref linkend="sql-createview"/>.
+    <command>UPDATE</command>, <command>DELETE</command>, or
+    <command>MERGE</command> is applied to the base relation in the
+    appropriate way.  Views that are <quote>simple enough</quote> for this
+    are called <firstterm>automatically updatable</firstterm>.  For detailed
+    information on the kinds of view that can be automatically updated, see
+    <xref linkend="sql-createview"/>.
 </para>
 
 <para>
@@ -821,10 +828,10 @@ SELECT t1.a, t2.b, t1.ctid FROM t1, t2 WHERE t1.a = t2.a;
     Rewriting works slightly differently
     in this case.  For <command>INSERT</command>, the rewriter does
     nothing at all with the view, leaving it as the result relation
-    for the query.  For <command>UPDATE</command> and
-    <command>DELETE</command>, it's still necessary to expand the
+    for the query.  For <command>UPDATE</command>, <command>DELETE</command>,
+    and <command>MERGE</command>, it's still necessary to expand the
     view query to produce the <quote>old</quote> rows that the command will
-    attempt to update or delete.  So the view is expanded as normal,
+    attempt to update, delete, or merge.  So the view is expanded as normal,
     but another unexpanded range-table entry is added to the query
     to represent the view in its capacity as the result relation.
 </para>
@@ -836,13 +843,13 @@ SELECT t1.a, t2.b, t1.ctid FROM t1, t2 WHERE t1.a = t2.a;
     list to identify the physical locations of the rows to be updated.
     This does not work if the result relation is a view, because a view
     does not have any <acronym>CTID</acronym>, since its rows do not have
-    actual physical locations. Instead, for an <command>UPDATE</command>
-    or <command>DELETE</command> operation, a special <literal>wholerow</literal>
-    entry is added to the target list, which expands to include all
-    columns from the view. The executor uses this value to supply the
-    <quote>old</quote> row to the <literal>INSTEAD OF</literal> trigger.  It is
-    up to the trigger to work out what to update based on the old and
-    new row values.
+    actual physical locations. Instead, for an <command>UPDATE</command>,
+    <command>DELETE</command>, or <command>MERGE</command> operation, a
+    special <literal>wholerow</literal> entry is added to the target list,
+    which expands to include all columns from the view. The executor uses this
+    value to supply the <quote>old</quote> row to the
+    <literal>INSTEAD OF</literal> trigger.  It is up to the trigger to work
+    out what to update based on the old and new row values.
 </para>
 
 <para>
@@ -851,7 +858,9 @@ SELECT t1.a, t2.b, t1.ctid FROM t1, t2 WHERE t1.a = t2.a;
     <command>UPDATE</command>, and <command>DELETE</command> commands on
     a view. These rules will rewrite the command, typically into a command
     that updates one or more tables, rather than views. That is the topic
-    of <xref linkend="rules-update"/>.
+    of <xref linkend="rules-update"/>.  Note that this will not work with
+    <command>MERGE</command>, which currently does not support rules on
+    the target relation other than <command>SELECT</command> rules.
 </para>
 
 <para>
@@ -865,7 +874,8 @@ SELECT t1.a, t2.b, t1.ctid FROM t1, t2 WHERE t1.a = t2.a;
 
 <para>
     Automatic rewriting of an <command>INSERT</command>,
-    <command>UPDATE</command>, or <command>DELETE</command> query on a
+    <command>UPDATE</command>, <command>DELETE</command>, or
+    <command>MERGE</command> query on a
     simple view is always tried last. Therefore, if a view has rules or
     triggers, they will override the default behavior of automatically
     updatable views.
@@ -1010,7 +1020,7 @@ VACUUM ANALYZE wrd;
 <programlisting>
 SELECT count(*) FROM words WHERE word = 'caterpiler';
 
- count 
+ count
 -------
      0
 (1 row)
@@ -1019,8 +1029,8 @@ SELECT count(*) FROM words WHERE word = 'caterpiler';
     With <command>EXPLAIN ANALYZE</command>, we see:
 
 <programlisting>
- Aggregate  (cost=21763.99..21764.00 rows=1 width=0) (actual time=188.180..188.181 rows=1 loops=1)
-   -&gt;  Foreign Scan on words  (cost=0.00..21761.41 rows=1032 width=0) (actual time=188.177..188.177 rows=0 loops=1)
+ Aggregate  (cost=21763.99..21764.00 rows=1 width=0) (actual time=188.180..188.181 rows=1.00 loops=1)
+   -&gt;  Foreign Scan on words  (cost=0.00..21761.41 rows=1032 width=0) (actual time=188.177..188.177 rows=0.00 loops=1)
          Filter: (word = 'caterpiler'::text)
          Rows Removed by Filter: 479829
          Foreign File: /usr/share/dict/words
@@ -1032,10 +1042,11 @@ SELECT count(*) FROM words WHERE word = 'caterpiler';
     If the materialized view is used instead, the query is much faster:
 
 <programlisting>
- Aggregate  (cost=4.44..4.45 rows=1 width=0) (actual time=0.042..0.042 rows=1 loops=1)
-   -&gt;  Index Only Scan using wrd_word on wrd  (cost=0.42..4.44 rows=1 width=0) (actual time=0.039..0.039 rows=0 loops=1)
+ Aggregate  (cost=4.44..4.45 rows=1 width=0) (actual time=0.042..0.042 rows=1.00 loops=1)
+   -&gt;  Index Only Scan using wrd_word on wrd  (cost=0.42..4.44 rows=1 width=0) (actual time=0.039..0.039 rows=0.00 loops=1)
          Index Cond: (word = 'caterpiler'::text)
          Heap Fetches: 0
+         Index Searches: 1
  Planning time: 0.164 ms
  Execution time: 0.117 ms
 </programlisting>
@@ -1047,7 +1058,7 @@ SELECT count(*) FROM words WHERE word = 'caterpiler';
 <programlisting>
 SELECT word FROM words ORDER BY word &lt;-&gt; 'caterpiler' LIMIT 10;
 
-     word     
+     word
 ---------------
  cater
  caterpillar
@@ -1063,11 +1074,11 @@ SELECT word FROM words ORDER BY word &lt;-&gt; 'caterpiler' LIMIT 10;
 </programlisting>
 
 <programlisting>
- Limit  (cost=11583.61..11583.64 rows=10 width=32) (actual time=1431.591..1431.594 rows=10 loops=1)
-   -&gt;  Sort  (cost=11583.61..11804.76 rows=88459 width=32) (actual time=1431.589..1431.591 rows=10 loops=1)
+ Limit  (cost=11583.61..11583.64 rows=10 width=32) (actual time=1431.591..1431.594 rows=10.00 loops=1)
+   -&gt;  Sort  (cost=11583.61..11804.76 rows=88459 width=32) (actual time=1431.589..1431.591 rows=10.00 loops=1)
          Sort Key: ((word &lt;-&gt; 'caterpiler'::text))
          Sort Method: top-N heapsort  Memory: 25kB
-         -&gt;  Foreign Scan on words  (cost=0.00..9672.05 rows=88459 width=32) (actual time=0.057..1286.455 rows=479829 loops=1)
+         -&gt;  Foreign Scan on words  (cost=0.00..9672.05 rows=88459 width=32) (actual time=0.057..1286.455 rows=479829.00 loops=1)
                Foreign File: /usr/share/dict/words
                Foreign File Size: 4953699
  Planning time: 0.128 ms
@@ -1077,9 +1088,10 @@ SELECT word FROM words ORDER BY word &lt;-&gt; 'caterpiler' LIMIT 10;
     Using the materialized view:
 
 <programlisting>
- Limit  (cost=0.29..1.06 rows=10 width=10) (actual time=187.222..188.257 rows=10 loops=1)
-   -&gt;  Index Scan using wrd_trgm on wrd  (cost=0.29..37020.87 rows=479829 width=10) (actual time=187.219..188.252 rows=10 loops=1)
+ Limit  (cost=0.29..1.06 rows=10 width=10) (actual time=187.222..188.257 rows=10.00 loops=1)
+   -&gt;  Index Scan using wrd_trgm on wrd  (cost=0.29..37020.87 rows=479829 width=10) (actual time=187.219..188.252 rows=10.00 loops=1)
          Order By: (word &lt;-&gt; 'caterpiler'::text)
+         Index Searches: 1
  Planning time: 0.196 ms
  Execution time: 198.640 ms
 </programlisting>
@@ -1111,7 +1123,7 @@ SELECT word FROM words ORDER BY word &lt;-&gt; 'caterpiler' LIMIT 10;
 <para>
     Rules that are defined on <command>INSERT</command>, <command>UPDATE</command>,
     and <command>DELETE</command> are significantly different from the view rules
-    described in the previous section. First, their <command>CREATE
+    described in the previous sections. First, their <command>CREATE
     RULE</command> command allows more:
 
     <itemizedlist>
@@ -1172,7 +1184,7 @@ SELECT word FROM words ORDER BY word &lt;-&gt; 'caterpiler' LIMIT 10;
  </para>
 </caution>
 
-<sect2>
+<sect2 id="rules-update-how">
 <title>How Update Rules Work</title>
 
 <para>
@@ -1296,7 +1308,7 @@ CREATE [ OR REPLACE ] RULE <replaceable class="parameter">name</replaceable> AS 
     there is no need to apply update rules to the output of view rewriting.
 </para>
 
-<sect3>
+<sect3 id="rules-update-how-first">
 <title>A First Rule Step by Step</title>
 
 <para>
@@ -1337,7 +1349,7 @@ UPDATE shoelace_data SET sl_avail = 6 WHERE sl_name = 'sl7';
 <programlisting>
 SELECT * FROM shoelace_log;
 
- sl_name | sl_avail | log_who | log_when                        
+ sl_name | sl_avail | log_who | log_when
 ---------+----------+---------+----------------------------------
  sl7     |        6 | Al      | Tue Oct 20 16:14:45 1998 MET DST
 (1 row)
@@ -1636,6 +1648,23 @@ CREATE RULE shoelace_ins AS ON INSERT TO shoelace
    </para>
 
    <para>
+    Note that in the <literal>RETURNING</literal> clause of a rule,
+    <literal>OLD</literal> and <literal>NEW</literal> refer to the
+    pseudorelations added as extra range table entries to the rewritten
+    query, rather than old/new rows in the result relation.  Thus, for
+    example, in a rule supporting <command>UPDATE</command> queries on this
+    view, if the <literal>RETURNING</literal> clause contained
+    <literal>old.sl_name</literal>, the old name would always be returned,
+    regardless of whether the <literal>RETURNING</literal> clause in the
+    query on the view specified <literal>OLD</literal> or <literal>NEW</literal>,
+    which might be confusing.  To avoid this confusion, and support returning
+    old and new values in queries on the view, the <literal>RETURNING</literal>
+    clause in the rule definition should refer to entries from the result
+    relation such as <literal>shoelace_data.sl_name</literal>, without
+    specifying <literal>OLD</literal> or <literal>NEW</literal>.
+   </para>
+
+   <para>
     Now assume that once in a while, a pack of shoelaces arrives at
     the shop and a big parts list along with it.  But you don't want
     to manually update the <literal>shoelace</literal> view every
@@ -1718,7 +1747,7 @@ SELECT * FROM shoelace ORDER BY sl_name;
 
 SELECT * FROM shoelace_log;
 
- sl_name | sl_avail | log_who| log_when                        
+ sl_name | sl_avail | log_who| log_when
 ---------+----------+--------+----------------------------------
  sl7     |        6 | Al     | Tue Oct 20 19:14:45 1998 MET DST
  sl3     |       10 | Al     | Tue Oct 20 19:25:16 1998 MET DST
@@ -2007,11 +2036,14 @@ SELECT * FROM shoelace;
     a relation (table or view) is automatically the owner of the
     rewrite rules that are defined for it.
     The <productname>PostgreSQL</productname> rule system changes the
-    behavior of the default access control system. Relations that
-    are used due to rules get checked against the
+    behavior of the default access control system. With the exception of
+    <literal>SELECT</literal> rules associated with security invoker views
+    (see <link linkend="sql-createview"><command>CREATE VIEW</command></link>),
+    all relations that are used due to rules get checked against the
     privileges of the rule owner, not the user invoking the rule.
-    This means that users only need the required privileges
-    for the tables/views that are explicitly named in their queries.
+    This means that, except for security invoker views, users only need the
+    required privileges for the tables/views that are explicitly named in
+    their queries.
 </para>
 
 <para>
@@ -2149,9 +2181,20 @@ CREATE VIEW phone_number WITH (security_barrier) AS
     <literal>LEAKPROOF</literal> to be pushed down, as they never receive data
     from the view.  In contrast, a function that might throw an error depending
     on the values received as arguments (such as one that throws an error in the
-    event of overflow or division by zero) is not leak-proof, and could provide
+    event of overflow or division by zero) is not leakproof, and could provide
     significant information about the unseen rows if applied before the security
     view's row filters.
+</para>
+
+<para>
+    For example, an index scan cannot be selected for queries on security
+    barrier views (or tables with row-level security policies) if an
+    operator used in the <literal>WHERE</literal> clause is associated with the
+    operator family of the index, but its underlying function is not marked
+    <literal>LEAKPROOF</literal>. The <xref linkend="app-psql"/> program's
+    <command><link linkend="app-psql-meta-command-dao">\dAo+</link></command>
+    meta-command is useful to list operator families and determine which of
+    their operators are marked as leakproof.
 </para>
 
 <para>

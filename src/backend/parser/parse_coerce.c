@@ -3,7 +3,7 @@
  * parse_coerce.c
  *		handle type coercions/conversions for parser
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -12,7 +12,6 @@
  *
  *-------------------------------------------------------------------------
  */
-#include "nodes/primnodes.h"
 #include "postgres.h"
 
 #include "catalog/pg_cast.h"
@@ -31,8 +30,6 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
-#include "miscadmin.h"
-#include "adapter/mysql/adapter.h"
 
 
 static Node *coerce_type_typmod(Node *node,
@@ -417,6 +414,12 @@ coerce_type(ParseState *pstate, Node *node,
 									 &funcId);
 	if (pathtype != COERCION_PATH_NONE)
 	{
+		Oid			baseTypeId;
+		int32		baseTypeMod;
+
+		baseTypeMod = targetTypeMod;
+		baseTypeId = getBaseTypeAndTypmod(targetTypeId, &baseTypeMod);
+
 		if (pathtype != COERCION_PATH_RELABELTYPE)
 		{
 			/*
@@ -426,12 +429,6 @@ coerce_type(ParseState *pstate, Node *node,
 			 * and we need to extract the correct typmod to use from the
 			 * domain's typtypmod.
 			 */
-			Oid			baseTypeId;
-			int32		baseTypeMod;
-
-			baseTypeMod = targetTypeMod;
-			baseTypeId = getBaseTypeAndTypmod(targetTypeId, &baseTypeMod);
-
 			result = build_coercion_expression(node, pathtype, funcId,
 											   baseTypeId, baseTypeMod,
 											   ccontext, cformat, location);
@@ -457,7 +454,8 @@ coerce_type(ParseState *pstate, Node *node,
 			 * that must be accounted for.  If the destination is a domain
 			 * then we won't need a RelabelType node.
 			 */
-			result = coerce_to_domain(node, InvalidOid, -1, targetTypeId,
+			result = coerce_to_domain(node, baseTypeId, baseTypeMod,
+									  targetTypeId,
 									  ccontext, cformat, location,
 									  false);
 			if (result == node)
@@ -574,6 +572,10 @@ can_coerce_type(int nargs, const Oid *input_typeids, const Oid *target_typeids,
 		if (inputTypeId == targetTypeId)
 			continue;
 
+		/* reject all cases of casting something else to/from "internal" */
+		if (inputTypeId == INTERNALOID || targetTypeId == INTERNALOID)
+			return false;
+
 		/* accept if target is ANY */
 		if (targetTypeId == ANYOID)
 			continue;
@@ -663,10 +665,8 @@ can_coerce_type(int nargs, const Oid *input_typeids, const Oid *target_typeids,
  * Create an expression tree to represent coercion to a domain type.
  *
  * 'arg': input expression
- * 'baseTypeId': base type of domain, if known (pass InvalidOid if caller
- *		has not bothered to look this up)
- * 'baseTypeMod': base type typmod of domain, if known (pass -1 if caller
- *		has not bothered to look this up)
+ * 'baseTypeId': base type of domain
+ * 'baseTypeMod': base type typmod of domain
  * 'typeId': target type to coerce to
  * 'ccontext': context indicator to control coercions
  * 'cformat': coercion display format
@@ -682,9 +682,8 @@ coerce_to_domain(Node *arg, Oid baseTypeId, int32 baseTypeMod, Oid typeId,
 {
 	CoerceToDomain *result;
 
-	/* Get the base type if it hasn't been supplied */
-	if (baseTypeId == InvalidOid)
-		baseTypeId = getBaseTypeAndTypmod(typeId, &baseTypeMod);
+	/* We now require the caller to supply correct baseTypeId/baseTypeMod */
+	Assert(OidIsValid(baseTypeId));
 
 	/* If it isn't a domain, return the node as it was passed in */
 	if (baseTypeId == typeId)
@@ -1039,13 +1038,12 @@ coerce_record_to_complex(ParseState *pstate, Node *node,
 	else if (node && IsA(node, Var) &&
 			 ((Var *) node)->varattno == InvalidAttrNumber)
 	{
-		int			rtindex = ((Var *) node)->varno;
-		int			sublevels_up = ((Var *) node)->varlevelsup;
-		int			vlocation = ((Var *) node)->location;
+		Var		   *var = (Var *) node;
 		ParseNamespaceItem *nsitem;
 
-		nsitem = GetNSItemByRangeTablePosn(pstate, rtindex, sublevels_up);
-		args = expandNSItemVars(nsitem, sublevels_up, vlocation, NULL);
+		nsitem = GetNSItemByVar(pstate, var);
+		args = expandNSItemVars(pstate, nsitem, var->varlevelsup,
+								var->location, NULL);
 	}
 	else
 		ereport(ERROR,
@@ -1170,11 +1168,11 @@ coerce_to_boolean(ParseState *pstate, Node *node,
 	{
 		Node	   *newnode;
 
-        newnode = coerce_to_target_type(pstate, node, inputTypeId,
-                                        BOOLOID, -1,
-                                        COERCION_ASSIGNMENT,
-                                        COERCE_IMPLICIT_CAST,
-                                        -1);
+		newnode = coerce_to_target_type(pstate, node, inputTypeId,
+										BOOLOID, -1,
+										COERCION_ASSIGNMENT,
+										COERCE_IMPLICIT_CAST,
+										-1);
 		if (newnode == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
@@ -1581,70 +1579,18 @@ coerce_to_common_type(ParseState *pstate, Node *node,
 
 	if (inputTypeId == targetTypeId)
 		return node;			/* no work */
-    
-    /* 这个函数可能会被递归调到，不能随便“改名重载” */
-	/* if (can_coerce_type(1, &inputTypeId, &targetTypeId, COERCION_IMPLICIT)) */
-	/*     node = coerce_type(pstate, node, inputTypeId, targetTypeId, -1, */
-	/*                        COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1); */
-	/* else */
-	/*     ereport(ERROR, */
-	/*             (errcode(ERRCODE_CANNOT_COERCE), */
-	/*     [> translator: first %s is name of a SQL construct, eg CASE <] */
-	/*              errmsg("%s could not convert type %s to %s", */
-	/*                     context, */
-	/*                     format_type_be(inputTypeId), */
-	/*                     format_type_be(targetTypeId)), */
-	/*              parser_errposition(pstate, exprLocation(node)))); */
-    if ((MyProcPort == NULL) || 
-        (nodeTag(MyProcPort->protocol_handler) != T_MySQLProtocol))
-    {
-        if (can_coerce_type(1, &inputTypeId, &targetTypeId, COERCION_EXPLICIT))
-            node = coerce_type(pstate, node, inputTypeId, targetTypeId, -1,
-                               COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
-        else
-            ereport(ERROR,
-                    (errcode(ERRCODE_CANNOT_COERCE),
-                     /* translator: first %s is name of a SQL construct, eg CASE */
-                     errmsg("%s could not convert type %s to %s",
-                            context,
-                            format_type_be(inputTypeId),
-                            format_type_be(targetTypeId)),
-                     parser_errposition(pstate, exprLocation(node))));
-    }
-    else 
-    {
-        if ((targetTypeId == TEXTOID) && (strncasecmp(context, "UNION", 5) == 0))
-        {
-            if (can_coerce_type(1, &inputTypeId, &targetTypeId, COERCION_EXPLICIT))
-                node = coerce_type(pstate, node, inputTypeId, targetTypeId, -1,
-                                   COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
-            else
-                ereport(ERROR,
-                        (errcode(ERRCODE_CANNOT_COERCE),
-                         /* translator: first %s is name of a SQL construct, eg CASE */
-                         errmsg("%s could not convert type %s to %s",
-                                context,
-                                format_type_be(inputTypeId),
-                                format_type_be(targetTypeId)),
-                         parser_errposition(pstate, exprLocation(node))));
-        }
-        else 
-        {
-            if (can_coerce_type(1, &inputTypeId, &targetTypeId, COERCION_IMPLICIT))
-                node = coerce_type(pstate, node, inputTypeId, targetTypeId, -1,
-                                   COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
-            else
-                ereport(ERROR,
-                        (errcode(ERRCODE_CANNOT_COERCE),
-                         /* translator: first %s is name of a SQL construct, eg CASE */
-                         errmsg("%s could not convert type %s to %s",
-                                context,
-                                format_type_be(inputTypeId),
-                                format_type_be(targetTypeId)),
-                         parser_errposition(pstate, exprLocation(node))));
-        }
-    }
-    
+	if (can_coerce_type(1, &inputTypeId, &targetTypeId, COERCION_IMPLICIT))
+		node = coerce_type(pstate, node, inputTypeId, targetTypeId, -1,
+						   COERCION_IMPLICIT, COERCE_IMPLICIT_CAST, -1);
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_CANNOT_COERCE),
+		/* translator: first %s is name of a SQL construct, eg CASE */
+				 errmsg("%s could not convert type %s to %s",
+						context,
+						format_type_be(inputTypeId),
+						format_type_be(targetTypeId)),
+				 parser_errposition(pstate, exprLocation(node))));
 	return node;
 }
 
@@ -3086,9 +3032,27 @@ IsPreferredType(TYPCATEGORY category, Oid type)
 bool
 IsBinaryCoercible(Oid srctype, Oid targettype)
 {
+	Oid			castoid;
+
+	return IsBinaryCoercibleWithCast(srctype, targettype, &castoid);
+}
+
+/* IsBinaryCoercibleWithCast()
+ *		Check if srctype is binary-coercible to targettype.
+ *
+ * This variant also returns the OID of the pg_cast entry if one is involved.
+ * *castoid is set to InvalidOid if no binary-coercible cast exists, or if
+ * there is a hard-wired rule for it rather than a pg_cast entry.
+ */
+bool
+IsBinaryCoercibleWithCast(Oid srctype, Oid targettype,
+						  Oid *castoid)
+{
 	HeapTuple	tuple;
 	Form_pg_cast castForm;
 	bool		result;
+
+	*castoid = InvalidOid;
 
 	/* Fast path if same type */
 	if (srctype == targettype)
@@ -3153,6 +3117,9 @@ IsBinaryCoercible(Oid srctype, Oid targettype)
 	result = (castForm->castmethod == COERCION_METHOD_BINARY &&
 			  castForm->castcontext == COERCION_CODE_IMPLICIT);
 
+	if (result)
+		*castoid = castForm->oid;
+
 	ReleaseSysCache(tuple);
 
 	return result;
@@ -3204,6 +3171,10 @@ find_coercion_pathway(Oid targetTypeId, Oid sourceTypeId,
 	/* Domains are always coercible to and from their base type */
 	if (sourceTypeId == targetTypeId)
 		return COERCION_PATH_RELABELTYPE;
+
+	/* Reject all cases of casting something else to/from "internal" */
+	if (sourceTypeId == INTERNALOID || targetTypeId == INTERNALOID)
+		return COERCION_PATH_NONE;
 
 	/* Look in pg_cast */
 	tuple = SearchSysCache2(CASTSOURCETARGET,

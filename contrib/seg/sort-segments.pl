@@ -1,11 +1,11 @@
 #!/usr/bin/perl
 
-# Copyright (c) 2021, PostgreSQL Global Development Group
+# Copyright (c) 2021-2025, PostgreSQL Global Development Group
 
 # this script will sort any table with the segment data type in its last column
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 my @rows;
 

@@ -3,7 +3,7 @@
  * tsvector.c
  *	  I/O functions for tsvector
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -14,11 +14,14 @@
 
 #include "postgres.h"
 
+#include "common/int.h"
 #include "libpq/pqformat.h"
+#include "nodes/miscnodes.h"
 #include "tsearch/ts_locale.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 typedef struct
 {
@@ -35,9 +38,7 @@ compareWordEntryPos(const void *a, const void *b)
 	int			apos = WEP_GETPOS(*(const WordEntryPos *) a);
 	int			bpos = WEP_GETPOS(*(const WordEntryPos *) b);
 
-	if (apos == bpos)
-		return 0;
-	return (apos > bpos) ? 1 : -1;
+	return pg_cmp_s32(apos, bpos);
 }
 
 /*
@@ -56,7 +57,7 @@ uniquePos(WordEntryPos *a, int l)
 	if (l <= 1)
 		return l;
 
-	qsort((void *) a, l, sizeof(WordEntryPos), compareWordEntryPos);
+	qsort(a, l, sizeof(WordEntryPos), compareWordEntryPos);
 
 	res = a;
 	ptr = a + 1;
@@ -108,8 +109,7 @@ uniqueentry(WordEntryIN *a, int l, char *buf, int *outbuflen)
 	Assert(l >= 1);
 
 	if (l > 1)
-		qsort_arg((void *) a, l, sizeof(WordEntryIN), compareentry,
-				  (void *) buf);
+		qsort_arg(a, l, sizeof(WordEntryIN), compareentry, buf);
 
 	buflen = 0;
 	res = a;
@@ -175,6 +175,7 @@ Datum
 tsvectorin(PG_FUNCTION_ARGS)
 {
 	char	   *buf = PG_GETARG_CSTRING(0);
+	Node	   *escontext = fcinfo->context;
 	TSVectorParseState state;
 	WordEntryIN *arr;
 	int			totallen;
@@ -198,7 +199,7 @@ tsvectorin(PG_FUNCTION_ARGS)
 	char	   *cur;
 	int			buflen = 256;	/* allocated size of tmpbuf */
 
-	state = init_tsvector_parser(buf, 0);
+	state = init_tsvector_parser(buf, 0, escontext);
 
 	arrlen = 64;
 	arr = (WordEntryIN *) palloc(sizeof(WordEntryIN) * arrlen);
@@ -207,17 +208,17 @@ tsvectorin(PG_FUNCTION_ARGS)
 	while (gettoken_tsvector(state, &token, &toklen, &pos, &poslen, NULL))
 	{
 		if (toklen >= MAXSTRLEN)
-			ereport(ERROR,
+			ereturn(escontext, (Datum) 0,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("word is too long (%ld bytes, max %ld bytes)",
 							(long) toklen,
 							(long) (MAXSTRLEN - 1))));
 
 		if (cur - tmpbuf > MAXSTRPOS)
-			ereport(ERROR,
+			ereturn(escontext, (Datum) 0,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("string is too long for tsvector (%ld bytes, max %ld bytes)",
-							(long) (cur - tmpbuf), (long) MAXSTRPOS)));
+					 errmsg("string is too long for tsvector (%zu bytes, max %zu bytes)",
+							(size_t) (cur - tmpbuf), (size_t) MAXSTRPOS)));
 
 		/*
 		 * Enlarge buffers if needed
@@ -226,19 +227,19 @@ tsvectorin(PG_FUNCTION_ARGS)
 		{
 			arrlen *= 2;
 			arr = (WordEntryIN *)
-				repalloc((void *) arr, sizeof(WordEntryIN) * arrlen);
+				repalloc(arr, sizeof(WordEntryIN) * arrlen);
 		}
 		while ((cur - tmpbuf) + toklen >= buflen)
 		{
 			int			dist = cur - tmpbuf;
 
 			buflen *= 2;
-			tmpbuf = (char *) repalloc((void *) tmpbuf, buflen);
+			tmpbuf = (char *) repalloc(tmpbuf, buflen);
 			cur = tmpbuf + dist;
 		}
 		arr[len].entry.len = toklen;
 		arr[len].entry.pos = cur - tmpbuf;
-		memcpy((void *) cur, (void *) token, toklen);
+		memcpy(cur, token, toklen);
 		cur += toklen;
 
 		if (poslen != 0)
@@ -258,15 +259,20 @@ tsvectorin(PG_FUNCTION_ARGS)
 
 	close_tsvector_parser(state);
 
+	/* Did gettoken_tsvector fail? */
+	if (SOFT_ERROR_OCCURRED(escontext))
+		PG_RETURN_NULL();
+
 	if (len > 0)
 		len = uniqueentry(arr, len, tmpbuf, &buflen);
 	else
 		buflen = 0;
 
 	if (buflen > MAXSTRPOS)
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("string is too long for tsvector (%d bytes, max %d bytes)", buflen, MAXSTRPOS)));
+				 errmsg("string is too long for tsvector (%zu bytes, max %zu bytes)",
+						(size_t) buflen, (size_t) MAXSTRPOS)));
 
 	totallen = CALCDATASIZE(len, buflen);
 	in = (TSVector) palloc0(totallen);
@@ -282,6 +288,7 @@ tsvectorin(PG_FUNCTION_ARGS)
 		stroff += arr[i].entry.len;
 		if (arr[i].entry.haspos)
 		{
+			/* This should be unreachable because of MAXNUMPOS restrictions */
 			if (arr[i].poslen > 0xFFFF)
 				elog(ERROR, "positions array too long");
 
@@ -310,17 +317,17 @@ tsvectorout(PG_FUNCTION_ARGS)
 	TSVector	out = PG_GETARG_TSVECTOR(0);
 	char	   *outbuf;
 	int32		i,
-				lenbuf = 0,
 				pp;
+	size_t		lenbuf;
 	WordEntry  *ptr = ARRPTR(out);
-	char	   *curbegin,
-			   *curin,
+	char	   *curin,
 			   *curout;
+	const char *curend;
 
 	lenbuf = out->size * 2 /* '' */ + out->size - 1 /* space */ + 2 /* \0 */ ;
 	for (i = 0; i < out->size; i++)
 	{
-		lenbuf += ptr[i].len * 2 * pg_database_encoding_max_length() /* for escape */ ;
+		lenbuf += ptr[i].len * 2 /* allow for escapes */ ;
 		if (ptr[i].haspos)
 			lenbuf += 1 /* : */ + 7 /* int2 + , + weight */ * POSDATALEN(out, &(ptr[i]));
 	}
@@ -328,13 +335,14 @@ tsvectorout(PG_FUNCTION_ARGS)
 	curout = outbuf = (char *) palloc(lenbuf);
 	for (i = 0; i < out->size; i++)
 	{
-		curbegin = curin = STRPTR(out) + ptr->pos;
+		curin = STRPTR(out) + ptr->pos;
+		curend = curin + ptr->len;
 		if (i != 0)
 			*curout++ = ' ';
 		*curout++ = '\'';
-		while (curin - curbegin < ptr->len)
+		while (curin < curend)
 		{
-			int			len = pg_mblen(curin);
+			int			len = pg_mblen_range(curin, curend);
 
 			if (t_iseq(curin, '\''))
 				*curout++ = '\'';
@@ -451,12 +459,14 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 	bool		needSort = false;
 
 	nentries = pq_getmsgint(buf, sizeof(int32));
-	if (nentries < 0 || nentries > (MaxAllocSize / sizeof(WordEntry)))
+
+	/* We disallow empty lexemes, so more than MAXSTRPOS of them can't fit */
+	if (nentries < 0 || nentries > MAXSTRPOS)
 		elog(ERROR, "invalid size of tsvector");
 
 	hdrlen = DATAHDRSIZE + sizeof(WordEntry) * nentries;
 
-	len = hdrlen * 2;			/* times two to make room for lexemes */
+	len = hdrlen * 2;			/* times two to make some room for lexemes */
 	vec = (TSVector) palloc0(len);
 	vec->size = nentries;
 
@@ -473,6 +483,8 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 		/* sanity checks */
 
 		lex_len = strlen(lexeme);
+		if (lex_len == 0)
+			elog(ERROR, "invalid tsvector: empty lexeme");
 		if (lex_len > MAXSTRLEN)
 			elog(ERROR, "invalid tsvector: lexeme too long");
 
@@ -538,11 +550,20 @@ tsvectorrecv(PG_FUNCTION_ARGS)
 		}
 	}
 
+	/*
+	 * Enforce that datalen is still within MAXSTRPOS, ie the last lexeme
+	 * didn't go past that.  We could allow that, since no "pos" field
+	 * overflowed, but tsvectorrecv shouldn't accept values that other
+	 * tsvector-constructing routines wouldn't.
+	 */
+	if (datalen > MAXSTRPOS)
+		elog(ERROR, "invalid tsvector: maximum total lexeme length exceeded");
+
 	SET_VARSIZE(vec, hdrlen + datalen);
 
 	if (needSort)
-		qsort_arg((void *) ARRPTR(vec), vec->size, sizeof(WordEntry),
-				  compareentry, (void *) STRPTR(vec));
+		qsort_arg(ARRPTR(vec), vec->size, sizeof(WordEntry),
+				  compareentry, STRPTR(vec));
 
 	PG_RETURN_TSVECTOR(vec);
 }

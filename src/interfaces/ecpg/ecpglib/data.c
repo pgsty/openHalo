@@ -438,7 +438,6 @@ ecpg_get_data(const PGresult *results, int act_tuple, int act_field, int lineno,
 					}
 					break;
 
-#ifdef HAVE_STRTOLL
 				case ECPGt_long_long:
 					*((long long int *) (var + offset * act_tuple)) = strtoll(pval, &scan_length, 10);
 					if (garbage_left(isarray, &scan_length, compat))
@@ -449,8 +448,7 @@ ecpg_get_data(const PGresult *results, int act_tuple, int act_field, int lineno,
 					pval = scan_length;
 
 					break;
-#endif							/* HAVE_STRTOLL */
-#ifdef HAVE_STRTOULL
+
 				case ECPGt_unsigned_long_long:
 					*((unsigned long long int *) (var + offset * act_tuple)) = strtoull(pval, &scan_length, 10);
 					if (garbage_left(isarray, &scan_length, compat))
@@ -461,7 +459,6 @@ ecpg_get_data(const PGresult *results, int act_tuple, int act_field, int lineno,
 					pval = scan_length;
 
 					break;
-#endif							/* HAVE_STRTOULL */
 
 				case ECPGt_float:
 				case ECPGt_double:
@@ -524,10 +521,17 @@ ecpg_get_data(const PGresult *results, int act_tuple, int act_field, int lineno,
 				case ECPGt_bytea:
 					{
 						struct ECPGgeneric_bytea *variable =
-						(struct ECPGgeneric_bytea *) (var + offset * act_tuple);
+							(struct ECPGgeneric_bytea *) (var + offset * act_tuple);
 						long		dst_size,
 									src_size,
 									dec_size;
+
+						if (size < 2 || pval[0] != '\\' || pval[1] != 'x')
+						{
+							ecpg_raise(lineno, ECPG_BYTEA_FORMAT,
+									   ECPG_SQLSTATE_DATATYPE_MISMATCH, pval);
+							return false;
+						}
 
 						dst_size = ecpg_hex_enc_len(varcharsize);
 						src_size = size - 2;	/* exclude backslash + 'x' */
@@ -564,7 +568,6 @@ ecpg_get_data(const PGresult *results, int act_tuple, int act_field, int lineno,
 						}
 
 						pval += size;
-
 					}
 					break;
 
@@ -694,7 +697,7 @@ ecpg_get_data(const PGresult *results, int act_tuple, int act_field, int lineno,
 				case ECPGt_varchar:
 					{
 						struct ECPGgeneric_varchar *variable =
-						(struct ECPGgeneric_varchar *) (var + offset * act_tuple);
+							(struct ECPGgeneric_varchar *) (var + offset * act_tuple);
 
 						variable->len = size;
 						if (varcharsize == 0)

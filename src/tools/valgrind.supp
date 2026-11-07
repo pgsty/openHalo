@@ -15,26 +15,6 @@
 # those bytes as padding, this is harmless.
 
 {
-	padding_pgstat_send
-	Memcheck:Param
-	socketcall.send(msg)
-
-	...
-	fun:*send*
-	fun:pgstat_send
-}
-
-{
-	padding_pgstat_sendto
-	Memcheck:Param
-	socketcall.sendto(msg)
-
-	...
-	fun:*send*
-	fun:pgstat_send
-}
-
-{
 	padding_pgstat_write
 	Memcheck:Param
 	write(buf)
@@ -133,7 +113,7 @@
 	overread_tuplestruct_pg_cast
 	Memcheck:Addr4
 
-	fun:IsBinaryCoercible
+	fun:IsBinaryCoercibleWithCast
 }
 
 # Python's allocator does some low-level tricks for efficiency. Those
@@ -199,4 +179,18 @@
    python_clever_allocator
    Memcheck:Cond
    fun:PyObject_Realloc
+}
+
+# NUMA introspection requires touching memory first, and some of it may
+# be marked as noacess (e.g. unpinned buffers). So just ignore that.
+{
+   pg_numa_touch_mem_if_required
+   Memcheck:Addr4
+   fun:pg_numa_touch_mem_if_required
+}
+
+{
+   pg_numa_touch_mem_if_required
+   Memcheck:Addr8
+   fun:pg_numa_touch_mem_if_required
 }

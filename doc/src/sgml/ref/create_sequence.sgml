@@ -21,11 +21,13 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-CREATE [ TEMPORARY | TEMP ] SEQUENCE [ IF NOT EXISTS ] <replaceable class="parameter">name</replaceable>
+CREATE [ { TEMPORARY | TEMP } | UNLOGGED ] SEQUENCE [ IF NOT EXISTS ] <replaceable class="parameter">name</replaceable>
     [ AS <replaceable class="parameter">data_type</replaceable> ]
     [ INCREMENT [ BY ] <replaceable class="parameter">increment</replaceable> ]
     [ MINVALUE <replaceable class="parameter">minvalue</replaceable> | NO MINVALUE ] [ MAXVALUE <replaceable class="parameter">maxvalue</replaceable> | NO MAXVALUE ]
-    [ START [ WITH ] <replaceable class="parameter">start</replaceable> ] [ CACHE <replaceable class="parameter">cache</replaceable> ] [ [ NO ] CYCLE ]
+    [ [ NO ] CYCLE ]
+    [ START [ WITH ] <replaceable class="parameter">start</replaceable> ]
+    [ CACHE <replaceable class="parameter">cache</replaceable> ]
     [ OWNED BY { <replaceable class="parameter">table_name</replaceable>.<replaceable class="parameter">column_name</replaceable> | NONE } ]
 </synopsis>
  </refsynopsisdiv>
@@ -46,8 +48,9 @@ CREATE [ TEMPORARY | TEMP ] SEQUENCE [ IF NOT EXISTS ] <replaceable class="param
    specified schema.  Otherwise it is created in the current schema.
    Temporary sequences exist in a special schema, so a schema name cannot be
    given when creating a temporary sequence.
-   The sequence name must be distinct from the name of any other sequence,
-   table, index, view, or foreign table in the same schema.
+   The sequence name must be distinct from the name of any other relation
+   (table, sequence, index, view, materialized view, or foreign table) in
+   the same schema.
   </para>
 
   <para>
@@ -87,6 +90,27 @@ SELECT * FROM <replaceable>name</replaceable>;
       permanent sequences with the same name are not visible (in this
       session) while the temporary sequence exists, unless they are
       referenced with schema-qualified names.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>UNLOGGED</literal></term>
+    <listitem>
+     <para>
+      If specified, the sequence is created as an unlogged sequence.  Changes
+      to unlogged sequences are not written to the write-ahead log.  They are
+      not crash-safe: an unlogged sequence is automatically reset to its
+      initial state after a crash or unclean shutdown.  Unlogged sequences are
+      also not replicated to standby servers.
+     </para>
+
+     <para>
+      Unlike unlogged tables, unlogged sequences do not offer a significant
+      performance advantage.  This option is mainly intended for sequences
+      associated with unlogged tables via identity columns or serial columns.
+      In those cases, it usually wouldn't make sense to have the sequence
+      WAL-logged and replicated but not its associated table.
      </para>
     </listitem>
    </varlistentry>
@@ -172,6 +196,31 @@ SELECT * FROM <replaceable>name</replaceable>;
    </varlistentry>
 
    <varlistentry>
+    <term><literal>CYCLE</literal></term>
+    <term><literal>NO CYCLE</literal></term>
+    <listitem>
+     <para>
+      The <literal>CYCLE</literal> option allows the sequence to wrap
+      around when the <replaceable
+      class="parameter">maxvalue</replaceable> or <replaceable
+      class="parameter">minvalue</replaceable> has been reached by an
+      ascending or descending sequence respectively. If the limit is
+      reached, the next number generated will be the <replaceable
+      class="parameter">minvalue</replaceable> or <replaceable
+      class="parameter">maxvalue</replaceable>, respectively.
+     </para>
+
+     <para>
+      If <literal>NO CYCLE</literal> is specified, any calls to
+      <function>nextval</function> after the sequence has reached its
+      maximum value will return an error.  If neither
+      <literal>CYCLE</literal> or <literal>NO CYCLE</literal> are
+      specified, <literal>NO CYCLE</literal> is the default.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><replaceable class="parameter">start</replaceable></term>
     <listitem>
      <para>
@@ -195,31 +244,6 @@ SELECT * FROM <replaceable>name</replaceable>;
       memory for faster access. The minimum value is 1 (only one value
       can be generated at a time, i.e., no cache), and this is also the
       default.
-     </para>
-    </listitem>
-   </varlistentry>
-
-   <varlistentry>
-    <term><literal>CYCLE</literal></term>
-    <term><literal>NO CYCLE</literal></term>
-    <listitem>
-     <para>
-      The <literal>CYCLE</literal> option allows the sequence to wrap
-      around when the <replaceable
-      class="parameter">maxvalue</replaceable> or <replaceable
-      class="parameter">minvalue</replaceable> has been reached by an
-      ascending or descending sequence respectively. If the limit is
-      reached, the next number generated will be the <replaceable
-      class="parameter">minvalue</replaceable> or <replaceable
-      class="parameter">maxvalue</replaceable>, respectively.
-     </para>
-
-     <para>
-      If <literal>NO CYCLE</literal> is specified, any calls to
-      <function>nextval</function> after the sequence has reached its
-      maximum value will return an error.  If neither
-      <literal>CYCLE</literal> or <literal>NO CYCLE</literal> are
-      specified, <literal>NO CYCLE</literal> is the default.
      </para>
     </listitem>
    </varlistentry>

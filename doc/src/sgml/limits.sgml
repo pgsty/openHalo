@@ -135,7 +135,7 @@
   created tuples are internally marked as null in the tuple's null bitmap, the
   null bitmap also occupies space.
  </para>
- 
+
  <para>
   Each table can store a theoretical maximum of 2^32 out-of-line values; see
   <xref linkend="storage-toast" /> for a detailed discussion of out-of-line

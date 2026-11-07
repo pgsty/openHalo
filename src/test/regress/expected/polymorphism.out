@@ -1165,6 +1165,8 @@ create function dfunc(a int = 1, b int) returns int as $$
   select $1 + $2;
 $$ language sql;
 ERROR:  input parameters after one with a default value must also have defaults
+LINE 1: create function dfunc(a int = 1, b int) returns int as $$
+                                         ^
 -- however, this should work:
 create function dfunc(a int = 1, out sum int, b int = 2) as $$
   select $1 + $2;
@@ -1270,6 +1272,8 @@ create function dfunc(out int = 20) returns int as $$
   select 1;
 $$ language sql;
 ERROR:  only input parameters can have default values
+LINE 1: create function dfunc(out int = 20) returns int as $$
+                              ^
 -- polymorphic parameter test
 create function dfunc(anyelement = 'World'::text) returns text as $$
   select 'Hello, ' || $1::text;
@@ -1567,12 +1571,20 @@ drop function dfunc(varchar, numeric);
 --fail, named parameters are not unique
 create function testpolym(a int, a int) returns int as $$ select 1;$$ language sql;
 ERROR:  parameter name "a" used more than once
+LINE 1: create function testpolym(a int, a int) returns int as $$ se...
+                                         ^
 create function testpolym(int, out a int, out a int) returns int as $$ select 1;$$ language sql;
 ERROR:  parameter name "a" used more than once
+LINE 1: create function testpolym(int, out a int, out a int) returns...
+                                                  ^
 create function testpolym(out a int, inout a int) returns int as $$ select 1;$$ language sql;
 ERROR:  parameter name "a" used more than once
+LINE 1: create function testpolym(out a int, inout a int) returns in...
+                                             ^
 create function testpolym(a int, inout a int) returns int as $$ select 1;$$ language sql;
 ERROR:  parameter name "a" used more than once
+LINE 1: create function testpolym(a int, inout a int) returns int as...
+                                         ^
 -- valid
 create function testpolym(a int, out a int) returns int as $$ select $1;$$ language sql;
 select testpolym(37);
@@ -1801,10 +1813,10 @@ select * from dfview;
  c3     | bigint |           |          |         | plain   | 
  c4     | bigint |           |          |         | plain   | 
 View definition:
- SELECT int8_tbl.q1,
-    int8_tbl.q2,
-    dfunc(int8_tbl.q1, int8_tbl.q2, flag => int8_tbl.q1 > int8_tbl.q2) AS c3,
-    dfunc(int8_tbl.q1, flag => int8_tbl.q1 < int8_tbl.q2, b => int8_tbl.q2) AS c4
+ SELECT q1,
+    q2,
+    dfunc(q1, q2, flag => q1 > q2) AS c3,
+    dfunc(q1, flag => q1 < q2, b => q2) AS c4
    FROM int8_tbl;
 
 drop view dfview;

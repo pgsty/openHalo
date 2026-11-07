@@ -29,6 +29,17 @@ SELECT pg_drop_replication_slot('regression_slot');
 (1 row)
 
 RESET ROLE;
+-- no users can load an untrusted plugin
+SET output_plugin_libraries = pgoutput;
+SET ROLE regress_lr_replication;
+SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot', 'test_decoding');
+ERROR:  library "test_decoding" may not be used as an output plugin
+HINT:  If it is safe for all REPLICATION users to use this library as an output plugin, add it to "output_plugin_libraries" and reload the server configuration.
+RESET ROLE;
+SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot', 'test_decoding');
+ERROR:  library "test_decoding" may not be used as an output plugin
+HINT:  If it is safe for all REPLICATION users to use this library as an output plugin, add it to "output_plugin_libraries" and reload the server configuration.
+RESET output_plugin_libraries;
 -- replication user can control replication
 SET ROLE regress_lr_replication;
 SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot', 'test_decoding');
@@ -54,13 +65,19 @@ RESET ROLE;
 -- plain user *can't* can control replication
 SET ROLE regress_lr_normal;
 SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot', 'test_decoding');
-ERROR:  must be superuser or replication role to use replication slots
+ERROR:  permission denied to use replication slots
+DETAIL:  Only roles with the REPLICATION attribute may use replication slots.
 INSERT INTO lr_test VALUES('lr_superuser_init');
 ERROR:  permission denied for table lr_test
 SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
-ERROR:  must be superuser or replication role to use replication slots
+ERROR:  permission denied to use replication slots
+DETAIL:  Only roles with the REPLICATION attribute may use replication slots.
 SELECT pg_drop_replication_slot('regression_slot');
-ERROR:  must be superuser or replication role to use replication slots
+ERROR:  permission denied to use replication slots
+DETAIL:  Only roles with the REPLICATION attribute may use replication slots.
+SELECT pg_sync_replication_slots();
+ERROR:  permission denied to use replication slots
+DETAIL:  Only roles with the REPLICATION attribute may use replication slots.
 RESET ROLE;
 -- replication users can drop superuser created slots
 SET ROLE regress_lr_superuser;
@@ -90,7 +107,8 @@ SELECT 'init' FROM pg_create_logical_replication_slot('regression_slot', 'test_d
 RESET ROLE;
 SET ROLE regress_lr_normal;
 SELECT pg_drop_replication_slot('regression_slot');
-ERROR:  must be superuser or replication role to use replication slots
+ERROR:  permission denied to use replication slots
+DETAIL:  Only roles with the REPLICATION attribute may use replication slots.
 RESET ROLE;
 -- all users can see existing slots
 SET ROLE regress_lr_superuser;

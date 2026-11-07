@@ -19,7 +19,7 @@
  * tree after local transformations that might introduce nested AND/ORs.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -34,7 +34,6 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
-#include "optimizer/prep.h"
 #include "utils/lsyscache.h"
 
 
@@ -128,6 +127,7 @@ negate_clause(Node *node)
 					newopexpr->opno = negator;
 					newopexpr->opfuncid = InvalidOid;
 					newopexpr->hashfuncid = InvalidOid;
+					newopexpr->negfuncid = InvalidOid;
 					newopexpr->useOr = !saopexpr->useOr;
 					newopexpr->inputcollid = saopexpr->inputcollid;
 					newopexpr->args = saopexpr->args;

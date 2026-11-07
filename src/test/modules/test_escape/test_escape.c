@@ -219,7 +219,6 @@ test_gb18030_json(pe_test_config *tc)
 	JsonLexContext *lex;
 	JsonSemAction sem = {0};	/* no callbacks */
 	JsonParseErrorType json_error;
-	char	   *error_str;
 
 	/* prepare input like test_one_vector_escape() does */
 	raw_buf = createPQExpBuffer();
@@ -235,16 +234,14 @@ test_gb18030_json(pe_test_config *tc)
 	appendPQExpBuffer(testname, "< - GB18030 - pg_parse_json");
 
 	/* test itself */
-	lex = makeJsonLexContextCstringLen(raw_buf->data, input_len,
+	lex = makeJsonLexContextCstringLen(NULL, raw_buf->data, input_len,
 									   PG_GB18030, false);
 	json_error = pg_parse_json(lex, &sem);
-	error_str = psprintf("JsonParseErrorType %d", json_error);
 	report_result(tc, json_error == JSON_UNICODE_ESCAPE_FORMAT,
 				  testname->data, "",
-				  "diagnosed", error_str);
+				  "diagnosed", json_errdetail(json_error, lex));
 
-	pfree(error_str);
-	pfree(lex);
+	freeJsonLexContext(lex);
 	destroyPQExpBuffer(testname);
 	destroyPQExpBuffer(raw_buf);
 }
@@ -260,8 +257,7 @@ escape_literal(PGconn *conn, PQExpBuffer target,
 	escaped = PQescapeLiteral(conn, unescaped, unescaped_len);
 	if (!escaped)
 	{
-		appendPQExpBuffer(escape_err, "%s",
-						  PQerrorMessage(conn));
+		appendPQExpBufferStr(escape_err, PQerrorMessage(conn));
 		escape_err->data[escape_err->len - 1] = 0;
 		escape_err->len--;
 		return false;
@@ -284,8 +280,7 @@ escape_identifier(PGconn *conn, PQExpBuffer target,
 	escaped = PQescapeIdentifier(conn, unescaped, unescaped_len);
 	if (!escaped)
 	{
-		appendPQExpBuffer(escape_err, "%s",
-						  PQerrorMessage(conn));
+		appendPQExpBufferStr(escape_err, PQerrorMessage(conn));
 		escape_err->data[escape_err->len - 1] = 0;
 		escape_err->len--;
 		return false;
@@ -317,8 +312,7 @@ escape_string_conn(PGconn *conn, PQExpBuffer target,
 
 	if (error)
 	{
-		appendPQExpBuffer(escape_err, "%s",
-						  PQerrorMessage(conn));
+		appendPQExpBufferStr(escape_err, PQerrorMessage(conn));
 		escape_err->data[escape_err->len - 1] = 0;
 		escape_err->len--;
 		return false;
@@ -613,7 +607,7 @@ test_psql_parse(pe_test_config *tc, PQExpBuffer testname,
 						  "#\t\t %d: scan_result: %s prompt: %u, query_buf: ",
 						  matches, scan_res_s(scan_result), prompt_status);
 		escapify(details, query_buf->data, query_buf->len);
-		appendPQExpBuffer(details, "\n");
+		appendPQExpBufferChar(details, '\n');
 
 		matches++;
 	}
@@ -665,7 +659,7 @@ test_one_vector_escape(pe_test_config *tc, const pe_test_vector *tv, const pe_te
 	}
 
 	/* name to describe the test */
-	appendPQExpBuffer(testname, ">");
+	appendPQExpBufferChar(testname, '>');
 	escapify(testname, tv->escape, tv->escape_len);
 	appendPQExpBuffer(testname, "< - %s - %s",
 					  tv->client_encoding, ef->name);
@@ -674,7 +668,7 @@ test_one_vector_escape(pe_test_config *tc, const pe_test_vector *tv, const pe_te
 	appendPQExpBuffer(details, "#\t input: %zd bytes: ",
 					  tv->escape_len);
 	escapify(details, tv->escape, tv->escape_len);
-	appendPQExpBufferStr(details, "\n");
+	appendPQExpBufferChar(details, '\n');
 	appendPQExpBuffer(details, "#\t encoding: %s\n",
 					  tv->client_encoding);
 

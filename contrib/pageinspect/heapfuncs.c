@@ -15,7 +15,7 @@
  * there's hardly any use case for using these without superuser-rights
  * anyway.
  *
- * Copyright (c) 2007-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pageinspect/heapfuncs.c
@@ -32,7 +32,6 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "pageinspect.h"
 #include "port/pg_bitutils.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -43,13 +42,14 @@
  * was used to upgrade from an older version, tuples might still have an
  * oid. Seems worthwhile to display that.
  */
-#define HeapTupleHeaderGetOidOld(tup) \
-( \
-	((tup)->t_infomask & HEAP_HASOID_OLD) ? \
-	   *((Oid *) ((char *)(tup) + (tup)->t_hoff - sizeof(Oid))) \
-	: \
-		InvalidOid \
-)
+static inline Oid
+HeapTupleHeaderGetOidOld(const HeapTupleHeaderData *tup)
+{
+	if (tup->t_infomask & HEAP_HASOID_OLD)
+		return *((Oid *) ((char *) (tup) + (tup)->t_hoff - sizeof(Oid)));
+	else
+		return InvalidOid;
+}
 
 
 /*
@@ -101,7 +101,7 @@ text_to_bits(char *str, int len)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid character \"%.*s\" in t_bits string",
-							pg_mblen(str + off), str + off)));
+							pg_mblen_cstr(str + off), str + off)));
 
 		if (off % 8 == 7)
 			bits[off / 8] = byte;
@@ -259,7 +259,7 @@ heap_page_items(PG_FUNCTION_ARGS)
 					values[12] = HeapTupleHeaderGetOidOld(tuphdr);
 				else
 					nulls[12] = true;
-				
+
 				/* Copy raw tuple data into bytea attribute */
 				tuple_data_len = lp_len - tuphdr->t_hoff;
 				tuple_data_bytea = (bytea *) palloc(tuple_data_len + VARHDRSZ);
@@ -344,11 +344,11 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 
 	for (i = 0; i < nattrs; i++)
 	{
-		Form_pg_attribute attr;
+		CompactAttribute *attr;
 		bool		is_null;
 		bytea	   *attr_data = NULL;
 
-		attr = TupleDescAttr(tupdesc, i);
+		attr = TupleDescCompactAttr(tupdesc, i);
 
 		/*
 		 * Tuple header can specify fewer attributes than tuple descriptor as
@@ -367,8 +367,8 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 
 			if (attr->attlen == -1)
 			{
-				off = att_align_pointer(off, attr->attalign, -1,
-										tupdata + off);
+				off = att_pointer_alignby(off, attr->attalignby, -1,
+										  tupdata + off);
 
 				/*
 				 * As VARSIZE_ANY throws an exception if it can't properly
@@ -386,7 +386,7 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 			}
 			else
 			{
-				off = att_align_nominal(off, attr->attalign);
+				off = att_nominal_alignby(off, attr->attalignby);
 				len = attr->attlen;
 			}
 
@@ -396,7 +396,7 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 						 errmsg("unexpected end of tuple data")));
 
 			if (attr->attlen == -1 && do_detoast)
-				attr_data = DatumGetByteaPCopy(tupdata + off);
+				attr_data = pg_detoast_datum_copy((struct varlena *) (tupdata + off));
 			else
 			{
 				attr_data = (bytea *) palloc(len + VARHDRSZ);
@@ -468,8 +468,8 @@ tuple_data_split(PG_FUNCTION_ARGS)
 	 */
 	if (t_infomask & HEAP_HASNULL)
 	{
-		int			bits_str_len;
-		int			bits_len;
+		size_t		bits_str_len;
+		size_t		bits_len;
 
 		bits_len = BITMAPLEN(t_infomask2 & HEAP_NATTS_MASK) * BITS_PER_BYTE;
 		if (!t_bits_str)
@@ -481,7 +481,7 @@ tuple_data_split(PG_FUNCTION_ARGS)
 		if (bits_len != bits_str_len)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("unexpected length of t_bits string: %u, expected %u",
+					 errmsg("unexpected length of t_bits string: %zu, expected %zu",
 							bits_str_len, bits_len)));
 
 		/* do the conversion */
@@ -505,7 +505,7 @@ tuple_data_split(PG_FUNCTION_ARGS)
 	if (t_bits)
 		pfree(t_bits);
 
-	PG_RETURN_ARRAYTYPE_P(res);
+	PG_RETURN_DATUM(res);
 }
 
 /*
@@ -520,8 +520,8 @@ Datum
 heap_tuple_infomask_flags(PG_FUNCTION_ARGS)
 {
 #define HEAP_TUPLE_INFOMASK_COLS 2
-	Datum		values[HEAP_TUPLE_INFOMASK_COLS];
-	bool		nulls[HEAP_TUPLE_INFOMASK_COLS];
+	Datum		values[HEAP_TUPLE_INFOMASK_COLS] = {0};
+	bool		nulls[HEAP_TUPLE_INFOMASK_COLS] = {0};
 	uint16		t_infomask = PG_GETARG_INT16(0);
 	uint16		t_infomask2 = PG_GETARG_INT16(1);
 	int			cnt = 0;
@@ -542,10 +542,6 @@ heap_tuple_infomask_flags(PG_FUNCTION_ARGS)
 
 	bitcnt = pg_popcount((const char *) &t_infomask, sizeof(uint16)) +
 		pg_popcount((const char *) &t_infomask2, sizeof(uint16));
-
-	/* Initialize values and NULL flags arrays */
-	MemSet(values, 0, sizeof(values));
-	MemSet(nulls, 0, sizeof(nulls));
 
 	/* If no flags, return a set of empty arrays */
 	if (bitcnt <= 0)
@@ -603,7 +599,7 @@ heap_tuple_infomask_flags(PG_FUNCTION_ARGS)
 
 	/* build value */
 	Assert(cnt <= bitcnt);
-	a = construct_array(flags, cnt, TEXTOID, -1, false, TYPALIGN_INT);
+	a = construct_array_builtin(flags, cnt, TEXTOID);
 	values[0] = PointerGetDatum(a);
 
 	/*
@@ -625,7 +621,7 @@ heap_tuple_infomask_flags(PG_FUNCTION_ARGS)
 	if (cnt == 0)
 		a = construct_empty_array(TEXTOID);
 	else
-		a = construct_array(flags, cnt, TEXTOID, -1, false, TYPALIGN_INT);
+		a = construct_array_builtin(flags, cnt, TEXTOID);
 	pfree(flags);
 	values[1] = PointerGetDatum(a);
 

@@ -11,7 +11,7 @@
  *		can't be inside more-complex expressions.  If that'd otherwise be
  *		the case, the planner adds additional ProjectSet nodes.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,7 +26,6 @@
 #include "executor/nodeProjectSet.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "utils/memutils.h"
 
 
 static TupleTableSlot *ExecProjectSRF(ProjectSetState *node, bool continuing);
@@ -329,16 +328,6 @@ void
 ExecEndProjectSet(ProjectSetState *node)
 {
 	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
-
-	/*
 	 * shut down subplans
 	 */
 	ExecEndNode(outerPlanState(node));
@@ -347,6 +336,8 @@ ExecEndProjectSet(ProjectSetState *node)
 void
 ExecReScanProjectSet(ProjectSetState *node)
 {
+	PlanState  *outerPlan = outerPlanState(node);
+
 	/* Forget any incompletely-evaluated SRFs */
 	node->pending_srf_tuples = false;
 
@@ -354,6 +345,6 @@ ExecReScanProjectSet(ProjectSetState *node)
 	 * If chgParam of subnode is not null then plan will be re-scanned by
 	 * first ExecProcNode.
 	 */
-	if (node->ps.lefttree->chgParam == NULL)
-		ExecReScan(node->ps.lefttree);
+	if (outerPlan->chgParam == NULL)
+		ExecReScan(outerPlan);
 }

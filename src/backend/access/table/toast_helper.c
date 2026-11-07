@@ -4,7 +4,7 @@
  *	  Helper functions for table AMs implementing compressed or
  *    out-of-line storage of varlena attributes.
  *
- * Copyright (c) 2000-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/access/table/toast_helper.c
@@ -15,10 +15,10 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
-#include "access/table.h"
 #include "access/toast_helper.h"
 #include "access/toast_internals.h"
 #include "catalog/pg_type_d.h"
+#include "varatt.h"
 
 
 /*
@@ -75,7 +75,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 			{
 				if (ttc->ttc_isnull[i] ||
 					!VARATT_IS_EXTERNAL_ONDISK(new_value) ||
-					memcmp((char *) old_value, (char *) new_value,
+					memcmp(old_value, new_value,
 						   VARSIZE_EXTERNAL(old_value)) != 0)
 				{
 					/*
@@ -315,7 +315,7 @@ toast_tuple_cleanup(ToastTupleContext *ttc)
  * relation.
  */
 void
-toast_delete_external(Relation rel, Datum *values, bool *isnull,
+toast_delete_external(Relation rel, const Datum *values, const bool *isnull,
 					  bool is_speculative)
 {
 	TupleDesc	tupleDesc = rel->rd_att;
@@ -324,13 +324,13 @@ toast_delete_external(Relation rel, Datum *values, bool *isnull,
 
 	for (i = 0; i < numAttrs; i++)
 	{
-		if (TupleDescAttr(tupleDesc, i)->attlen == -1)
+		if (TupleDescCompactAttr(tupleDesc, i)->attlen == -1)
 		{
 			Datum		value = values[i];
 
 			if (isnull[i])
 				continue;
-			else if (VARATT_IS_EXTERNAL_ONDISK(PointerGetDatum(value)))
+			else if (VARATT_IS_EXTERNAL_ONDISK(value))
 				toast_delete_datum(rel, value, is_speculative);
 		}
 	}

@@ -6,7 +6,7 @@
  *
  * Transforms tokenized jsonpath into tree of JsonPathParseItem structs.
  *
- * Copyright (c) 2019-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/jsonpath_gram.y
@@ -18,26 +18,11 @@
 
 #include "catalog/pg_collation.h"
 #include "fmgr.h"
+#include "jsonpath_internal.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "regex/regex.h"
 #include "utils/builtins.h"
-#include "utils/jsonpath.h"
-
-/* struct JsonPathString is shared between scan and gram */
-typedef struct JsonPathString
-{
-	char	   *val;
-	int			len;
-	int			total;
-}			JsonPathString;
-
-union YYSTYPE;
-
-/* flex 2.5.4 doesn't bother with a decl for this */
-int	jsonpath_yylex(union YYSTYPE *yylval_param);
-int	jsonpath_yyparse(JsonPathParseResult **result);
-void jsonpath_yyerror(JsonPathParseResult **result, const char *message);
 
 static JsonPathParseItem *makeItemType(JsonPathItemType type);
 static JsonPathParseItem *makeItemString(JsonPathString *s);
@@ -53,17 +38,16 @@ static JsonPathParseItem *makeItemUnary(JsonPathItemType type,
 static JsonPathParseItem *makeItemList(List *list);
 static JsonPathParseItem *makeIndexArray(List *list);
 static JsonPathParseItem *makeAny(int first, int last);
-static JsonPathParseItem *makeItemLikeRegex(JsonPathParseItem *expr,
-											JsonPathString *pattern,
-											JsonPathString *flags);
+static bool makeItemLikeRegex(JsonPathParseItem *expr,
+							  JsonPathString *pattern,
+							  JsonPathString *flags,
+							  JsonPathParseItem ** result,
+							  struct Node *escontext);
 
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
  * so we can easily have it use palloc instead of malloc.  This prevents
- * memory leaks if we error out during parsing.  Note this only works with
- * bison >= 2.0.  However, in bison 1.875 the default is to use alloca()
- * if possible, so there's not really much problem anyhow, at least if
- * you're building with gcc.
+ * memory leaks if we error out during parsing.
  */
 #define YYMALLOC palloc
 #define YYFREE   pfree
@@ -75,8 +59,14 @@ static JsonPathParseItem *makeItemLikeRegex(JsonPathParseItem *expr,
 %expect 0
 %name-prefix="jsonpath_yy"
 %parse-param {JsonPathParseResult **result}
+%parse-param {struct Node *escontext}
+%parse-param {yyscan_t yyscanner}
+%lex-param {JsonPathParseResult **result}
+%lex-param {struct Node *escontext}
+%lex-param {yyscan_t yyscanner}
 
-%union {
+%union
+{
 	JsonPathString		str;
 	List			   *elems;	/* list of JsonPathParseItem */
 	List			   *indexs;	/* list of integers */
@@ -94,15 +84,18 @@ static JsonPathParseItem *makeItemLikeRegex(JsonPathParseItem *expr,
 %token	<str>		ANY_P STRICT_P LAX_P LAST_P STARTS_P WITH_P LIKE_REGEX_P FLAG_P
 %token	<str>		ABS_P SIZE_P TYPE_P FLOOR_P DOUBLE_P CEILING_P KEYVALUE_P
 %token	<str>		DATETIME_P
+%token	<str>		BIGINT_P BOOLEAN_P DATE_P DECIMAL_P INTEGER_P NUMBER_P
+%token	<str>		STRINGFUNC_P TIME_P TIME_TZ_P TIMESTAMP_P TIMESTAMP_TZ_P
 
 %type	<result>	result
 
 %type	<value>		scalar_value path_primary expr array_accessor
 					any_path accessor_op key predicate delimited_predicate
 					index_elem starts_with_initial expr_or_predicate
-					datetime_template opt_datetime_template
+					datetime_template opt_datetime_template csv_elem
+					datetime_precision opt_datetime_precision
 
-%type	<elems>		accessor_expr
+%type	<elems>		accessor_expr csv_list opt_csv_list
 
 %type	<indexs>	index_list
 
@@ -180,9 +173,20 @@ predicate:
 									{ $$ = makeItemUnary(jpiIsUnknown, $2); }
 	| expr STARTS_P WITH_P starts_with_initial
 									{ $$ = makeItemBinary(jpiStartsWith, $1, $4); }
-	| expr LIKE_REGEX_P STRING_P	{ $$ = makeItemLikeRegex($1, &$3, NULL); }
+	| expr LIKE_REGEX_P STRING_P
+	{
+		JsonPathParseItem *jppitem;
+		if (! makeItemLikeRegex($1, &$3, NULL, &jppitem, escontext))
+			YYABORT;
+		$$ = jppitem;
+	}
 	| expr LIKE_REGEX_P STRING_P FLAG_P STRING_P
-									{ $$ = makeItemLikeRegex($1, &$3, &$5); }
+	{
+		JsonPathParseItem *jppitem;
+		if (! makeItemLikeRegex($1, &$3, &$5, &jppitem, escontext))
+			YYABORT;
+		$$ = jppitem;
+	}
 	;
 
 starts_with_initial:
@@ -232,7 +236,7 @@ array_accessor:
 	;
 
 any_level:
-	INT_P							{ $$ = pg_atoi($1.val, 4, 0); }
+	INT_P							{ $$ = pg_strtoint32($1.val); }
 	| LAST_P						{ $$ = -1; }
 	;
 
@@ -249,9 +253,59 @@ accessor_op:
 	| array_accessor				{ $$ = $1; }
 	| '.' any_path					{ $$ = $2; }
 	| '.' method '(' ')'			{ $$ = makeItemType($2); }
-	| '.' DATETIME_P '(' opt_datetime_template ')'
-									{ $$ = makeItemUnary(jpiDatetime, $4); }
 	| '?' '(' predicate ')'			{ $$ = makeItemUnary(jpiFilter, $3); }
+	| '.' DECIMAL_P '(' opt_csv_list ')'
+		{
+			if (list_length($4) == 0)
+				$$ = makeItemBinary(jpiDecimal, NULL, NULL);
+			else if (list_length($4) == 1)
+				$$ = makeItemBinary(jpiDecimal, linitial($4), NULL);
+			else if (list_length($4) == 2)
+				$$ = makeItemBinary(jpiDecimal, linitial($4), lsecond($4));
+			else
+				ereturn(escontext, false,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("invalid input syntax for type %s", "jsonpath"),
+						 errdetail(".decimal() can only have an optional precision[,scale].")));
+		}
+	| '.' DATETIME_P '(' opt_datetime_template ')'
+		{ $$ = makeItemUnary(jpiDatetime, $4); }
+	| '.' TIME_P '(' opt_datetime_precision ')'
+		{ $$ = makeItemUnary(jpiTime, $4); }
+	| '.' TIME_TZ_P '(' opt_datetime_precision ')'
+		{ $$ = makeItemUnary(jpiTimeTz, $4); }
+	| '.' TIMESTAMP_P '(' opt_datetime_precision ')'
+		{ $$ = makeItemUnary(jpiTimestamp, $4); }
+	| '.' TIMESTAMP_TZ_P '(' opt_datetime_precision ')'
+		{ $$ = makeItemUnary(jpiTimestampTz, $4); }
+	;
+
+csv_elem:
+	INT_P
+		{ $$ = makeItemNumeric(&$1); }
+	| '+' INT_P %prec UMINUS
+		{ $$ = makeItemUnary(jpiPlus, makeItemNumeric(&$2)); }
+	| '-' INT_P %prec UMINUS
+		{ $$ = makeItemUnary(jpiMinus, makeItemNumeric(&$2)); }
+	;
+
+csv_list:
+	csv_elem						{ $$ = list_make1($1); }
+	| csv_list ',' csv_elem			{ $$ = lappend($1, $3); }
+	;
+
+opt_csv_list:
+	csv_list						{ $$ = $1; }
+	| /* EMPTY */					{ $$ = NULL; }
+	;
+
+datetime_precision:
+	INT_P							{ $$ = makeItemNumeric(&$1); }
+	;
+
+opt_datetime_precision:
+	datetime_precision				{ $$ = $1; }
+	| /* EMPTY */					{ $$ = NULL; }
 	;
 
 datetime_template:
@@ -292,6 +346,17 @@ key_name:
 	| WITH_P
 	| LIKE_REGEX_P
 	| FLAG_P
+	| BIGINT_P
+	| BOOLEAN_P
+	| DATE_P
+	| DECIMAL_P
+	| INTEGER_P
+	| NUMBER_P
+	| STRINGFUNC_P
+	| TIME_P
+	| TIME_TZ_P
+	| TIMESTAMP_P
+	| TIMESTAMP_TZ_P
 	;
 
 method:
@@ -302,6 +367,12 @@ method:
 	| DOUBLE_P						{ $$ = jpiDouble; }
 	| CEILING_P						{ $$ = jpiCeiling; }
 	| KEYVALUE_P					{ $$ = jpiKeyValue; }
+	| BIGINT_P						{ $$ = jpiBigint; }
+	| BOOLEAN_P						{ $$ = jpiBoolean; }
+	| DATE_P						{ $$ = jpiDate; }
+	| INTEGER_P						{ $$ = jpiInteger; }
+	| NUMBER_P						{ $$ = jpiNumber; }
+	| STRINGFUNC_P					{ $$ = jpiStringFunc; }
 	;
 %%
 
@@ -313,7 +384,7 @@ method:
 static JsonPathParseItem *
 makeItemType(JsonPathItemType type)
 {
-	JsonPathParseItem  *v = palloc(sizeof(*v));
+	JsonPathParseItem *v = palloc(sizeof(*v));
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -326,7 +397,7 @@ makeItemType(JsonPathItemType type)
 static JsonPathParseItem *
 makeItemString(JsonPathString *s)
 {
-	JsonPathParseItem  *v;
+	JsonPathParseItem *v;
 
 	if (s == NULL)
 	{
@@ -345,7 +416,7 @@ makeItemString(JsonPathString *s)
 static JsonPathParseItem *
 makeItemVariable(JsonPathString *s)
 {
-	JsonPathParseItem  *v;
+	JsonPathParseItem *v;
 
 	v = makeItemType(jpiVariable);
 	v->value.string.val = s->val;
@@ -357,7 +428,7 @@ makeItemVariable(JsonPathString *s)
 static JsonPathParseItem *
 makeItemKey(JsonPathString *s)
 {
-	JsonPathParseItem  *v;
+	JsonPathParseItem *v;
 
 	v = makeItemString(s);
 	v->type = jpiKey;
@@ -368,7 +439,7 @@ makeItemKey(JsonPathString *s)
 static JsonPathParseItem *
 makeItemNumeric(JsonPathString *s)
 {
-	JsonPathParseItem  *v;
+	JsonPathParseItem *v;
 
 	v = makeItemType(jpiNumeric);
 	v->value.numeric =
@@ -383,7 +454,7 @@ makeItemNumeric(JsonPathString *s)
 static JsonPathParseItem *
 makeItemBool(bool val)
 {
-	JsonPathParseItem  *v = makeItemType(jpiBool);
+	JsonPathParseItem *v = makeItemType(jpiBool);
 
 	v->value.boolean = val;
 
@@ -393,7 +464,7 @@ makeItemBool(bool val)
 static JsonPathParseItem *
 makeItemBinary(JsonPathItemType type, JsonPathParseItem *la, JsonPathParseItem *ra)
 {
-	JsonPathParseItem  *v = makeItemType(type);
+	JsonPathParseItem *v = makeItemType(type);
 
 	v->value.args.left = la;
 	v->value.args.right = ra;
@@ -404,7 +475,7 @@ makeItemBinary(JsonPathItemType type, JsonPathParseItem *la, JsonPathParseItem *
 static JsonPathParseItem *
 makeItemUnary(JsonPathItemType type, JsonPathParseItem *a)
 {
-	JsonPathParseItem  *v;
+	JsonPathParseItem *v;
 
 	if (type == jpiPlus && a->type == jpiNumeric && !a->next)
 		return a;
@@ -428,9 +499,9 @@ makeItemUnary(JsonPathItemType type, JsonPathParseItem *a)
 static JsonPathParseItem *
 makeItemList(List *list)
 {
-	JsonPathParseItem  *head,
-					   *end;
-	ListCell		   *cell;
+	JsonPathParseItem *head,
+			   *end;
+	ListCell   *cell;
 
 	head = end = (JsonPathParseItem *) linitial(list);
 
@@ -455,11 +526,11 @@ makeItemList(List *list)
 static JsonPathParseItem *
 makeIndexArray(List *list)
 {
-	JsonPathParseItem  *v = makeItemType(jpiIndexArray);
-	ListCell		   *cell;
-	int					i = 0;
+	JsonPathParseItem *v = makeItemType(jpiIndexArray);
+	ListCell   *cell;
+	int			i = 0;
 
-	Assert(list_length(list) > 0);
+	Assert(list != NIL);
 	v->value.array.nelems = list_length(list);
 
 	v->value.array.elems = palloc(sizeof(v->value.array.elems[0]) *
@@ -467,7 +538,7 @@ makeIndexArray(List *list)
 
 	foreach(cell, list)
 	{
-		JsonPathParseItem  *jpi = lfirst(cell);
+		JsonPathParseItem *jpi = lfirst(cell);
 
 		Assert(jpi->type == jpiSubscript);
 
@@ -481,7 +552,7 @@ makeIndexArray(List *list)
 static JsonPathParseItem *
 makeAny(int first, int last)
 {
-	JsonPathParseItem  *v = makeItemType(jpiAny);
+	JsonPathParseItem *v = makeItemType(jpiAny);
 
 	v->value.anybounds.first = (first >= 0) ? first : PG_UINT32_MAX;
 	v->value.anybounds.last = (last >= 0) ? last : PG_UINT32_MAX;
@@ -489,13 +560,14 @@ makeAny(int first, int last)
 	return v;
 }
 
-static JsonPathParseItem *
+static bool
 makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
-				  JsonPathString *flags)
+				  JsonPathString *flags, JsonPathParseItem **result,
+				  struct Node *escontext)
 {
-	JsonPathParseItem  *v = makeItemType(jpiLikeRegex);
-	int					i;
-	int					cflags;
+	JsonPathParseItem *v = makeItemType(jpiLikeRegex);
+	int			i;
+	int			cflags;
 
 	v->value.like_regex.expr = expr;
 	v->value.like_regex.pattern = pattern->val;
@@ -523,31 +595,56 @@ makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
 				v->value.like_regex.flags |= JSP_REGEX_QUOTE;
 				break;
 			default:
-				ereport(ERROR,
+				ereturn(escontext, false,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("invalid input syntax for type %s", "jsonpath"),
-						 errdetail("unrecognized flag character \"%.*s\" in LIKE_REGEX predicate",
-								   pg_mblen(flags->val + i), flags->val + i)));
+						 errdetail("Unrecognized flag character \"%.*s\" in LIKE_REGEX predicate.",
+								   pg_mblen_range(flags->val + i, flags->val + flags->len),
+								   flags->val + i)));
 				break;
 		}
 	}
 
-	/* Convert flags to what RE_compile_and_cache needs */
-	cflags = jspConvertRegexFlags(v->value.like_regex.flags);
+	/* Convert flags to what pg_regcomp needs */
+	if (!jspConvertRegexFlags(v->value.like_regex.flags, &cflags, escontext))
+		return false;
 
 	/* check regex validity */
-	(void) RE_compile_and_cache(cstring_to_text_with_len(pattern->val,
-														 pattern->len),
-								cflags, DEFAULT_COLLATION_OID);
+	{
+		regex_t		re_tmp;
+		pg_wchar   *wpattern;
+		int			wpattern_len;
+		int			re_result;
 
-	return v;
+		wpattern = (pg_wchar *) palloc((pattern->len + 1) * sizeof(pg_wchar));
+		wpattern_len = pg_mb2wchar_with_len(pattern->val,
+											wpattern,
+											pattern->len);
+
+		if ((re_result = pg_regcomp(&re_tmp, wpattern, wpattern_len, cflags,
+									DEFAULT_COLLATION_OID)) != REG_OKAY)
+		{
+			char		errMsg[100];
+
+			pg_regerror(re_result, &re_tmp, errMsg, sizeof(errMsg));
+			ereturn(escontext, false,
+					(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
+					 errmsg("invalid regular expression: %s", errMsg)));
+		}
+
+		pg_regfree(&re_tmp);
+	}
+
+	*result = v;
+
+	return true;
 }
 
 /*
  * Convert from XQuery regex flags to those recognized by our regex library.
  */
-int
-jspConvertRegexFlags(uint32 xflags)
+bool
+jspConvertRegexFlags(uint32 xflags, int *result, struct Node *escontext)
 {
 	/* By default, XQuery is very nearly the same as Spencer's AREs */
 	int			cflags = REG_ADVANCED;
@@ -578,20 +675,12 @@ jspConvertRegexFlags(uint32 xflags)
 		 * XQuery-style ignore-whitespace mode.
 		 */
 		if (xflags & JSP_REGEX_WSPACE)
-			ereport(ERROR,
+			ereturn(escontext, false,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("XQuery \"x\" flag (expanded regular expressions) is not implemented")));
 	}
 
-	return cflags;
+	*result = cflags;
+
+	return true;
 }
-
-/*
- * jsonpath_scan.l is compiled as part of jsonpath_gram.y.  Currently, this is
- * unavoidable because jsonpath_gram does not create a .h file to export its
- * token symbols.  If these files ever grow large enough to be worth compiling
- * separately, that could be fixed; but for now it seems like useless
- * complication.
- */
-
-#include "jsonpath_scan.c"

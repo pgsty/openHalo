@@ -25,13 +25,12 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "pgstat.h"
-#include "tcop/tcopprot.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
@@ -40,7 +39,10 @@
 #include "utils/typcache.h"
 
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pltcl",
+					.version = PG_VERSION
+);
 
 #define HAVE_TCL_VERSION(maj,min) \
 	((TCL_MAJOR_VERSION > maj) || \
@@ -128,19 +130,21 @@ typedef struct pltcl_interp_desc
  * The pltcl_proc_desc struct itself, as well as all subsidiary data,
  * is stored in the memory context identified by the fn_cxt field.
  * We can reclaim all the data by deleting that context, and should do so
- * when the fn_refcount goes to zero.  (But note that we do not bother
- * trying to clean up Tcl's copy of the procedure definition: it's Tcl's
- * problem to manage its memory when we replace a proc definition.  We do
- * not clean up pltcl_proc_descs when a pg_proc row is deleted, only when
- * it is updated, and the same policy applies to Tcl's copy as well.)
+ * when the fn_refcount goes to zero.  That will happen if we build a new
+ * pltcl_proc_desc following an update of the pg_proc row.  If that happens
+ * while the old proc is being executed, we mustn't remove the struct until
+ * execution finishes.  When building a new pltcl_proc_desc, we unlink
+ * Tcl's copy of the old procedure definition, similarly relying on Tcl's
+ * internal reference counting to prevent that structure from disappearing
+ * while it's in use.
  *
  * Note that the data in this struct is shared across all active calls;
  * nothing except the fn_refcount should be changed by a call instance.
  **********************************************************************/
 typedef struct pltcl_proc_desc
 {
-	char	   *user_proname;	/* user's name (from pg_proc.proname) */
-	char	   *internal_proname;	/* Tcl name (based on function OID) */
+	char	   *user_proname;	/* user's name (from format_procedure) */
+	char	   *internal_proname;	/* Tcl proc name (NULL if deleted) */
 	MemoryContext fn_cxt;		/* memory context for this procedure */
 	unsigned long fn_refcount;	/* number of active references */
 	TransactionId fn_xmin;		/* xmin of pg_proc row */
@@ -258,14 +262,13 @@ typedef struct
 } TclExceptionNameMap;
 
 static const TclExceptionNameMap exception_name_map[] = {
-#include "pltclerrcodes.h"		/* pgrminclude ignore */
+#include "pltclerrcodes.h"
 	{NULL, 0}
 };
 
 /**********************************************************************
  * Forward declarations
  **********************************************************************/
-void		_PG_init(void);
 
 static void pltcl_init_interp(pltcl_interp_desc *interp_desc,
 							  Oid prolang, bool pltrusted);
@@ -339,7 +342,7 @@ static void pltcl_init_tuple_store(pltcl_call_state *call_state);
 /*
  * Hack to override Tcl's builtin Notifier subsystem.  This prevents the
  * backend from becoming multithreaded, which breaks all sorts of things.
- * That happens in the default version of Tcl_InitNotifier if the TCL library
+ * That happens in the default version of Tcl_InitNotifier if the Tcl library
  * has been compiled with multithreading support (i.e. when TCL_THREADS is
  * defined under Unix, and in all cases under Windows).
  * It's okay to disable the notifier because we never enter the Tcl event loop
@@ -477,6 +480,9 @@ _PG_init(void)
 							   NULL,
 							   PGC_SUSET, 0,
 							   NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("pltcl");
+	MarkGUCPrefixReserved("pltclu");
 
 	pltcl_pm_init_done = true;
 }
@@ -617,11 +623,11 @@ call_pltcl_start_proc(Oid prolang, bool pltrusted)
 	error_context_stack = &errcallback;
 
 	/* Parse possibly-qualified identifier and look up the function */
-	namelist = stringToQualifiedNameList(start_proc);
+	namelist = stringToQualifiedNameList(start_proc, NULL);
 	procOid = LookupFuncName(namelist, 0, NULL, false);
 
 	/* Current user must have permission to call function */
-	aclresult = pg_proc_aclcheck(procOid, GetUserId(), ACL_EXECUTE);
+	aclresult = object_aclcheck(ProcedureRelationId, procOid, GetUserId(), ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_FUNCTION, start_proc);
 
@@ -808,8 +814,7 @@ pltcl_func_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 		!castNode(CallContext, fcinfo->context)->atomic;
 
 	/* Connect to SPI manager */
-	if (SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0) != SPI_OK_CONNECT)
-		elog(ERROR, "could not connect to SPI manager");
+	SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0);
 
 	/* Find or compile the function */
 	prodesc = compile_pltcl_function(fcinfo->flinfo->fn_oid, InvalidOid,
@@ -830,11 +835,15 @@ pltcl_func_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 	{
 		ReturnSetInfo *rsi = (ReturnSetInfo *) fcinfo->resultinfo;
 
-		if (!rsi || !IsA(rsi, ReturnSetInfo) ||
-			(rsi->allowedModes & SFRM_Materialize) == 0)
+		if (!rsi || !IsA(rsi, ReturnSetInfo))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("set-valued function called in context that cannot accept a set")));
+
+		if (!(rsi->allowedModes & SFRM_Materialize))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("materialize mode required, but it is not allowed in this context")));
 
 		call_state->rsi = rsi;
 		call_state->tuple_store_cxt = rsi->econtext->ecxt_per_query_memory;
@@ -1068,8 +1077,7 @@ pltcl_trigger_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 	call_state->trigdata = trigdata;
 
 	/* Connect to SPI manager */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "could not connect to SPI manager");
+	SPI_connect();
 
 	/* Make transition tables visible to this SPI connection */
 	rc = SPI_register_trigger_data(trigdata);
@@ -1243,7 +1251,6 @@ pltcl_trigger_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 		for (i = 0; i < trigdata->tg_trigger->tgnargs; i++)
 			Tcl_ListObjAppendElement(NULL, tcl_cmd,
 									 Tcl_NewStringObj(utf_e2u(trigdata->tg_trigger->tgargs[i]), -1));
-
 	}
 	PG_CATCH();
 	{
@@ -1318,8 +1325,7 @@ pltcl_event_trigger_handler(PG_FUNCTION_ARGS, pltcl_call_state *call_state,
 	int			tcl_rc;
 
 	/* Connect to SPI manager */
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "could not connect to SPI manager");
+	SPI_connect();
 
 	/* Find or compile the function */
 	prodesc = compile_pltcl_function(fcinfo->flinfo->fn_oid,
@@ -1374,13 +1380,29 @@ throw_tcl_error(Tcl_Interp *interp, const char *proname)
 	 */
 	char	   *emsg;
 	char	   *econtext;
+	int			emsglen;
 
 	emsg = pstrdup(utf_u2e(Tcl_GetStringResult(interp)));
 	econtext = utf_u2e(Tcl_GetVar(interp, "errorInfo", TCL_GLOBAL_ONLY));
+
+	/*
+	 * Typically, the first line of errorInfo matches the primary error
+	 * message (the interpreter result); don't print that twice if so.
+	 */
+	emsglen = strlen(emsg);
+	if (strncmp(emsg, econtext, emsglen) == 0 &&
+		econtext[emsglen] == '\n')
+		econtext += emsglen + 1;
+
+	/* Tcl likes to prefix the next line with some spaces, too */
+	while (*econtext == ' ')
+		econtext++;
+
+	/* Note: proname will already contain quoting if any is needed */
 	ereport(ERROR,
 			(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
 			 errmsg("%s", emsg),
-			 errcontext("%s\nin PL/Tcl function \"%s\"",
+			 errcontext("%s\nin PL/Tcl function %s",
 						econtext, proname)));
 }
 
@@ -1404,7 +1426,9 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 	pltcl_proc_desc *old_prodesc;
 	volatile MemoryContext proc_cxt = NULL;
 	Tcl_DString proc_internal_def;
+	Tcl_DString proc_internal_name;
 	Tcl_DString proc_internal_body;
+	Tcl_DString proc_internal_args;
 
 	/* We'll need the pg_proc tuple in any case... */
 	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
@@ -1434,6 +1458,7 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 	 * function's pg_proc entry without changing its OID.
 	 ************************************************************/
 	if (prodesc != NULL &&
+		prodesc->internal_proname != NULL &&
 		prodesc->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
 		ItemPointerEquals(&prodesc->fn_tid, &procTup->t_self))
 	{
@@ -1451,37 +1476,104 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 	 * Then we load the procedure into the Tcl interpreter.
 	 ************************************************************/
 	Tcl_DStringInit(&proc_internal_def);
+	Tcl_DStringInit(&proc_internal_name);
 	Tcl_DStringInit(&proc_internal_body);
+	Tcl_DStringInit(&proc_internal_args);
 	PG_TRY();
 	{
 		bool		is_trigger = OidIsValid(tgreloid);
-		char		internal_proname[128];
+		Tcl_CmdInfo cmdinfo;
+		const char *user_proname;
+		const char *internal_proname;
+		bool		need_underscore;
 		HeapTuple	typeTup;
 		Form_pg_type typeStruct;
-		char		proc_internal_args[33 * FUNC_MAX_ARGS];
 		Datum		prosrcdatum;
-		bool		isnull;
 		char	   *proc_source;
-		char		buf[48];
+		char		buf[64];
+		pltcl_interp_desc *interp_desc;
 		Tcl_Interp *interp;
 		int			i;
 		int			tcl_rc;
 		MemoryContext oldcontext;
 
 		/************************************************************
-		 * Build our internal proc name from the function's Oid.  Append
-		 * "_trigger" when appropriate to ensure the normal and trigger
-		 * cases are kept separate.  Note name must be all-ASCII.
+		 * Identify the interpreter to use for the function
 		 ************************************************************/
+		interp_desc = pltcl_fetch_interp(procStruct->prolang, pltrusted);
+		interp = interp_desc->interp;
+
+		/************************************************************
+		 * If redefining the function, try to remove the old internal
+		 * procedure from Tcl's namespace.  The point of this is partly to
+		 * allow re-use of the same internal proc name, and partly to avoid
+		 * leaking the Tcl procedure object if we end up not choosing the same
+		 * name.  We assume that Tcl is smart enough to not physically delete
+		 * the procedure object if it's currently being executed.
+		 ************************************************************/
+		if (prodesc != NULL &&
+			prodesc->internal_proname != NULL)
+		{
+			/* We simply ignore any error */
+			(void) Tcl_DeleteCommand(interp, prodesc->internal_proname);
+			/* Don't do this more than once */
+			prodesc->internal_proname = NULL;
+		}
+
+		/************************************************************
+		 * Build the proc name we'll use in error messages.
+		 ************************************************************/
+		user_proname = format_procedure(fn_oid);
+
+		/************************************************************
+		 * Build the internal proc name from the user_proname and/or OID.
+		 * The internal name must be all-ASCII since we don't want to deal
+		 * with encoding conversions.  We don't want to worry about Tcl
+		 * quoting rules either, so use only the characters of the function
+		 * name that are ASCII alphanumerics, plus underscores to separate
+		 * function name and arguments.  If what we end up with isn't
+		 * unique (that is, it matches some existing Tcl command name),
+		 * append the function OID (perhaps repeatedly) so that it is unique.
+		 ************************************************************/
+
+		/* For historical reasons, use a function-type-specific prefix */
 		if (is_event_trigger)
-			snprintf(internal_proname, sizeof(internal_proname),
-					 "__PLTcl_proc_%u_evttrigger", fn_oid);
+			Tcl_DStringAppend(&proc_internal_name,
+							  "__PLTcl_evttrigger_", -1);
 		else if (is_trigger)
-			snprintf(internal_proname, sizeof(internal_proname),
-					 "__PLTcl_proc_%u_trigger", fn_oid);
+			Tcl_DStringAppend(&proc_internal_name,
+							  "__PLTcl_trigger_", -1);
 		else
-			snprintf(internal_proname, sizeof(internal_proname),
-					 "__PLTcl_proc_%u", fn_oid);
+			Tcl_DStringAppend(&proc_internal_name,
+							  "__PLTcl_proc_", -1);
+		/* Now add what we can from the user_proname */
+		need_underscore = false;
+		for (const char *ptr = user_proname; *ptr; ptr++)
+		{
+			if (strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+					   "abcdefghijklmnopqrstuvwxyz"
+					   "0123456789_", *ptr) != NULL)
+			{
+				/* Done this way to avoid adding a trailing underscore */
+				if (need_underscore)
+				{
+					Tcl_DStringAppend(&proc_internal_name, "_", 1);
+					need_underscore = false;
+				}
+				Tcl_DStringAppend(&proc_internal_name, ptr, 1);
+			}
+			else if (strchr("(, ", *ptr) != NULL)
+				need_underscore = true;
+		}
+		/* If this name already exists, append fn_oid; repeat as needed */
+		while (Tcl_GetCommandInfo(interp,
+								  Tcl_DStringValue(&proc_internal_name),
+								  &cmdinfo))
+		{
+			snprintf(buf, sizeof(buf), "_%u", fn_oid);
+			Tcl_DStringAppend(&proc_internal_name, buf, -1);
+		}
+		internal_proname = Tcl_DStringValue(&proc_internal_name);
 
 		/************************************************************
 		 * Allocate a context that will hold all PG data for the procedure.
@@ -1495,8 +1587,8 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		 * struct prodesc and subsidiary data must all live in proc_cxt.
 		 ************************************************************/
 		oldcontext = MemoryContextSwitchTo(proc_cxt);
-		prodesc = (pltcl_proc_desc *) palloc0(sizeof(pltcl_proc_desc));
-		prodesc->user_proname = pstrdup(NameStr(procStruct->proname));
+		prodesc = palloc0_object(pltcl_proc_desc);
+		prodesc->user_proname = pstrdup(user_proname);
 		MemoryContextSetIdentifier(proc_cxt, prodesc->user_proname);
 		prodesc->internal_proname = pstrdup(internal_proname);
 		prodesc->fn_cxt = proc_cxt;
@@ -1504,8 +1596,8 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		prodesc->fn_xmin = HeapTupleHeaderGetRawXmin(procTup->t_data);
 		prodesc->fn_tid = procTup->t_self;
 		prodesc->nargs = procStruct->pronargs;
-		prodesc->arg_out_func = (FmgrInfo *) palloc0(prodesc->nargs * sizeof(FmgrInfo));
-		prodesc->arg_is_rowtype = (bool *) palloc0(prodesc->nargs * sizeof(bool));
+		prodesc->arg_out_func = palloc0_array(FmgrInfo, prodesc->nargs);
+		prodesc->arg_is_rowtype = palloc0_array(bool, prodesc->nargs);
 		MemoryContextSwitchTo(oldcontext);
 
 		/* Remember if function is STABLE/IMMUTABLE */
@@ -1513,13 +1605,8 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 			(procStruct->provolatile != PROVOLATILE_VOLATILE);
 		/* And whether it is trusted */
 		prodesc->lanpltrusted = pltrusted;
-
-		/************************************************************
-		 * Identify the interpreter to use for the function
-		 ************************************************************/
-		prodesc->interp_desc = pltcl_fetch_interp(procStruct->prolang,
-												  prodesc->lanpltrusted);
-		interp = prodesc->interp_desc->interp;
+		/* Save the associated interpreter, too */
+		prodesc->interp_desc = interp_desc;
 
 		/************************************************************
 		 * Get the required information for input conversion of the
@@ -1572,7 +1659,6 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		 ************************************************************/
 		if (!is_trigger && !is_event_trigger)
 		{
-			proc_internal_args[0] = '\0';
 			for (i = 0; i < prodesc->nargs; i++)
 			{
 				Oid			argtype = procStruct->proargtypes.values[i];
@@ -1605,8 +1691,8 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 				}
 
 				if (i > 0)
-					strcat(proc_internal_args, " ");
-				strcat(proc_internal_args, buf);
+					Tcl_DStringAppend(&proc_internal_args, " ", -1);
+				Tcl_DStringAppend(&proc_internal_args, buf, -1);
 
 				ReleaseSysCache(typeTup);
 			}
@@ -1614,13 +1700,14 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		else if (is_trigger)
 		{
 			/* trigger procedure has fixed args */
-			strcpy(proc_internal_args,
-				   "TG_name TG_relid TG_table_name TG_table_schema TG_relatts TG_when TG_level TG_op __PLTcl_Tup_NEW __PLTcl_Tup_OLD args");
+			Tcl_DStringAppend(&proc_internal_args,
+							  "TG_name TG_relid TG_table_name TG_table_schema TG_relatts TG_when TG_level TG_op __PLTcl_Tup_NEW __PLTcl_Tup_OLD args",
+							  -1);
 		}
 		else if (is_event_trigger)
 		{
 			/* event trigger procedure has fixed args */
-			strcpy(proc_internal_args, "TG_event TG_tag");
+			Tcl_DStringAppend(&proc_internal_args, "TG_event TG_tag", -1);
 		}
 
 		/************************************************************
@@ -1633,7 +1720,8 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		 ************************************************************/
 		Tcl_DStringAppendElement(&proc_internal_def, "proc");
 		Tcl_DStringAppendElement(&proc_internal_def, internal_proname);
-		Tcl_DStringAppendElement(&proc_internal_def, proc_internal_args);
+		Tcl_DStringAppendElement(&proc_internal_def,
+								 Tcl_DStringValue(&proc_internal_args));
 
 		/************************************************************
 		 * prefix procedure body with
@@ -1679,10 +1767,8 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		/************************************************************
 		 * Add user's function definition to proc body
 		 ************************************************************/
-		prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
-									  Anum_pg_proc_prosrc, &isnull);
-		if (isnull)
-			elog(ERROR, "null prosrc");
+		prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup,
+											 Anum_pg_proc_prosrc);
 		proc_source = TextDatumGetCString(prosrcdatum);
 		UTF_BEGIN;
 		Tcl_DStringAppend(&proc_internal_body, UTF_E2U(proc_source), -1);
@@ -1714,7 +1800,9 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		if (proc_cxt)
 			MemoryContextDelete(proc_cxt);
 		Tcl_DStringFree(&proc_internal_def);
+		Tcl_DStringFree(&proc_internal_name);
 		Tcl_DStringFree(&proc_internal_body);
+		Tcl_DStringFree(&proc_internal_args);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1742,7 +1830,9 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 	}
 
 	Tcl_DStringFree(&proc_internal_def);
+	Tcl_DStringFree(&proc_internal_name);
 	Tcl_DStringFree(&proc_internal_body);
+	Tcl_DStringFree(&proc_internal_args);
 
 	ReleaseSysCache(procTup);
 
@@ -2026,7 +2116,7 @@ pltcl_quote(ClientData cdata, Tcl_Interp *interp,
 	 * grow to and initialize pointers
 	 ************************************************************/
 	cp1 = Tcl_GetStringFromObj(objv[1], &length);
-	tmp = palloc(length * 2 + 1);
+	tmp = palloc(add_size(mul_size(length, 2), 1));
 	cp2 = tmp;
 
 	/************************************************************
@@ -2447,6 +2537,7 @@ pltcl_process_SPI_result(Tcl_Interp *interp,
 		case SPI_OK_INSERT:
 		case SPI_OK_DELETE:
 		case SPI_OK_UPDATE:
+		case SPI_OK_MERGE:
 			Tcl_SetObjResult(interp, Tcl_NewWideIntObj(ntuples));
 			break;
 
@@ -2464,6 +2555,7 @@ pltcl_process_SPI_result(Tcl_Interp *interp,
 		case SPI_OK_INSERT_RETURNING:
 		case SPI_OK_DELETE_RETURNING:
 		case SPI_OK_UPDATE_RETURNING:
+		case SPI_OK_MERGE_RETURNING:
 
 			/*
 			 * Process the tuples we got
@@ -2580,12 +2672,12 @@ pltcl_SPI_prepare(ClientData cdata, Tcl_Interp *interp,
 									 "PL/Tcl spi_prepare query",
 									 ALLOCSET_SMALL_SIZES);
 	MemoryContextSwitchTo(plan_cxt);
-	qdesc = (pltcl_query_desc *) palloc0(sizeof(pltcl_query_desc));
+	qdesc = palloc0_object(pltcl_query_desc);
 	snprintf(qdesc->qname, sizeof(qdesc->qname), "%p", qdesc);
 	qdesc->nargs = nargs;
-	qdesc->argtypes = (Oid *) palloc(nargs * sizeof(Oid));
-	qdesc->arginfuncs = (FmgrInfo *) palloc(nargs * sizeof(FmgrInfo));
-	qdesc->argtypioparams = (Oid *) palloc(nargs * sizeof(Oid));
+	qdesc->argtypes = palloc_array(Oid, nargs);
+	qdesc->arginfuncs = palloc_array(FmgrInfo, nargs);
+	qdesc->argtypioparams = palloc_array(Oid, nargs);
 	MemoryContextSwitchTo(oldcontext);
 
 	/************************************************************
@@ -2609,7 +2701,8 @@ pltcl_SPI_prepare(ClientData cdata, Tcl_Interp *interp,
 						typIOParam;
 			int32		typmod;
 
-			parseTypeString(Tcl_GetString(argsObj[i]), &typId, &typmod, false);
+			(void) parseTypeString(Tcl_GetString(argsObj[i]),
+								   &typId, &typmod, NULL);
 
 			getTypeInputInfo(typId, &typInput, &typIOParam);
 
@@ -2827,7 +2920,7 @@ pltcl_SPI_execute_plan(ClientData cdata, Tcl_Interp *interp,
 		 * Setup the value array for SPI_execute_plan() using
 		 * the type specific input functions
 		 ************************************************************/
-		argvalues = (Datum *) palloc(callObjc * sizeof(Datum));
+		argvalues = palloc_array(Datum, callObjc);
 
 		for (j = 0; j < callObjc; j++)
 		{
@@ -3120,6 +3213,9 @@ pltcl_build_tuple_argument(HeapTuple tuple, TupleDesc tupdesc, bool include_gene
 			/* don't include unless requested */
 			if (!include_generated)
 				continue;
+			/* never include virtual columns */
+			if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+				continue;
 		}
 
 		/************************************************************
@@ -3198,7 +3294,7 @@ pltcl_build_tuple_result(Tcl_Interp *interp, Tcl_Obj **kvObjv, int kvObjc,
 		attinmeta = NULL;
 	}
 
-	values = (char **) palloc0(tupdesc->natts * sizeof(char *));
+	values = palloc0_array(char *, tupdesc->natts);
 
 	if (kvObjc % 2 != 0)
 		ereport(ERROR,

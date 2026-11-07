@@ -10,6 +10,7 @@
 #include "postgres.h"
 
 #include <float.h>
+#include <math.h>
 
 #include "access/gist.h"
 #include "access/stratnum.h"
@@ -27,7 +28,10 @@
 #define GIST_QUERY_DEBUG
 */
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "seg",
+					.version = PG_VERSION
+);
 
 /*
  * Auxiliary data structure for picksplit method.
@@ -92,7 +96,7 @@ PG_FUNCTION_INFO_V1(seg_different);
 /*
 ** Auxiliary functions
 */
-static int	restore(char *s, float val, int n);
+static int	restore(char *result, float val, int n);
 
 
 /*****************************************************************************
@@ -104,13 +108,14 @@ seg_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
 	SEG		   *result = palloc(sizeof(SEG));
+	yyscan_t	scanner;
 
-	seg_scanner_init(str);
+	seg_scanner_init(str, &scanner);
 
-	if (seg_yyparse(result) != 0)
-		seg_yyerror(result, "bogus input");
+	if (seg_yyparse(result, fcinfo->context, scanner) != 0)
+		seg_yyerror(result, fcinfo->context, scanner, "bogus input");
 
-	seg_scanner_finish();
+	seg_scanner_finish(scanner);
 
 	PG_RETURN_POINTER(result);
 }
@@ -147,7 +152,7 @@ seg_out(PG_FUNCTION_ARGS)
 		{
 			/* print the upper boundary if exists */
 			p += sprintf(p, " ");
-			if (seg->u_ext == '>' || seg->u_ext == '<' || seg->l_ext == '~')
+			if (seg->u_ext == '>' || seg->u_ext == '<' || seg->u_ext == '~')
 				p += sprintf(p, "%c", seg->u_ext);
 			p += restore(p, seg->upper, seg->u_sigd);
 		}
@@ -706,7 +711,7 @@ rt_seg_size(SEG *a, float *size)
 	if (a == (SEG *) NULL || a->upper <= a->lower)
 		*size = 0.0;
 	else
-		*size = (float) Abs(a->upper - a->lower);
+		*size = fabsf(a->upper - a->lower);
 }
 
 Datum
@@ -714,7 +719,7 @@ seg_size(PG_FUNCTION_ARGS)
 {
 	SEG		   *seg = PG_GETARG_SEG_P(0);
 
-	PG_RETURN_FLOAT4((float) Abs(seg->upper - seg->lower));
+	PG_RETURN_FLOAT4(fabsf(seg->upper - seg->lower));
 }
 
 
@@ -956,7 +961,7 @@ restore(char *result, float val, int n)
 	}
 	else
 	{
-		if (Abs(exp) <= 4)
+		if (abs(exp) <= 4)
 		{
 			/*
 			 * remove the decimal point from the mantissa and write the digits
@@ -1043,7 +1048,7 @@ restore(char *result, float val, int n)
 			}
 		}
 
-		/* do nothing for Abs(exp) > 4; %e must be OK */
+		/* do nothing for abs(exp) > 4; %e must be OK */
 		/* just get rid of zeroes after [eE]- and +zeroes after [Ee]. */
 
 		/* ... this is not done yet. */

@@ -2,27 +2,23 @@
  * brinfuncs.c
  *		Functions to investigate BRIN indexes
  *
- * Copyright (c) 2014-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/brinfuncs.c
  */
 #include "postgres.h"
 
-#include "access/brin.h"
 #include "access/brin_internal.h"
 #include "access/brin_page.h"
-#include "access/brin_revmap.h"
 #include "access/brin_tuple.h"
 #include "access/htup_details.h"
-#include "catalog/index.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -63,12 +59,12 @@ brin_page_type(PG_FUNCTION_ARGS)
 
 	/* verify the special space has the expected size */
 	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(BrinSpecialSpace)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("input page is not a valid %s page", "BRIN"),
-					 errdetail("Expected special size %d, got %d.",
-							   (int) MAXALIGN(sizeof(BrinSpecialSpace)),
-							   (int) PageGetSpecialSize(page))));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("input page is not a valid %s page", "BRIN"),
+				 errdetail("Expected special size %d, got %d.",
+						   (int) MAXALIGN(sizeof(BrinSpecialSpace)),
+						   (int) PageGetSpecialSize(page))));
 
 	switch (BrinPageType(page))
 	{
@@ -103,12 +99,12 @@ verify_brin_page(bytea *raw_page, uint16 type, const char *strtype)
 
 	/* verify the special space has the expected size */
 	if (PageGetSpecialSize(page) != MAXALIGN(sizeof(BrinSpecialSpace)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("input page is not a valid %s page", "BRIN"),
-					 errdetail("Expected special size %d, got %d.",
-							   (int) MAXALIGN(sizeof(BrinSpecialSpace)),
-							   (int) PageGetSpecialSize(page))));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("input page is not a valid %s page", "BRIN"),
+				 errdetail("Expected special size %d, got %d.",
+						   (int) MAXALIGN(sizeof(BrinSpecialSpace)),
+						   (int) PageGetSpecialSize(page))));
 
 	/* verify the special space says this page is what we want */
 	if (BrinPageType(page) != type)
@@ -121,6 +117,8 @@ verify_brin_page(bytea *raw_page, uint16 type, const char *strtype)
 	return page;
 }
 
+/* Number of output arguments (columns) for brin_page_items() */
+#define BRIN_PAGE_ITEMS_V1_12	8
 
 /*
  * Extract all item values from a BRIN index page
@@ -133,9 +131,6 @@ brin_page_items(PG_FUNCTION_ARGS)
 	bytea	   *raw_page = PG_GETARG_BYTEA_P(0);
 	Oid			indexRelid = PG_GETARG_OID(1);
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc	tupdesc;
-	MemoryContext oldcontext;
-	Tuplestorestate *tupstore;
 	Relation	indexRel;
 	brin_column_state **columns;
 	BrinDesc   *bdesc;
@@ -150,30 +145,22 @@ brin_page_items(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to use raw page functions")));
 
-	/* check to see if caller supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+	InitMaterializedSRF(fcinfo, 0);
+
+	/*
+	 * Version 1.12 added a new output column for the empty range flag. But as
+	 * it was added in the middle, it may cause crashes with function
+	 * definitions from older versions of the extension.
+	 *
+	 * There is no way to reliably avoid the problems created by the old
+	 * function definition at this point, so insist that the user update the
+	 * extension.
+	 */
+	if (rsinfo->setDesc->natts < BRIN_PAGE_ITEMS_V1_12)
 		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize) ||
-		rsinfo->expectedDesc == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	/* Build a tuple descriptor for our result type */
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-
-	/* Build tuplestore to hold the result rows */
-	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-
-	MemoryContextSwitchTo(oldcontext);
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("function has wrong number of declared columns"),
+				 errhint("To resolve the problem, update the \"pageinspect\" extension to the latest version.")));
 
 	indexRel = index_open(indexRelid, AccessShareLock);
 
@@ -227,8 +214,8 @@ brin_page_items(PG_FUNCTION_ARGS)
 	dtup = NULL;
 	for (;;)
 	{
-		Datum		values[7];
-		bool		nulls[7];
+		Datum		values[8];
+		bool		nulls[8] = {0};
 
 		/*
 		 * This loop is called once for every attribute of every tuple in the
@@ -256,8 +243,6 @@ brin_page_items(PG_FUNCTION_ARGS)
 		else
 			attno++;
 
-		MemSet(nulls, 0, sizeof(nulls));
-
 		if (unusedItem)
 		{
 			values[0] = UInt16GetDatum(offset);
@@ -267,13 +252,14 @@ brin_page_items(PG_FUNCTION_ARGS)
 			nulls[4] = true;
 			nulls[5] = true;
 			nulls[6] = true;
+			nulls[7] = true;
 		}
 		else
 		{
 			int			att = attno - 1;
 
 			values[0] = UInt16GetDatum(offset);
-			switch (TupleDescAttr(tupdesc, 1)->atttypid)
+			switch (TupleDescAttr(rsinfo->setDesc, 1)->atttypid)
 			{
 				case INT8OID:
 					values[1] = Int64GetDatum((int64) dtup->bt_blkno);
@@ -289,6 +275,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 			values[3] = BoolGetDatum(dtup->bt_columns[att].bv_allnulls);
 			values[4] = BoolGetDatum(dtup->bt_columns[att].bv_hasnulls);
 			values[5] = BoolGetDatum(dtup->bt_placeholder);
+			values[6] = BoolGetDatum(dtup->bt_empty_range);
 			if (!dtup->bt_columns[att].bv_allnulls)
 			{
 				BrinValues *bvalues = &dtup->bt_columns[att];
@@ -314,16 +301,16 @@ brin_page_items(PG_FUNCTION_ARGS)
 				}
 				appendStringInfoChar(&s, '}');
 
-				values[6] = CStringGetTextDatum(s.data);
+				values[7] = CStringGetTextDatum(s.data);
 				pfree(s.data);
 			}
 			else
 			{
-				nulls[6] = true;
+				nulls[7] = true;
 			}
 		}
 
-		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
 		/*
 		 * If the item was unused, jump straight to the next one; otherwise,
@@ -346,9 +333,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 			break;
 	}
 
-	/* clean up and return the tuplestore */
 	brin_free_desc(bdesc);
-	tuplestore_donestoring(tupstore);
 	index_close(indexRel, AccessShareLock);
 
 	return (Datum) 0;
@@ -362,7 +347,7 @@ brin_metapage_info(PG_FUNCTION_ARGS)
 	BrinMetaPageData *meta;
 	TupleDesc	tupdesc;
 	Datum		values[4];
-	bool		nulls[4];
+	bool		nulls[4] = {0};
 	HeapTuple	htup;
 
 	if (!superuser())
@@ -382,7 +367,6 @@ brin_metapage_info(PG_FUNCTION_ARGS)
 
 	/* Extract values from the metapage */
 	meta = (BrinMetaPageData *) PageGetContents(page);
-	MemSet(nulls, 0, sizeof(nulls));
 	values[0] = CStringGetTextDatum(psprintf("0x%08X", meta->brinMagic));
 	values[1] = Int32GetDatum(meta->brinVersion);
 	values[2] = Int32GetDatum(meta->pagesPerRange);

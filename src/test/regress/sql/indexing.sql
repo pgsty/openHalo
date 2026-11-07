@@ -246,6 +246,65 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
    where relname like 'idxpart%' order by relname;
 drop table idxpart;
 
+-- Verify that re-attaching an already-attached partition index can
+-- validate the parent index if it was still invalid, including
+-- indirect ancestors in subpartitions.
+create table idxpart (a int, b int) partition by range (a);
+create table idxpart1 partition of idxpart for values from (0) to (1000) partition by range (a);
+create table idxpart11 partition of idxpart1 for values from (0) to (500);
+-- Partitioned table with no partitions
+create table idxpart2 partition of idxpart for values from (1000) to (2000) partition by range (a);
+-- create parent indexes
+create index on only idxpart ((a/b));
+create index on only idxpart1 ((a/b));
+create index on only idxpart2 ((a/b));
+-- fail, leaves behind an invalid index on the leaf partition
+insert into idxpart11 values (1, 0);
+create index concurrently on idxpart11 ((a/b));
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%' order by relname;
+-- attach the indexes; parents stay invalid
+alter index idxpart1_expr_idx attach partition idxpart11_expr_idx;
+alter index idxpart_expr_idx attach partition idxpart1_expr_idx;
+alter index idxpart_expr_idx attach partition idxpart2_expr_idx;
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%' order by relname;
+-- fix the index on the leaf partition
+delete from idxpart11 where b = 0;
+reindex index concurrently idxpart11_expr_idx;
+-- reattach the leaf partition index; parents should now be valid
+alter index idxpart1_expr_idx attach partition idxpart11_expr_idx;
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%' order by relname;
+drop table idxpart;
+
+-- Verify that re-attaching does not validate the parent when another
+-- child index is still invalid.
+create table idxpart (a int, b int) partition by range (a);
+create table idxpart1 partition of idxpart for values from (0) to (500);
+create table idxpart2 partition of idxpart for values from (500) to (1000);
+create index on only idxpart ((a/b));
+-- create invalid indexes on both children
+insert into idxpart1 values (1, 0);
+insert into idxpart2 values (501, 0);
+create index concurrently on idxpart1 ((a/b));
+create index concurrently on idxpart2 ((a/b));
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%' order by relname;
+-- attach both; parent stays invalid
+alter index idxpart_expr_idx attach partition idxpart1_expr_idx;
+alter index idxpart_expr_idx attach partition idxpart2_expr_idx;
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%' order by relname;
+-- fix only idxpart1's index, leave idxpart2's still invalid
+delete from idxpart1 where b = 0;
+reindex index concurrently idxpart1_expr_idx;
+-- re-attach the fixed child; parent should stay invalid
+alter index idxpart_expr_idx attach partition idxpart1_expr_idx;
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%' order by relname;
+drop table idxpart;
+
 -- verify dependency handling during ALTER TABLE DETACH PARTITION
 create table idxpart (a int) partition by range (a);
 create table idxpart1 (like idxpart);
@@ -483,8 +542,27 @@ create table idxpart (a int, b int primary key) partition by range (b, a);
 create table idxpart (a int, b int, c text, primary key  (a, b, c)) partition by range (b, c, a);
 drop table idxpart;
 
--- not other types of index-based constraints
-create table idxpart (a int, exclude (a with = )) partition by range (a);
+-- OK to add an exclusion constraint if partitioning by its equal column
+create table idxpart (a int4range, exclude USING GIST (a with = )) partition by range (a);
+drop table idxpart;
+-- OK more than one equal column
+create table idxpart (a int4range, b int4range, exclude USING GIST (a with =, b with =)) partition by range (a, b);
+drop table idxpart;
+-- OK with more than one equal column: constraint is a proper superset of partition key
+create table idxpart (a int4range, b int4range, exclude USING GIST (a with =, b with =)) partition by range (a);
+drop table idxpart;
+-- Not OK more than one equal column: partition keys are a proper superset of constraint
+create table idxpart (a int4range, b int4range, exclude USING GIST (a with = )) partition by range (a, b);
+-- Not OK with just -|-
+create table idxpart (a int4range, exclude USING GIST (a with -|- )) partition by range (a);
+-- OK with equals and &&, and equals is the partition key
+create table idxpart (a int4range, b int4range, exclude USING GIST (a with =, b with &&)) partition by range (a);
+drop table idxpart;
+-- Not OK with equals and &&, and equals is not the partition key
+create table idxpart (a int4range, b int4range, c int4range, exclude USING GIST (b with =, c with &&)) partition by range (a);
+-- OK more than one equal column and a && column
+create table idxpart (a int4range, b int4range, c int4range, exclude USING GIST (a with =, b with =, c with &&)) partition by range (a, b);
+drop table idxpart;
 
 -- no expressions in partition key for PK/UNIQUE
 create table idxpart (a int primary key, b int) partition by range ((b + a));
@@ -506,9 +584,37 @@ alter table idxpart add unique (b, a);		-- this works
 \d idxpart
 drop table idxpart;
 
--- Exclusion constraints cannot be added
-create table idxpart (a int, b int) partition by range (a);
-alter table idxpart add exclude (a with =);
+-- Exclusion constraints can be added if partitioning by their equal column
+create table idxpart (a int4range, b int4range) partition by range (a);
+alter table idxpart add exclude USING GIST (a with =);
+drop table idxpart;
+-- OK more than one equal column
+create table idxpart (a int4range, b int4range) partition by range (a, b);
+alter table idxpart add exclude USING GIST (a with =, b with =);
+drop table idxpart;
+-- OK with more than one equal column: constraint is a proper superset of partition key
+create table idxpart (a int4range, b int4range) partition by range (a);
+alter table idxpart add exclude USING GIST (a with =, b with =);
+drop table idxpart;
+-- Not OK more than one equal column: partition keys are a proper superset of constraint
+create table idxpart (a int4range, b int4range) partition by range (a, b);
+alter table idxpart add exclude USING GIST (a with =);
+drop table idxpart;
+-- Not OK with just -|-
+create table idxpart (a int4range, b int4range) partition by range (a, b);
+alter table idxpart add exclude USING GIST (a with -|-);
+drop table idxpart;
+-- OK with equals and &&, and equals is the partition key
+create table idxpart (a int4range, b int4range) partition by range (a);
+alter table idxpart add exclude USING GIST (a with =, b with &&);
+drop table idxpart;
+-- Not OK with equals and &&, and equals is not the partition key
+create table idxpart (a int4range, b int4range, c int4range) partition by range (a);
+alter table idxpart add exclude USING GIST (b with =, c with &&);
+drop table idxpart;
+-- OK more than one equal column and a && column
+create table idxpart (a int4range, b int4range, c int4range) partition by range (a, b);
+alter table idxpart add exclude USING GIST (a with =, b with =, c with &&);
 drop table idxpart;
 
 -- When (sub)partitions are created, they also contain the constraint
@@ -522,7 +628,7 @@ create table idxpart3 (b int not null, a int not null);
 alter table idxpart attach partition idxpart3 for values from (20, 20) to (30, 30);
 select conname, contype, conrelid::regclass, conindid::regclass, conkey
   from pg_constraint where conrelid::regclass::text like 'idxpart%'
-  order by conname;
+  order by conrelid::regclass::text, conname;
 drop table idxpart;
 
 -- Verify that multi-layer partitioning honors the requirement that all
@@ -545,7 +651,7 @@ create table idxpart2 partition of idxpart for values from (0) to (1000) partiti
 create table idxpart21 partition of idxpart2 for values from (0) to (1000);
 select conname, contype, conrelid::regclass, conindid::regclass, conkey
   from pg_constraint where conrelid::regclass::text like 'idxpart%'
-  order by conname;
+  order by conrelid::regclass::text, conname;
 drop table idxpart;
 
 -- If a partitioned table has a unique/PK constraint, then it's not possible
@@ -620,10 +726,10 @@ create table idxpart (a int) partition by range (a);
 create table idxpart0 (like idxpart);
 alter table idxpart0 add unique (a);
 alter table idxpart attach partition idxpart0 default;
-alter table only idxpart add primary key (a);  -- fail, no NOT NULL constraint
+alter table only idxpart add primary key (a);  -- fail, no not-null constraint
 alter table idxpart0 alter column a set not null;
 alter table only idxpart add primary key (a);  -- now it works
-alter table idxpart0 alter column a drop not null;  -- fail, pkey needs it
+alter index idxpart_pkey attach partition idxpart0_a_key;
 drop table idxpart;
 
 -- if a partition has a unique index without a constraint, does not attach
@@ -871,3 +977,33 @@ select indexrelid::regclass, indisvalid, indisreplident,
   where indexrelid::regclass::text like 'parted_replica%'
   order by indexrelid::regclass::text collate "C";
 drop table parted_replica_tab;
+
+-- test that indexing commands work with TOASTed values in pg_index
+create table test_pg_index_toast_table (a int);
+create or replace function test_pg_index_toast_func (a int, b int[])
+  returns bool as $$ select true $$ language sql immutable;
+select array_agg(n) b from generate_series(1, 10000) n \gset
+create index concurrently test_pg_index_toast_index
+  on test_pg_index_toast_table (test_pg_index_toast_func(a, :'b'));
+reindex index concurrently test_pg_index_toast_index;
+drop index concurrently test_pg_index_toast_index;
+create index test_pg_index_toast_index
+  on test_pg_index_toast_table (test_pg_index_toast_func(a, :'b'));
+reindex index test_pg_index_toast_index;
+drop index test_pg_index_toast_index;
+drop function test_pg_index_toast_func;
+drop table test_pg_index_toast_table;
+
+-- Test of a partitioned index attach, when there are exclusion constraints.
+create table idx_excl_part (a int4range, b int4range) partition by list (a);
+create table idx_excl_part_1 (a int4range, b int4range);
+alter table only idx_excl_part attach partition idx_excl_part_1 for values in ('[0,1)'::int4range);
+alter table only idx_excl_part add constraint idxpart_id_data_excl exclude using gist (a with =, b with &&);
+alter table idx_excl_part_1 add constraint idxpart_1_id_data_excl exclude using gist (a with &&, b with &&);
+-- This should be disallowed, because the constraints don't match.
+alter index idxpart_id_data_excl attach partition idxpart_1_id_data_excl;
+-- but if we recreate the constraint differently, it's allowed:
+alter table idx_excl_part_1 drop constraint idxpart_1_id_data_excl;
+alter table idx_excl_part_1 add constraint idxpart_1_id_data_excl exclude using gist (a with =, b with &&);
+alter index idxpart_id_data_excl attach partition idxpart_1_id_data_excl;
+-- leave these tables around, for pg_upgrade testing

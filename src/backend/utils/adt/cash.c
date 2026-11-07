@@ -27,7 +27,6 @@
 #include "utils/builtins.h"
 #include "utils/cash.h"
 #include "utils/float.h"
-#include "utils/int8.h"
 #include "utils/numeric.h"
 #include "utils/pg_locale.h"
 
@@ -36,10 +35,9 @@
  * Private routines
  ************************************************************************/
 
-static const char *
-num_word(Cash value)
+static void
+append_num_word(StringInfo buf, Cash value)
 {
-	static char buf[128];
 	static const char *const small[] = {
 		"zero", "one", "two", "three", "four", "five", "six", "seven",
 		"eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
@@ -51,13 +49,16 @@ num_word(Cash value)
 
 	/* deal with the simple cases first */
 	if (value <= 20)
-		return small[value];
+	{
+		appendStringInfoString(buf, small[value]);
+		return;
+	}
 
 	/* is it an even multiple of 100? */
 	if (!tu)
 	{
-		sprintf(buf, "%s hundred", small[value / 100]);
-		return buf;
+		appendStringInfo(buf, "%s hundred", small[value / 100]);
+		return;
 	}
 
 	/* more than 99? */
@@ -65,28 +66,26 @@ num_word(Cash value)
 	{
 		/* is it an even multiple of 10 other than 10? */
 		if (value % 10 == 0 && tu > 10)
-			sprintf(buf, "%s hundred %s",
-					small[value / 100], big[tu / 10]);
+			appendStringInfo(buf, "%s hundred %s",
+							 small[value / 100], big[tu / 10]);
 		else if (tu < 20)
-			sprintf(buf, "%s hundred and %s",
-					small[value / 100], small[tu]);
+			appendStringInfo(buf, "%s hundred and %s",
+							 small[value / 100], small[tu]);
 		else
-			sprintf(buf, "%s hundred %s %s",
-					small[value / 100], big[tu / 10], small[tu % 10]);
+			appendStringInfo(buf, "%s hundred %s %s",
+							 small[value / 100], big[tu / 10], small[tu % 10]);
 	}
 	else
 	{
 		/* is it an even multiple of 10 other than 10? */
 		if (value % 10 == 0 && tu > 10)
-			sprintf(buf, "%s", big[tu / 10]);
+			appendStringInfoString(buf, big[tu / 10]);
 		else if (tu < 20)
-			sprintf(buf, "%s", small[tu]);
+			appendStringInfoString(buf, small[tu]);
 		else
-			sprintf(buf, "%s %s", big[tu / 10], small[tu % 10]);
+			appendStringInfo(buf, "%s %s", big[tu / 10], small[tu % 10]);
 	}
-
-	return buf;
-}								/* num_word() */
+}
 
 static inline Cash
 cash_pl_cash(Cash c1, Cash c2)
@@ -161,6 +160,22 @@ cash_div_int64(Cash c, int64 i)
 				(errcode(ERRCODE_DIVISION_BY_ZERO),
 				 errmsg("division by zero")));
 
+	/*
+	 * INT64_MIN / -1 is problematic, since the result can't be represented on
+	 * a two's-complement machine.  Some machines produce INT64_MIN, some
+	 * produce zero, some throw an exception.  We can dodge the problem by
+	 * recognizing that division by -1 is the same as negation.
+	 */
+	if (i == -1)
+	{
+		if (unlikely(c == PG_INT64_MIN))
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("money out of range")));
+		return -c;
+	}
+
+	/* No overflow is possible */
 	return c / i;
 }
 
@@ -174,6 +189,7 @@ Datum
 cash_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
+	Node	   *escontext = fcinfo->context;
 	Cash		result;
 	Cash		value = 0;
 	Cash		dec = 0;
@@ -287,7 +303,7 @@ cash_in(PG_FUNCTION_ARGS)
 
 			if (pg_mul_s64_overflow(value, 10, &value) ||
 				pg_sub_s64_overflow(value, digit, &value))
-				ereport(ERROR,
+				ereturn(escontext, (Datum) 0,
 						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 						 errmsg("value \"%s\" is out of range for type %s",
 								str, "money")));
@@ -312,7 +328,7 @@ cash_in(PG_FUNCTION_ARGS)
 	{
 		/* remember we build the value in the negative */
 		if (pg_sub_s64_overflow(value, 1, &value))
-			ereport(ERROR,
+			ereturn(escontext, (Datum) 0,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("value \"%s\" is out of range for type %s",
 							str, "money")));
@@ -322,7 +338,7 @@ cash_in(PG_FUNCTION_ARGS)
 	for (; dec < fpoint; dec++)
 	{
 		if (pg_mul_s64_overflow(value, 10, &value))
-			ereport(ERROR,
+			ereturn(escontext, (Datum) 0,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("value \"%s\" is out of range for type %s",
 							str, "money")));
@@ -349,7 +365,7 @@ cash_in(PG_FUNCTION_ARGS)
 		else if (strncmp(s, csymbol, strlen(csymbol)) == 0)
 			s += strlen(csymbol);
 		else
-			ereport(ERROR,
+			ereturn(escontext, (Datum) 0,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for type %s: \"%s\"",
 							"money", str)));
@@ -362,7 +378,7 @@ cash_in(PG_FUNCTION_ARGS)
 	if (sgn > 0)
 	{
 		if (value == PG_INT64_MIN)
-			ereport(ERROR,
+			ereturn(escontext, (Datum) 0,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 					 errmsg("value \"%s\" is out of range for type %s",
 							str, "money")));
@@ -387,6 +403,7 @@ Datum
 cash_out(PG_FUNCTION_ARGS)
 {
 	Cash		value = PG_GETARG_CASH(0);
+	uint64		uvalue;
 	char	   *result;
 	char		buf[128];
 	char	   *bufptr;
@@ -429,8 +446,6 @@ cash_out(PG_FUNCTION_ARGS)
 
 	if (value < 0)
 	{
-		/* make the amount positive for digit-reconstruction loop */
-		value = -value;
 		/* set up formatting data */
 		signsymbol = (*lconvert->negative_sign != '\0') ? lconvert->negative_sign : "-";
 		sign_posn = lconvert->n_sign_posn;
@@ -444,6 +459,9 @@ cash_out(PG_FUNCTION_ARGS)
 		cs_precedes = lconvert->p_cs_precedes;
 		sep_by_space = lconvert->p_sep_by_space;
 	}
+
+	/* make the amount positive for digit-reconstruction loop */
+	uvalue = pg_abs_s64(value);
 
 	/* we build the digits+decimal-point+sep string right-to-left in buf[] */
 	bufptr = buf + sizeof(buf) - 1;
@@ -470,10 +488,10 @@ cash_out(PG_FUNCTION_ARGS)
 			memcpy(bufptr, ssymbol, strlen(ssymbol));
 		}
 
-		*(--bufptr) = ((uint64) value % 10) + '0';
-		value = ((uint64) value) / 10;
+		*(--bufptr) = (uvalue % 10) + '0';
+		uvalue = uvalue / 10;
 		digit_pos--;
-	} while (value || digit_pos >= 0);
+	} while (uvalue || digit_pos >= 0);
 
 	/*----------
 	 * Now, attach currency symbol and sign symbol in the correct order.
@@ -960,8 +978,9 @@ cash_words(PG_FUNCTION_ARGS)
 {
 	Cash		value = PG_GETARG_CASH(0);
 	uint64		val;
-	char		buf[256];
-	char	   *p = buf;
+	StringInfoData buf;
+	text	   *res;
+	Cash		dollars;
 	Cash		m0;
 	Cash		m1;
 	Cash		m2;
@@ -970,19 +989,19 @@ cash_words(PG_FUNCTION_ARGS)
 	Cash		m5;
 	Cash		m6;
 
+	initStringInfo(&buf);
+
 	/* work with positive numbers */
 	if (value < 0)
 	{
 		value = -value;
-		strcpy(buf, "minus ");
-		p += 6;
+		appendStringInfoString(&buf, "minus ");
 	}
-	else
-		buf[0] = '\0';
 
 	/* Now treat as unsigned, to avoid trouble at INT_MIN */
 	val = (uint64) value;
 
+	dollars = val / INT64CONST(100);
 	m0 = val % INT64CONST(100); /* cents */
 	m1 = (val / INT64CONST(100)) % 1000;	/* hundreds */
 	m2 = (val / INT64CONST(100000)) % 1000; /* thousands */
@@ -993,49 +1012,51 @@ cash_words(PG_FUNCTION_ARGS)
 
 	if (m6)
 	{
-		strcat(buf, num_word(m6));
-		strcat(buf, " quadrillion ");
+		append_num_word(&buf, m6);
+		appendStringInfoString(&buf, " quadrillion ");
 	}
 
 	if (m5)
 	{
-		strcat(buf, num_word(m5));
-		strcat(buf, " trillion ");
+		append_num_word(&buf, m5);
+		appendStringInfoString(&buf, " trillion ");
 	}
 
 	if (m4)
 	{
-		strcat(buf, num_word(m4));
-		strcat(buf, " billion ");
+		append_num_word(&buf, m4);
+		appendStringInfoString(&buf, " billion ");
 	}
 
 	if (m3)
 	{
-		strcat(buf, num_word(m3));
-		strcat(buf, " million ");
+		append_num_word(&buf, m3);
+		appendStringInfoString(&buf, " million ");
 	}
 
 	if (m2)
 	{
-		strcat(buf, num_word(m2));
-		strcat(buf, " thousand ");
+		append_num_word(&buf, m2);
+		appendStringInfoString(&buf, " thousand ");
 	}
 
 	if (m1)
-		strcat(buf, num_word(m1));
+		append_num_word(&buf, m1);
 
-	if (!*p)
-		strcat(buf, "zero");
+	if (dollars == 0)
+		appendStringInfoString(&buf, "zero");
 
-	strcat(buf, (val / 100) == 1 ? " dollar and " : " dollars and ");
-	strcat(buf, num_word(m0));
-	strcat(buf, m0 == 1 ? " cent" : " cents");
+	appendStringInfoString(&buf, dollars == 1 ? " dollar and " : " dollars and ");
+	append_num_word(&buf, m0);
+	appendStringInfoString(&buf, m0 == 1 ? " cent" : " cents");
 
 	/* capitalize output */
-	buf[0] = pg_toupper((unsigned char) buf[0]);
+	buf.data[0] = pg_toupper((unsigned char) buf.data[0]);
 
 	/* return as text datum */
-	PG_RETURN_TEXT_P(cstring_to_text(buf));
+	res = cstring_to_text_with_len(buf.data, buf.len);
+	pfree(buf.data);
+	PG_RETURN_TEXT_P(res);
 }
 
 

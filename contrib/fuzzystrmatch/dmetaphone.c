@@ -117,7 +117,7 @@ The remaining code is authored by Andrew Dunstan <amdunstan@ncshp.org> and
 #include <ctype.h>
 
 /* prototype for the main function we got from the perl module */
-static void DoubleMetaphone(char *, char **);
+static void DoubleMetaphone(char *str, char **codes);
 
 #ifndef DMETAPHONE_MAIN
 
@@ -308,13 +308,13 @@ IsVowel(metastring *s, int pos)
 static int
 SlavoGermanic(metastring *s)
 {
-	if ((char *) strstr(s->str, "W"))
+	if (strstr(s->str, "W"))
 		return 1;
-	else if ((char *) strstr(s->str, "K"))
+	else if (strstr(s->str, "K"))
 		return 1;
-	else if ((char *) strstr(s->str, "CZ"))
+	else if (strstr(s->str, "CZ"))
 		return 1;
-	else if ((char *) strstr(s->str, "WITZ"))
+	else if (strstr(s->str, "WITZ"))
 		return 1;
 	else
 		return 0;

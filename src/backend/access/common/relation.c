@@ -3,7 +3,7 @@
  * relation.c
  *	  Generic relation related routines.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,7 +23,6 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
-#include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "utils/inval.h"
@@ -73,7 +72,7 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	if (RelationUsesLocalBuffers(r))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
 
-	pgstat_initstats(r);
+	pgstat_init_relation(r);
 
 	return r;
 }
@@ -123,7 +122,7 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 	if (RelationUsesLocalBuffers(r))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
 
-	pgstat_initstats(r);
+	pgstat_init_relation(r);
 
 	return r;
 }

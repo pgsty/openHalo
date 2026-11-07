@@ -3,12 +3,15 @@
 #include <math.h>
 
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "plperl.h"
-#include "plperl_helpers.h"
 #include "utils/fmgrprotos.h"
 #include "utils/jsonb.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "jsonb_plperl",
+					.version = PG_VERSION
+);
 
 static SV  *Jsonb_to_SV(JsonbContainer *jsonb);
 static JsonbValue *SV_to_JsonbValue(SV *obj, JsonbParseState **ps, bool is_elem);
@@ -63,6 +66,9 @@ Jsonb_to_SV(JsonbContainer *jsonb)
 	JsonbValue	v;
 	JsonbIterator *it;
 	JsonbIteratorToken r;
+
+	/* this can recurse via JsonbValue_to_SV() */
+	check_stack_depth();
 
 	it = JsonbIteratorInit(jsonb);
 	r = JsonbIteratorNext(&it, &v, true);
@@ -177,9 +183,20 @@ SV_to_JsonbValue(SV *in, JsonbParseState **jsonb_state, bool is_elem)
 	dTHX;
 	JsonbValue	out;			/* result */
 
+	/* this can recurse via AV_to_JsonbValue() or HV_to_JsonbValue() */
+	check_stack_depth();
+
 	/* Dereference references recursively. */
 	while (SvROK(in))
+	{
+		/*
+		 * It's possible for circular references to make this an infinite
+		 * loop.  Checking for such a situation seems like much more trouble
+		 * than it's worth, but let's provide a way to break out of the loop.
+		 */
+		CHECK_FOR_INTERRUPTS();
 		in = SvRV(in);
+	}
 
 	switch (SvTYPE(in))
 	{

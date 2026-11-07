@@ -3,7 +3,7 @@
  * tableamapi.c
  *		Support routines for API for Postgres table access methods
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/table/tableamapi.c
@@ -11,17 +11,11 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
-#include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/xact.h"
-#include "catalog/pg_am.h"
-#include "catalog/pg_proc.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
-#include "utils/fmgroids.h"
-#include "utils/memutils.h"
-#include "utils/syscache.h"
+#include "utils/guc_hooks.h"
 
 
 /*
@@ -82,7 +76,7 @@ GetTableAmRoutine(Oid amhandler)
 	Assert(routine->tuple_update != NULL);
 	Assert(routine->tuple_lock != NULL);
 
-	Assert(routine->relation_set_new_filenode != NULL);
+	Assert(routine->relation_set_new_filelocator != NULL);
 	Assert(routine->relation_nontransactional_truncate != NULL);
 	Assert(routine->relation_copy_data != NULL);
 	Assert(routine->relation_copy_for_cluster != NULL);
@@ -97,9 +91,6 @@ GetTableAmRoutine(Oid amhandler)
 
 	Assert(routine->relation_estimate_size != NULL);
 
-	/* optional, but one callback implies presence of the other */
-	Assert((routine->scan_bitmap_next_block == NULL) ==
-		   (routine->scan_bitmap_next_tuple == NULL));
 	Assert(routine->scan_sample_next_block != NULL);
 	Assert(routine->scan_sample_next_tuple != NULL);
 
@@ -112,14 +103,14 @@ check_default_table_access_method(char **newval, void **extra, GucSource source)
 {
 	if (**newval == '\0')
 	{
-		GUC_check_errdetail("%s cannot be empty.",
+		GUC_check_errdetail("\"%s\" cannot be empty.",
 							"default_table_access_method");
 		return false;
 	}
 
 	if (strlen(*newval) >= NAMEDATALEN)
 	{
-		GUC_check_errdetail("%s is too long (maximum %d characters).",
+		GUC_check_errdetail("\"%s\" is too long (maximum %d characters).",
 							"default_table_access_method", NAMEDATALEN - 1);
 		return false;
 	}

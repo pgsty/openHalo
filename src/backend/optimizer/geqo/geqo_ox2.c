@@ -34,10 +34,12 @@
 /*************************************************************/
 
 #include "postgres.h"
-#include "optimizer/geqo_random.h"
-#include "optimizer/geqo_recombination.h"
+#include "optimizer/geqo.h"
 
 #if defined(OX2)
+
+#include "optimizer/geqo_random.h"
+#include "optimizer/geqo_recombination.h"
 
 /* ox2
  *
@@ -106,7 +108,6 @@ ox2(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene, 
 			/* city isn't used yet, so inherit from tour2 */
 			offspring[k] = tour2[k];
 	}
-
 }
 
 #endif							/* defined(OX2) */

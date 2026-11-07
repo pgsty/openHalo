@@ -4,7 +4,7 @@
  *	  fetch tuples from a GiST scan.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,7 +20,6 @@
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "utils/float.h"
 #include "utils/memutils.h"
@@ -346,7 +345,6 @@ gistScanPage(IndexScanDesc scan, GISTSearchItem *pageItem,
 	PredicateLockPage(r, BufferGetBlockNumber(buffer), scan->xs_snapshot);
 	gistcheckpage(scan->indexRelation, buffer);
 	page = BufferGetPage(buffer);
-	TestForOldSnapshot(scan->xs_snapshot, r, page);
 	opaque = GistPageGetOpaque(page);
 
 	/*
@@ -627,6 +625,8 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
 		GISTSearchItem fakeItem;
 
 		pgstat_count_index_scan(scan->indexRelation);
+		if (scan->instrument)
+			scan->instrument->nsearches++;
 
 		so->firstCall = false;
 		so->curPageData = so->nPageData = 0;
@@ -657,7 +657,7 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
 					if (so->killedItems == NULL)
 					{
 						MemoryContext oldCxt =
-						MemoryContextSwitchTo(so->giststate->scanCxt);
+							MemoryContextSwitchTo(so->giststate->scanCxt);
 
 						so->killedItems =
 							(OffsetNumber *) palloc(MaxIndexTuplesPerPage
@@ -694,7 +694,7 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
 				if (so->killedItems == NULL)
 				{
 					MemoryContext oldCxt =
-					MemoryContextSwitchTo(so->giststate->scanCxt);
+						MemoryContextSwitchTo(so->giststate->scanCxt);
 
 					so->killedItems =
 						(OffsetNumber *) palloc(MaxIndexTuplesPerPage
@@ -752,6 +752,8 @@ gistgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		return 0;
 
 	pgstat_count_index_scan(scan->indexRelation);
+	if (scan->instrument)
+		scan->instrument->nsearches++;
 
 	/* Begin the scan by processing the root page */
 	so->curPageData = so->nPageData = 0;

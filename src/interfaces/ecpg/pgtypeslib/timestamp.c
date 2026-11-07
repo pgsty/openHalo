@@ -11,6 +11,7 @@
 #error -ffast-math is known to break this code
 #endif
 
+#include "common/int.h"
 #include "dt.h"
 #include "pgtypes_date.h"
 #include "pgtypes_timestamp.h"
@@ -48,14 +49,8 @@ tm2timestamp(struct tm *tm, fsec_t fsec, int *tzp, timestamp * result)
 
 	dDate = date2j(tm->tm_year, tm->tm_mon, tm->tm_mday) - date2j(2000, 1, 1);
 	time = time2t(tm->tm_hour, tm->tm_min, tm->tm_sec, fsec);
-	*result = (dDate * USECS_PER_DAY) + time;
-	/* check for major overflow */
-	if ((*result - time) / USECS_PER_DAY != dDate)
-		return -1;
-	/* check for just-barely overflow (okay except time-of-day wraps) */
-	/* caution: we want to allow 1999-12-31 24:00:00 */
-	if ((*result < 0 && dDate > 0) ||
-		(*result > 0 && dDate < -1))
+	if (unlikely(pg_mul_s64_overflow(dDate, USECS_PER_DAY, result) ||
+				 pg_add_s64_overflow(*result, time, result)))
 		return -1;
 	if (tzp != NULL)
 		*result = dt2local(*result, -(*tzp));
@@ -134,11 +129,12 @@ timestamp2tm(timestamp dt, int *tzp, struct tm *tm, fsec_t *fsec, const char **t
 		if (IS_VALID_UTIME(tm->tm_year, tm->tm_mon, tm->tm_mday))
 		{
 #if defined(HAVE_STRUCT_TM_TM_ZONE) || defined(HAVE_INT_TIMEZONE)
+			struct tm	tmbuf;
 
 			utime = dt / USECS_PER_SEC +
 				((date0 - date2j(1970, 1, 1)) * INT64CONST(86400));
 
-			tx = localtime(&utime);
+			tx = localtime_r(&utime, &tmbuf);
 			tm->tm_year = tx->tm_year + 1900;
 			tm->tm_mon = tx->tm_mon + 1;
 			tm->tm_mday = tx->tm_mday;
@@ -346,8 +342,8 @@ dttofmtasc_replace(timestamp * ts, date dDate, int dow, struct tm *tm,
 					break;
 
 					/*
-					 * The	preferred  date  and  time	representation	for
-					 * the current locale.
+					 * The preferred date and time representation for the
+					 * current locale.
 					 */
 				case 'c':
 					/* XXX */
@@ -863,8 +859,6 @@ PGTYPEStimestamp_add_interval(timestamp * tin, interval * span, timestamp * tout
 {
 	if (TIMESTAMP_NOT_FINITE(*tin))
 		*tout = *tin;
-
-
 	else
 	{
 		if (span->month != 0)
@@ -872,7 +866,6 @@ PGTYPEStimestamp_add_interval(timestamp * tin, interval * span, timestamp * tout
 			struct tm	tt,
 					   *tm = &tt;
 			fsec_t		fsec;
-
 
 			if (timestamp2tm(*tin, NULL, tm, &fsec, NULL) != 0)
 				return -1;
@@ -898,12 +891,11 @@ PGTYPEStimestamp_add_interval(timestamp * tin, interval * span, timestamp * tout
 				return -1;
 		}
 
-
 		*tin += span->time;
 		*tout = *tin;
 	}
-	return 0;
 
+	return 0;
 }
 
 
@@ -924,7 +916,6 @@ PGTYPEStimestamp_sub_interval(timestamp * tin, interval * span, timestamp * tout
 
 	tspan.month = -span->month;
 	tspan.time = -span->time;
-
 
 	return PGTYPEStimestamp_add_interval(tin, &tspan, tout);
 }

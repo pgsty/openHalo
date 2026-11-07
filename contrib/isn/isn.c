@@ -4,7 +4,7 @@
  *	  PostgreSQL type definitions for ISNs (ISBN, ISMN, ISSN, EAN13, UPC)
  *
  * Author:	German Mendez Bravo (Kronuz)
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/isn/isn.c
@@ -21,9 +21,12 @@
 #include "UPC.h"
 #include "fmgr.h"
 #include "isn.h"
-#include "utils/builtins.h"
+#include "utils/guc.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "isn",
+					.version = PG_VERSION
+);
 
 #ifdef USE_ASSERT_CHECKING
 #define ISN_DEBUG 1
@@ -40,6 +43,7 @@ enum isn_type
 
 static const char *const isn_names[] = {"EAN13/UPC/ISxN", "EAN13/UPC/ISxN", "EAN13", "ISBN", "ISMN", "ISSN", "UPC"};
 
+/* GUC value */
 static bool g_weak = false;
 
 
@@ -675,14 +679,14 @@ eantoobig:
 /*
  * string2ean --- try to parse a string into an ean13.
  *
- * If errorOK is false, ereport a useful error message if the string is bad.
- * If errorOK is true, just return "false" for bad input.
+ * ereturn false with a useful error message if the string is bad.
+ * Otherwise return true.
  *
  * if the input string ends with '!' it will always be treated as invalid
  * (even if the check digit is valid)
  */
 static bool
-string2ean(const char *str, bool errorOK, ean13 *result,
+string2ean(const char *str, struct Node *escontext, ean13 *result,
 		   enum isn_type accept)
 {
 	bool		digit,
@@ -876,55 +880,43 @@ eanbadcheck:
 		return true;
 	}
 
-	if (!errorOK)
+	if (rcheck == (unsigned) -1)
 	{
-		if (rcheck == (unsigned) -1)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid %s number: \"%s\"",
-							isn_names[accept], str)));
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("invalid check digit for %s number: \"%s\", should be %c",
-							isn_names[accept], str, (rcheck == 10) ? ('X') : (rcheck + '0'))));
-		}
+		ereturn(escontext, false,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid %s number: \"%s\"",
+						isn_names[accept], str)));
 	}
-	return false;
+	else
+	{
+		ereturn(escontext, false,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid check digit for %s number: \"%s\", should be %c",
+						isn_names[accept], str, (rcheck == 10) ? ('X') : (rcheck + '0'))));
+	}
 
 eaninvalid:
-	if (!errorOK)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("invalid input syntax for %s number: \"%s\"",
-						isn_names[accept], str)));
-	return false;
+	ereturn(escontext, false,
+			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+			 errmsg("invalid input syntax for %s number: \"%s\"",
+					isn_names[accept], str)));
 
 eanwrongtype:
-	if (!errorOK)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				 errmsg("cannot cast %s to %s for number: \"%s\"",
-						isn_names[type], isn_names[accept], str)));
-	return false;
+	ereturn(escontext, false,
+			(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+			 errmsg("cannot cast %s to %s for number: \"%s\"",
+					isn_names[type], isn_names[accept], str)));
 
 eantoobig:
-	if (!errorOK)
-		ereport(ERROR,
-				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("value \"%s\" is out of range for %s type",
-						str, isn_names[accept])));
-	return false;
+	ereturn(escontext, false,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("value \"%s\" is out of range for %s type",
+					str, isn_names[accept])));
 }
 
 /*----------------------------------------------------------
  * Exported routines.
  *---------------------------------------------------------*/
-
-void		_PG_init(void);
 
 void
 _PG_init(void)
@@ -942,6 +934,20 @@ _PG_init(void)
 		if (!check_table(UPC_range, UPC_index))
 			elog(ERROR, "UPC failed check");
 	}
+
+	/* Define a GUC variable for weak mode. */
+	DefineCustomBoolVariable("isn.weak",
+							 "Accept input with invalid ISN check digits.",
+							 NULL,
+							 &g_weak,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	MarkGUCPrefixReserved("isn");
 }
 
 /* isn_out
@@ -985,7 +991,8 @@ ean13_in(PG_FUNCTION_ARGS)
 	const char *str = PG_GETARG_CSTRING(0);
 	ean13		result;
 
-	(void) string2ean(str, false, &result, EAN13);
+	if (!string2ean(str, fcinfo->context, &result, EAN13))
+		PG_RETURN_NULL();
 	PG_RETURN_EAN13(result);
 }
 
@@ -998,7 +1005,8 @@ isbn_in(PG_FUNCTION_ARGS)
 	const char *str = PG_GETARG_CSTRING(0);
 	ean13		result;
 
-	(void) string2ean(str, false, &result, ISBN);
+	if (!string2ean(str, fcinfo->context, &result, ISBN))
+		PG_RETURN_NULL();
 	PG_RETURN_EAN13(result);
 }
 
@@ -1011,7 +1019,8 @@ ismn_in(PG_FUNCTION_ARGS)
 	const char *str = PG_GETARG_CSTRING(0);
 	ean13		result;
 
-	(void) string2ean(str, false, &result, ISMN);
+	if (!string2ean(str, fcinfo->context, &result, ISMN))
+		PG_RETURN_NULL();
 	PG_RETURN_EAN13(result);
 }
 
@@ -1024,7 +1033,8 @@ issn_in(PG_FUNCTION_ARGS)
 	const char *str = PG_GETARG_CSTRING(0);
 	ean13		result;
 
-	(void) string2ean(str, false, &result, ISSN);
+	if (!string2ean(str, fcinfo->context, &result, ISSN))
+		PG_RETURN_NULL();
 	PG_RETURN_EAN13(result);
 }
 
@@ -1037,7 +1047,8 @@ upc_in(PG_FUNCTION_ARGS)
 	const char *str = PG_GETARG_CSTRING(0);
 	ean13		result;
 
-	(void) string2ean(str, false, &result, UPC);
+	if (!string2ean(str, fcinfo->context, &result, UPC))
+		PG_RETURN_NULL();
 	PG_RETURN_EAN13(result);
 }
 
@@ -1117,17 +1128,16 @@ make_valid(PG_FUNCTION_ARGS)
 
 /* this function temporarily sets weak input flag
  * (to lose the strictness of check digit acceptance)
- * It's a helper function, not intended to be used!!
  */
 PG_FUNCTION_INFO_V1(accept_weak_input);
 Datum
 accept_weak_input(PG_FUNCTION_ARGS)
 {
-#ifdef ISN_WEAK_MODE
-	g_weak = PG_GETARG_BOOL(0);
-#else
-	/* function has no effect */
-#endif							/* ISN_WEAK_MODE */
+	bool		newvalue = PG_GETARG_BOOL(0);
+
+	(void) set_config_option("isn.weak", newvalue ? "on" : "off",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SET, true, 0, false);
 	PG_RETURN_BOOL(g_weak);
 }
 

@@ -4,7 +4,7 @@
  *	  header file for read.c and readfuncs.c. These functions are internal
  *	  to the stringToNode interface and should not be used by anyone else.
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/readfuncs.h
@@ -19,8 +19,8 @@
 /*
  * variable in read.c that needs to be accessible to readfuncs.c
  */
-#ifdef WRITE_READ_PARSE_PLAN_TREES
-extern bool restore_location_fields;
+#ifdef DEBUG_NODE_TESTS_ENABLED
+extern PGDLLIMPORT bool restore_location_fields;
 #endif
 
 /*
@@ -34,9 +34,5 @@ extern void *nodeRead(const char *token, int tok_len);
  * prototypes for functions in readfuncs.c
  */
 extern Node *parseNodeString(void);
-
-
-const char *pg_strtok_reentrant(char *token_name, int *length);
-
 
 #endif							/* READFUNCS_H */

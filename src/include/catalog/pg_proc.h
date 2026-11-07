@@ -3,7 +3,7 @@
  * pg_proc.h
  *	  definition of the "procedure" system catalog (pg_proc)
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_proc.h
@@ -19,10 +19,7 @@
 
 #include "catalog/genbki.h"
 #include "catalog/objectaddress.h"
-#include "catalog/pg_proc_d.h"
-
-#include "parser/parse_node.h"
-
+#include "catalog/pg_proc_d.h"	/* IWYU pragma: export */
 #include "nodes/pg_list.h"
 
 /* ----------------
@@ -64,7 +61,7 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 	/* security definer */
 	bool		prosecdef BKI_DEFAULT(f);
 
-	/* is it a leak-proof function? */
+	/* is it a leakproof function? */
 	bool		proleakproof BKI_DEFAULT(f);
 
 	/* strict with respect to NULLs? */
@@ -93,8 +90,6 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 	 * variable-length fields start here, but we allow direct access to
 	 * proargtypes
 	 */
-	/* package function or procedure access modifier */
-	char		proaccess BKI_DEFAULT(n);
 
 	/* parameter types (excludes OUT params) */
 	oidvector	proargtypes BKI_LOOKUP(pg_type) BKI_FORCE_NOT_NULL;
@@ -142,10 +137,11 @@ typedef FormData_pg_proc *Form_pg_proc;
 
 DECLARE_TOAST(pg_proc, 2836, 2837);
 
-DECLARE_UNIQUE_INDEX_PKEY(pg_proc_oid_index, 2690, on pg_proc using btree(oid oid_ops));
-#define ProcedureOidIndexId  2690
-DECLARE_UNIQUE_INDEX(pg_proc_proname_args_nsp_index, 2691, on pg_proc using btree(proname name_ops, proargtypes oidvector_ops, pronamespace oid_ops));
-#define ProcedureNameArgsNspIndexId  2691
+DECLARE_UNIQUE_INDEX_PKEY(pg_proc_oid_index, 2690, ProcedureOidIndexId, pg_proc, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_proc_proname_args_nsp_index, 2691, ProcedureNameArgsNspIndexId, pg_proc, btree(proname name_ops, proargtypes oidvector_ops, pronamespace oid_ops));
+
+MAKE_SYSCACHE(PROCOID, pg_proc_oid_index, 128);
+MAKE_SYSCACHE(PROCNAMEARGSNSP, pg_proc_proname_args_nsp_index, 128);
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 
@@ -190,7 +186,7 @@ DECLARE_UNIQUE_INDEX(pg_proc_proname_args_nsp_index, 2691, on pg_proc using btre
 #define PROARGMODE_TABLE	't'
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
-#define NON_PACKAGE_MEMBER		'n'
+
 
 extern ObjectAddress ProcedureCreate(const char *procedureName,
 									 Oid procNamespace,
@@ -209,50 +205,20 @@ extern ObjectAddress ProcedureCreate(const char *procedureName,
 									 bool isStrict,
 									 char volatility,
 									 char parallel,
-									 char proaccess,
 									 oidvector *parameterTypes,
 									 Datum allParameterTypes,
 									 Datum parameterModes,
 									 Datum parameterNames,
 									 List *parameterDefaults,
 									 Datum trftypes,
+									 List *trfoids,
 									 Datum proconfig,
 									 Oid prosupport,
 									 float4 procost,
 									 float4 prorows);
 
-
-extern ObjectAddress mys_ProcedureCreate(const char *procedureName,
-                                        Oid procNamespace,
-                                        bool replace,
-                                        bool returnsSet,
-                                        Oid returnType,
-                                        Oid proowner,
-                                        Oid languageObjectId,
-                                        Oid languageValidator,
-                                        const char *prosrc,
-                                        const char *probin,
-                                        Node *prosqlbody,
-                                        char prokind,
-                                        bool security_definer,
-                                        bool isLeakProof,
-                                        bool isStrict,
-                                        char volatility,
-                                        char parallel,
-                                        char proaccess,
-                                        oidvector *parameterTypes,
-                                        Datum allParameterTypes,
-                                        Datum parameterModes,
-                                        Datum parameterNames,
-                                        List *parameterDefaults,
-                                        Datum trftypes,
-                                        Datum proconfig,
-                                        Oid prosupport,
-                                        float4 procost,
-                                        float4 prorows);
-
-						
 extern bool function_parse_error_transpose(const char *prosrc);
 
 extern List *oid_array_to_list(Datum datum);
+
 #endif							/* PG_PROC_H */

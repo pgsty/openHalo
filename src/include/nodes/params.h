@@ -4,7 +4,7 @@
  *	  Support for finding the values associated with Param nodes.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/params.h
@@ -107,8 +107,6 @@ typedef void (*ParamCompileHook) (ParamListInfo params, struct Param *param,
 
 typedef void (*ParserSetupHook) (struct ParseState *pstate, void *arg);
 
-typedef void (*ParentFunctionFetchHook) (ParamListInfo params, void **fn_extra);
-
 typedef struct ParamListInfoData
 {
 	ParamFetchHook paramFetch;	/* parameter fetch hook */
@@ -119,7 +117,6 @@ typedef struct ParamListInfoData
 	void	   *parserSetupArg;
 	char	   *paramValuesStr; /* params as a single string for errors */
 	int			numParams;		/* nominal/maximum # of Params represented */
-	ParentFunctionFetchHook parentfunctionFetch;	/* nest function fetch parent function infomation */
 
 	/*
 	 * params[] may be of length zero if paramFetch is supplied; otherwise it
@@ -166,8 +163,8 @@ extern ParamListInfo copyParamList(ParamListInfo from);
 extern Size EstimateParamListSpace(ParamListInfo paramLI);
 extern void SerializeParamList(ParamListInfo paramLI, char **start_address);
 extern ParamListInfo RestoreParamList(char **start_address);
-extern char *BuildParamLogString(ParamListInfo params, char **paramTextValues,
-								 int valueLen);
+extern char *BuildParamLogString(ParamListInfo params, char **knownTextValues,
+								 int maxlen);
 extern void ParamsErrorCallback(void *arg);
 
 #endif							/* PARAMS_H */

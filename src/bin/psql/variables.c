@@ -1,11 +1,13 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2021, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  * src/bin/psql/variables.c
  */
 #include "postgres_fe.h"
+
+#include <math.h>
 
 #include "common.h"
 #include "common/logging.h"
@@ -45,7 +47,7 @@ valid_variable_name(const char *name)
  * that serves as list header.
  *
  * The list entries are kept in name order (according to strcmp).  This
- * is mainly to make the results of PrintVariables() more pleasing.
+ * is mainly to make the output of PrintVariables() more pleasing.
  */
 VariableSpace
 CreateVariableSpace(void)
@@ -180,6 +182,75 @@ ParseVariableNum(const char *value, const char *name, int *result)
 }
 
 /*
+ * Try to interpret "value" as a double value, and if successful store it in
+ * *result. If unsuccessful, *result isn't clobbered. "name" is the variable
+ * which is being assigned, the value of which is only used to produce a good
+ * error message. Pass NULL as the name to suppress the error message.  The
+ * value must be within the range [min,max] in order to be considered valid.
+ *
+ * Returns true, with *result containing the interpreted value, if "value" is
+ * syntactically valid, else false (with *result unchanged).
+ */
+bool
+ParseVariableDouble(const char *value, const char *name, double *result, double min, double max)
+{
+	char	   *end;
+	double		dblval;
+
+	/*
+	 * Empty-string input has historically been treated differently by strtod
+	 * on various platforms, so handle that by specifically checking for it.
+	 */
+	if ((value == NULL) || (*value == '\0'))
+	{
+		if (name)
+			pg_log_error("invalid input syntax for variable \"%s\"", name);
+		return false;
+	}
+
+	errno = 0;
+	dblval = strtod(value, &end);
+	if (errno == 0 && *end == '\0' && end != value)
+	{
+		if (dblval < min)
+		{
+			if (name)
+				pg_log_error("invalid value \"%s\" for variable \"%s\": must be greater than %.2f",
+							 value, name, min);
+			return false;
+		}
+		else if (dblval > max)
+		{
+			if (name)
+				pg_log_error("invalid value \"%s\" for variable \"%s\": must be less than %.2f",
+							 value, name, max);
+			return false;
+		}
+		*result = dblval;
+		return true;
+	}
+
+	/*
+	 * Cater for platforms which treat values which aren't zero, but that are
+	 * too close to zero to have full precision, by checking for zero or real
+	 * out-of-range values.
+	 */
+	else if ((errno == ERANGE) &&
+			 (dblval == 0.0 || dblval >= HUGE_VAL || dblval <= -HUGE_VAL))
+	{
+		if (name)
+			pg_log_error("value \"%s\" is out of range for variable \"%s\"", value, name);
+		return false;
+	}
+	else
+	{
+		if (name)
+			pg_log_error("invalid value \"%s\" for variable \"%s\"", value, name);
+		return false;
+	}
+}
+
+/*
  * Print values of all variables.
  */
 void
@@ -255,8 +326,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 
 			if (confirmed)
 			{
-				if (current->value)
-					pg_free(current->value);
+				pg_free(current->value);
 				current->value = new_value;
 
 				/*
@@ -272,7 +342,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 					free(current);
 				}
 			}
-			else if (new_value)
+			else
 				pg_free(new_value); /* current->value is left unchanged */
 
 			return confirmed;

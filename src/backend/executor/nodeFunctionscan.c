@@ -3,7 +3,7 @@
  * nodeFunctionscan.c
  *	  Support routines for scanning RangeFunctions (functions in rangetable).
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,10 +26,7 @@
 #include "executor/nodeFunctionscan.h"
 #include "funcapi.h"
 #include "nodes/nodeFuncs.h"
-#include "utils/builtins.h"
 #include "utils/memutils.h"
-
-#include "executor/executor_engine.h"
 
 
 /*
@@ -94,11 +91,11 @@ FunctionNext(FunctionScanState *node)
 		if (tstore == NULL)
 		{
 			node->funcstates[0].tstore = tstore =
-					ExecMakeTableFunctionResult(node->funcstates[0].setexpr,
-												node->ss.ps.ps_ExprContext,
-												node->argcontext,
-												node->funcstates[0].tupdesc,
-												node->eflags & EXEC_FLAG_BACKWARD);
+				ExecMakeTableFunctionResult(node->funcstates[0].setexpr,
+											node->ss.ps.ps_ExprContext,
+											node->argcontext,
+											node->funcstates[0].tupdesc,
+											node->eflags & EXEC_FLAG_BACKWARD);
 
 			/*
 			 * paranoia - cope if the function, which may have constructed the
@@ -153,11 +150,11 @@ FunctionNext(FunctionScanState *node)
 		if (fs->tstore == NULL)
 		{
 			fs->tstore =
-					ExecMakeTableFunctionResult(fs->setexpr,
-												node->ss.ps.ps_ExprContext,
-												node->argcontext,
-												fs->tupdesc,
-												node->eflags & EXEC_FLAG_BACKWARD);
+				ExecMakeTableFunctionResult(fs->setexpr,
+											node->ss.ps.ps_ExprContext,
+											node->argcontext,
+											fs->tupdesc,
+											node->eflags & EXEC_FLAG_BACKWARD);
 
 			/*
 			 * paranoia - cope if the function, which may have constructed the
@@ -535,26 +532,11 @@ ExecEndFunctionScan(FunctionScanState *node)
 	int			i;
 
 	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	if (node->ss.ps.ps_ResultTupleSlot)
-		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-
-	/*
 	 * Release slots and tuplestore resources
 	 */
 	for (i = 0; i < node->nfuncs; i++)
 	{
 		FunctionScanPerFuncState *fs = &node->funcstates[i];
-
-		if (fs->func_slot)
-			ExecClearTuple(fs->func_slot);
 
 		if (fs->tstore != NULL)
 		{

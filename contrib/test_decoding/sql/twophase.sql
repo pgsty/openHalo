@@ -69,7 +69,10 @@ FROM pg_locks
 WHERE locktype = 'relation'
   AND relation = 'test_prepared1'::regclass;
 -- The above CLUSTER command shouldn't cause a timeout on 2pc decoding.
-SET statement_timeout = '180s';
+\set env_timeout ''
+\getenv env_timeout PG_TEST_TIMEOUT_DEFAULT
+SELECT COALESCE(NULLIF(:'env_timeout', ''), '180') || 's' AS timeout \gset
+SET statement_timeout = :'timeout';
 SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
 RESET statement_timeout;
 COMMIT PREPARED 'test_prepared_lock';
@@ -122,10 +125,23 @@ COMMIT PREPARED 'test_toast_table_access';
 -- consume commit prepared
 SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1', 'stream-changes', '1');
 
+-- Test that an empty prepared transaction should not be decoded, whether it
+-- is committed or rolled back.
+BEGIN;
+SELECT * FROM test_prepared1 WHERE id = 1 FOR SHARE;
+PREPARE TRANSACTION 'test_empty_transaction';
+COMMIT PREPARED 'test_empty_transaction';
+BEGIN;
+SELECT * FROM test_prepared1 WHERE id = 1 FOR SHARE;
+PREPARE TRANSACTION 'test_empty_transaction';
+ROLLBACK PREPARED 'test_empty_transaction';
+SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
+
 -- Test 8:
 -- cleanup and make sure results are also empty
 DROP TABLE test_prepared1;
 DROP TABLE test_prepared2;
+DROP TABLE test_prepared_savepoint;
 DROP TABLE test_tab;
 -- show results. There should be nothing to show
 SELECT data FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');

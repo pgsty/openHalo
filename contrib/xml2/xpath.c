@@ -11,7 +11,6 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
-#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/xml.h"
 
@@ -23,7 +22,10 @@
 #include <libxml/xmlerror.h>
 #include <libxml/parserInternals.h>
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "xml2",
+					.version = PG_VERSION
+);
 
 /* exported for use by xslt_proc.c */
 
@@ -74,54 +76,7 @@ pgxml_parser_init(PgXmlStrictness strictness)
 	/* Initialize libxml */
 	xmlInitParser();
 
-	xmlSubstituteEntitiesDefault(1);
-
 	return xmlerrcxt;
-}
-
-
-/*
- * Returns true if document is well-formed
- *
- * Note: this has been superseded by a core function.  We still have to
- * have it in the contrib module so that existing SQL-level references
- * to the function won't fail; but in normal usage with up-to-date SQL
- * definitions for the contrib module, this won't be called.
- */
-
-PG_FUNCTION_INFO_V1(xml_is_well_formed);
-
-Datum
-xml_is_well_formed(PG_FUNCTION_ARGS)
-{
-	text	   *t = PG_GETARG_TEXT_PP(0);	/* document buffer */
-	bool		result = false;
-	int32		docsize = VARSIZE_ANY_EXHDR(t);
-	xmlDocPtr	doctree;
-	PgXmlErrorContext *xmlerrcxt;
-
-	xmlerrcxt = pgxml_parser_init(PG_XML_STRICTNESS_LEGACY);
-
-	PG_TRY();
-	{
-		doctree = xmlParseMemory((char *) VARDATA_ANY(t), docsize);
-
-		result = (doctree != NULL);
-
-		if (doctree != NULL)
-			xmlFreeDoc(doctree);
-	}
-	PG_CATCH();
-	{
-		pg_xml_done(xmlerrcxt, true);
-
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	pg_xml_done(xmlerrcxt, false);
-
-	PG_RETURN_BOOL(result);
 }
 
 
@@ -194,16 +149,23 @@ pgxmlNodeSetToText(xmlNodeSetPtr nodeset,
 			}
 			else
 			{
+				xmlNodePtr	node = nodeset->nodeTab[i];
+
 				if ((septagname != NULL) && (xmlStrlen(septagname) > 0))
 				{
 					xmlBufferWriteChar(buf, "<");
 					xmlBufferWriteCHAR(buf, septagname);
 					xmlBufferWriteChar(buf, ">");
 				}
-				xmlNodeDump(buf,
-							nodeset->nodeTab[i]->doc,
-							nodeset->nodeTab[i],
-							1, 0);
+
+				/*
+				 * XML_NAMESPACE_DECL nodes are xmlNs structs, that cannot
+				 * be processed by xmlNodeDump().
+				 */
+				if (node->type == XML_NAMESPACE_DECL)
+					xmlBufferWriteCHAR(buf, xmlXPathCastNodeToString(node));
+				else
+					xmlNodeDump(buf, node->doc, node, 1, 0);
 
 				if ((septagname != NULL) && (xmlStrlen(septagname) > 0))
 				{
@@ -221,7 +183,7 @@ pgxmlNodeSetToText(xmlNodeSetPtr nodeset,
 		xmlBufferWriteCHAR(buf, toptagname);
 		xmlBufferWriteChar(buf, ">");
 	}
-	result = xmlStrdup(buf->content);
+	result = xmlStrdup(xmlBufferContent(buf));
 	xmlBufferFree(buf);
 	return result;
 }
@@ -326,8 +288,8 @@ xpath_string(PG_FUNCTION_ARGS)
 	/* We could try casting to string using the libxml function? */
 
 	xpath = (xmlChar *) palloc(pathsize + 9);
-	memcpy((char *) xpath, "string(", 7);
-	memcpy((char *) (xpath + 7), VARDATA_ANY(xpathsupp), pathsize);
+	memcpy(xpath, "string(", 7);
+	memcpy(xpath + 7, VARDATA_ANY(xpathsupp), pathsize);
 	xpath[pathsize + 7] = ')';
 	xpath[pathsize + 8] = '\0';
 
@@ -424,17 +386,18 @@ pgxml_xpath(text *document, xmlChar *xpath, xpath_workspace *workspace)
 
 	PG_TRY();
 	{
-		workspace->doctree = xmlParseMemory((char *) VARDATA_ANY(document),
-											docsize);
+		workspace->doctree = xmlReadMemory((char *) VARDATA_ANY(document),
+										   docsize, NULL, NULL,
+										   XML_PARSE_NOENT);
 		if (workspace->doctree != NULL)
 		{
 			workspace->ctxt = xmlXPathNewContext(workspace->doctree);
 			workspace->ctxt->node = xmlDocGetRootElement(workspace->doctree);
 
 			/* compile the path */
-            comppath = xmlXPathCtxtCompile(workspace->ctxt, xpath);
+			comppath = xmlXPathCtxtCompile(workspace->ctxt, xpath);
 			if (comppath == NULL)
-				xml_ereport(xmlerrcxt, ERROR, ERRCODE_EXTERNAL_ROUTINE_EXCEPTION,
+				xml_ereport(xmlerrcxt, ERROR, ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
 							"XPath Syntax Error");
 
 			/* Now evaluate the path expression. */
@@ -535,15 +498,9 @@ xpath_table(PG_FUNCTION_ARGS)
 	HeapTuple	spi_tuple;
 	TupleDesc	spi_tupdesc;
 
-	/* Output tuple (tuplestore) support */
-	Tuplestorestate *tupstore = NULL;
-	TupleDesc	ret_tupdesc;
-	HeapTuple	ret_tuple;
 
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	AttInMetadata *attinmeta;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
 
 	char	  **values;
 	xmlChar   **xpaths;
@@ -561,48 +518,10 @@ xpath_table(PG_FUNCTION_ARGS)
 	PgXmlErrorContext *xmlerrcxt;
 	volatile xmlDocPtr doctree = NULL;
 
-	/* We only have a valid tuple description in table function mode */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (rsinfo->expectedDesc == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("xpath_table must be called as a table function")));
-
-	/*
-	 * We want to materialise because it means that we don't have to carry
-	 * libxml2 parser state between invocations of this function
-	 */
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("xpath_table requires Materialize mode, but it is not "
-						"allowed in this context")));
-
-	/*
-	 * The tuplestore must exist in a higher context than this function call
-	 * (per_query_ctx is used)
-	 */
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-
-	/*
-	 * Create the tuplestore - work_mem is the max in-memory size before a
-	 * file is created on disk to hold it.
-	 */
-	tupstore =
-		tuplestore_begin_heap(rsinfo->allowedModes & SFRM_Materialize_Random,
-							  false, work_mem);
-
-	MemoryContextSwitchTo(oldcontext);
-
-	/* get the requested return tuple description */
-	ret_tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC);
 
 	/* must have at least one output column (for the pkey) */
-	if (ret_tupdesc->natts < 1)
+	if (rsinfo->setDesc->natts < 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("xpath_table must have at least one output column")));
@@ -615,14 +534,10 @@ xpath_table(PG_FUNCTION_ARGS)
 	 * representation.
 	 */
 
-	attinmeta = TupleDescGetAttInMetadata(ret_tupdesc);
+	attinmeta = TupleDescGetAttInMetadata(rsinfo->setDesc);
 
-	/* Set return mode and allocate value space. */
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setDesc = ret_tupdesc;
-
-	values = (char **) palloc(ret_tupdesc->natts * sizeof(char *));
-	xpaths = (xmlChar **) palloc(ret_tupdesc->natts * sizeof(xmlChar *));
+	values = (char **) palloc(rsinfo->setDesc->natts * sizeof(char *));
+	xpaths = (xmlChar **) palloc(rsinfo->setDesc->natts * sizeof(xmlChar *));
 
 	/*
 	 * Split XPaths. xpathset is a writable CString.
@@ -631,7 +546,7 @@ xpath_table(PG_FUNCTION_ARGS)
 	 */
 	numpaths = 0;
 	pos = xpathset;
-	while (numpaths < (ret_tupdesc->natts - 1))
+	while (numpaths < (rsinfo->setDesc->natts - 1))
 	{
 		xpaths[numpaths++] = (xmlChar *) pos;
 		pos = strstr(pos, pathsep);
@@ -654,8 +569,7 @@ xpath_table(PG_FUNCTION_ARGS)
 					 relname,
 					 condition);
 
-	if ((ret = SPI_connect()) < 0)
-		elog(ERROR, "xpath_table: SPI_connect returned %d", ret);
+	SPI_connect();
 
 	if ((ret = SPI_exec(query_buf.data, 0)) != SPI_OK_SELECT)
 		elog(ERROR, "xpath_table: SPI execution failed for query %s",
@@ -664,9 +578,6 @@ xpath_table(PG_FUNCTION_ARGS)
 	proc = SPI_processed;
 	tuptable = SPI_tuptable;
 	spi_tupdesc = tuptable->tupdesc;
-
-	/* Switch out of SPI context */
-	MemoryContextSwitchTo(oldcontext);
 
 	/*
 	 * Check that SPI returned correct result. If you put a comma into one of
@@ -699,6 +610,7 @@ xpath_table(PG_FUNCTION_ARGS)
 			xmlXPathObjectPtr res;
 			xmlChar    *resstr;
 			xmlXPathCompExprPtr comppath;
+			HeapTuple	ret_tuple;
 
 			/* Extract the row data as C Strings */
 			spi_tuple = tuptable->vals[i];
@@ -710,7 +622,7 @@ xpath_table(PG_FUNCTION_ARGS)
 			 * return NULL in all columns.  Note that this also means that
 			 * spare columns will be NULL.
 			 */
-			for (j = 0; j < ret_tupdesc->natts; j++)
+			for (j = 0; j < rsinfo->setDesc->natts; j++)
 				values[j] = NULL;
 
 			/* Insert primary key */
@@ -718,7 +630,9 @@ xpath_table(PG_FUNCTION_ARGS)
 
 			/* Parse the document */
 			if (xmldoc)
-				doctree = xmlParseMemory(xmldoc, strlen(xmldoc));
+				doctree = xmlReadMemory(xmldoc, strlen(xmldoc),
+										NULL, NULL,
+										XML_PARSE_NOENT);
 			else				/* treat NULL as not well-formed */
 				doctree = NULL;
 
@@ -726,7 +640,7 @@ xpath_table(PG_FUNCTION_ARGS)
 			{
 				/* not well-formed, so output all-NULL tuple */
 				ret_tuple = BuildTupleFromCStrings(attinmeta, values);
-				tuplestore_puttuple(tupstore, ret_tuple);
+				tuplestore_puttuple(rsinfo->setResult, ret_tuple);
 				heap_freetuple(ret_tuple);
 			}
 			else
@@ -744,10 +658,10 @@ xpath_table(PG_FUNCTION_ARGS)
 						ctxt->node = xmlDocGetRootElement(doctree);
 
 						/* compile the path */
-                        comppath = xmlXPathCtxtCompile(ctxt, xpaths[j]);
+						comppath = xmlXPathCtxtCompile(ctxt, xpaths[j]);
 						if (comppath == NULL)
 							xml_ereport(xmlerrcxt, ERROR,
-										ERRCODE_EXTERNAL_ROUTINE_EXCEPTION,
+										ERRCODE_INVALID_ARGUMENT_FOR_XQUERY,
 										"XPath Syntax Error");
 
 						/* Now evaluate the path expression. */
@@ -793,7 +707,7 @@ xpath_table(PG_FUNCTION_ARGS)
 					if (had_values)
 					{
 						ret_tuple = BuildTupleFromCStrings(attinmeta, values);
-						tuplestore_puttuple(tupstore, ret_tuple);
+						tuplestore_puttuple(rsinfo->setResult, ret_tuple);
 						heap_freetuple(ret_tuple);
 					}
 
@@ -827,11 +741,7 @@ xpath_table(PG_FUNCTION_ARGS)
 
 	pg_xml_done(xmlerrcxt, false);
 
-	tuplestore_donestoring(tupstore);
-
 	SPI_finish();
-
-	rsinfo->setResult = tupstore;
 
 	/*
 	 * SFRM_Materialize mode expects us to return a NULL Datum. The actual

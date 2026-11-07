@@ -36,10 +36,12 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
-#include "utils/builtins.h"
 #include "utils/varlena.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pgstattuple",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(pgstattuple);
 PG_FUNCTION_INFO_V1(pgstattuple_v1_5);
@@ -252,70 +254,58 @@ pgstat_relation(Relation rel, FunctionCallInfo fcinfo)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary tables of other sessions")));
 
-	switch (rel->rd_rel->relkind)
+	if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind) ||
+		rel->rd_rel->relkind == RELKIND_SEQUENCE)
 	{
-		case RELKIND_RELATION:
-		case RELKIND_MATVIEW:
-		case RELKIND_TOASTVALUE:
-		case RELKIND_SEQUENCE:
-			return pgstat_heap(rel, fcinfo);
-		case RELKIND_INDEX:
-			/* see pgstatindex_impl */
-			if (!rel->rd_index->indisvalid)
-				ereport(ERROR,
-						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-						 errmsg("index \"%s\" is not valid",
-								RelationGetRelationName(rel))));
+		return pgstat_heap(rel, fcinfo);
+	}
+	else if (rel->rd_rel->relkind == RELKIND_INDEX)
+	{
+		/* see pgstatindex_impl */
+		if (!rel->rd_index->indisvalid)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("index \"%s\" is not valid",
+							RelationGetRelationName(rel))));
 
-			switch (rel->rd_rel->relam)
-			{
-				case BTREE_AM_OID:
-					return pgstat_index(rel, BTREE_METAPAGE + 1,
-										pgstat_btree_page, fcinfo);
-				case HASH_AM_OID:
-					return pgstat_index(rel, HASH_METAPAGE + 1,
-										pgstat_hash_page, fcinfo);
-				case GIST_AM_OID:
-					return pgstat_index(rel, GIST_ROOT_BLKNO + 1,
-										pgstat_gist_page, fcinfo);
-				case GIN_AM_OID:
-					err = "gin index";
-					break;
-				case SPGIST_AM_OID:
-					err = "spgist index";
-					break;
-				case BRIN_AM_OID:
-					err = "brin index";
-					break;
-				default:
-					err = "unknown index";
-					break;
-			}
-			break;
-		case RELKIND_VIEW:
-			err = "view";
-			break;
-		case RELKIND_COMPOSITE_TYPE:
-			err = "composite type";
-			break;
-		case RELKIND_FOREIGN_TABLE:
-			err = "foreign table";
-			break;
-		case RELKIND_PARTITIONED_TABLE:
-			err = "partitioned table";
-			break;
-		case RELKIND_PARTITIONED_INDEX:
-			err = "partitioned index";
-			break;
-		default:
-			err = "unknown";
-			break;
+		switch (rel->rd_rel->relam)
+		{
+			case BTREE_AM_OID:
+				return pgstat_index(rel, BTREE_METAPAGE + 1,
+									pgstat_btree_page, fcinfo);
+			case HASH_AM_OID:
+				return pgstat_index(rel, HASH_METAPAGE + 1,
+									pgstat_hash_page, fcinfo);
+			case GIST_AM_OID:
+				return pgstat_index(rel, GIST_ROOT_BLKNO + 1,
+									pgstat_gist_page, fcinfo);
+			case GIN_AM_OID:
+				err = "gin index";
+				break;
+			case SPGIST_AM_OID:
+				err = "spgist index";
+				break;
+			case BRIN_AM_OID:
+				err = "brin index";
+				break;
+			default:
+				err = "unknown index";
+				break;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("index \"%s\" (%s) is not supported",
+						RelationGetRelationName(rel), err)));
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot get tuple-level statistics for relation \"%s\"",
+						RelationGetRelationName(rel)),
+				 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 	}
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("\"%s\" (%s) is not supported",
-					RelationGetRelationName(rel), err)));
 	return 0;					/* should not happen */
 }
 
@@ -335,7 +325,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 	pgstattuple_type stat = {0};
 	SnapshotData SnapshotDirty;
 
-    /*
+	/*
 	 * Sequences always use heap AM, but they don't show that in the catalogs.
 	 */
 	if (rel->rd_rel->relkind != RELKIND_SEQUENCE &&
@@ -388,7 +378,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
 										RBM_NORMAL, hscan->rs_strategy);
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
-			stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
+			stat.free_space += PageGetExactFreeSpace((Page) BufferGetPage(buffer));
 			UnlockReleaseBuffer(buffer);
 			block++;
 		}
@@ -401,7 +391,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
 									RBM_NORMAL, hscan->rs_strategy);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
-		stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
+		stat.free_space += PageGetExactFreeSpace((Page) BufferGetPage(buffer));
 		UnlockReleaseBuffer(buffer);
 		block++;
 	}
@@ -434,11 +424,11 @@ pgstat_btree_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
 		/* fully empty page */
 		stat->free_space += BLCKSZ;
 	}
-	else
+	else if (PageGetSpecialSize(page) == MAXALIGN(sizeof(BTPageOpaqueData)))
 	{
 		BTPageOpaque opaque;
 
-		opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+		opaque = BTPageGetOpaque(page);
 		if (P_IGNORE(opaque))
 		{
 			/* deleted or half-dead page */
@@ -468,14 +458,20 @@ pgstat_hash_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
 	Buffer		buf;
 	Page		page;
 
-	buf = _hash_getbuf_with_strategy(rel, blkno, HASH_READ, 0, bstrategy);
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
+	LockBuffer(buf, HASH_READ);
 	page = BufferGetPage(buf);
 
-	if (PageGetSpecialSize(page) == MAXALIGN(sizeof(HashPageOpaqueData)))
+	if (PageIsNew(page))
+	{
+		/* fully empty page */
+		stat->free_space += BLCKSZ;
+	}
+	else if (PageGetSpecialSize(page) == MAXALIGN(sizeof(HashPageOpaqueData)))
 	{
 		HashPageOpaque opaque;
 
-		opaque = (HashPageOpaque) PageGetSpecialPointer(page);
+		opaque = HashPageGetOpaque(page);
 		switch (opaque->hasho_flag & LH_PAGE_TYPE)
 		{
 			case LH_UNUSED_PAGE:
@@ -512,17 +508,23 @@ pgstat_gist_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
 
 	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
 	LockBuffer(buf, GIST_SHARE);
-	gistcheckpage(rel, buf);
 	page = BufferGetPage(buf);
-
-	if (GistPageIsLeaf(page))
+	if (PageIsNew(page))
 	{
-		pgstat_index_page(stat, page, FirstOffsetNumber,
-						  PageGetMaxOffsetNumber(page));
+		/* fully empty page */
+		stat->free_space += BLCKSZ;
 	}
-	else
+	else if (PageGetSpecialSize(page) == MAXALIGN(sizeof(GISTPageOpaqueData)))
 	{
-		/* root or node */
+		if (GistPageIsLeaf(page))
+		{
+			pgstat_index_page(stat, page, FirstOffsetNumber,
+							  PageGetMaxOffsetNumber(page));
+		}
+		else
+		{
+			/* root or node */
+		}
 	}
 
 	UnlockReleaseBuffer(buf);
@@ -581,7 +583,7 @@ pgstat_index_page(pgstattuple_type *stat, Page page,
 {
 	OffsetNumber i;
 
-	stat->free_space += PageGetFreeSpace(page);
+	stat->free_space += PageGetExactFreeSpace(page);
 
 	for (i = minoff; i <= maxoff; i = OffsetNumberNext(i))
 	{

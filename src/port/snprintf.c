@@ -2,7 +2,7 @@
  * Copyright (c) 1983, 1995, 1996 Eric P. Allman
  * Copyright (c) 1988, 1993
  *	The Regents of the University of California.  All rights reserved.
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -108,16 +108,6 @@
 #undef	fprintf
 #undef	vprintf
 #undef	printf
-
-/*
- * We use the platform's native snprintf() for some machine-dependent cases.
- * While that's required by C99, Microsoft Visual Studio lacks it before
- * VS2015.  Fortunately, we don't really need the length check in practice,
- * so just fall back to native sprintf() on that platform.
- */
-#if defined(_MSC_VER) && _MSC_VER < 1900	/* pre-VS2015 */
-#define snprintf(str,size,...) sprintf(str,__VA_ARGS__)
-#endif
 
 /*
  * Info about where the formatted output is going.
@@ -567,6 +557,28 @@ nextch2:
 					fmtpos = accum;
 				accum = 0;
 				goto nextch2;
+#ifdef WIN32
+			case 'I':
+				/* Windows PRI*{32,64,PTR} size */
+				if (format[0] == '3' && format[1] == '2')
+					format += 2;
+				else if (format[0] == '6' && format[1] == '4')
+				{
+					format += 2;
+					longlongflag = 1;
+				}
+				else
+				{
+#if SIZEOF_VOID_P == SIZEOF_LONG
+					longflag = 1;
+#elif SIZEOF_VOID_P == SIZEOF_LONG_LONG
+					longlongflag = 1;
+#else
+#error "cannot find integer type of the same size as intptr_t"
+#endif
+				}
+				goto nextch2;
+#endif
 			case 'l':
 				if (longflag)
 					longlongflag = 1;
@@ -574,16 +586,12 @@ nextch2:
 					longflag = 1;
 				goto nextch2;
 			case 'z':
-#if SIZEOF_SIZE_T == 8
-#ifdef HAVE_LONG_INT_64
+#if SIZEOF_SIZE_T == SIZEOF_LONG
 				longflag = 1;
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
 				longlongflag = 1;
 #else
-#error "Don't know how to print 64bit integers"
-#endif
-#else
-				/* assume size_t is same size as int */
+#error "cannot find integer type of the same size as size_t"
 #endif
 				goto nextch2;
 			case 'h':
@@ -763,12 +771,8 @@ find_arguments(const char *format, va_list args,
 	int			longflag;
 	int			fmtpos;
 	int			i;
-	int			last_dollar;
-	PrintfArgType argtypes[PG_NL_ARGMAX + 1];
-
-	/* Initialize to "no dollar arguments known" */
-	last_dollar = 0;
-	MemSet(argtypes, 0, sizeof(argtypes));
+	int			last_dollar = 0;	/* Init to "no dollar arguments known" */
+	PrintfArgType argtypes[PG_NL_ARGMAX + 1] = {0};
 
 	/*
 	 * This loop must accept the same format strings as the one in dopr().
@@ -838,6 +842,28 @@ nextch1:
 					fmtpos = accum;
 				accum = 0;
 				goto nextch1;
+#ifdef WIN32
+			case 'I':
+				/* Windows PRI*{32,64,PTR} size */
+				if (format[0] == '3' && format[1] == '2')
+					format += 2;
+				else if (format[0] == '6' && format[1] == '4')
+				{
+					format += 2;
+					longlongflag = 1;
+				}
+				else
+				{
+#if SIZEOF_VOID_P == SIZEOF_LONG
+					longflag = 1;
+#elif SIZEOF_VOID_P == SIZEOF_LONG_LONG
+					longlongflag = 1;
+#else
+#error "cannot find integer type of the same size as intptr_t"
+#endif
+				}
+				goto nextch1;
+#endif
 			case 'l':
 				if (longflag)
 					longlongflag = 1;
@@ -845,16 +871,12 @@ nextch1:
 					longflag = 1;
 				goto nextch1;
 			case 'z':
-#if SIZEOF_SIZE_T == 8
-#ifdef HAVE_LONG_INT_64
+#if SIZEOF_SIZE_T == SIZEOF_LONG
 				longflag = 1;
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
 				longlongflag = 1;
 #else
-#error "Don't know how to print 64bit integers"
-#endif
-#else
-				/* assume size_t is same size as int */
+#error "cannot find integer type of the same size as size_t"
 #endif
 				goto nextch1;
 			case 'h':
@@ -1022,8 +1044,8 @@ fmtint(long long value, char type, int forcesign, int leftjust,
 	   int minlen, int zpad, int precision, int pointflag,
 	   PrintfTarget *target)
 {
-	unsigned long long base;
 	unsigned long long uvalue;
+	int			base;
 	int			dosign;
 	const char *cvt = "0123456789abcdef";
 	int			signvalue = 0;
@@ -1082,12 +1104,36 @@ fmtint(long long value, char type, int forcesign, int leftjust,
 		vallen = 0;
 	else
 	{
-		/* make integer string */
-		do
+		/*
+		 * Convert integer to string.  We special-case each of the possible
+		 * base values so as to avoid general-purpose divisions.  On most
+		 * machines, division by a fixed constant can be done much more
+		 * cheaply than a general divide.
+		 */
+		if (base == 10)
 		{
-			convert[sizeof(convert) - (++vallen)] = cvt[uvalue % base];
-			uvalue = uvalue / base;
-		} while (uvalue);
+			do
+			{
+				convert[sizeof(convert) - (++vallen)] = cvt[uvalue % 10];
+				uvalue = uvalue / 10;
+			} while (uvalue);
+		}
+		else if (base == 16)
+		{
+			do
+			{
+				convert[sizeof(convert) - (++vallen)] = cvt[uvalue % 16];
+				uvalue = uvalue / 16;
+			} while (uvalue);
+		}
+		else					/* base == 8 */
+		{
+			do
+			{
+				convert[sizeof(convert) - (++vallen)] = cvt[uvalue % 8];
+				uvalue = uvalue / 8;
+			} while (uvalue);
+		}
 	}
 
 	zeropad = Max(0, precision - vallen);

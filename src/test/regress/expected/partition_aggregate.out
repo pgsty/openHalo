@@ -164,10 +164,9 @@ SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
            QUERY PLAN           
 --------------------------------
  GroupAggregate
-   Group Key: c
    ->  Result
          One-Time Filter: false
-(4 rows)
+(3 rows)
 
 SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
  c | sum 
@@ -336,6 +335,37 @@ SELECT a FROM pagg_tab WHERE a < 3 GROUP BY a ORDER BY 1;
  2
 (3 rows)
 
+-- Test partitionwise aggregation with ordered append path built from fractional paths
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pagg_tab GROUP BY c ORDER BY c LIMIT 1;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Limit
+   ->  Merge Append
+         Sort Key: pagg_tab.c
+         ->  GroupAggregate
+               Group Key: pagg_tab.c
+               ->  Sort
+                     Sort Key: pagg_tab.c
+                     ->  Seq Scan on pagg_tab_p1 pagg_tab
+         ->  GroupAggregate
+               Group Key: pagg_tab_1.c
+               ->  Sort
+                     Sort Key: pagg_tab_1.c
+                     ->  Seq Scan on pagg_tab_p2 pagg_tab_1
+         ->  GroupAggregate
+               Group Key: pagg_tab_2.c
+               ->  Sort
+                     Sort Key: pagg_tab_2.c
+                     ->  Seq Scan on pagg_tab_p3 pagg_tab_2
+(18 rows)
+
+SELECT count(*) FROM pagg_tab GROUP BY c ORDER BY c LIMIT 1;
+ count 
+-------
+   250
+(1 row)
+
 RESET enable_hashagg;
 -- ROLLUP, partitionwise aggregation does not apply
 EXPLAIN (COSTS OFF)
@@ -367,17 +397,17 @@ SELECT c, sum(b order by a) FROM pagg_tab GROUP BY c ORDER BY 1, 2;
          ->  GroupAggregate
                Group Key: pagg_tab.c
                ->  Sort
-                     Sort Key: pagg_tab.c
+                     Sort Key: pagg_tab.c, pagg_tab.a
                      ->  Seq Scan on pagg_tab_p1 pagg_tab
          ->  GroupAggregate
                Group Key: pagg_tab_1.c
                ->  Sort
-                     Sort Key: pagg_tab_1.c
+                     Sort Key: pagg_tab_1.c, pagg_tab_1.a
                      ->  Seq Scan on pagg_tab_p2 pagg_tab_1
          ->  GroupAggregate
                Group Key: pagg_tab_2.c
                ->  Sort
-                     Sort Key: pagg_tab_2.c
+                     Sort Key: pagg_tab_2.c, pagg_tab_2.a
                      ->  Seq Scan on pagg_tab_p3 pagg_tab_2
 (18 rows)
 
@@ -805,10 +835,10 @@ SELECT a.x, b.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x < 20) a FULL JOI
 -- Empty join relation because of empty outer side, no partitionwise agg plan
 EXPLAIN (COSTS OFF)
 SELECT a.x, a.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x = 1 AND x = 2) a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x, a.y ORDER BY 1, 2;
-              QUERY PLAN               
----------------------------------------
+              QUERY PLAN              
+--------------------------------------
  GroupAggregate
-   Group Key: pagg_tab1.x, pagg_tab1.y
+   Group Key: pagg_tab1.y
    ->  Sort
          Sort Key: pagg_tab1.y
          ->  Result
@@ -902,15 +932,15 @@ SELECT a, c, sum(b), avg(c), count(*) FROM pagg_tab_m GROUP BY (a+b)/2, 2, 1 HAV
    Sort Key: pagg_tab_m.a, pagg_tab_m.c, (sum(pagg_tab_m.b))
    ->  Append
          ->  HashAggregate
-               Group Key: ((pagg_tab_m.a + pagg_tab_m.b) / 2), pagg_tab_m.c, pagg_tab_m.a
+               Group Key: pagg_tab_m.a, pagg_tab_m.c, ((pagg_tab_m.a + pagg_tab_m.b) / 2)
                Filter: ((sum(pagg_tab_m.b) = 50) AND (avg(pagg_tab_m.c) > '25'::numeric))
                ->  Seq Scan on pagg_tab_m_p1 pagg_tab_m
          ->  HashAggregate
-               Group Key: ((pagg_tab_m_1.a + pagg_tab_m_1.b) / 2), pagg_tab_m_1.c, pagg_tab_m_1.a
+               Group Key: pagg_tab_m_1.a, pagg_tab_m_1.c, ((pagg_tab_m_1.a + pagg_tab_m_1.b) / 2)
                Filter: ((sum(pagg_tab_m_1.b) = 50) AND (avg(pagg_tab_m_1.c) > '25'::numeric))
                ->  Seq Scan on pagg_tab_m_p2 pagg_tab_m_1
          ->  HashAggregate
-               Group Key: ((pagg_tab_m_2.a + pagg_tab_m_2.b) / 2), pagg_tab_m_2.c, pagg_tab_m_2.a
+               Group Key: pagg_tab_m_2.a, pagg_tab_m_2.c, ((pagg_tab_m_2.a + pagg_tab_m_2.b) / 2)
                Filter: ((sum(pagg_tab_m_2.b) = 50) AND (avg(pagg_tab_m_2.c) > '25'::numeric))
                ->  Seq Scan on pagg_tab_m_p3 pagg_tab_m_2
 (15 rows)
@@ -942,6 +972,7 @@ INSERT INTO pagg_tab_ml SELECT i % 30, i % 10, to_char(i % 4, 'FM0000') FROM gen
 ANALYZE pagg_tab_ml;
 -- For Parallel Append
 SET max_parallel_workers_per_gather TO 2;
+SET parallel_setup_cost = 0;
 -- Full aggregation at level 1 as GROUP BY clause matches with PARTITION KEY
 -- for level 1 only. For subpartitions, GROUP BY clause does not match with
 -- PARTITION KEY, but still we do not see a partial aggregation as array_agg()
@@ -959,13 +990,13 @@ SELECT a, sum(b), array_agg(distinct c), count(*) FROM pagg_tab_ml GROUP BY a HA
                      Group Key: pagg_tab_ml.a
                      Filter: (avg(pagg_tab_ml.b) < '3'::numeric)
                      ->  Sort
-                           Sort Key: pagg_tab_ml.a
+                           Sort Key: pagg_tab_ml.a, pagg_tab_ml.c
                            ->  Seq Scan on pagg_tab_ml_p1 pagg_tab_ml
                ->  GroupAggregate
                      Group Key: pagg_tab_ml_5.a
                      Filter: (avg(pagg_tab_ml_5.b) < '3'::numeric)
                      ->  Sort
-                           Sort Key: pagg_tab_ml_5.a
+                           Sort Key: pagg_tab_ml_5.a, pagg_tab_ml_5.c
                            ->  Append
                                  ->  Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_5
                                  ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_6
@@ -973,7 +1004,7 @@ SELECT a, sum(b), array_agg(distinct c), count(*) FROM pagg_tab_ml GROUP BY a HA
                      Group Key: pagg_tab_ml_2.a
                      Filter: (avg(pagg_tab_ml_2.b) < '3'::numeric)
                      ->  Sort
-                           Sort Key: pagg_tab_ml_2.a
+                           Sort Key: pagg_tab_ml_2.a, pagg_tab_ml_2.c
                            ->  Append
                                  ->  Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_2
                                  ->  Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_3
@@ -1005,13 +1036,13 @@ SELECT a, sum(b), array_agg(distinct c), count(*) FROM pagg_tab_ml GROUP BY a HA
                Group Key: pagg_tab_ml.a
                Filter: (avg(pagg_tab_ml.b) < '3'::numeric)
                ->  Sort
-                     Sort Key: pagg_tab_ml.a
+                     Sort Key: pagg_tab_ml.a, pagg_tab_ml.c
                      ->  Seq Scan on pagg_tab_ml_p1 pagg_tab_ml
          ->  GroupAggregate
                Group Key: pagg_tab_ml_5.a
                Filter: (avg(pagg_tab_ml_5.b) < '3'::numeric)
                ->  Sort
-                     Sort Key: pagg_tab_ml_5.a
+                     Sort Key: pagg_tab_ml_5.a, pagg_tab_ml_5.c
                      ->  Append
                            ->  Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_5
                            ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_6
@@ -1019,12 +1050,13 @@ SELECT a, sum(b), array_agg(distinct c), count(*) FROM pagg_tab_ml GROUP BY a HA
                Group Key: pagg_tab_ml_2.a
                Filter: (avg(pagg_tab_ml_2.b) < '3'::numeric)
                ->  Sort
-                     Sort Key: pagg_tab_ml_2.a
+                     Sort Key: pagg_tab_ml_2.a, pagg_tab_ml_2.c
                      ->  Append
                            ->  Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_2
                            ->  Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_3
 (25 rows)
 
+RESET parallel_setup_cost;
 -- Full aggregation at level 1 as GROUP BY clause matches with PARTITION KEY
 -- for level 1 only. For subpartitions, GROUP BY clause does not match with
 -- PARTITION KEY, thus we will have a partial aggregation for them.

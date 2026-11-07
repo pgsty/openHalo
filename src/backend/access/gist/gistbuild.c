@@ -22,7 +22,7 @@
  * tuples (unless buffering mode is disabled).
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -36,14 +36,14 @@
 
 #include "access/genam.h"
 #include "access/gist_private.h"
-#include "access/gistxlog.h"
 #include "access/tableam.h"
 #include "access/xloginsert.h"
-#include "catalog/index.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "optimizer/optimizer.h"
 #include "storage/bufmgr.h"
-#include "storage/smgr.h"
+#include "storage/bulk_write.h"
+
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplesort.h"
@@ -75,7 +75,7 @@ typedef enum
 	GIST_BUFFERING_STATS,		/* gathering statistics of index tuple size
 								 * before switching to the buffering build
 								 * mode */
-	GIST_BUFFERING_ACTIVE		/* in buffering build mode */
+	GIST_BUFFERING_ACTIVE,		/* in buffering build mode */
 } GistBuildMode;
 
 /* Working state for gistbuild and its callback */
@@ -106,23 +106,27 @@ typedef struct
 	Tuplesortstate *sortstate;	/* state data for tuplesort.c */
 
 	BlockNumber pages_allocated;
-	BlockNumber pages_written;
 
-	int			ready_num_pages;
-	BlockNumber ready_blknos[XLR_MAX_BLOCK_ID];
-	Page		ready_pages[XLR_MAX_BLOCK_ID];
+	BulkWriteState *bulkstate;
 } GISTBuildState;
+
+#define GIST_SORTED_BUILD_PAGE_NUM 4
 
 /*
  * In sorted build, we use a stack of these structs, one for each level,
- * to hold an in-memory buffer of the rightmost page at the level. When the
- * page fills up, it is written out and a new page is allocated.
+ * to hold an in-memory buffer of last pages at the level.
+ *
+ * Sorting GiST build requires good linearization of the sort opclass. This is
+ * not always the case in multidimensional data. To tackle the anomalies, we
+ * buffer index tuples and apply picksplit that can be multidimension-aware.
  */
-typedef struct GistSortedBuildPageState
+typedef struct GistSortedBuildLevelState
 {
-	Page		page;
-	struct GistSortedBuildPageState *parent;	/* Upper level, if any */
-} GistSortedBuildPageState;
+	int			current_page;
+	BlockNumber last_blkno;
+	struct GistSortedBuildLevelState *parent;	/* Upper level, if any */
+	Page		pages[GIST_SORTED_BUILD_PAGE_NUM];
+} GistSortedBuildLevelState;
 
 /* prototypes for private functions */
 
@@ -130,12 +134,11 @@ static void gistSortedBuildCallback(Relation index, ItemPointer tid,
 									Datum *values, bool *isnull,
 									bool tupleIsAlive, void *state);
 static void gist_indexsortbuild(GISTBuildState *state);
-static void gist_indexsortbuild_pagestate_add(GISTBuildState *state,
-											  GistSortedBuildPageState *pagestate,
-											  IndexTuple itup);
-static void gist_indexsortbuild_pagestate_flush(GISTBuildState *state,
-												GistSortedBuildPageState *pagestate);
-static void gist_indexsortbuild_flush_ready_pages(GISTBuildState *state);
+static void gist_indexsortbuild_levelstate_add(GISTBuildState *state,
+											   GistSortedBuildLevelState *levelstate,
+											   IndexTuple itup);
+static void gist_indexsortbuild_levelstate_flush(GISTBuildState *state,
+												 GistSortedBuildLevelState *levelstate);
 
 static void gistInitBuffering(GISTBuildState *buildstate);
 static int	calculatePagesPerBuffer(GISTBuildState *buildstate, int levelStep);
@@ -155,7 +158,7 @@ static BlockNumber gistbufferinginserttuples(GISTBuildState *buildstate,
 											 BlockNumber parentblk, OffsetNumber downlinkoffnum);
 static Buffer gistBufferingFindCorrectParent(GISTBuildState *buildstate,
 											 BlockNumber childblkno, int level,
-											 BlockNumber *parentblk,
+											 BlockNumber *parentblkno,
 											 OffsetNumber *downlinkoffnum);
 static void gistProcessEmptyingQueue(GISTBuildState *buildstate);
 static void gistEmptyAllBuffers(GISTBuildState *buildstate);
@@ -164,7 +167,8 @@ static int	gistGetMaxLevel(Relation index);
 static void gistInitParentMap(GISTBuildState *buildstate);
 static void gistMemorizeParent(GISTBuildState *buildstate, BlockNumber child,
 							   BlockNumber parent);
-static void gistMemorizeAllDownlinks(GISTBuildState *buildstate, Buffer parent);
+static void gistMemorizeAllDownlinks(GISTBuildState *buildstate,
+									 Buffer parentbuf);
 static BlockNumber gistGetParent(GISTBuildState *buildstate, BlockNumber child);
 
 
@@ -264,12 +268,12 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 														  index,
 														  maintenance_work_mem,
 														  NULL,
-														  false);
+														  TUPLESORT_NONE);
 
 		/* Scan the table, adding all tuples to the tuplesort */
 		reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
 										   gistSortedBuildCallback,
-										   (void *) &buildstate, NULL);
+										   &buildstate, NULL);
 
 		/*
 		 * Perform the sort and build index pages.
@@ -290,7 +294,7 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		Page		page;
 
 		/* initialize the root page */
-		buffer = gistNewBuffer(index);
+		buffer = gistNewBuffer(index, heap);
 		Assert(BufferGetBlockNumber(buffer) == GIST_ROOT_BLKNO);
 		page = BufferGetPage(buffer);
 
@@ -308,7 +312,7 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		/* Scan the table, inserting all the tuples to the index. */
 		reltuples = table_index_build_scan(heap, index, indexInfo, true, true,
 										   gistBuildCallback,
-										   (void *) &buildstate, NULL);
+										   &buildstate, NULL);
 
 		/*
 		 * If buffering was used, flush out all the tuples that are still in
@@ -396,207 +400,212 @@ static void
 gist_indexsortbuild(GISTBuildState *state)
 {
 	IndexTuple	itup;
-	GistSortedBuildPageState *leafstate;
-	GistSortedBuildPageState *pagestate;
-	Page		page;
+	GistSortedBuildLevelState *levelstate;
+	BulkWriteBuffer rootbuf;
 
-	state->pages_allocated = 0;
-	state->pages_written = 0;
-	state->ready_num_pages = 0;
+	/* Reserve block 0 for the root page */
+	state->pages_allocated = 1;
 
-	/*
-	 * Write an empty page as a placeholder for the root page. It will be
-	 * replaced with the real root page at the end.
-	 */
-	page = palloc0(BLCKSZ);
-	smgrextend(RelationGetSmgr(state->indexrel), MAIN_FORKNUM, GIST_ROOT_BLKNO,
-			   page, true);
-	state->pages_allocated++;
-	state->pages_written++;
+	state->bulkstate = smgr_bulk_start_rel(state->indexrel, MAIN_FORKNUM);
 
-	/* Allocate a temporary buffer for the first leaf page. */
-	leafstate = palloc(sizeof(GistSortedBuildPageState));
-	leafstate->page = page;
-	leafstate->parent = NULL;
-	gistinitpage(page, F_LEAF);
+	/* Allocate a temporary buffer for the first leaf page batch. */
+	levelstate = palloc0(sizeof(GistSortedBuildLevelState));
+	levelstate->pages[0] = palloc(BLCKSZ);
+	levelstate->parent = NULL;
+	gistinitpage(levelstate->pages[0], F_LEAF);
 
 	/*
 	 * Fill index pages with tuples in the sorted order.
 	 */
 	while ((itup = tuplesort_getindextuple(state->sortstate, true)) != NULL)
 	{
-		gist_indexsortbuild_pagestate_add(state, leafstate, itup);
+		gist_indexsortbuild_levelstate_add(state, levelstate, itup);
 		MemoryContextReset(state->giststate->tempCxt);
 	}
 
 	/*
 	 * Write out the partially full non-root pages.
 	 *
-	 * Keep in mind that flush can build a new root.
+	 * Keep in mind that flush can build a new root. If number of pages is > 1
+	 * then new root is required.
 	 */
-	pagestate = leafstate;
-	while (pagestate->parent != NULL)
+	while (levelstate->parent != NULL || levelstate->current_page != 0)
 	{
-		GistSortedBuildPageState *parent;
+		GistSortedBuildLevelState *parent;
 
-		gist_indexsortbuild_pagestate_flush(state, pagestate);
-		parent = pagestate->parent;
-		pfree(pagestate->page);
-		pfree(pagestate);
-		pagestate = parent;
+		gist_indexsortbuild_levelstate_flush(state, levelstate);
+		parent = levelstate->parent;
+		for (int i = 0; i < GIST_SORTED_BUILD_PAGE_NUM; i++)
+			if (levelstate->pages[i])
+				pfree(levelstate->pages[i]);
+		pfree(levelstate);
+		levelstate = parent;
 	}
 
-	gist_indexsortbuild_flush_ready_pages(state);
-
 	/* Write out the root */
-	PageSetLSN(pagestate->page, GistBuildLSN);
-	PageSetChecksumInplace(pagestate->page, GIST_ROOT_BLKNO);
-	smgrwrite(RelationGetSmgr(state->indexrel), MAIN_FORKNUM, GIST_ROOT_BLKNO,
-			  pagestate->page, true);
-	if (RelationNeedsWAL(state->indexrel))
-		log_newpage(&state->indexrel->rd_node, MAIN_FORKNUM, GIST_ROOT_BLKNO,
-					pagestate->page, true);
+	PageSetLSN(levelstate->pages[0], GistBuildLSN);
+	rootbuf = smgr_bulk_get_buf(state->bulkstate);
+	memcpy(rootbuf, levelstate->pages[0], BLCKSZ);
+	smgr_bulk_write(state->bulkstate, GIST_ROOT_BLKNO, rootbuf, true);
 
-	pfree(pagestate->page);
-	pfree(pagestate);
+	pfree(levelstate);
 
-	/*
-	 * When we WAL-logged index pages, we must nonetheless fsync index files.
-	 * Since we're building outside shared buffers, a CHECKPOINT occurring
-	 * during the build has no way to flush the previously written data to
-	 * disk (indeed it won't know the index even exists).  A crash later on
-	 * would replay WAL from the checkpoint, therefore it wouldn't replay our
-	 * earlier WAL entries. If we do not fsync those pages here, they might
-	 * still not be on disk when the crash occurs.
-	 */
-	if (RelationNeedsWAL(state->indexrel))
-		smgrimmedsync(RelationGetSmgr(state->indexrel), MAIN_FORKNUM);
+	smgr_bulk_finish(state->bulkstate);
 }
 
 /*
- * Add tuple to a page. If the pages is full, write it out and re-initialize
+ * Add tuple to a page. If the pages are full, write them out and re-initialize
  * a new page first.
  */
 static void
-gist_indexsortbuild_pagestate_add(GISTBuildState *state,
-								  GistSortedBuildPageState *pagestate,
-								  IndexTuple itup)
+gist_indexsortbuild_levelstate_add(GISTBuildState *state,
+								   GistSortedBuildLevelState *levelstate,
+								   IndexTuple itup)
 {
 	Size		sizeNeeded;
 
-	/* Does the tuple fit? If not, flush */
-	sizeNeeded = IndexTupleSize(itup) + sizeof(ItemIdData) + state->freespace;
-	if (PageGetFreeSpace(pagestate->page) < sizeNeeded)
-		gist_indexsortbuild_pagestate_flush(state, pagestate);
+	/* Check if tuple can be added to the current page */
+	sizeNeeded = IndexTupleSize(itup) + sizeof(ItemIdData); /* fillfactor ignored */
+	if (PageGetFreeSpace(levelstate->pages[levelstate->current_page]) < sizeNeeded)
+	{
+		Page		newPage;
+		Page		old_page = levelstate->pages[levelstate->current_page];
+		uint16		old_page_flags = GistPageGetOpaque(old_page)->flags;
 
-	gistfillbuffer(pagestate->page, &itup, 1, InvalidOffsetNumber);
+		if (levelstate->current_page + 1 == GIST_SORTED_BUILD_PAGE_NUM)
+		{
+			gist_indexsortbuild_levelstate_flush(state, levelstate);
+		}
+		else
+			levelstate->current_page++;
+
+		if (levelstate->pages[levelstate->current_page] == NULL)
+			levelstate->pages[levelstate->current_page] = palloc0(BLCKSZ);
+
+		newPage = levelstate->pages[levelstate->current_page];
+		gistinitpage(newPage, old_page_flags);
+	}
+
+	gistfillbuffer(levelstate->pages[levelstate->current_page], &itup, 1, InvalidOffsetNumber);
 }
 
 static void
-gist_indexsortbuild_pagestate_flush(GISTBuildState *state,
-									GistSortedBuildPageState *pagestate)
+gist_indexsortbuild_levelstate_flush(GISTBuildState *state,
+									 GistSortedBuildLevelState *levelstate)
 {
-	GistSortedBuildPageState *parent;
-	IndexTuple *itvec;
-	IndexTuple	union_tuple;
-	int			vect_len;
-	bool		isleaf;
+	GistSortedBuildLevelState *parent;
 	BlockNumber blkno;
 	MemoryContext oldCtx;
+	IndexTuple	union_tuple;
+	SplitPageLayout *dist;
+	IndexTuple *itvec;
+	int			vect_len;
+	bool		isleaf = GistPageIsLeaf(levelstate->pages[0]);
 
-	/* check once per page */
 	CHECK_FOR_INTERRUPTS();
 
-	if (state->ready_num_pages == XLR_MAX_BLOCK_ID)
-		gist_indexsortbuild_flush_ready_pages(state);
-
-	/*
-	 * The page is now complete. Assign a block number to it, and add it to
-	 * the list of finished pages. (We don't write it out immediately, because
-	 * we want to WAL-log the pages in batches.)
-	 */
-	blkno = state->pages_allocated++;
-	state->ready_blknos[state->ready_num_pages] = blkno;
-	state->ready_pages[state->ready_num_pages] = pagestate->page;
-	state->ready_num_pages++;
-
-	isleaf = GistPageIsLeaf(pagestate->page);
-
-	/*
-	 * Form a downlink tuple to represent all the tuples on the page.
-	 */
 	oldCtx = MemoryContextSwitchTo(state->giststate->tempCxt);
-	itvec = gistextractpage(pagestate->page, &vect_len);
-	union_tuple = gistunion(state->indexrel, itvec, vect_len,
-							state->giststate);
-	ItemPointerSetBlockNumber(&(union_tuple->t_tid), blkno);
+
+	/* Get index tuples from first page */
+	itvec = gistextractpage(levelstate->pages[0], &vect_len);
+	if (levelstate->current_page > 0)
+	{
+		/* Append tuples from each page */
+		for (int i = 1; i < levelstate->current_page + 1; i++)
+		{
+			int			len_local;
+			IndexTuple *itvec_local = gistextractpage(levelstate->pages[i], &len_local);
+
+			itvec = gistjoinvector(itvec, &vect_len, itvec_local, len_local);
+			pfree(itvec_local);
+		}
+
+		/* Apply picksplit to list of all collected tuples */
+		dist = gistSplit(state->indexrel, levelstate->pages[0], itvec, vect_len, state->giststate);
+	}
+	else
+	{
+		/* Create split layout from single page */
+		dist = (SplitPageLayout *) palloc0(sizeof(SplitPageLayout));
+		union_tuple = gistunion(state->indexrel, itvec, vect_len,
+								state->giststate);
+		dist->itup = union_tuple;
+		dist->list = gistfillitupvec(itvec, vect_len, &(dist->lenlist));
+		dist->block.num = vect_len;
+	}
+
 	MemoryContextSwitchTo(oldCtx);
 
-	/*
-	 * Insert the downlink to the parent page. If this was the root, create a
-	 * new page as the parent, which becomes the new root.
-	 */
-	parent = pagestate->parent;
-	if (parent == NULL)
+	/* Reset page counter */
+	levelstate->current_page = 0;
+
+	/* Create pages for all partitions in split result */
+	for (; dist != NULL; dist = dist->next)
 	{
-		parent = palloc(sizeof(GistSortedBuildPageState));
-		parent->page = (Page) palloc(BLCKSZ);
-		parent->parent = NULL;
-		gistinitpage(parent->page, 0);
+		char	   *data;
+		BulkWriteBuffer buf;
+		Page		target;
 
-		pagestate->parent = parent;
+		/* check once per page */
+		CHECK_FOR_INTERRUPTS();
+
+		/* Create page and copy data */
+		data = (char *) (dist->list);
+		buf = smgr_bulk_get_buf(state->bulkstate);
+		target = (Page) buf;
+		gistinitpage(target, isleaf ? F_LEAF : 0);
+		for (int i = 0; i < dist->block.num; i++)
+		{
+			IndexTuple	thistup = (IndexTuple) data;
+
+			if (PageAddItem(target, (Item) data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+				elog(ERROR, "failed to add item to index page in \"%s\"", RelationGetRelationName(state->indexrel));
+
+			data += IndexTupleSize(thistup);
+		}
+		union_tuple = dist->itup;
+
+		/*
+		 * Set the right link to point to the previous page. This is just for
+		 * debugging purposes: GiST only follows the right link if a page is
+		 * split concurrently to a scan, and that cannot happen during index
+		 * build.
+		 *
+		 * It's a bit counterintuitive that we set the right link on the new
+		 * page to point to the previous page, not the other way around. But
+		 * GiST pages are not ordered like B-tree pages are, so as long as the
+		 * right-links form a chain through all the pages at the same level,
+		 * the order doesn't matter.
+		 */
+		if (levelstate->last_blkno)
+			GistPageGetOpaque(target)->rightlink = levelstate->last_blkno;
+
+		/*
+		 * The page is now complete. Assign a block number to it, and pass it
+		 * to the bulk writer.
+		 */
+		blkno = state->pages_allocated++;
+		PageSetLSN(target, GistBuildLSN);
+		smgr_bulk_write(state->bulkstate, blkno, buf, true);
+		ItemPointerSetBlockNumber(&(union_tuple->t_tid), blkno);
+		levelstate->last_blkno = blkno;
+
+		/*
+		 * Insert the downlink to the parent page. If this was the root,
+		 * create a new page as the parent, which becomes the new root.
+		 */
+		parent = levelstate->parent;
+		if (parent == NULL)
+		{
+			parent = palloc0(sizeof(GistSortedBuildLevelState));
+			parent->pages[0] = palloc(BLCKSZ);
+			parent->parent = NULL;
+			gistinitpage(parent->pages[0], 0);
+
+			levelstate->parent = parent;
+		}
+		gist_indexsortbuild_levelstate_add(state, parent, union_tuple);
 	}
-	gist_indexsortbuild_pagestate_add(state, parent, union_tuple);
-
-	/* Re-initialize the page buffer for next page on this level. */
-	pagestate->page = palloc(BLCKSZ);
-	gistinitpage(pagestate->page, isleaf ? F_LEAF : 0);
-
-	/*
-	 * Set the right link to point to the previous page. This is just for
-	 * debugging purposes: GiST only follows the right link if a page is split
-	 * concurrently to a scan, and that cannot happen during index build.
-	 *
-	 * It's a bit counterintuitive that we set the right link on the new page
-	 * to point to the previous page, and not the other way round. But GiST
-	 * pages are not ordered like B-tree pages are, so as long as the
-	 * right-links form a chain through all the pages in the same level, the
-	 * order doesn't matter.
-	 */
-	GistPageGetOpaque(pagestate->page)->rightlink = blkno;
-}
-
-static void
-gist_indexsortbuild_flush_ready_pages(GISTBuildState *state)
-{
-	if (state->ready_num_pages == 0)
-		return;
-
-	for (int i = 0; i < state->ready_num_pages; i++)
-	{
-		Page		page = state->ready_pages[i];
-		BlockNumber blkno = state->ready_blknos[i];
-
-		/* Currently, the blocks must be buffered in order. */
-		if (blkno != state->pages_written)
-			elog(ERROR, "unexpected block number to flush GiST sorting build");
-
-		PageSetLSN(page, GistBuildLSN);
-		PageSetChecksumInplace(page, blkno);
-		smgrextend(RelationGetSmgr(state->indexrel), MAIN_FORKNUM, blkno, page,
-				   true);
-
-		state->pages_written++;
-	}
-
-	if (RelationNeedsWAL(state->indexrel))
-		log_newpages(&state->indexrel->rd_node, MAIN_FORKNUM, state->ready_num_pages,
-					 state->ready_blknos, state->ready_pages, true);
-
-	for (int i = 0; i < state->ready_num_pages; i++)
-		pfree(state->ready_pages[i]);
-
-	state->ready_num_pages = 0;
 }
 
 
@@ -648,10 +657,12 @@ gistInitBuffering(GISTBuildState *buildstate)
 	itupMinSize = (Size) MAXALIGN(sizeof(IndexTupleData));
 	for (i = 0; i < index->rd_att->natts; i++)
 	{
-		if (TupleDescAttr(index->rd_att, i)->attlen < 0)
+		CompactAttribute *attr = TupleDescCompactAttr(index->rd_att, i);
+
+		if (attr->attlen < 0)
 			itupMinSize += VARHDRSZ;
 		else
-			itupMinSize += TupleDescAttr(index->rd_att, i)->attlen;
+			itupMinSize += attr->attlen;
 	}
 
 	/* Calculate average and maximal number of index tuples which fit to page */
@@ -1522,7 +1533,7 @@ gistMemorizeParent(GISTBuildState *buildstate, BlockNumber child, BlockNumber pa
 	bool		found;
 
 	entry = (ParentMapEntry *) hash_search(buildstate->parentMap,
-										   (const void *) &child,
+										   &child,
 										   HASH_ENTER,
 										   &found);
 	entry->parentblkno = parent;
@@ -1560,7 +1571,7 @@ gistGetParent(GISTBuildState *buildstate, BlockNumber child)
 
 	/* Find node buffer in hash table */
 	entry = (ParentMapEntry *) hash_search(buildstate->parentMap,
-										   (const void *) &child,
+										   &child,
 										   HASH_FIND,
 										   &found);
 	if (!found)

@@ -4,7 +4,7 @@
  *	  Private declarations for SP-GiST access method.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/spgist_private.h
@@ -157,7 +157,7 @@ typedef struct SpGistState
 
 	char	   *deadTupleStorage;	/* workspace for spgFormDeadTuple */
 
-	TransactionId myXid;		/* XID to use when creating a redirect tuple */
+	TransactionId redirectXid;	/* XID to use when creating a redirect tuple */
 	bool		isBuild;		/* true if doing index build */
 } SpGistState;
 
@@ -465,7 +465,7 @@ typedef SpGistDeadTupleData *SpGistDeadTuple;
 
 #define STORE_STATE(s, d)  \
 	do { \
-		(d).myXid = (s)->myXid; \
+		(d).redirectXid = (s)->redirectXid; \
 		(d).isBuild = (s)->isBuild; \
 	} while(0)
 
@@ -507,10 +507,10 @@ extern void SpGistInitBuffer(Buffer b, uint16 f);
 extern void SpGistInitMetapage(Page page);
 extern unsigned int SpGistGetInnerTypeSize(SpGistTypeDesc *att, Datum datum);
 extern Size SpGistGetLeafTupleSize(TupleDesc tupleDescriptor,
-								   Datum *datums, bool *isnulls);
+								   const Datum *datums, const bool *isnulls);
 extern SpGistLeafTuple spgFormLeafTuple(SpGistState *state,
 										ItemPointer heapPtr,
-										Datum *datums, bool *isnulls);
+										const Datum *datums, const bool *isnulls);
 extern SpGistNodeTuple spgFormNodeTuple(SpGistState *state,
 										Datum label, bool isnull);
 extern SpGistInnerTuple spgFormInnerTuple(SpGistState *state,

@@ -3,7 +3,7 @@
  * tsvector_op.c
  *	  operations over tsvector
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -19,6 +19,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/trigger.h"
+#include "common/int.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "lib/qunique.h"
@@ -28,7 +29,6 @@
 #include "tsearch/ts_utils.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/lsyscache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 
@@ -71,6 +71,10 @@ typedef struct
 static TSTernaryValue TS_execute_recurse(QueryItem *curitem, void *arg,
 										 uint32 flags,
 										 TSExecuteCallback chkcond);
+static bool TS_execute_locations_recurse(QueryItem *curitem,
+										 void *arg,
+										 TSExecuteCallback chkcond,
+										 List **locations);
 static int	tsvector_bsearch(const TSVector tsv, char *lexeme, int lexeme_len);
 static Datum tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column);
 
@@ -171,6 +175,7 @@ tsvector_strip(PG_FUNCTION_ARGS)
 			   *arrout;
 	char	   *cur;
 
+	/* Output can't be bigger than input, so no need for overflow checks */
 	for (i = 0; i < in->size; i++)
 		len += arrin[i].len;
 
@@ -203,17 +208,10 @@ tsvector_length(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(ret);
 }
 
-Datum
-tsvector_setweight(PG_FUNCTION_ARGS)
+static int
+parse_weight(char cw)
 {
-	TSVector	in = PG_GETARG_TSVECTOR(0);
-	char		cw = PG_GETARG_CHAR(1);
-	TSVector	out;
-	int			i,
-				j;
-	WordEntry  *entry;
-	WordEntryPos *p;
-	int			w = 0;
+	int			w;
 
 	switch (cw)
 	{
@@ -234,9 +232,32 @@ tsvector_setweight(PG_FUNCTION_ARGS)
 			w = 0;
 			break;
 		default:
-			/* internal error */
-			elog(ERROR, "unrecognized weight: %d", cw);
+			/* Avoid printing non-ASCII bytes, else we have encoding issues */
+			if (cw >= ' ' && cw < 0x7f)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized weight: \"%c\"", cw)));
+			else				/* use \ooo format, like charout() */
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized weight: \"\\%03o\"",
+								(unsigned char) cw)));
 	}
+	return w;
+}
+
+
+Datum
+tsvector_setweight(PG_FUNCTION_ARGS)
+{
+	TSVector	in = PG_GETARG_TSVECTOR(0);
+	char		cw = PG_GETARG_CHAR(1);
+	TSVector	out;
+	int			i,
+				j;
+	WordEntry  *entry;
+	WordEntryPos *p;
+	int			w = parse_weight(cw);
 
 	out = (TSVector) palloc(VARSIZE(in));
 	memcpy(out, in, VARSIZE(in));
@@ -281,35 +302,13 @@ tsvector_setweight_by_filter(PG_FUNCTION_ARGS)
 	Datum	   *dlexemes;
 	bool	   *nulls;
 
-	switch (char_weight)
-	{
-		case 'A':
-		case 'a':
-			weight = 3;
-			break;
-		case 'B':
-		case 'b':
-			weight = 2;
-			break;
-		case 'C':
-		case 'c':
-			weight = 1;
-			break;
-		case 'D':
-		case 'd':
-			weight = 0;
-			break;
-		default:
-			/* internal error */
-			elog(ERROR, "unrecognized weight: %c", char_weight);
-	}
+	weight = parse_weight(char_weight);
 
 	tsout = (TSVector) palloc(VARSIZE(tsin));
 	memcpy(tsout, tsin, VARSIZE(tsin));
 	entry = ARRPTR(tsout);
 
-	deconstruct_array(lexemes, TEXTOID, -1, false, TYPALIGN_INT,
-					  &dlexemes, &nulls, &nlexemes);
+	deconstruct_array_builtin(lexemes, TEXTOID, &dlexemes, &nulls, &nlexemes);
 
 	/*
 	 * Assuming that lexemes array is significantly shorter than tsvector we
@@ -322,10 +321,9 @@ tsvector_setweight_by_filter(PG_FUNCTION_ARGS)
 		int			lex_len,
 					lex_pos;
 
+		/* Ignore null array elements, they surely don't match */
 		if (nulls[i])
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("lexeme array may not contain nulls")));
+			continue;
 
 		lex = VARDATA(dlexemes[i]);
 		lex_len = VARSIZE(dlexemes[i]) - VARHDRSZ;
@@ -433,9 +431,7 @@ compare_int(const void *va, const void *vb)
 	int			a = *((const int *) va);
 	int			b = *((const int *) vb);
 
-	if (a == b)
-		return 0;
-	return (a > b) ? 1 : -1;
+	return pg_cmp_s32(a, b);
 }
 
 static int
@@ -497,6 +493,8 @@ tsvector_delete_by_indices(TSVector tsv, int *indices_to_delete,
 
 	/*
 	 * Copy tsv to tsout, skipping lexemes listed in indices_to_delete.
+	 *
+	 * Output can't be bigger than input, so no need for overflow checks.
 	 */
 	arrout = ARRPTR(tsout);
 	dataout = STRPTR(tsout);
@@ -523,7 +521,7 @@ tsvector_delete_by_indices(TSVector tsv, int *indices_to_delete,
 		if (arrin[i].haspos)
 		{
 			int			len = POSDATALEN(tsv, arrin + i) * sizeof(WordEntryPos)
-			+ sizeof(uint16);
+				+ sizeof(uint16);
 
 			curoff = SHORTALIGN(curoff);
 			memcpy(dataout + curoff,
@@ -587,8 +585,7 @@ tsvector_delete_arr(PG_FUNCTION_ARGS)
 	Datum	   *dlexemes;
 	bool	   *nulls;
 
-	deconstruct_array(lexemes, TEXTOID, -1, false, TYPALIGN_INT,
-					  &dlexemes, &nulls, &nlex);
+	deconstruct_array_builtin(lexemes, TEXTOID, &dlexemes, &nulls, &nlex);
 
 	/*
 	 * In typical use case array of lexemes to delete is relatively small. So
@@ -602,10 +599,9 @@ tsvector_delete_arr(PG_FUNCTION_ARGS)
 		int			lex_len,
 					lex_pos;
 
+		/* Ignore null array elements, they surely don't match */
 		if (nulls[i])
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("lexeme array may not contain nulls")));
+			continue;
 
 		lex = VARDATA(dlexemes[i]);
 		lex_len = VARSIZE(dlexemes[i]) - VARHDRSZ;
@@ -651,7 +647,9 @@ tsvector_unnest(PG_FUNCTION_ARGS)
 						   INT2ARRAYOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "weights",
 						   TEXTARRAYOID, -1, 0);
-		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+		funcctx->tuple_desc = tupdesc;
 
 		funcctx->user_fctx = PG_GETARG_TSVECTOR_COPY(0);
 
@@ -696,10 +694,8 @@ tsvector_unnest(PG_FUNCTION_ARGS)
 																	  1));
 			}
 
-			values[1] = PointerGetDatum(construct_array(positions, posv->npos,
-														INT2OID, 2, true, TYPALIGN_SHORT));
-			values[2] = PointerGetDatum(construct_array(weights, posv->npos,
-														TEXTOID, -1, false, TYPALIGN_INT));
+			values[1] = PointerGetDatum(construct_array_builtin(positions, posv->npos, INT2OID));
+			values[2] = PointerGetDatum(construct_array_builtin(weights, posv->npos, TEXTOID));
 		}
 		else
 		{
@@ -727,7 +723,7 @@ tsvector_to_array(PG_FUNCTION_ARGS)
 	int			i;
 	ArrayType  *array;
 
-	elements = palloc(tsin->size * sizeof(Datum));
+	elements = palloc_array(Datum, tsin->size);
 
 	for (i = 0; i < tsin->size; i++)
 	{
@@ -735,7 +731,7 @@ tsvector_to_array(PG_FUNCTION_ARGS)
 															   arrin[i].len));
 	}
 
-	array = construct_array(elements, tsin->size, TEXTOID, -1, false, TYPALIGN_INT);
+	array = construct_array_builtin(elements, tsin->size, TEXTOID);
 
 	pfree(elements);
 	PG_FREE_IF_COPY(tsin, 0);
@@ -759,15 +755,32 @@ array_to_tsvector(PG_FUNCTION_ARGS)
 				datalen = 0;
 	char	   *cur;
 
-	deconstruct_array(v, TEXTOID, -1, false, TYPALIGN_INT, &dlexemes, &nulls, &nitems);
+	deconstruct_array_builtin(v, TEXTOID, &dlexemes, &nulls, &nitems);
 
-	/* Reject nulls (maybe we should just ignore them, instead?) */
+	/*
+	 * Reject nulls and zero-length or over-length strings (maybe we should
+	 * just ignore them, instead?)
+	 */
 	for (i = 0; i < nitems; i++)
 	{
+		int			toklen;
+
 		if (nulls[i])
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("lexeme array may not contain nulls")));
+
+		toklen = VARSIZE(dlexemes[i]) - VARHDRSZ;
+		if (toklen == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_ZERO_LENGTH_CHARACTER_STRING),
+					 errmsg("lexeme array may not contain empty strings")));
+		if (toklen >= MAXSTRLEN)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("word is too long (%d bytes, max %d bytes)",
+							toklen,
+							MAXSTRLEN - 1)));
 	}
 
 	/* Sort and de-dup, because this is required for a valid tsvector. */
@@ -781,6 +794,11 @@ array_to_tsvector(PG_FUNCTION_ARGS)
 	/* Calculate space needed for surviving lexemes. */
 	for (i = 0; i < nitems; i++)
 		datalen += VARSIZE(dlexemes[i]) - VARHDRSZ;
+	if (datalen > MAXSTRPOS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("string is too long for tsvector (%zu bytes, max %zu bytes)",
+						(size_t) datalen, (size_t) MAXSTRPOS)));
 	tslen = CALCDATASIZE(nitems, datalen);
 
 	/* Allocate and fill tsvector. */
@@ -827,8 +845,7 @@ tsvector_filter(PG_FUNCTION_ARGS)
 	int			cur_pos = 0;
 	char		mask = 0;
 
-	deconstruct_array(weights, CHAROID, 1, true, TYPALIGN_CHAR,
-					  &dweights, &nulls, &nweights);
+	deconstruct_array_builtin(weights, CHAROID, &dweights, &nulls, &nweights);
 
 	for (i = 0; i < nweights; i++)
 	{
@@ -840,34 +857,18 @@ tsvector_filter(PG_FUNCTION_ARGS)
 					 errmsg("weight array may not contain nulls")));
 
 		char_weight = DatumGetChar(dweights[i]);
-		switch (char_weight)
-		{
-			case 'A':
-			case 'a':
-				mask = mask | 8;
-				break;
-			case 'B':
-			case 'b':
-				mask = mask | 4;
-				break;
-			case 'C':
-			case 'c':
-				mask = mask | 2;
-				break;
-			case 'D':
-			case 'd':
-				mask = mask | 1;
-				break;
-			default:
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("unrecognized weight: \"%c\"", char_weight)));
-		}
+		mask |= 1 << parse_weight(char_weight);
 	}
 
+	/*
+	 * The output tsvector might be smaller than the input, but it can't be
+	 * bigger, so VARSIZE(tsin) is surely enough space.  Also, we don't need
+	 * to worry about overflows below.
+	 */
 	tsout = (TSVector) palloc0(VARSIZE(tsin));
 	tsout->size = tsin->size;
 	arrout = ARRPTR(tsout);
+	/* worst-case location of output's lexemes; we may need to adjust below */
 	dataout = STRPTR(tsout);
 
 	for (i = j = 0; i < tsin->size; i++)
@@ -967,6 +968,12 @@ tsvector_concat(PG_FUNCTION_ARGS)
 	 * Conservative estimate of space needed.  We might need all the data in
 	 * both inputs, and conceivably add a pad byte before position data for
 	 * each item where there was none before.
+	 *
+	 * Note: since the MAXSTRPOS limit constrains each input tsvector to be
+	 * considerably less than MaxAllocSize, we don't need to worry about
+	 * integer overflow here, nor in the data-copying steps below.  We do need
+	 * to enforce that the result meets the MAXSTRPOS limit, but we check that
+	 * once at the end.
 	 */
 	output_bytes = VARSIZE(in1) + VARSIZE(in2) + i1 + i2;
 
@@ -1118,7 +1125,8 @@ tsvector_concat(PG_FUNCTION_ARGS)
 	if (dataoff > MAXSTRPOS)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("string is too long for tsvector (%d bytes, max %d bytes)", dataoff, MAXSTRPOS)));
+				 errmsg("string is too long for tsvector (%zu bytes, max %zu bytes)",
+						(size_t) dataoff, (size_t) MAXSTRPOS)));
 
 	/*
 	 * Adjust sizes (asserting that we didn't overrun the original estimates)
@@ -1161,7 +1169,7 @@ tsCompareString(char *a, int lena, char *b, int lenb, bool prefix)
 	}
 	else
 	{
-		cmp = memcmp(a, b, Min(lena, lenb));
+		cmp = memcmp(a, b, Min((unsigned int) lena, (unsigned int) lenb));
 
 		if (prefix)
 		{
@@ -1568,10 +1576,10 @@ TS_phrase_output(ExecPhraseData *data,
  * In addition to the same arguments used for TS_execute, the caller may pass
  * a preinitialized-to-zeroes ExecPhraseData struct, to be filled with lexeme
  * match position info on success.  data == NULL if no position data need be
- * returned.  (In practice, outside callers pass NULL, and only the internal
- * recursion cases pass a data pointer.)
+ * returned.
  * Note: the function assumes data != NULL for operators other than OP_PHRASE.
- * This is OK because an outside call always starts from an OP_PHRASE node.
+ * This is OK because an outside call always starts from an OP_PHRASE node,
+ * and all internal recursion cases pass data != NULL.
  *
  * The detailed semantics of the match data, given that the function returned
  * TS_YES (successful match), are:
@@ -1969,6 +1977,177 @@ TS_execute_recurse(QueryItem *curitem, void *arg, uint32 flags,
 }
 
 /*
+ * Evaluate tsquery and report locations of matching terms.
+ *
+ * This is like TS_execute except that it returns match locations not just
+ * success/failure status.  The callback function is required to provide
+ * position data (we report failure if it doesn't).
+ *
+ * On successful match, the result is a List of ExecPhraseData structs, one
+ * for each AND'ed term or phrase operator in the query.  Each struct includes
+ * a sorted array of lexeme positions matching that term.  (Recall that for
+ * phrase operators, the match includes width+1 lexemes, and the recorded
+ * position is that of the rightmost lexeme.)
+ *
+ * OR subexpressions are handled by union'ing their match locations into a
+ * single List element, which is valid since any of those locations contains
+ * a match.  However, when some of the OR'ed terms are phrase operators, we
+ * report the maximum width of any of the OR'ed terms, making such cases
+ * slightly imprecise in the conservative direction.  (For example, if the
+ * tsquery is "(A <-> B) | C", an occurrence of C in the data would be
+ * reported as though it includes the lexeme to the left of C.)
+ *
+ * Locations of NOT subexpressions are not reported.  (Obviously, there can
+ * be no successful NOT matches at top level, or the match would have failed.
+ * So this amounts to ignoring NOTs underneath ORs.)
+ *
+ * The result is NIL if no match, or if position data was not returned.
+ *
+ * Arguments are the same as for TS_execute, although flags is currently
+ * vestigial since none of the defined bits are sensible here.
+ */
+List *
+TS_execute_locations(QueryItem *curitem, void *arg,
+					 uint32 flags,
+					 TSExecuteCallback chkcond)
+{
+	List	   *result;
+
+	/* No flags supported, as yet */
+	Assert(flags == TS_EXEC_EMPTY);
+	if (TS_execute_locations_recurse(curitem, arg, chkcond, &result))
+		return result;
+	return NIL;
+}
+
+/*
+ * TS_execute_locations recursion for operators above any phrase operator.
+ * OP_PHRASE subexpressions can be passed off to TS_phrase_execute.
+ */
+static bool
+TS_execute_locations_recurse(QueryItem *curitem, void *arg,
+							 TSExecuteCallback chkcond,
+							 List **locations)
+{
+	bool		lmatch,
+				rmatch;
+	List	   *llocations,
+			   *rlocations;
+	ExecPhraseData *data;
+
+	/* since this function recurses, it could be driven to stack overflow */
+	check_stack_depth();
+
+	/* ... and let's check for query cancel while we're at it */
+	CHECK_FOR_INTERRUPTS();
+
+	/* Default locations result is empty */
+	*locations = NIL;
+
+	if (curitem->type == QI_VAL)
+	{
+		data = palloc0_object(ExecPhraseData);
+		if (chkcond(arg, (QueryOperand *) curitem, data) == TS_YES)
+		{
+			*locations = list_make1(data);
+			return true;
+		}
+		pfree(data);
+		return false;
+	}
+
+	switch (curitem->qoperator.oper)
+	{
+		case OP_NOT:
+			if (!TS_execute_locations_recurse(curitem + 1, arg, chkcond,
+											  &llocations))
+				return true;	/* we don't pass back any locations */
+			return false;
+
+		case OP_AND:
+			if (!TS_execute_locations_recurse(curitem + curitem->qoperator.left,
+											  arg, chkcond,
+											  &llocations))
+				return false;
+			if (!TS_execute_locations_recurse(curitem + 1,
+											  arg, chkcond,
+											  &rlocations))
+				return false;
+			*locations = list_concat(llocations, rlocations);
+			return true;
+
+		case OP_OR:
+			lmatch = TS_execute_locations_recurse(curitem + curitem->qoperator.left,
+												  arg, chkcond,
+												  &llocations);
+			rmatch = TS_execute_locations_recurse(curitem + 1,
+												  arg, chkcond,
+												  &rlocations);
+			if (lmatch || rmatch)
+			{
+				/*
+				 * We generate an AND'able location struct from each
+				 * combination of sub-matches, following the disjunctive law
+				 * (A & B) | (C & D) = (A | C) & (A | D) & (B | C) & (B | D).
+				 *
+				 * However, if either input didn't produce locations (i.e., it
+				 * failed or was a NOT), we must just return the other list.
+				 */
+				if (llocations == NIL)
+					*locations = rlocations;
+				else if (rlocations == NIL)
+					*locations = llocations;
+				else
+				{
+					ListCell   *ll;
+
+					foreach(ll, llocations)
+					{
+						ExecPhraseData *ldata = (ExecPhraseData *) lfirst(ll);
+						ListCell   *lr;
+
+						foreach(lr, rlocations)
+						{
+							ExecPhraseData *rdata = (ExecPhraseData *) lfirst(lr);
+
+							data = palloc0_object(ExecPhraseData);
+							(void) TS_phrase_output(data, ldata, rdata,
+													TSPO_BOTH | TSPO_L_ONLY | TSPO_R_ONLY,
+													0, 0,
+													ldata->npos + rdata->npos);
+							/* Report the larger width, as explained above. */
+							data->width = Max(ldata->width, rdata->width);
+							*locations = lappend(*locations, data);
+						}
+					}
+				}
+
+				return true;
+			}
+			return false;
+
+		case OP_PHRASE:
+			/* We can hand this off to TS_phrase_execute */
+			data = palloc0_object(ExecPhraseData);
+			if (TS_phrase_execute(curitem, arg, TS_EXEC_EMPTY, chkcond,
+								  data) == TS_YES)
+			{
+				if (!data->negate)
+					*locations = list_make1(data);
+				return true;
+			}
+			pfree(data);
+			return false;
+
+		default:
+			elog(ERROR, "unrecognized operator: %d", curitem->qoperator.oper);
+	}
+
+	/* not reachable, but keep compiler quiet */
+	return false;
+}
+
+/*
  * Detect whether a tsquery boolean expression requires any positive matches
  * to values shown in the tsquery.
  *
@@ -2193,7 +2372,6 @@ insertStatEntry(MemoryContext persistentContext, TSVectorStat *stat, TSVector tx
 			else
 				pnode->right = node;
 		}
-
 	}
 	else
 	{
@@ -2277,7 +2455,7 @@ ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 	MemoryContext oldcontext;
 	StatEntry  *node;
 
-	funcctx->user_fctx = (void *) stat;
+	funcctx->user_fctx = stat;
 
 	oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
@@ -2302,14 +2480,9 @@ ts_setup_firstcall(FunctionCallInfo fcinfo, FuncCallContext *funcctx,
 		}
 	Assert(stat->stackpos <= stat->maxdepth);
 
-	tupdesc = CreateTemplateTupleDesc(3);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "word",
-					   TEXTOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "ndoc",
-					   INT4OID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "nentry",
-					   INT4OID, -1, 0);
-	funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	funcctx->tuple_desc = tupdesc;
 	funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
 
 	MemoryContextSwitchTo(oldcontext);
@@ -2434,11 +2607,15 @@ ts_stat_sql(MemoryContext persistentContext, text *txt, text *ws)
 	if (ws)
 	{
 		char	   *buf;
+		const char *end;
 
 		buf = VARDATA_ANY(ws);
-		while (buf - VARDATA_ANY(ws) < VARSIZE_ANY_EXHDR(ws))
+		end = buf + VARSIZE_ANY_EXHDR(ws);
+		while (buf < end)
 		{
-			if (pg_mblen(buf) == 1)
+			int			len = pg_mblen_range(buf, end);
+
+			if (len == 1)
 			{
 				switch (*buf)
 				{
@@ -2462,7 +2639,7 @@ ts_stat_sql(MemoryContext persistentContext, text *txt, text *ws)
 						stat->weight |= 0;
 				}
 			}
-			buf += pg_mblen(buf);
+			buf += len;
 		}
 	}
 
@@ -2655,7 +2832,7 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 	{
 		List	   *names;
 
-		names = stringToQualifiedNameList(trigger->tgargs[1]);
+		names = stringToQualifiedNameList(trigger->tgargs[1], NULL);
 		/* require a schema so that results are not search path dependent */
 		if (list_length(names) < 2)
 			ereport(ERROR,

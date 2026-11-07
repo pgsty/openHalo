@@ -2,7 +2,7 @@
 #
 # Makefile for src/bin/pg_checksums
 #
-# Copyright (c) 1998-2021, PostgreSQL Global Development Group
+# Copyright (c) 1998-2025, PostgreSQL Global Development Group
 #
 # src/bin/pg_checksums/Makefile
 #
@@ -14,6 +14,9 @@ PGAPPICON=win32
 subdir = src/bin/pg_checksums
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
+
+# We need libpq only because fe_utils does.
+LDFLAGS_INTERNAL += -L$(top_builddir)/src/fe_utils -lpgfeutils $(libpq_pgport)
 
 OBJS = \
 	$(WIN32RES) \
@@ -33,7 +36,7 @@ installdirs:
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pg_checksums$(X)'
 
-clean distclean maintainer-clean:
+clean distclean:
 	rm -f pg_checksums$(X) $(OBJS)
 	rm -rf tmp_check
 

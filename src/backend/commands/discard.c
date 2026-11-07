@@ -3,7 +3,7 @@
  * discard.c
  *	  The implementation of the DISCARD command
  *
- * Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -37,7 +37,6 @@ DiscardCommand(DiscardStmt *stmt, bool isTopLevel)
 			break;
 
 		case DISCARD_PLANS:
-			elog(DEBUG1, "DiscardCommand: invalidate all cached plans.");
 			ResetPlanCache();
 			break;
 
@@ -73,7 +72,6 @@ DiscardAll(bool isTopLevel)
 	DropAllPreparedStatements();
 	Async_UnlistenAll();
 	LockReleaseAll(USER_LOCKMETHOD, true);
-	elog(DEBUG1, "DiscardAll: invalidate all cached plans.");
 	ResetPlanCache();
 	ResetTempTableNamespace();
 	ResetSequenceCaches();

@@ -3,7 +3,7 @@
  * dict_synonym.c
  *		Synonym dictionary: replace word by its synonym
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -13,16 +13,17 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_collation_d.h"
 #include "commands/defrem.h"
 #include "tsearch/ts_locale.h"
-#include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
+#include "tsearch/ts_public.h"
+#include "utils/fmgrprotos.h"
+#include "utils/formatting.h"
 
 typedef struct
 {
 	char	   *in;
 	char	   *out;
-	int			outlen;
 	uint16		flags;
 } Syn;
 
@@ -47,8 +48,8 @@ findwrd(char *in, char **end, uint16 *flags)
 	char	   *lastchar;
 
 	/* Skip leading spaces */
-	while (*in && t_isspace(in))
-		in += pg_mblen(in);
+	while (*in && isspace((unsigned char) *in))
+		in += pg_mblen_cstr(in);
 
 	/* Return NULL on empty lines */
 	if (*in == '\0')
@@ -60,10 +61,10 @@ findwrd(char *in, char **end, uint16 *flags)
 	lastchar = start = in;
 
 	/* Find end of word */
-	while (*in && !t_isspace(in))
+	while (*in && !isspace((unsigned char) *in))
 	{
 		lastchar = in;
-		in += pg_mblen(in);
+		in += pg_mblen_cstr(in);
 	}
 
 	if (in - lastchar == 1 && t_iseq(lastchar, '*') && flags)
@@ -183,11 +184,10 @@ dsynonym_init(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			d->syn[cur].in = lowerstr(starti);
-			d->syn[cur].out = lowerstr(starto);
+			d->syn[cur].in = str_tolower(starti, strlen(starti), DEFAULT_COLLATION_OID);
+			d->syn[cur].out = str_tolower(starto, strlen(starto), DEFAULT_COLLATION_OID);
 		}
 
-		d->syn[cur].outlen = strlen(starto);
 		d->syn[cur].flags = flags;
 
 		cur++;
@@ -223,7 +223,7 @@ dsynonym_lexize(PG_FUNCTION_ARGS)
 	if (d->case_sensitive)
 		key.in = pnstrdup(in, len);
 	else
-		key.in = lowerstr_with_len(in, len);
+		key.in = str_tolower(in, len, DEFAULT_COLLATION_OID);
 
 	key.out = NULL;
 
@@ -234,7 +234,7 @@ dsynonym_lexize(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(NULL);
 
 	res = palloc0(sizeof(TSLexeme) * 2);
-	res[0].lexeme = pnstrdup(found->out, found->outlen);
+	res[0].lexeme = pstrdup(found->out);
 	res[0].flags = found->flags;
 
 	PG_RETURN_POINTER(res);

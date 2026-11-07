@@ -31,7 +31,7 @@
  * should be killed by SIGQUIT and then a recovery cycle started.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -48,17 +48,17 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/walwriter.h"
+#include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
-#include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/smgr.h"
-#include "utils/guc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -68,7 +68,7 @@
  * GUC parameters
  */
 int			WalWriterDelay = 200;
-int			WalWriterFlushAfter = 128;
+int			WalWriterFlushAfter = DEFAULT_WAL_WRITER_FLUSH_AFTER;
 
 /*
  * Number of do-nothing loops before lengthening the delay time, and the
@@ -78,9 +78,6 @@ int			WalWriterFlushAfter = 128;
 #define LOOPS_UNTIL_HIBERNATE		50
 #define HIBERNATE_FACTOR			25
 
-/* Prototypes for private functions */
-static void HandleWalWriterInterrupts(void);
-
 /*
  * Main entry point for walwriter process
  *
@@ -88,12 +85,17 @@ static void HandleWalWriterInterrupts(void);
  * basic execution environment, but not enabled signals yet.
  */
 void
-WalWriterMain(void)
+WalWriterMain(const void *startup_data, size_t startup_data_len)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext walwriter_context;
 	int			left_till_hibernate;
 	bool		hibernating;
+
+	Assert(startup_data_len == 0);
+
+	MyBackendType = B_WAL_WRITER;
+	AuxiliaryProcessMainCommon();
 
 	/*
 	 * Properly accept or ignore signals the postmaster might send us
@@ -163,7 +165,7 @@ WalWriterMain(void)
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
-		AbortBufferIO();
+		pgaio_error_cleanup();
 		UnlockBuffers();
 		ReleaseAuxProcessResources(false);
 		AtEOXact_Buffers(false);
@@ -179,7 +181,7 @@ WalWriterMain(void)
 		FlushErrorState();
 
 		/* Flush any leaked data in the top-level context */
-		MemoryContextResetAndDeleteChildren(walwriter_context);
+		MemoryContextReset(walwriter_context);
 
 		/* Now we can allow interrupts again */
 		RESUME_INTERRUPTS();
@@ -190,13 +192,6 @@ WalWriterMain(void)
 		 * fast as we can.
 		 */
 		pg_usleep(1000000L);
-
-		/*
-		 * Close all open files after any error.  This is helpful on Windows,
-		 * where holding deleted files open causes various strange errors.
-		 * It's not clear we need it elsewhere, but shouldn't hurt.
-		 */
-		smgrcloseall();
 	}
 
 	/* We can now handle ereport(ERROR) */
@@ -205,7 +200,7 @@ WalWriterMain(void)
 	/*
 	 * Unblock signals (they were blocked when the postmaster forked us)
 	 */
-	PG_SETMASK(&UnBlockSig);
+	sigprocmask(SIG_SETMASK, &UnBlockSig, NULL);
 
 	/*
 	 * Reset hibernation state after any error.
@@ -215,10 +210,10 @@ WalWriterMain(void)
 	SetWalWriterSleeping(false);
 
 	/*
-	 * Advertise our latch that backends can use to wake us up while we're
-	 * sleeping.
+	 * Advertise our proc number that backends can use to wake us up while
+	 * we're sleeping.
 	 */
-	ProcGlobal->walwriterLatch = &MyProc->procLatch;
+	ProcGlobal->walwriterProc = MyProcNumber;
 
 	/*
 	 * Loop forever
@@ -246,7 +241,7 @@ WalWriterMain(void)
 		ResetLatch(MyLatch);
 
 		/* Process any signals received recently */
-		HandleWalWriterInterrupts();
+		ProcessMainLoopInterrupts();
 
 		/*
 		 * Do what we're here for; then, if XLogBackgroundFlush() found useful
@@ -257,8 +252,8 @@ WalWriterMain(void)
 		else if (left_till_hibernate > 0)
 			left_till_hibernate--;
 
-		/* Send WAL statistics to the stats collector */
-		pgstat_send_wal(false);
+		/* report pending statistics to the cumulative stats system */
+		pgstat_report_wal(false);
 
 		/*
 		 * Sleep until we are signaled or WalWriterDelay has elapsed.  If we
@@ -274,36 +269,5 @@ WalWriterMain(void)
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 cur_timeout,
 						 WAIT_EVENT_WAL_WRITER_MAIN);
-	}
-}
-
-/*
- * Interrupt handler for main loops of WAL writer process.
- */
-static void
-HandleWalWriterInterrupts(void)
-{
-	if (ProcSignalBarrierPending)
-		ProcessProcSignalBarrier();
-
-	if (ConfigReloadPending)
-	{
-		ConfigReloadPending = false;
-		ProcessConfigFile(PGC_SIGHUP);
-	}
-
-	if (ShutdownRequestPending)
-	{
-		/*
-		 * Force to send remaining WAL statistics to the stats collector at
-		 * process exit.
-		 *
-		 * Since pgstat_send_wal is invoked with 'force' is false in main loop
-		 * to avoid overloading to the stats collector, there may exist unsent
-		 * stats counters for the WAL writer.
-		 */
-		pgstat_send_wal(true);
-
-		proc_exit(0);
 	}
 }

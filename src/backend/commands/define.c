@@ -4,7 +4,7 @@
  *	  Support routines for various kinds of object creation.
  *
  *
- * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -12,20 +12,7 @@
  *	  src/backend/commands/define.c
  *
  * DESCRIPTION
- *	  The "DefineFoo" routines take the parse tree and pick out the
- *	  appropriate arguments/flags, passing the results to the
- *	  corresponding "FooDefine" routines (in src/catalog) that do
- *	  the actual catalog-munging.  These routines also verify permission
- *	  of the user to execute the command.
- *
- * NOTES
- *	  These things must be defined and committed in the following order:
- *		"create function":
- *				input/output, recv/send procedures
- *		"create type":
- *				type
- *		"create operator":
- *				operators
+ *	  Support routines for dealing with DefElem nodes.
  *
  *
  *-------------------------------------------------------------------------
@@ -39,8 +26,7 @@
 #include "commands/defrem.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
-#include "parser/scansup.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 
 /*
  * Extract a string value (otherwise uninterpreted) from a DefElem.
@@ -58,12 +44,9 @@ defGetString(DefElem *def)
 		case T_Integer:
 			return psprintf("%ld", (long) intVal(def->arg));
 		case T_Float:
-
-			/*
-			 * T_Float values are kept in string form, so this type cheat
-			 * works (and doesn't risk losing precision)
-			 */
-			return strVal(def->arg);
+			return castNode(Float, def->arg)->fval;
+		case T_Boolean:
+			return boolVal(def->arg) ? "true" : "false";
 		case T_String:
 			return strVal(def->arg);
 		case T_TypeName:
@@ -111,7 +94,7 @@ bool
 defGetBoolean(DefElem *def)
 {
 	/*
-	 * If no parameter given, assume "true" is meant.
+	 * If no parameter value given, assume "true" is meant.
 	 */
 	if (def->arg == NULL)
 		return true;
@@ -206,7 +189,40 @@ defGetInt64(DefElem *def)
 			 * strings.
 			 */
 			return DatumGetInt64(DirectFunctionCall1(int8in,
-													 CStringGetDatum(strVal(def->arg))));
+													 CStringGetDatum(castNode(Float, def->arg)->fval)));
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("%s requires a numeric value",
+							def->defname)));
+	}
+	return 0;					/* keep compiler quiet */
+}
+
+/*
+ * Extract an OID value from a DefElem.
+ */
+Oid
+defGetObjectId(DefElem *def)
+{
+	if (def->arg == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("%s requires a numeric value",
+						def->defname)));
+	switch (nodeTag(def->arg))
+	{
+		case T_Integer:
+			return (Oid) intVal(def->arg);
+		case T_Float:
+
+			/*
+			 * Values too large for int4 will be represented as Float
+			 * constants by the lexer.  Accept these if they are valid OID
+			 * strings.
+			 */
+			return DatumGetObjectId(DirectFunctionCall1(oidin,
+														CStringGetDatum(castNode(Float, def->arg)->fval)));
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -346,4 +362,16 @@ defGetStringList(DefElem *def)
 	}
 
 	return (List *) def->arg;
+}
+
+/*
+ * Raise an error about a conflicting DefElem.
+ */
+void
+errorConflictingDefElem(DefElem *defel, ParseState *pstate)
+{
+	ereport(ERROR,
+			errcode(ERRCODE_SYNTAX_ERROR),
+			errmsg("conflicting or redundant options"),
+			parser_errposition(pstate, defel->location));
 }
