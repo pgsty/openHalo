@@ -24,6 +24,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
@@ -33,6 +34,9 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/parser.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
@@ -42,7 +46,9 @@
 #include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 #include "halo_mysql.h"
@@ -873,6 +879,12 @@ mys_column_extra(PG_FUNCTION_ARGS)
 
 		if (att->attidentity)
 			appendStringInfoString(&result, "auto_increment");
+		/* mysqldump leaves these columns out of its INSERTs */
+		if (att->attgenerated)
+			appendStringInfoString(&result,
+								   att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL ||
+								   mys_generated_virtual(relid, attnum) ?
+								   "VIRTUAL GENERATED" : "STORED GENERATED");
 		if (rel->trigdesc)
 			for (int i = 0; i < rel->trigdesc->numtriggers; i++)
 			{
@@ -893,4 +905,208 @@ mys_column_extra(PG_FUNCTION_ARGS)
 	}
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(result.data));
+}
+
+/*
+ * MySQL text of a deparsed expression: an identifier PostgreSQL printed in
+ * double quotes, which MySQL reads as a string, is a column name in
+ * backquotes, or bare when PostgreSQL needs no quotes for it (function and
+ * type names); a backslash in a string literal is doubled unless
+ * NO_BACKSLASH_ESCAPES.
+ */
+static char *
+mysql_expression_text(const char *s, TupleDesc desc)
+{
+	StringInfoData buf;
+	bool		backslash_escapes = !(mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES);
+
+	initStringInfo(&buf);
+	while (*s)
+	{
+		if (*s == '\'')
+		{
+			appendStringInfoChar(&buf, *s++);
+			for (; *s; s++)
+			{
+				if (*s == '\'' && s[1] != '\'')
+					break;
+				if (*s == '\'')
+					appendStringInfoChar(&buf, *s++);
+				else if (*s == '\\' && backslash_escapes)
+					appendStringInfoChar(&buf, '\\');
+				appendStringInfoChar(&buf, *s);
+			}
+			if (*s)
+				appendStringInfoChar(&buf, *s++);
+		}
+		else if (*s == '"')
+		{
+			StringInfoData name;
+			bool		column = false;
+
+			initStringInfo(&name);
+			for (s++; *s; s++)
+			{
+				if (*s == '"' && s[1] != '"')
+					break;
+				if (*s == '"')
+					s++;
+				appendStringInfoChar(&name, *s);
+			}
+			if (*s)
+				s++;
+			for (int i = 0; i < desc->natts && !column; i++)
+				column = !TupleDescAttr(desc, i)->attisdropped &&
+					strcmp(NameStr(TupleDescAttr(desc, i)->attname), name.data) == 0;
+			if (!column && strcmp(quote_identifier(name.data), name.data) == 0)
+				appendStringInfoString(&buf, name.data);
+			else
+			{
+				appendStringInfoChar(&buf, '`');
+				for (char *p = name.data; *p; p++)
+				{
+					if (*p == '`')
+						appendStringInfoChar(&buf, '`');
+					appendStringInfoChar(&buf, *p);
+				}
+				appendStringInfoChar(&buf, '`');
+			}
+		}
+		else
+			appendStringInfoChar(&buf, *s++);
+	}
+	return buf.data;
+}
+
+/* a generator's parameters are the arguments of its call */
+static Node *
+generator_arguments(Node *node, List *args)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Param) && ((Param *) node)->paramkind == PARAM_EXTERN &&
+		((Param *) node)->paramid >= 1 && ((Param *) node)->paramid <= list_length(args))
+		return copyObject(list_nth(args, ((Param *) node)->paramid - 1));
+	/* the COLLATE that keeps a parameter collated as its column */
+	if (IsA(node, CollateExpr))
+	{
+		Node	   *arg = generator_arguments((Node *) ((CollateExpr *) node)->arg, args);
+
+		if (exprCollation(arg) == ((CollateExpr *) node)->collOid)
+			return arg;
+	}
+	return expression_tree_mutator(node, generator_arguments, args);
+}
+
+/* the expression a generator function (mys_utility.c) computes */
+Node *
+mys_unwrap_generator(Node *expr)
+{
+	Node	   *call = strip_implicit_coercions(expr);
+	char	   *name;
+	HeapTuple	tup;
+	Datum		body;
+	bool		isnull;
+	Node	   *query;
+
+	if (!IsA(call, FuncExpr) ||
+		(name = get_func_name(((FuncExpr *) call)->funcid)) == NULL ||
+		strncmp(name, MYS_GENERATOR_PREFIX, strlen(MYS_GENERATOR_PREFIX)) != 0)
+		return expr;
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(((FuncExpr *) call)->funcid));
+	if (!HeapTupleIsValid(tup))
+		return expr;
+	body = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_prosqlbody, &isnull);
+	query = isnull ? NULL : stringToNode(TextDatumGetCString(body));
+	ReleaseSysCache(tup);
+	if (query == NULL || !IsA(query, Query) || list_length(((Query *) query)->targetList) != 1)
+		return expr;
+	return generator_arguments((Node *) linitial_node(TargetEntry, ((Query *) query)->targetList)->expr,
+							   ((FuncExpr *) call)->args);
+}
+
+/* mysql.generated_column(name, expr) shows as the column it reads */
+static Node *
+generated_refs_to_columns(Node *node, void *context)
+{
+	Relation	rel = (Relation) context;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, FuncExpr) && list_length(((FuncExpr *) node)->args) == 2 &&
+		IsA(linitial(((FuncExpr *) node)->args), Const))
+	{
+		FuncExpr   *f = (FuncExpr *) node;
+		Const	   *name = linitial_node(Const, f->args);
+		char	   *func = get_func_name(f->funcid);
+		AttrNumber	attnum;
+
+		if (func && strcmp(func, MYS_GENERATED_REF) == 0 && !name->constisnull &&
+			name->consttype == TEXTOID &&
+			strcmp(get_namespace_name(get_func_namespace(f->funcid)), "mysql") == 0 &&
+			(attnum = get_attnum(RelationGetRelid(rel),
+								 TextDatumGetCString(name->constvalue))) > 0)
+		{
+			Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+
+			return (Node *) makeVar(1, attnum, att->atttypid, att->atttypmod,
+									att->attcollation, 0);
+		}
+	}
+	return expression_tree_mutator(node, generated_refs_to_columns, context);
+}
+
+/*
+ * mysql.column_generation(table, attnum): the expression of a generated
+ * column as SHOW CREATE TABLE and information_schema.COLUMNS show it, NULL
+ * for another column.  aux_mysql reads it back as the same expression.
+ */
+PG_FUNCTION_INFO_V1(mys_column_generation);
+
+Datum
+mys_column_generation(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int			attnum = PG_GETARG_INT32(1);
+	Relation	rel = try_relation_open(relid, AccessShareLock);
+	TupleConstr *constr;
+	Node	   *expr = NULL;
+	char	   *text;
+	bool		save_quote = quote_all_identifiers;
+	bool		save_strings = standard_conforming_strings;
+
+	if (rel == NULL)
+		PG_RETURN_NULL();
+	constr = RelationGetDescr(rel)->constr;
+	if (attnum > 0 && attnum <= RelationGetDescr(rel)->natts &&
+		TupleDescAttr(RelationGetDescr(rel), attnum - 1)->attgenerated && constr)
+		for (int i = 0; i < constr->num_defval; i++)
+			if (constr->defval[i].adnum == attnum)
+				expr = mys_unwrap_generator(stringToNode(constr->defval[i].adbin));
+	if (expr == NULL)
+	{
+		relation_close(rel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+
+	expr = generated_refs_to_columns(expr, rel);
+
+	/* every identifier delimited; literals with plain backslashes */
+	quote_all_identifiers = true;
+	standard_conforming_strings = true;
+	PG_TRY();
+	{
+		text = deparse_expression(expr,
+								  deparse_context_for(RelationGetRelationName(rel), relid),
+								  false, false);
+	}
+	PG_FINALLY();
+	{
+		quote_all_identifiers = save_quote;
+		standard_conforming_strings = save_strings;
+	}
+	PG_END_TRY();
+	text = mysql_expression_text(text, RelationGetDescr(rel));
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(text));
 }

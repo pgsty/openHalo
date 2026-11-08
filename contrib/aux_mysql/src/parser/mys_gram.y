@@ -678,7 +678,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 %type <node> array_agg_list
 %type <list> character_set_collates
 %type <node> character_set_collate
-%type <node> stored_virtual
+%type <ival> stored_virtual
 %type <list> index_options
 %type <node> index_option
 %type <node> algorithm_value
@@ -6752,7 +6752,6 @@ ColConstraintElem:
 					n->location = @1;
 					$$ = (Node *)n;
 				}
-			//| GENERATED generated_when AS '(' a_expr ')' STORED
 			| GENERATED generated_when AS '(' a_expr ')' stored_virtual
 				{
 					Constraint *n = makeNode(Constraint);
@@ -6760,6 +6759,7 @@ ColConstraintElem:
 					n->generated_when = $2;
 					n->raw_expr = $5;
 					n->cooked_expr = NULL;
+					n->generated_kind = $7;
 					n->location = @1;
 
 					/*
@@ -6781,22 +6781,10 @@ ColConstraintElem:
 					Constraint *n = makeNode(Constraint);
 					n->contype = CONSTR_GENERATED;
 					n->generated_when = ATTRIBUTE_IDENTITY_ALWAYS;
-					n->raw_expr = $5;
+					n->raw_expr = $3;
 					n->cooked_expr = NULL;
+					n->generated_kind = $5;
 					n->location = @1;
-
-					/*
-					 * Can't do this in the grammar because of shift/reduce
-					 * conflicts.  (IDENTITY allows both ALWAYS and BY
-					 * DEFAULT, but generated columns only allow ALWAYS.)  We
-					 * can also give a more useful error message and location.
-					 */
-                    // if ($2 != ATTRIBUTE_IDENTITY_ALWAYS)
-                    //     ereport(ERROR,
-                    //             (errcode(ERRCODE_SYNTAX_ERROR),
-                    //              errmsg("for a generated column, GENERATED ALWAYS must be specified"),
-                    //              parser_errposition(@2)));
-
 					$$ = (Node *)n;
 				}
             | ZEROFILL
@@ -6806,9 +6794,9 @@ ColConstraintElem:
 		;
 
 stored_virtual:
-            STORED          { $$ = NULL; }
-            | VIRTUAL       { $$ = NULL; }
-            | /* empty */   { $$ = NULL; }
+			STORED			{ $$ = ATTRIBUTE_GENERATED_STORED; }
+			| VIRTUAL		{ $$ = ATTRIBUTE_GENERATED_VIRTUAL; }
+			| /* empty */	{ $$ = ATTRIBUTE_GENERATED_VIRTUAL; }
         ;
 
 generated_when:

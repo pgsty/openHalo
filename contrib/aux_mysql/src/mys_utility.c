@@ -12,7 +12,9 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/relation.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
@@ -20,16 +22,28 @@
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_attrdef.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_depend.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
 #include "commands/defrem.h"
 #include "commands/trigger.h"
 #include "commands/seclabel.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
+#include "executor/functions.h"
 #include "executor/spi.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
+#include "parser/parse_expr.h"
+#include "parser/parse_func.h"
+#include "parser/parse_type.h"
+#include "parser/parser.h"
 #include "tcop/utility.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -40,6 +54,8 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/acl.h"
+#include "utils/fmgroids.h"
+#include "utils/ruleutils.h"
 #include "miscadmin.h"
 
 #include "halo_mysql.h"
@@ -55,6 +71,19 @@ static bool collation_provider_registered = false;
 #define ON_UPDATE_TRIGGER	"aux_mysql_on_update"
 #define AUTOINC_TRIGGER		"aux_mysql_auto_increment"
 
+/* generated columns during a MySQL ALTER TABLE (mysql_alter_table()) */
+typedef struct GenAlter
+{
+	List	   *changed;		/* names of the columns MODIFY / CHANGE redefine */
+	List	   *detached;		/* generated columns set aside (GenColumn) */
+} GenAlter;
+
+static void detach_generated_readers(Oid relid, AttrNumber attnum, GenAlter *gen,
+									 List **cmds);
+static void refresh_generated(AlterTableStmt *stmt, Oid relid, GenAlter *gen,
+							  PlannedStmt *pstmt, const char *queryString,
+							  ParamListInfo params, QueryEnvironment *queryEnv);
+
 /*
  * Store the table default in PostgreSQL's provider-owned object labels.
  * Unlike an OID-keyed extension table this follows rename/drop and pg_dump
@@ -64,6 +93,16 @@ static bool collation_provider_registered = false;
 static void
 check_collation_label(const ObjectAddress *object, const char *label)
 {
+	/* a column: the declared kind of a generated column (mys_rewrite.c) */
+	if (object->classId == RelationRelationId && object->objectSubId > 0 &&
+		(get_rel_relkind(object->objectId) == RELKIND_RELATION ||
+		 get_rel_relkind(object->objectId) == RELKIND_PARTITIONED_TABLE))
+	{
+		if (label && strcmp(label, MYS_GENERATED_VIRTUAL) != 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("invalid aux_mysql column label")));
+		return;
+	}
 	if (object->classId != RelationRelationId || object->objectSubId != 0 ||
 		(get_rel_relkind(object->objectId) != RELKIND_RELATION &&
 		 get_rel_relkind(object->objectId) != RELKIND_PARTITIONED_TABLE))
@@ -88,6 +127,25 @@ mys_table_default_collation(Oid relid)
 		return label;
 	return halo_mysql_default_collation && halo_mysql_default_collation[0] ?
 		halo_mysql_default_collation : "default";
+}
+
+/* whether a generated column was declared VIRTUAL (it is stored) */
+bool
+mys_generated_virtual(Oid relid, AttrNumber attnum)
+{
+	ObjectAddress object;
+
+	ObjectAddressSubSet(object, RelationRelationId, relid, attnum);
+	return GetSecurityLabel(&object, "aux_mysql") != NULL;
+}
+
+static void
+set_generated_virtual(Oid relid, AttrNumber attnum, bool is_virtual)
+{
+	ObjectAddress object;
+
+	ObjectAddressSubSet(object, RelationRelationId, relid, attnum);
+	SetSecurityLabel(&object, "aux_mysql", is_virtual ? MYS_GENERATED_VIRTUAL : NULL);
 }
 
 static void
@@ -202,6 +260,28 @@ column_is_identity(Oid relid, AttrNumber attnum)
 	return result;
 }
 
+/* whether a generated column of the table other than attnum reads it */
+static bool
+column_used_by_generated(Oid relid, AttrNumber attnum)
+{
+	Relation	rel = relation_open(relid, NoLock);
+	TupleConstr *constr = RelationGetDescr(rel)->constr;
+	bool		used = false;
+
+	for (int i = 0; constr && i < constr->num_defval && !used; i++)
+	{
+		Bitmapset  *attrs = NULL;
+
+		if (constr->defval[i].adnum == attnum ||
+			!TupleDescAttr(RelationGetDescr(rel), constr->defval[i].adnum - 1)->attgenerated)
+			continue;
+		pull_varattnos(stringToNode(constr->defval[i].adbin), 1, &attrs);
+		used = bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber, attrs);
+	}
+	relation_close(rel, NoLock);
+	return used;
+}
+
 /*
  * MODIFY/CHANGE [COLUMN] col <full column definition>: MySQL replaces the
  * whole definition (type, nullability, default, AUTO_INCREMENT).
@@ -213,7 +293,7 @@ column_is_identity(Oid relid, AttrNumber attnum)
  */
 static void
 modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
-			  List **cmds, List **after, bool *added_identity,
+			  List **cmds, List **after, bool *added_identity, GenAlter *gen,
 			  PlannedStmt *pstmt, const char *queryString,
 			  ParamListInfo params, QueryEnvironment *queryEnv)
 {
@@ -223,8 +303,11 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	bool		notnull = def->is_not_null;
 	Node	   *defexpr = NULL;
 	Constraint *identity = NULL;
+	Constraint *generated = NULL;
 	AttrNumber	attnum = get_attnum(relid, colname);
 	bool		was_identity = attnum > 0 && column_is_identity(relid, attnum);
+	bool		was_generated = attnum > 0 && get_attgenerated(relid, attnum) != '\0';
+	bool		keep_type = false;
 	List	   *checks = NIL;
 	ListCell   *lc;
 
@@ -244,6 +327,8 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 				identity = c;
 			else if (c->contype == CONSTR_CHECK)
 				checks = lappend(checks, c);
+			else if (c->contype == CONSTR_GENERATED)
+				generated = c;
 		}
 		else if (IsA(n, CommentStmt))
 			*after = lappend(*after, make_column_comment(relid, colname,
@@ -256,14 +341,54 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	}
 
 	/*
+	 * Generated columns.  PostgreSQL keeps a generated column's values when
+	 * it becomes an ordinary column (MySQL: a STORED one), but cannot turn
+	 * an existing column into a generated one (MySQL recomputes it).
+	 */
+	if (generated && !was_generated)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot turn column \"%s\" into a generated column", colname),
+				 errhint("Add a generated column and drop this one.")));
+
+	/*
 	 * Drop the old default first: it may not be castable to the new type.
 	 * An identity column has no default; drop the identity instead when the
-	 * new definition has no AUTO_INCREMENT.
+	 * new definition has no AUTO_INCREMENT.  A generated column keeps its
+	 * expression until SET EXPRESSION below.
 	 */
-	if (!was_identity)
+	if (was_generated)
+	{
+		if (!generated)
+			*cmds = lappend(*cmds, make_cmd(AT_DropExpression, colname, NULL));
+	}
+	else if (!was_identity)
 		*cmds = lappend(*cmds, make_cmd(AT_ColumnDefault, colname, NULL));
 	else if (!identity)
 		*cmds = lappend(*cmds, make_cmd(AT_DropIdentity, colname, NULL));
+	if (generated || was_generated)
+		gen->changed = lappend(gen->changed, colname);
+
+	/*
+	 * PostgreSQL refuses ALTER TYPE of a column a generated column reads,
+	 * even to the same type: keep the type when MODIFY does, else set those
+	 * columns aside until refresh_generated().
+	 */
+	if (column_used_by_generated(relid, attnum))
+	{
+		Oid			typid;
+		int32		typmod;
+		Oid			collid;
+		Oid			new_typid;
+		int32		new_typmod;
+
+		get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
+		typenameTypeIdAndMod(NULL, def->typeName, &new_typid, &new_typmod);
+		keep_type = new_typid == typid && new_typmod == typmod &&
+			GetColumnDefCollation(NULL, def, new_typid) == collid;
+		if (!keep_type)
+			detach_generated_readers(relid, attnum, gen, cmds);
+	}
 	/* Remove only our domain guard for this attribute, including after CHANGE. */
 	{
 		Relation rel = relation_open(relid, NoLock);
@@ -318,8 +443,12 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	tdef->colname = colname;
 	tdef->typeName = def->typeName;
 	tdef->collClause = def->collClause;
-	tdef->raw_default = (Node *) using;
-	*cmds = lappend(*cmds, make_cmd(AT_AlterColumnType, colname, (Node *) tdef));
+	/* a generated column takes the type of its expression, no USING */
+	tdef->raw_default = generated ? NULL : (Node *) using;
+	if (!keep_type)
+		*cmds = lappend(*cmds, make_cmd(AT_AlterColumnType, colname, (Node *) tdef));
+	if (generated)
+		*cmds = lappend(*cmds, make_cmd(AT_SetExpression, colname, generated->raw_expr));
 
 	if (notnull)
 		*cmds = lappend(*cmds, make_cmd(AT_SetNotNull, colname, NULL));
@@ -355,6 +484,7 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 	bool		added_identity = false;
 	bool		has_start = false;
 	int64		start = 1;
+	GenAlter	gen = {NIL, NIL};
 	ListCell   *lc;
 
 	relid = RangeVarGetRelid(stmt->relation, AccessExclusiveLock, stmt->missing_ok);
@@ -377,7 +507,7 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 		{
 			case AT_ModifyColumn:
 				modify_column(stmt, relid, cmd->name, (ColumnDef *) cmd->def, &cmds, &after,
-							  &added_identity, pstmt, queryString, params, queryEnv);
+							  &added_identity, &gen, pstmt, queryString, params, queryEnv);
 				break;
 
 			case AT_ChangeColumn:
@@ -397,7 +527,7 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 						run_utility((Node *) rn, pstmt, queryString, params, queryEnv);
 					}
 					modify_column(stmt, relid, def->colname, def, &cmds, &after,
-								  &added_identity, pstmt, queryString, params, queryEnv);
+								  &added_identity, &gen, pstmt, queryString, params, queryEnv);
 					break;
 				}
 
@@ -494,6 +624,7 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 		}
 	}
 	flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
+	refresh_generated(stmt, relid, &gen, pstmt, queryString, params, queryEnv);
 
 	/* a column that just became AUTO_INCREMENT continues after its maximum */
 	if (added_identity)
@@ -548,6 +679,808 @@ mysql_rename_index(RenameStmt *stmt, PlannedStmt *pstmt, const char *queryString
 	rename->newname = mys_key_pg_name(get_rel_name(relid), stmt->newname,
 									  get_rel_namespace(relid), NIL);
 	run_utility((Node *) rename, pstmt, queryString, params, queryEnv);
+}
+
+/* ----------------------------------------------------------------
+ * Generated column expressions: col type AS (expr) (mys_rewrite.c).
+ *
+ * PostgreSQL computes all generated columns from the row as written and
+ * wants an immutable expression.  MySQL lets a generated column read the
+ * generated columns before it, and accepts deterministic functions that are
+ * STABLE or VOLATILE here (CONCAT, IFNULL, /, DIV, DATE_FORMAT: they read
+ * sql_mode or are written in PL/pgSQL).  So, in MySQL DDL:
+ *
+ *	- a reference to another generated column reads that column's expression,
+ *	  cast to its type, as mysql.generated_column(name, expression): SHOW
+ *	  shows the reference, and the reading columns follow when ALTER TABLE
+ *	  redefines the column they read;
+ *	- an expression PostgreSQL finds mutable becomes a call of an IMMUTABLE
+ *	  SQL function in the table's schema, MYS_GENERATOR_PREFIX<hash>(the
+ *	  columns it reads) RETURN expr, its parameters collated as the columns.
+ *	  An ordinary function for pg_dump; identical expressions share one (LIKE
+ *	  copies them); DROP TABLE / ALTER TABLE drop the ones left unused.
+ * ----------------------------------------------------------------
+ */
+typedef struct GenColumn
+{
+	char	   *name;
+	TypeName   *type;
+	List	   *collname;		/* COLLATE of a parameter reading it, or NIL */
+	Node	   *generation;		/* raw expression, once known */
+	bool		generated;		/* a generated column others may read */
+	Oid			relid;			/* expression still in the catalog */
+	AttrNumber	attnum;
+	bool		notnull;
+} GenColumn;
+
+static bool
+name_member(List *names, const char *name)
+{
+	foreach_ptr(char, n, names)
+		if (strcmp(n, name) == 0)
+			return true;
+	return false;
+}
+
+static GenColumn *
+find_gen_column(List *columns, const char *name)
+{
+	foreach_ptr(GenColumn, c, columns)
+		if (strcmp(c->name, name) == 0)
+			return c;
+	return NULL;
+}
+
+/*
+ * Raw expression of a generated column: from the catalog through its text
+ * (a generator's body, not its call).
+ */
+static Node *
+gen_column_expression(GenColumn *c)
+{
+	if (c->generation == NULL && OidIsValid(c->relid))
+	{
+		Relation	rel = relation_open(c->relid, AccessShareLock);
+		TupleConstr *constr = RelationGetDescr(rel)->constr;
+		char	   *text = NULL;
+
+		for (int i = 0; constr && i < constr->num_defval; i++)
+			if (constr->defval[i].adnum == c->attnum)
+				text = deparse_expression(mys_unwrap_generator(stringToNode(constr->defval[i].adbin)),
+										  deparse_context_for(RelationGetRelationName(rel),
+															  c->relid),
+										  false, false);
+		relation_close(rel, AccessShareLock);
+		if (text)
+		{
+			RawStmt    *raw = linitial_node(RawStmt, raw_parser(text, RAW_PARSE_PLPGSQL_EXPR));
+
+			c->generation = linitial_node(ResTarget,
+										  castNode(SelectStmt, raw->stmt)->targetList)->val;
+		}
+	}
+	return c->generation;
+}
+
+/* the column name of mysql.generated_column(name, expr), else NULL */
+static char *
+generated_ref_name(Node *node)
+{
+	FuncCall   *f = (FuncCall *) node;
+	Node	   *arg;
+
+	if (!IsA(node, FuncCall) || list_length(f->args) != 2 ||
+		strcmp(strVal(llast(f->funcname)), MYS_GENERATED_REF) != 0 ||
+		(list_length(f->funcname) == 2 && strcmp(strVal(linitial(f->funcname)), "mysql") != 0) ||
+		list_length(f->funcname) > 2)
+		return NULL;
+	arg = linitial(f->args);
+	if (IsA(arg, TypeCast))
+		arg = ((TypeCast *) arg)->arg;
+	if (!IsA(arg, A_Const) || ((A_Const *) arg)->isnull || !IsA(&((A_Const *) arg)->val, String))
+		return NULL;
+	return strVal(&((A_Const *) arg)->val);
+}
+
+/*
+ * References to generated columns read their current expressions; one read
+ * before (mysql.generated_column) is read again, or becomes a plain
+ * reference when the column is no longer generated.
+ */
+static Node *
+inline_generated(Node *node, List *columns)
+{
+	ListCell   *lc;
+	char	   *name = NULL;
+	GenColumn  *c;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, ColumnRef) && list_length(((ColumnRef *) node)->fields) == 1 &&
+		IsA(linitial(((ColumnRef *) node)->fields), String))
+		name = strVal(linitial(((ColumnRef *) node)->fields));
+	else
+		name = generated_ref_name(node);
+	if (name && (c = find_gen_column(columns, name)) != NULL)
+	{
+		TypeCast   *tc;
+		A_Const    *ref;
+
+		if (!c->generated || gen_column_expression(c) == NULL)
+		{
+			ColumnRef  *cr = makeNode(ColumnRef);
+
+			if (IsA(node, ColumnRef))
+				return node;
+			cr->fields = list_make1(makeString(name));
+			cr->location = -1;
+			return (Node *) cr;
+		}
+		tc = makeNode(TypeCast);
+		tc->arg = copyObject(c->generation);
+		tc->typeName = copyObject(c->type);
+		tc->location = -1;
+		ref = makeNode(A_Const);
+		ref->val.sval.type = T_String;
+		ref->val.sval.sval = pstrdup(name);
+		ref->location = -1;
+		return (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString(MYS_GENERATED_REF)),
+									 list_make2(ref, tc), COERCE_EXPLICIT_CALL, -1);
+	}
+	if (name)
+		return node;			/* a column of another kind of reference */
+	switch (nodeTag(node))
+	{
+		case T_List:
+			foreach(lc, (List *) node)
+				lfirst(lc) = inline_generated(lfirst(lc), columns);
+			break;
+		case T_A_Expr:
+			((A_Expr *) node)->lexpr = inline_generated(((A_Expr *) node)->lexpr, columns);
+			((A_Expr *) node)->rexpr = inline_generated(((A_Expr *) node)->rexpr, columns);
+			break;
+		case T_FuncCall:
+			((FuncCall *) node)->args = (List *) inline_generated((Node *) ((FuncCall *) node)->args, columns);
+			break;
+		case T_TypeCast:
+			((TypeCast *) node)->arg = inline_generated(((TypeCast *) node)->arg, columns);
+			break;
+		case T_CollateClause:
+			((CollateClause *) node)->arg = inline_generated(((CollateClause *) node)->arg, columns);
+			break;
+		case T_BoolExpr:
+			((BoolExpr *) node)->args = (List *) inline_generated((Node *) ((BoolExpr *) node)->args, columns);
+			break;
+		case T_NullTest:
+			((NullTest *) node)->arg = (Expr *) inline_generated((Node *) ((NullTest *) node)->arg, columns);
+			break;
+		case T_BooleanTest:
+			((BooleanTest *) node)->arg = (Expr *) inline_generated((Node *) ((BooleanTest *) node)->arg, columns);
+			break;
+		case T_CaseExpr:
+			((CaseExpr *) node)->arg = (Expr *) inline_generated((Node *) ((CaseExpr *) node)->arg, columns);
+			((CaseExpr *) node)->args = (List *) inline_generated((Node *) ((CaseExpr *) node)->args, columns);
+			((CaseExpr *) node)->defresult = (Expr *) inline_generated((Node *) ((CaseExpr *) node)->defresult, columns);
+			break;
+		case T_CaseWhen:
+			((CaseWhen *) node)->expr = (Expr *) inline_generated((Node *) ((CaseWhen *) node)->expr, columns);
+			((CaseWhen *) node)->result = (Expr *) inline_generated((Node *) ((CaseWhen *) node)->result, columns);
+			break;
+		case T_CoalesceExpr:
+			((CoalesceExpr *) node)->args = (List *) inline_generated((Node *) ((CoalesceExpr *) node)->args, columns);
+			break;
+		case T_MinMaxExpr:
+			((MinMaxExpr *) node)->args = (List *) inline_generated((Node *) ((MinMaxExpr *) node)->args, columns);
+			break;
+		case T_NamedArgExpr:
+			((NamedArgExpr *) node)->arg = (Expr *) inline_generated((Node *) ((NamedArgExpr *) node)->arg, columns);
+			break;
+		default:
+			/* other nodes keep their references; PostgreSQL reports them */
+			break;
+	}
+	return node;
+}
+
+/* names of the columns an expression reads, in order */
+static bool
+collect_column_refs(Node *node, List **names)
+{
+	if (node == NULL || nodeTag(node) >= T_MysNodeBase)
+		return false;
+	if (IsA(node, ColumnRef))
+	{
+		ColumnRef  *cr = (ColumnRef *) node;
+
+		if (list_length(cr->fields) == 1 && IsA(linitial(cr->fields), String))
+		{
+			foreach_ptr(char, name, *names)
+				if (strcmp(name, strVal(linitial(cr->fields))) == 0)
+					return false;
+			*names = lappend(*names, strVal(linitial(cr->fields)));
+		}
+		return false;
+	}
+	return raw_expression_tree_walker(node, collect_column_refs, names);
+}
+
+/* the expression with its column references collated as the columns */
+static Node *
+collate_params(Node *node, List *columns)
+{
+	ListCell   *lc;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, ColumnRef))
+	{
+		ColumnRef  *cr = (ColumnRef *) node;
+		GenColumn  *c = list_length(cr->fields) == 1 && IsA(linitial(cr->fields), String) ?
+			find_gen_column(columns, strVal(linitial(cr->fields))) : NULL;
+		CollateClause *coll;
+
+		if (c == NULL || c->collname == NIL)
+			return node;
+		coll = makeNode(CollateClause);
+		coll->arg = node;
+		coll->collname = copyObject(c->collname);
+		coll->location = -1;
+		return (Node *) coll;
+	}
+	if (IsA(node, List))
+	{
+		foreach(lc, (List *) node)
+			lfirst(lc) = collate_params(lfirst(lc), columns);
+		return node;
+	}
+	/* the node types inline_generated() handles, same fields */
+	switch (nodeTag(node))
+	{
+		case T_A_Expr:
+			((A_Expr *) node)->lexpr = collate_params(((A_Expr *) node)->lexpr, columns);
+			((A_Expr *) node)->rexpr = collate_params(((A_Expr *) node)->rexpr, columns);
+			break;
+		case T_FuncCall:
+			((FuncCall *) node)->args = (List *) collate_params((Node *) ((FuncCall *) node)->args, columns);
+			break;
+		case T_TypeCast:
+			((TypeCast *) node)->arg = collate_params(((TypeCast *) node)->arg, columns);
+			break;
+		case T_CollateClause:
+			((CollateClause *) node)->arg = collate_params(((CollateClause *) node)->arg, columns);
+			break;
+		case T_BoolExpr:
+			((BoolExpr *) node)->args = (List *) collate_params((Node *) ((BoolExpr *) node)->args, columns);
+			break;
+		case T_NullTest:
+			((NullTest *) node)->arg = (Expr *) collate_params((Node *) ((NullTest *) node)->arg, columns);
+			break;
+		case T_BooleanTest:
+			((BooleanTest *) node)->arg = (Expr *) collate_params((Node *) ((BooleanTest *) node)->arg, columns);
+			break;
+		case T_CaseExpr:
+			((CaseExpr *) node)->arg = (Expr *) collate_params((Node *) ((CaseExpr *) node)->arg, columns);
+			((CaseExpr *) node)->args = (List *) collate_params((Node *) ((CaseExpr *) node)->args, columns);
+			((CaseExpr *) node)->defresult = (Expr *) collate_params((Node *) ((CaseExpr *) node)->defresult, columns);
+			break;
+		case T_CaseWhen:
+			((CaseWhen *) node)->expr = (Expr *) collate_params((Node *) ((CaseWhen *) node)->expr, columns);
+			((CaseWhen *) node)->result = (Expr *) collate_params((Node *) ((CaseWhen *) node)->result, columns);
+			break;
+		case T_CoalesceExpr:
+			((CoalesceExpr *) node)->args = (List *) collate_params((Node *) ((CoalesceExpr *) node)->args, columns);
+			break;
+		case T_MinMaxExpr:
+			((MinMaxExpr *) node)->args = (List *) collate_params((Node *) ((MinMaxExpr *) node)->args, columns);
+			break;
+		case T_NamedArgExpr:
+			((NamedArgExpr *) node)->arg = (Expr *) collate_params((Node *) ((NamedArgExpr *) node)->arg, columns);
+			break;
+		default:
+			break;
+	}
+	return node;
+}
+
+/*
+ * The expression of a generated column, raw: as is when PostgreSQL finds it
+ * immutable, else a call of its generator function (created if needed).
+ */
+static Node *
+generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
+					  PlannedStmt *pstmt, const char *queryString,
+					  ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	List	   *names = NIL;
+	List	   *known = NIL;
+	SQLFunctionParseInfo *pinfo = palloc0(sizeof(SQLFunctionParseInfo));
+	ParseState *pstate = make_parsestate(NULL);
+	Node	   *expr;
+	Node	   *body;
+	Oid		   *argtypes;
+	List	   *funcname;
+	List	   *args = NIL;
+	StringInfoData key;
+	char		name[NAMEDATALEN];
+	int			n = 0;
+
+	(void) collect_column_refs(raw, &names);
+	foreach_ptr(char, colname, names)
+		if (find_gen_column(columns, colname))
+			known = lappend(known, colname);
+	argtypes = palloc(sizeof(Oid) * (list_length(known) + 1));
+	pinfo->fname = "generated column";
+	pinfo->argnames = palloc(sizeof(char *) * (list_length(known) + 1));
+	foreach_ptr(char, colname, known)
+	{
+		pinfo->argnames[n] = colname;
+		argtypes[n++] = typenameTypeId(NULL, find_gen_column(columns, colname)->type);
+	}
+	pinfo->nargs = n;
+	pinfo->argtypes = argtypes;
+	sql_fn_parser_setup(pstate, pinfo);
+	expr = transformExpr(pstate, copyObject(raw), EXPR_KIND_GENERATED_COLUMN);
+	free_parsestate(pstate);
+	if (!contain_mutable_functions_after_planning((Expr *) expr))
+		return raw;
+
+	/* named after what it computes: search_path resolves the names in it */
+	body = collate_params(copyObject(raw), columns);
+	initStringInfo(&key);
+	appendStringInfo(&key, "1|%s|%s|%u", nodeToString(body),	/* 1: its definition */
+					 GetConfigOption("search_path", false, false),
+					 typenameTypeId(NULL, type));
+	for (int i = 0; i < n; i++)
+		appendStringInfo(&key, ",%u", argtypes[i]);
+	snprintf(name, sizeof(name), "%s%016" PRIx64 "%016" PRIx64, MYS_GENERATOR_PREFIX,
+			 hash_bytes_extended((unsigned char *) key.data, key.len, 0),
+			 hash_bytes_extended((unsigned char *) key.data, key.len, UINT64CONST(0x9e3779b97f4a7c15)));
+	funcname = list_make2(makeString(get_namespace_name(nspid)), makeString(pstrdup(name)));
+
+	if (!OidIsValid(LookupFuncName(funcname, n, argtypes, true)))
+	{
+		CreateFunctionStmt *f = makeNode(CreateFunctionStmt);
+		ReturnStmt *ret = makeNode(ReturnStmt);
+		VariableSetStmt *path = makeNode(VariableSetStmt);
+
+		foreach_ptr(char, colname, known)
+		{
+			FunctionParameter *p = makeNode(FunctionParameter);
+
+			p->name = colname;
+			p->argType = copyObject(find_gen_column(columns, colname)->type);
+			p->mode = FUNC_PARAM_IN;
+			p->location = -1;
+			f->parameters = lappend(f->parameters, p);
+		}
+		/*
+		 * aux_mysql's PL/pgSQL functions resolve their names at run time,
+		 * through search_path: mysql, as in MySQL sessions, also when a
+		 * PostgreSQL session or pg_restore writes the table.
+		 */
+		path->kind = VAR_SET_VALUE;
+		path->name = "search_path";
+		path->args = list_make2(makeStringConst("mysql", -1), makeStringConst("pg_catalog", -1));
+		f->funcname = funcname;
+		f->returnType = copyObject(type);
+		f->options = list_make2(makeDefElem("volatility", (Node *) makeString("immutable"), -1),
+								makeDefElem("set", (Node *) path, -1));
+		ret->returnval = body;
+		f->sql_body = (Node *) ret;
+		run_utility((Node *) f, pstmt, queryString, params, queryEnv);
+		CommandCounterIncrement();
+	}
+	foreach_ptr(char, colname, known)
+	{
+		ColumnRef  *cr = makeNode(ColumnRef);
+
+		cr->fields = list_make1(makeString(colname));
+		cr->location = -1;
+		args = lappend(args, cr);
+	}
+	return (Node *) makeFuncCall(funcname, args, COERCE_EXPLICIT_CALL, -1);
+}
+
+static Constraint *
+generated_constraint(ColumnDef *def)
+{
+	foreach_ptr(Node, n, def->constraints)
+		if (IsA(n, Constraint) && ((Constraint *) n)->contype == CONSTR_GENERATED)
+			return (Constraint *) n;
+	return NULL;
+}
+
+/* the columns of a table, in order */
+static List *
+table_gen_columns(Oid relid)
+{
+	List	   *columns = NIL;
+	Relation	rel;
+
+	if (!OidIsValid(relid))
+		return NIL;
+	rel = relation_open(relid, AccessShareLock);
+	for (int i = 0; i < RelationGetDescr(rel)->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), i);
+		GenColumn  *c;
+
+		if (att->attisdropped)
+			continue;
+		c = palloc0(sizeof(GenColumn));
+		c->name = pstrdup(NameStr(att->attname));
+		c->type = makeTypeNameFromOid(att->atttypid, att->atttypmod);
+		if (OidIsValid(att->attcollation) &&
+			att->attcollation != get_typcollation(att->atttypid))
+		{
+			HeapTuple	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(att->attcollation));
+			Form_pg_collation coll = (Form_pg_collation) GETSTRUCT(tup);
+
+			c->collname = list_make2(makeString(get_namespace_name(coll->collnamespace)),
+									 makeString(pstrdup(NameStr(coll->collname))));
+			ReleaseSysCache(tup);
+		}
+		c->generated = att->attgenerated != '\0';
+		c->relid = relid;
+		c->attnum = att->attnum;
+		c->notnull = att->attnotnull;
+		columns = lappend(columns, c);
+	}
+	relation_close(rel, AccessShareLock);
+	return columns;
+}
+
+/*
+ * The generated columns among defs, the column definitions of a CREATE TABLE
+ * or ALTER TABLE (relid) in order: their expressions as PostgreSQL takes them.
+ */
+static void
+mysql_generated_columns(List *defs, Oid relid, Oid nspid,
+						PlannedStmt *pstmt, const char *queryString,
+						ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	List	   *columns;
+	bool		any = false;
+
+	foreach_node(ColumnDef, def, defs)
+		any |= generated_constraint(def) != NULL;
+	if (!any)
+		return;
+	columns = table_gen_columns(relid);
+	/* the statement's definitions replace the catalog's (MODIFY) */
+	foreach_node(ColumnDef, def, defs)
+	{
+		GenColumn  *c = find_gen_column(columns, def->colname);
+
+		if (c == NULL)
+		{
+			c = palloc0(sizeof(GenColumn));
+			c->name = def->colname;
+			columns = lappend(columns, c);
+		}
+		c->type = def->typeName;
+		c->collname = def->collClause ? def->collClause->collname : NIL;
+		c->generation = NULL;
+		c->generated = false;
+		c->relid = InvalidOid;
+	}
+	foreach_node(ColumnDef, def, defs)
+	{
+		Constraint *g = generated_constraint(def);
+		GenColumn  *c = find_gen_column(columns, def->colname);
+
+		if (g == NULL || g->raw_expr == NULL)
+			continue;
+		c->generation = inline_generated(copyObject(g->raw_expr), columns);
+		c->generated = true;
+		g->raw_expr = generation_expression(c->generation, def->typeName, columns, nspid,
+											pstmt, queryString, params, queryEnv);
+	}
+}
+
+/* generator functions called by the generated columns of a table */
+static List *
+table_generators(Oid relid, List *result)
+{
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *attrdefs = NIL;
+
+	if (!OidIsValid(relid))
+		return result;
+	depRel = table_open(DependRelationId, AccessShareLock);
+	/* the column expressions, which depend on the table */
+	ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationRelationId));
+	ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
+
+		if (dep->classid == AttrDefaultRelationId)
+			attrdefs = list_append_unique_oid(attrdefs, dep->objid);
+	}
+	systable_endscan(scan);
+	/* and the functions they call */
+	foreach_oid(attrdef, attrdefs)
+	{
+		ScanKeyInit(&key[0], Anum_pg_depend_classid, BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(AttrDefaultRelationId));
+		ScanKeyInit(&key[1], Anum_pg_depend_objid, BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(attrdef));
+		scan = systable_beginscan(depRel, DependDependerIndexId, true, NULL, 2, key);
+		while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		{
+			Form_pg_depend dep = (Form_pg_depend) GETSTRUCT(tup);
+			char	   *name;
+
+			if (dep->refclassid != ProcedureRelationId)
+				continue;
+			name = get_func_name(dep->refobjid);
+			if (name && strncmp(name, MYS_GENERATOR_PREFIX, strlen(MYS_GENERATOR_PREFIX)) == 0)
+				result = list_append_unique_oid(result, dep->refobjid);
+		}
+		systable_endscan(scan);
+	}
+	table_close(depRel, AccessShareLock);
+	return result;
+}
+
+/* generator functions a DROP TABLE / ALTER TABLE may leave unused */
+static List *
+statement_generators(Node *stmt)
+{
+	List	   *result = NIL;
+
+	if (IsA(stmt, DropStmt) && ((DropStmt *) stmt)->removeType == OBJECT_TABLE)
+	{
+		foreach_node(List, name, ((DropStmt *) stmt)->objects)
+			result = table_generators(RangeVarGetRelid(makeRangeVarFromNameList(name),
+													   NoLock, true), result);
+	}
+	else if (IsA(stmt, AlterTableStmt))
+		result = table_generators(RangeVarGetRelid(((AlterTableStmt *) stmt)->relation,
+												   NoLock, true), result);
+	return result;
+}
+
+static void
+drop_unused_generators(List *generators)
+{
+	bool		dropped = true;
+
+	/* a generator may call another */
+	while (dropped)
+	{
+		dropped = false;
+		foreach_oid(func, generators)
+		{
+			Relation	depRel;
+			ScanKeyData key[2];
+			SysScanDesc scan;
+			bool		used;
+			ObjectAddress object;
+
+			if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(func)))
+				continue;
+			depRel = table_open(DependRelationId, AccessShareLock);
+			ScanKeyInit(&key[0], Anum_pg_depend_refclassid, BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(ProcedureRelationId));
+			ScanKeyInit(&key[1], Anum_pg_depend_refobjid, BTEqualStrategyNumber, F_OIDEQ,
+						ObjectIdGetDatum(func));
+			scan = systable_beginscan(depRel, DependReferenceIndexId, true, NULL, 2, key);
+			used = HeapTupleIsValid(systable_getnext(scan));
+			systable_endscan(scan);
+			table_close(depRel, AccessShareLock);
+			if (used)
+				continue;
+			ObjectAddressSet(object, ProcedureRelationId, func);
+			performDeletion(&object, DROP_RESTRICT,
+							PERFORM_DELETION_INTERNAL | PERFORM_DELETION_QUIETLY);
+			CommandCounterIncrement();
+			dropped = true;
+		}
+	}
+}
+
+/* whether a raw expression reads a column named (as a generated column) */
+static bool
+reads_columns(Node *node, List *names)
+{
+	char	   *name;
+
+	if (node == NULL || nodeTag(node) >= T_MysNodeBase)
+		return false;
+	if ((name = generated_ref_name(node)) != NULL && name_member(names, name))
+		return true;
+	if (IsA(node, ColumnRef) && list_length(((ColumnRef *) node)->fields) == 1 &&
+		IsA(linitial(((ColumnRef *) node)->fields), String))
+		return name_member(names, strVal(linitial(((ColumnRef *) node)->fields)));
+	return raw_expression_tree_walker(node, reads_columns, names);
+}
+
+/* whether a cooked expression reads generated column name */
+static bool
+reads_generated(Node *node, const char *name)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, FuncExpr) && list_length(((FuncExpr *) node)->args) == 2 &&
+		IsA(linitial(((FuncExpr *) node)->args), Const))
+	{
+		Const	   *ref = linitial_node(Const, ((FuncExpr *) node)->args);
+		char	   *func = get_func_name(((FuncExpr *) node)->funcid);
+
+		if (func && strcmp(func, MYS_GENERATED_REF) == 0 && !ref->constisnull &&
+			ref->consttype == TEXTOID &&
+			strcmp(TextDatumGetCString(ref->constvalue), name) == 0)
+			return true;
+	}
+	return expression_tree_walker(node, reads_generated, (void *) name);
+}
+
+/*
+ * DROP COLUMN or a rename of a generated column other generated columns
+ * read (not dropped as well): refused, as in MySQL.
+ */
+static void
+check_generated_readers(Oid relid, const char *name, bool drop, List *dropped)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+	TupleConstr *constr = RelationGetDescr(rel)->constr;
+
+	for (int i = 0; constr && i < constr->num_defval; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), constr->defval[i].adnum - 1);
+
+		if (!att->attgenerated || name_member(dropped, NameStr(att->attname)) ||
+			!reads_generated(mys_unwrap_generator(stringToNode(constr->defval[i].adbin)), name))
+			continue;
+		if (drop)
+			ereport(ERROR,
+					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					 errmsg("Column '%s' has a generated column dependency.", name)));
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("Unknown column '%s' in 'generated column function'", name)));
+	}
+	relation_close(rel, AccessShareLock);
+}
+
+/*
+ * Before ALTER TYPE of column attnum: the generated columns reading it keep
+ * no expression (PostgreSQL refuses the type change otherwise) until
+ * refresh_generated() gives them theirs again, read now.
+ */
+static void
+detach_generated_readers(Oid relid, AttrNumber attnum, GenAlter *gen, List **cmds)
+{
+	Relation	rel = relation_open(relid, AccessShareLock);
+	TupleConstr *constr = RelationGetDescr(rel)->constr;
+	List	   *readers = NIL;
+
+	for (int i = 0; constr && i < constr->num_defval; i++)
+	{
+		Bitmapset  *attrs = NULL;
+
+		if (!TupleDescAttr(RelationGetDescr(rel), constr->defval[i].adnum - 1)->attgenerated)
+			continue;
+		pull_varattnos(stringToNode(constr->defval[i].adbin), 1, &attrs);
+		if (bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber, attrs))
+			readers = lappend_int(readers, constr->defval[i].adnum);
+	}
+	relation_close(rel, AccessShareLock);
+
+	foreach_ptr(GenColumn, c, table_gen_columns(relid))
+	{
+		A_Const    *null = makeNode(A_Const);
+
+		if (!list_member_int(readers, c->attnum))
+			continue;
+		(void) gen_column_expression(c);
+		c->relid = InvalidOid;
+		gen->detached = lappend(gen->detached, c);
+		if (c->notnull)
+			*cmds = lappend(*cmds, make_cmd(AT_DropNotNull, c->name, NULL));
+		null->isnull = true;
+		null->location = -1;
+		*cmds = lappend(*cmds, make_cmd(AT_SetExpression, c->name, (Node *) null));
+	}
+}
+
+/*
+ * A table LIKE another in another schema calls that schema's generators: its
+ * generated columns would go with that schema (DROP DATABASE).  Give them
+ * generators in the table's own schema.
+ */
+static void
+rehome_generators(Oid relid, PlannedStmt *pstmt, const char *queryString,
+				  ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	Oid			nspid = get_rel_namespace(relid);
+	List	   *columns = table_gen_columns(relid);
+	List	   *foreign = NIL;
+	List	   *cmds = NIL;
+	AlterTableStmt *stmt;
+	Relation	rel = relation_open(relid, AccessShareLock);
+	TupleConstr *constr = RelationGetDescr(rel)->constr;
+
+	for (int i = 0; constr && i < constr->num_defval; i++)
+	{
+		Node	   *call = strip_implicit_coercions(stringToNode(constr->defval[i].adbin));
+
+		if (TupleDescAttr(RelationGetDescr(rel), constr->defval[i].adnum - 1)->attgenerated &&
+			IsA(call, FuncExpr) && get_func_namespace(((FuncExpr *) call)->funcid) != nspid &&
+			mys_unwrap_generator(call) != call)
+			foreign = lappend_int(foreign, constr->defval[i].adnum);
+	}
+	relation_close(rel, AccessShareLock);
+	if (foreign == NIL)
+		return;
+	foreach_ptr(GenColumn, c, columns)
+	{
+		Node	   *raw;
+
+		if (!list_member_int(foreign, c->attnum) || (raw = gen_column_expression(c)) == NULL)
+			continue;
+		cmds = lappend(cmds, make_cmd(AT_SetExpression, c->name,
+									  generation_expression(raw, c->type, columns, nspid,
+															pstmt, queryString, params, queryEnv)));
+	}
+	stmt = makeNode(AlterTableStmt);
+	stmt->relation = makeRangeVar(get_namespace_name(nspid), get_rel_name(relid), -1);
+	stmt->objtype = OBJECT_TABLE;
+	flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
+}
+
+/*
+ * After MODIFY / CHANGE: the generated columns set aside, and those reading
+ * a generated column the statement redefined (through
+ * mysql.generated_column), get their expressions again, in column order.
+ */
+static void
+refresh_generated(AlterTableStmt *stmt, Oid relid, GenAlter *gen,
+				  PlannedStmt *pstmt, const char *queryString,
+				  ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	List	   *columns;
+	List	   *changed;
+	List	   *cmds = NIL;
+
+	if (gen->changed == NIL && gen->detached == NIL)
+		return;
+	columns = table_gen_columns(relid);
+	changed = list_copy(gen->changed);
+	foreach_ptr(GenColumn, c, columns)
+	{
+		GenColumn  *detached = NULL;
+		Node	   *raw;
+
+		foreach_ptr(GenColumn, d, gen->detached)
+			if (strcmp(d->name, c->name) == 0)
+				detached = d;
+		if (!c->generated)
+			continue;
+		if (detached)
+			raw = detached->generation;
+		else if (name_member(gen->changed, c->name) ||
+				 (raw = gen_column_expression(c)) == NULL || !reads_columns(raw, changed))
+			continue;
+		c->relid = InvalidOid;
+		c->generation = inline_generated(copyObject(raw), columns);
+		cmds = lappend(cmds, make_cmd(AT_SetExpression, c->name,
+									  generation_expression(c->generation, c->type, columns,
+															get_rel_namespace(relid),
+															pstmt, queryString, params, queryEnv)));
+		if (detached && detached->notnull)
+			cmds = lappend(cmds, make_cmd(AT_SetNotNull, c->name, NULL));
+		changed = lappend(changed, c->name);
+	}
+	flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
 }
 
 /* ----------------------------------------------------------------
@@ -716,6 +1649,33 @@ mysql_table_setup(DoStmt *d, PlannedStmt *pstmt, const char *queryString,
 			check_collation_label(&object, strVal(e->arg));
 			SetSecurityLabel(&object, "aux_mysql", strVal(e->arg));
 			CommandCounterIncrement();
+			continue;
+		}
+		/* generated columns: the kind they were declared with */
+		if (strcmp(e->defname, "generated_virtual") == 0 ||
+			strcmp(e->defname, "generated_stored") == 0)
+		{
+			attnum = get_attnum(relid, strVal(e->arg));
+			if (attnum > 0)
+				set_generated_virtual(relid, attnum,
+									  strcmp(e->defname, "generated_virtual") == 0);
+			continue;
+		}
+		if (strcmp(e->defname, "generated_like") == 0)
+		{
+			Oid			source = RangeVarGetRelid((RangeVar *) e->arg, NoLock, true);
+
+			if (OidIsValid(source))
+				for (AttrNumber col = 1; col <= natts; col++)
+				{
+					char	   *name = get_attname(relid, col, true);
+					AttrNumber	from = name ? get_attnum(source, name) : InvalidAttrNumber;
+
+					if (from > 0 && get_attgenerated(relid, col) &&
+						mys_generated_virtual(source, from))
+						set_generated_virtual(relid, col, true);
+				}
+			rehome_generators(relid, pstmt, queryString, params, queryEnv);
 			continue;
 		}
 		attnum = get_attnum(relid, strVal(e->arg));
@@ -1050,6 +2010,7 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 	{
 		AlterTableStmt *alter = copyObject((AlterTableStmt *) parsetree);
 		Oid relid = RangeVarGetRelid(alter->relation, AccessExclusiveLock, alter->missing_ok);
+		List	   *defs = NIL;
 
 		if (OidIsValid(relid))
 			foreach_node(AlterTableCmd, cmd, alter->cmds)
@@ -1057,8 +2018,11 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 				if (cmd->def && IsA(cmd->def, ColumnDef) &&
 					(cmd->subtype == AT_AddColumn || (int) cmd->subtype == AT_ModifyColumn ||
 					 (int) cmd->subtype == AT_ChangeColumn))
+				{
 					mys_rectify_column_collation((ColumnDef *) cmd->def,
 												mys_table_default_collation(relid));
+					defs = lappend(defs, cmd->def);
+				}
 				/* FOREIGN_KEY_CHECKS=0: MySQL does not check existing rows */
 				if (cmd->subtype == AT_AddConstraint && cmd->def &&
 					IsA(cmd->def, Constraint) &&
@@ -1069,8 +2033,62 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 					((Constraint *) cmd->def)->initially_valid = false;
 				}
 			}
+		if (OidIsValid(relid))
+		{
+			List	   *dropped = NIL;
+
+			/* generated columns other generated columns read stay */
+			foreach_node(AlterTableCmd, cmd, alter->cmds)
+				if (cmd->subtype == AT_DropColumn)
+					dropped = lappend(dropped, cmd->name);
+			foreach_node(AlterTableCmd, cmd, alter->cmds)
+				if (cmd->subtype == AT_DropColumn ||
+					((int) cmd->subtype == AT_ChangeColumn && cmd->def &&
+					 strcmp(cmd->name, ((ColumnDef *) cmd->def)->colname) != 0))
+					check_generated_readers(relid, cmd->name, cmd->subtype == AT_DropColumn,
+											dropped);
+			mysql_generated_columns(defs, relid, get_rel_namespace(relid),
+									pstmt, queryString, params, queryEnv);
+		}
 		pstmt = copyObject(pstmt);
 		pstmt->utilityStmt = parsetree = (Node *) alter;
+	}
+
+	if (mys_is_mysql_session() && IsA(parsetree, RenameStmt) &&
+		((RenameStmt *) parsetree)->renameType == OBJECT_COLUMN)
+	{
+		Oid			relid = RangeVarGetRelid(((RenameStmt *) parsetree)->relation,
+											 AccessExclusiveLock, true);
+
+		if (OidIsValid(relid))
+			check_generated_readers(relid, ((RenameStmt *) parsetree)->subname, false, NIL);
+	}
+
+	/* the same for the generated columns of CREATE TABLE */
+	if (mys_is_mysql_session() && halo_mysql_parser == MYS_PARSER_MYSQL &&
+		IsA(parsetree, CreateStmt))
+	{
+		CreateStmt *create = (CreateStmt *) parsetree;
+		List	   *defs = NIL;
+
+		foreach_ptr(Node, elt, create->tableElts)
+			if (IsA(elt, ColumnDef) && generated_constraint((ColumnDef *) elt))
+				defs = lappend(defs, elt);
+		if (defs != NIL &&
+			!(create->if_not_exists &&
+			  OidIsValid(RangeVarGetRelid(create->relation, NoLock, true))))
+		{
+			create = copyObject(create);
+			defs = NIL;
+			foreach_ptr(Node, elt, create->tableElts)
+				if (IsA(elt, ColumnDef))
+					defs = lappend(defs, elt);
+			mysql_generated_columns(defs, InvalidOid,
+									RangeVarGetCreationNamespace(create->relation),
+									pstmt, queryString, params, queryEnv);
+			pstmt = copyObject(pstmt);
+			pstmt->utilityStmt = parsetree = (Node *) create;
+		}
 	}
 
 	if (IsA(parsetree, CreateExtensionStmt) &&
@@ -1179,22 +2197,26 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				   DestReceiver *dest, QueryCompletion *qc)
 {
 	bool		saved = XactReadOnly;
+	List	   *generators = NIL;
 
+	if (mys_is_mysql_session())
+		generators = statement_generators(pstmt->utilityStmt);
 	if (!mys_is_mysql_session() || !server_read_only_utility(pstmt->utilityStmt, context))
-	{
 		process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
-		return;
-	}
-	XactReadOnly = true;
-	PG_TRY();
+	else
 	{
-		process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+		XactReadOnly = true;
+		PG_TRY();
+		{
+			process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+		}
+		PG_FINALLY();
+		{
+			XactReadOnly = saved;
+		}
+		PG_END_TRY();
 	}
-	PG_FINALLY();
-	{
-		XactReadOnly = saved;
-	}
-	PG_END_TRY();
+	drop_unused_generators(generators);
 }
 
 void

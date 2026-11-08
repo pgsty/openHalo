@@ -116,6 +116,17 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   error 1061. The index name alone carries the key name, so it survives `pg_dump`, `pg_upgrade` and
   `RENAME TABLE`; an index without the suffix (from PostgreSQL, or created before 1.8) is known by its
   name. `CREATE TABLE ... LIKE` keeps the key names.
+- **Generated columns** `col type [GENERATED ALWAYS] AS (expr) [VIRTUAL | STORED]`: computed as in MySQL;
+  VIRTUAL ones are stored too (PostgreSQL's virtual columns can neither be indexed nor use aux_mysql's
+  functions). Only `DEFAULT` can be written to them (3105 otherwise), also through REPLACE and
+  `ON DUPLICATE KEY UPDATE`. A generated column may read the generated columns defined before it, and
+  `ALTER TABLE ... MODIFY / CHANGE` recomputes the columns that read a redefined column, also when a
+  column they read changes type. An expression PostgreSQL deems mutable (CONCAT, IFNULL, `/`, DIV,
+  DATE_FORMAT: they read `sql_mode` or are PL/pgSQL) is computed by an IMMUTABLE SQL function
+  `aux_mysql_gen_<hash>` in the table's schema, removed by DROP TABLE / ALTER TABLE once unused.
+  `SHOW COLUMNS`, `SHOW CREATE TABLE` and `information_schema.COLUMNS` show them as MySQL does: no default,
+  Extra `VIRTUAL GENERATED` / `STORED GENERATED` (so mysqldump leaves them out of its INSERTs),
+  `GENERATION_EXPRESSION`, `GENERATED ALWAYS AS (expr) VIRTUAL | STORED`.
 - **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
 
 ## Known gaps
@@ -167,7 +178,7 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   rows MySQL treats as duplicates can coexist under a unique key, and `ON DUPLICATE KEY UPDATE` with
   such a value inserts a new row where MySQL updates the existing one.
 - `SHOW CREATE TABLE` shows PostgreSQL collation names (`COLLATE case_insensitive`); they replay into
-  aux_mysql, not into MySQL.
+  aux_mysql, not into MySQL. Generated column expressions carry PostgreSQL casts (`'a'::text`) alike.
 - `ON DUPLICATE KEY UPDATE` and `REPLACE` find duplicates in one unique key: the PRIMARY KEY or the
   first UNIQUE key whose columns the statement supplies, else the PRIMARY KEY or the first UNIQUE key
   (a table without one just inserts, as in MySQL, also when created earlier in the same packet). A
@@ -175,6 +186,15 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   with 1105, where MySQL updates. Their affected rows (and `ROW_COUNT()`) are MySQL's: 2 per updated or
   replaced row, 0 per row left unchanged (1 for CLIENT_FOUND_ROWS clients), but a plain `UPDATE` counts
   the rows it matches (MySQL without CLIENT_FOUND_ROWS: only those it changes).
+- Generated columns: MODIFY / CHANGE cannot turn a column into a generated one (drop it and add it
+  again; it moves to the end of the table). In non-strict `sql_mode` a generated value that does not fit
+  its column fails (1406; MySQL truncates it with a warning). Accepted although MySQL refuses them:
+  VIRTUAL primary keys, references to AUTO_INCREMENT columns, nondeterministic functions (computed when
+  the row is written), VIRTUAL to ordinary column by MODIFY (keeps the values). Dropping a column that
+  another generated column reads reports 1105 (MySQL: 3108). A table moved to another schema with
+  PostgreSQL's `ALTER TABLE ... SET SCHEMA` still calls the `aux_mysql_gen_*` functions of the old one:
+  dropping that schema drops those columns. Before 1.8, `col type AS (expr)` made an ordinary column,
+  always NULL, and `GENERATED ALWAYS AS (expr)` a default; such columns stay so until added again.
 - Foreign keys created before PostgreSQL 18 enforcement was enabled in aux_mysql are `NOT ENFORCED`
   (`pg_constraint.conenforced = false`). Re-create them as enforced without checking old rows, then
   validate when convenient:
@@ -189,9 +209,10 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
   AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0` (1.6)
   and SHOW / information_schema report DECIMAL precision and scale, SHOW prefix key parts (1.7), and
-  `GET_LOCK()` locks, SHOW / information_schema show key names, hexadecimal literals are binary strings
-  and numbers, `HEX()` / `UNHEX()` exist (1.8: in 1.7, `GET_LOCK()`, `RELEASE_LOCK()`, `IS_FREE_LOCK()`
-  and `IS_USED_LOCK()` were stubs that let every session "hold" every lock).
+  `GET_LOCK()` locks, SHOW / information_schema show key names and generated columns, hexadecimal
+  literals are binary strings and numbers, `HEX()` / `UNHEX()` exist (1.8: in 1.7, `GET_LOCK()`,
+  `RELEASE_LOCK()`, `IS_FREE_LOCK()` and `IS_USED_LOCK()` were stubs that let every session "hold"
+  every lock).
   With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
   table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
   fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION

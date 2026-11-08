@@ -881,6 +881,76 @@ rep(s[start:end], (
     '\t\t\t\t}\n'))
 
 # ---------------------------------------------------------------------------
+# Generated columns: col type [GENERATED ALWAYS] AS (expr) [VIRTUAL | STORED]
+# ---------------------------------------------------------------------------
+# PG18 reads Constraint.generated_kind; PG14 had stored columns only, so the
+# grammar never set it.  GENERATED ALWAYS AS became a DEFAULT (an error for an
+# expression with a column reference), and the short form kept $5 (the
+# VIRTUAL / STORED keyword, NULL) as its expression: a plain column, always
+# NULL.  Keep the declared kind, VIRTUAL when omitted as in MySQL;
+# mys_rewrite.c decides how PostgreSQL stores it.
+rep('%type <node> stored_virtual\n', '%type <ival> stored_virtual\n')
+rep('''stored_virtual:
+            STORED          { $$ = NULL; }
+            | VIRTUAL       { $$ = NULL; }
+            | /* empty */   { $$ = NULL; }
+''', '''stored_virtual:
+\t\t\tSTORED\t\t\t{ $$ = ATTRIBUTE_GENERATED_STORED; }
+\t\t\t| VIRTUAL\t\t{ $$ = ATTRIBUTE_GENERATED_VIRTUAL; }
+\t\t\t| /* empty */\t{ $$ = ATTRIBUTE_GENERATED_VIRTUAL; }
+''')
+rep('''\t\t\t//| GENERATED generated_when AS '(' a_expr ')' STORED
+\t\t\t| GENERATED generated_when AS '(' a_expr ')' stored_virtual
+\t\t\t\t{
+\t\t\t\t\tConstraint *n = makeNode(Constraint);
+\t\t\t\t\tn->contype = CONSTR_GENERATED;
+\t\t\t\t\tn->generated_when = $2;
+\t\t\t\t\tn->raw_expr = $5;
+\t\t\t\t\tn->cooked_expr = NULL;
+''', '''\t\t\t| GENERATED generated_when AS '(' a_expr ')' stored_virtual
+\t\t\t\t{
+\t\t\t\t\tConstraint *n = makeNode(Constraint);
+\t\t\t\t\tn->contype = CONSTR_GENERATED;
+\t\t\t\t\tn->generated_when = $2;
+\t\t\t\t\tn->raw_expr = $5;
+\t\t\t\t\tn->cooked_expr = NULL;
+\t\t\t\t\tn->generated_kind = $7;
+''')
+rep('''\t\t\t| AS '(' a_expr ')' stored_virtual
+\t\t\t\t{
+\t\t\t\t\tConstraint *n = makeNode(Constraint);
+\t\t\t\t\tn->contype = CONSTR_GENERATED;
+\t\t\t\t\tn->generated_when = ATTRIBUTE_IDENTITY_ALWAYS;
+\t\t\t\t\tn->raw_expr = $5;
+\t\t\t\t\tn->cooked_expr = NULL;
+\t\t\t\t\tn->location = @1;
+
+\t\t\t\t\t/*
+\t\t\t\t\t * Can't do this in the grammar because of shift/reduce
+\t\t\t\t\t * conflicts.  (IDENTITY allows both ALWAYS and BY
+\t\t\t\t\t * DEFAULT, but generated columns only allow ALWAYS.)  We
+\t\t\t\t\t * can also give a more useful error message and location.
+\t\t\t\t\t */
+                    // if ($2 != ATTRIBUTE_IDENTITY_ALWAYS)
+                    //     ereport(ERROR,
+                    //             (errcode(ERRCODE_SYNTAX_ERROR),
+                    //              errmsg("for a generated column, GENERATED ALWAYS must be specified"),
+                    //              parser_errposition(@2)));
+
+\t\t\t\t\t$$ = (Node *)n;
+''', '''\t\t\t| AS '(' a_expr ')' stored_virtual
+\t\t\t\t{
+\t\t\t\t\tConstraint *n = makeNode(Constraint);
+\t\t\t\t\tn->contype = CONSTR_GENERATED;
+\t\t\t\t\tn->generated_when = ATTRIBUTE_IDENTITY_ALWAYS;
+\t\t\t\t\tn->raw_expr = $3;
+\t\t\t\t\tn->cooked_expr = NULL;
+\t\t\t\t\tn->generated_kind = $5;
+\t\t\t\t\tn->location = @1;
+\t\t\t\t\t$$ = (Node *)n;
+''')
+
+# ---------------------------------------------------------------------------
 # DECIMAL
 # ---------------------------------------------------------------------------
 # MySQL's DECIMAL / DEC / NUMERIC column without a precision is DECIMAL(10,0);

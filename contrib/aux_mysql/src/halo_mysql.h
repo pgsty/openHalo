@@ -169,6 +169,14 @@ extern const char *mys_table_default_collation(Oid relid);
 
 /* mys_utility.c: per-table setup after MySQL DDL (triggers) */
 #define MYS_TABLE_SETUP_MARKER	"halo_mysql_table_setup"
+/* aux_mysql security label of a generated column declared VIRTUAL (stored) */
+#define MYS_GENERATED_VIRTUAL	"virtual"
+/* IMMUTABLE SQL function computing a generated column PostgreSQL finds mutable */
+#define MYS_GENERATOR_PREFIX	"aux_mysql_gen_"
+extern Node *mys_unwrap_generator(Node *expr);
+/* mysql.generated_column(name, expr): a generated column read by another */
+#define MYS_GENERATED_REF		"generated_column"
+extern bool mys_generated_virtual(Oid relid, AttrNumber attnum);
 extern char *halo_mysql_default_collation;
 
 /* mys_txn.c */

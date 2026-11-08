@@ -64,6 +64,18 @@ CREATE OR REPLACE FUNCTION mysql.index_key_name(pg_catalog.oid)
 RETURNS pg_catalog.text
 AS '$libdir/aux_mysql', 'mys_sql_index_key_name'
 LANGUAGE C STABLE STRICT;
+-- the expression of a generated column as MySQL shows it; NULL for another column
+CREATE OR REPLACE FUNCTION mysql.column_generation(pg_catalog.oid, pg_catalog.int4)
+RETURNS pg_catalog.text
+AS '$libdir/aux_mysql', 'mys_column_generation'
+LANGUAGE C STABLE STRICT;
+-- a generated column read by another one: its name and its value, the
+-- expression it is computed by (PostgreSQL computes generated columns from
+-- the row as written); the planner reduces it to the value
+CREATE OR REPLACE FUNCTION mysql.generated_column(pg_catalog.text, anyelement)
+RETURNS anyelement
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS 'SELECT $2';
 
 -- ==== from aux_mysql--1.1.sql ====
 
@@ -34001,7 +34013,7 @@ SELECT
     (select cl.relname from pg_catalog.pg_class cl where cl.oid = att.attrelid)::varchar(256) as TABLE_NAME,
     att.attname::varchar(256) as COLUMN_NAME,
     att.attnum::bigint as ORDINAL_POSITION,
-    (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), att.attrelid)))::text as COLUMN_DEFAULT,
+    (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), att.attrelid)))::text as COLUMN_DEFAULT,
     (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as IS_NULLABLE,
     (select
         case
@@ -34140,7 +34152,8 @@ SELECT
     mysql.column_extra(att.attrelid, att.attnum)::text as EXTRA,
     'select,insert,update,references'::varchar(256) as PRIVILEGES,
     col_description(att.attrelid, att.attnum)::varchar(512) as COLUMN_COMMENT,
-    ''::text as GENERATION_EXPRESSION,
+    (case when att.attgenerated <> '' then mysql.column_generation(att.attrelid, att.attnum)
+          else '' end)::text as GENERATION_EXPRESSION,
     1::int as SRS_ID
 FROM pg_catalog.pg_attribute att
 WHERE 16384 <= att.attrelid and att.attname != 'tableoid' and att.attname != 'cmax' and
@@ -34243,7 +34256,7 @@ BEGIN
                 where att.atttypid = ty.oid)::varchar(64) as Type,
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
-            (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), tabOid)))::text as Default,
+            (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
             mysql.column_extra(att.attrelid, att.attnum)::text as Extra
         FROM pg_catalog.pg_attribute att
         WHERE att.attrelid = tabOid and att.attname != 'tableoid' and att.attname != 'cmax' and
@@ -34354,7 +34367,7 @@ BEGIN
             (select colla.collname from pg_catalog.pg_collation colla where colla.oid = att.attcollation)::varchar(256) as Collation,
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
-            (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid), tabOid)))::text as Default,
+            (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
             mysql.column_extra(att.attrelid, att.attnum)::text as Extra,
             'select,insert,update,references'::varchar(256) as Privileges,
             (case when col_description(att.attrelid, att.attnum) is not null then col_description(att.attrelid, att.attnum) else '' end)::varchar(512) as Comment
@@ -34702,7 +34715,8 @@ BEGIN
 
     FOR records IN
         select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) as extra, att.attname as column_name,
-                (pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adrelid = tabOid and ad.adnum = att.attnum), tabOid)) as column_default,
+                (pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adrelid = tabOid and ad.adnum = att.attnum and att.attgenerated = ''), tabOid)) as column_default,
+                mysql.column_generation(att.attrelid, att.attnum) as generation,
                 (case when att.attnotnull then 'NO' else 'YES' end) as is_nullable,
                 (select
                     case
@@ -34765,6 +34779,10 @@ BEGIN
             ret := pg_catalog.concat(ret, records.column_name);
             ret := pg_catalog.concat(ret, '`');
             ret := pg_catalog.concat(ret, ' ', records.column_type);
+            if (records.generation is not null) then
+                ret := pg_catalog.concat(ret, ' GENERATED ALWAYS AS (', records.generation, ') ',
+                    pg_catalog.split_part(records.extra, ' ', 1));
+            end if;
             if (records.is_nullable = 'NO') then
                 ret := pg_catalog.concat(ret, ' NOT NULL');
             end if;
@@ -34790,7 +34808,7 @@ BEGIN
                     end if;
                 end if;
             else
-                if (records.is_nullable != 'NO') then
+                if (records.is_nullable != 'NO' and records.generation is null) then
                     ret := pg_catalog.concat(ret, ' DEFAULT NULL');
                 end if;
             end if;

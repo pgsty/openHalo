@@ -2,7 +2,7 @@
 -- The generated part of the 1.7 -> 1.8 update; the Makefile appends sql/aux_mysql_binary.sql.
 -- aux_mysql 1.7 -> 1.8: GET_LOCK(), RELEASE_LOCK(), IS_FREE_LOCK(), IS_USED_LOCK() and
 -- RELEASE_ALL_LOCKS() lock for real (the 1.7 functions were stubs that always succeeded);
--- MySQL key names per table in SHOW and information_schema.
+-- MySQL key names per table and generated columns in SHOW and information_schema.
 \echo Use "ALTER EXTENSION aux_mysql UPDATE TO '1.8'" to load this file. \quit
 SET LOCAL search_path = mysql, pg_catalog, public;
 SET LOCAL check_function_bodies = off;
@@ -589,3 +589,644 @@ from pg_catalog.pg_index ind
     join pg_catalog.pg_attribute att on att.attrelid = ind.indrelid and att.attname = k.column_name
 where tc.oid >= 16384 and tc.relkind in ('r', 'p');
 GRANT ALL PRIVILEGES ON mys_informa_schema.statistics TO public;
+
+-- the expression of a generated column as MySQL shows it; NULL for another column
+CREATE OR REPLACE FUNCTION mysql.column_generation(pg_catalog.oid, pg_catalog.int4)
+RETURNS pg_catalog.text
+AS '$libdir/aux_mysql', 'mys_column_generation'
+LANGUAGE C STABLE STRICT;
+-- a generated column read by another one: its name and its value, the
+-- expression it is computed by (PostgreSQL computes generated columns from
+-- the row as written); the planner reduces it to the value
+CREATE OR REPLACE FUNCTION mysql.generated_column(pg_catalog.text, anyelement)
+RETURNS anyelement
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+AS 'SELECT $2';
+
+CREATE OR REPLACE VIEW mys_informa_schema.columns AS
+SELECT
+    'def'::varchar(256) as TABLE_CATALOG,
+    (select ns.nspname from pg_catalog.pg_namespace ns where ns.oid = (select cl.relnamespace from pg_catalog.pg_class cl where cl.oid = att.attrelid))::varchar(256) as TABLE_SCHEMA,
+    (select cl.relname from pg_catalog.pg_class cl where cl.oid = att.attrelid)::varchar(256) as TABLE_NAME,
+    att.attname::varchar(256) as COLUMN_NAME,
+    att.attnum::bigint as ORDINAL_POSITION,
+    (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), att.attrelid)))::text as COLUMN_DEFAULT,
+    (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as IS_NULLABLE,
+    (select
+        case
+            when ty.typname='tinyint' then 'tinyint'
+            when ty.typname='tinyint signed' then 'tinyint signed'
+            when ty.typname='tinyint unsigned' then 'tinyint unsigned'
+            when ty.typname='smallint' then 'smallint'
+            when ty.typname='smallint signed' then 'smallint signed'
+            when ty.typname='smallint unsigned' then 'smallint unsigned'
+            when ty.typname='mediumint' then 'mediumint'
+            when ty.typname='mediumint signed' then 'mediumint signed'
+            when ty.typname='mediumint unsigned' then 'mediumint unsigned'
+            when ty.typname='int4' then 'int'
+            when ty.typname='int signed' then 'int signed'
+            when ty.typname='int unsigned' then 'int unsigned'
+            when ty.typname='int8' then 'bigint'
+            when ty.typname='bigint signed' then 'bigint signed'
+            when ty.typname='bigint unsigned' then 'bigint unsigned'
+            when ty.typname='varchar' then 'varchar'
+            when ty.typname='bpchar' then 'char'
+            when ty.typname='text' then 'text'
+            when ty.typname='blob' then 'blob'
+            when ty.typname='time' then 'time'
+            when ty.typname='date' then 'date'
+            when ty.typname='datetime' then 'datetime'
+            when ty.typname='timestamp' then 'timestamp'
+            when ty.typname='bit' then 'bit'
+            when ty.typname='varbit' then 'bit'
+            when ty.typname='binary' then 'binary'
+            when ty.typname='varbinary' then 'varbinary'
+            when ty.typname='tinyblob' then 'tinyblob'
+            when ty.typname='blob' then 'blob'
+            when ty.typname='mediumblob' then 'mediumblob'
+            when ty.typname='longblob' then 'longblob'
+            when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
+            when ty.typname='double' then 'double'
+            when ty.typname='decimal' then 'decimal'
+            when ty.typname='numeric' then 'decimal'
+            when ty.typname='real' then 'double'
+            when ty.typname='year_' then 'year'
+            else ty.typname
+        end
+        from pg_catalog.pg_type ty
+        where att.atttypid = ty.oid)::varchar(64) as DATA_TYPE,
+    65535::bigint as CHARACTER_MAXIMUM_LENGTH,
+    65535::bigint as CHARACTER_OCTET_LENGTH,
+    (case when att.atttypid='pg_catalog.numeric'::pg_catalog.regtype then (mysql.decimal_ps(att.atttypmod))[1] end)::bigint as NUMERIC_PRECISION,
+    (case when att.atttypid='pg_catalog.numeric'::pg_catalog.regtype then (mysql.decimal_ps(att.atttypmod))[2] end)::bigint as NUMERIC_SCALE,
+    NULL::bigint as DATETIME_PRECISION,
+    'utf8mb4'::varchar(256) as CHARACTER_SET_NAME,
+    (select
+        case
+            when ty.typname='tinyint' then NULL
+            when ty.typname='tinyint signed' then NULL
+            when ty.typname='tinyint unsigned' then NULL
+            when ty.typname='smallint' then NULL
+            when ty.typname='smallint signed' then NULL
+            when ty.typname='smallint unsigned' then NULL
+            when ty.typname='mediumint' then NULL
+            when ty.typname='mediumint signed' then NULL
+            when ty.typname='mediumint unsigned' then NULL
+            when ty.typname='int4' then NULL
+            when ty.typname='int signed' then NULL
+            when ty.typname='int unsigned' then NULL
+            when ty.typname='int8' then NULL
+            when ty.typname='bigint signed' then NULL
+            when ty.typname='bigint unsigned' then NULL
+            when ty.typname='date' then NULL
+            when ty.typname='time' then NULL
+            when ty.typname='datetime' then NULL
+            when ty.typname='timestamp' then NULL
+            when ty.typname='bit' then NULL
+            when ty.typname='varbit' then NULL
+            when ty.typname='binary' then NULL
+            when ty.typname='varbinary' then NULL
+            when ty.typname='tinyblob' then NULL
+            when ty.typname='blob' then NULL
+            when ty.typname='mediumblob' then NULL
+            when ty.typname='longblob' then NULL
+            when mysql.left(ty.typname, 5)='float' then NULL
+            when ty.typname='double' then NULL
+            when ty.typname='decimal' then NULL
+            when ty.typname='numeric' then NULL
+            when ty.typname='real' then NULL
+            when ty.typname='year_' then NULL
+            else 'utf8mb4_0900_ai_ci'
+        end
+        from pg_catalog.pg_type ty
+        where att.atttypid = ty.oid)::varchar(256) as COLLATION_NAME,
+    (select
+        case
+            when ty.typname='tinyint' then 'tinyint'
+            when ty.typname='tinyint signed' then 'tinyint signed'
+            when ty.typname='tinyint unsigned' then 'tinyint unsigned'
+            when ty.typname='smallint' then 'smallint'
+            when ty.typname='smallint signed' then 'smallint signed'
+            when ty.typname='smallint unsigned' then 'smallint unsigned'
+            when ty.typname='mediumint' then 'mediumint'
+            when ty.typname='mediumint signed' then 'mediumint signed'
+            when ty.typname='mediumint unsigned' then 'mediumint unsigned'
+            when ty.typname='int4' then 'int(11)'
+            when ty.typname='int signed' then 'int signed'
+            when ty.typname='int unsigned' then 'int unsigned'
+            when ty.typname='int8' then 'bigint'
+            when ty.typname='bigint signed' then 'bigint signed'
+            when ty.typname='bigint unsigned' then 'bigint unsigned'
+            when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
+            when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
+            when ty.typname='text' then 'text'
+            when ty.typname='date' then 'date'
+            when ty.typname='time' then 'time'
+            when ty.typname='datetime' then 'datetime(6)'
+            when ty.typname='timestamp' then (pg_catalog.concat('timestamp(', att.atttypmod, ')'))
+            when ty.typname='bit' then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+            when ty.typname='varbit' and att.atttypmod != -1 then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+            when ty.typname='varbit' and att.atttypmod = -1 then 'bit(1)'
+            when ty.typname='binary' then 'binary'
+            when ty.typname='varbinary' then 'varbinary'
+            when ty.typname='tinyblob' then 'tinyblob'
+            when ty.typname='blob' then 'blob'
+            when ty.typname='mediumblob' then 'mediumblob'
+            when ty.typname='longblob' then 'longblob'
+            when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
+            when ty.typname='double' then 'double'
+            when ty.typname='decimal' then 'decimal'
+            when ty.oid='pg_catalog.numeric'::pg_catalog.regtype then mysql.decimal_column_type(att.atttypmod)
+            when ty.typname='real' then 'double'
+            when ty.typname='year_' then 'year'
+            else ty.typname
+        end
+        from pg_catalog.pg_type ty
+        where att.atttypid = ty.oid)::text as COLUMN_TYPE,
+    (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as COLUMN_KEY,
+    mysql.column_extra(att.attrelid, att.attnum)::text as EXTRA,
+    'select,insert,update,references'::varchar(256) as PRIVILEGES,
+    col_description(att.attrelid, att.attnum)::varchar(512) as COLUMN_COMMENT,
+    (case when att.attgenerated <> '' then mysql.column_generation(att.attrelid, att.attnum)
+          else '' end)::text as GENERATION_EXPRESSION,
+    1::int as SRS_ID
+FROM pg_catalog.pg_attribute att
+WHERE 16384 <= att.attrelid and att.attname != 'tableoid' and att.attname != 'cmax' and
+      att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
+      att.attname != 'ctid' and att.attname not like '%pg.dropped.%'
+order by att.attnum;
+
+CREATE OR REPLACE FUNCTION mysql.show_table_columns(pg_catalog.text, pg_catalog.text)
+RETURNS setof RECORD
+AS
+$$
+DECLARE
+    schemaName pg_catalog.varchar(128);
+    tableName pg_catalog.varchar(128);
+    schOid pg_catalog.Oid;
+    tabOid pg_catalog.Oid;
+    sch RECORD;
+    tab RECORD;
+    columns RECORD;
+BEGIN
+    if ($1 is not null) then
+        schemaName := $1;
+    else
+        schemaName := (select database());
+    end if;
+    if ($2 is not null) then
+        tableName := $2;
+    else
+        raise EXCEPTION 'invalid table name';
+    end if;
+
+    schOid := 0;
+    tabOid := 0;
+
+    FOR sch IN
+        select oid from pg_namespace where nspname = schemaName
+    LOOP
+        schOid := sch.oid;
+    END LOOP;
+    if (schOid = 0) then
+        raise EXCEPTION 'invalid schema name';
+    end if;
+
+    FOR tab IN
+        select oid from pg_class where (16384 <= oid) and (relname = tableName) and (relnamespace = schOid)
+    LOOP
+        tabOid := tab.oid;
+    END LOOP;
+    if (tabOid = 0) then
+        raise EXCEPTION 'invalid table name';
+    end if;
+
+    FOR columns IN
+        select
+            att.attname::varchar(256) as Field,
+            (select
+                case
+                    when ty.typname='tinyint' then 'tinyint'
+                    when ty.typname='tinyint signed' then 'tinyint signed'
+                    when ty.typname='tinyint unsigned' then 'tinyint unsigned'
+                    when ty.typname='smallint' then 'smallint'
+                    when ty.typname='smallint signed' then 'smallint signed'
+                    when ty.typname='smallint unsigned' then 'smallint unsigned'
+                    when ty.typname='mediumint' then 'mediumint'
+                    when ty.typname='mediumint signed' then 'mediumint signed'
+                    when ty.typname='mediumint unsigned' then 'mediumint unsigned'
+                    when ty.typname='int4' then 'int(11)'
+                    when ty.typname='int signed' then 'int signed'
+                    when ty.typname='int unsigned' then 'int unsigned'
+                    when ty.typname='int8' then 'bigint'
+                    when ty.typname='bigint signed' then 'bigint signed'
+                    when ty.typname='bigint unsigned' then 'bigint unsigned'
+                    when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
+                    when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
+                    when ty.typname='text' then 'text'
+                    when ty.typname='date' then 'date'
+                    when ty.typname='time' then 'time'
+                    when ty.typname='datetime' then 'datetime(6)'
+                    when ty.typname='timestamp' then (pg_catalog.concat('timestamp(', att.atttypmod, ')'))
+                    when ty.typname='bit' then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+                    when ty.typname='varbit' and att.atttypmod != -1 then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+                    when ty.typname='varbit' and att.atttypmod = -1 then 'bit(1)'
+                    when ty.typname='binary' then 'binary'
+                    when ty.typname='varbinary' then 'varbinary'
+                    when ty.typname='tinyblob' then 'tinyblob'
+                    when ty.typname='blob' then 'blob'
+                    when ty.typname='mediumblob' then 'mediumblob'
+                    when ty.typname='longblob' then 'longblob'
+                    when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
+                    when ty.typname='double' then 'double'
+                    when ty.typname='decimal' then 'decimal'
+                    when ty.oid='pg_catalog.numeric'::pg_catalog.regtype then mysql.decimal_column_type(att.atttypmod)
+                    when ty.typname='real' then 'double'
+                    when ty.typname='year_' then 'year'
+                    else ty.typname
+                end
+                from pg_catalog.pg_type ty
+                where att.atttypid = ty.oid)::varchar(64) as Type,
+            (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
+            (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
+            (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
+            mysql.column_extra(att.attrelid, att.attnum)::text as Extra
+        FROM pg_catalog.pg_attribute att
+        WHERE att.attrelid = tabOid and att.attname != 'tableoid' and att.attname != 'cmax' and
+                att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
+                att.attname != 'ctid' and att.attname not like '%pg.dropped.%'
+                order by att.attnum
+    LOOP
+        return next columns;
+    END LOOP;
+
+    return;
+END;
+$$
+IMMUTABLE LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION mysql.show_table_full_columns(pg_catalog.text, pg_catalog.text)
+RETURNS setof RECORD
+AS
+$$
+DECLARE
+    schemaName pg_catalog.varchar(128);
+    tableName pg_catalog.varchar(128);
+    schOid pg_catalog.Oid;
+    tabOid pg_catalog.Oid;
+    sch RECORD;
+    tab RECORD;
+    columns RECORD;
+BEGIN
+    if ($1 is not null) then
+        schemaName := $1;
+    else
+        schemaName := (select database());
+    end if;
+    if ($2 is not null) then
+        tableName := $2;
+    else
+        raise EXCEPTION 'invalid table name';
+    end if;
+
+    schOid := 0;
+    tabOid := 0;
+
+    FOR sch IN
+        select oid from pg_namespace where nspname = schemaName
+    LOOP
+        schOid := sch.oid;
+    END LOOP;
+    if (schOid = 0) then
+        raise EXCEPTION 'invalid schema name';
+    end if;
+
+    FOR tab IN
+        select oid from pg_class where (16384 <= oid) and (relname = tableName) and (relnamespace = schOid)
+    LOOP
+        tabOid := tab.oid;
+    END LOOP;
+    if (tabOid = 0) then
+        raise EXCEPTION 'invalid table name';
+    end if;
+
+    FOR columns IN
+        select
+            att.attname::varchar(256) as Field,
+            (select
+                case
+                    when ty.typname='tinyint' then 'tinyint'
+                    when ty.typname='tinyint signed' then 'tinyint signed'
+                    when ty.typname='tinyint unsigned' then 'tinyint unsigned'
+                    when ty.typname='smallint' then 'smallint'
+                    when ty.typname='smallint signed' then 'smallint signed'
+                    when ty.typname='smallint unsigned' then 'smallint unsigned'
+                    when ty.typname='mediumint' then 'mediumint'
+                    when ty.typname='mediumint signed' then 'mediumint signed'
+                    when ty.typname='mediumint unsigned' then 'mediumint unsigned'
+                    when ty.typname='int4' then 'int(11)'
+                    when ty.typname='int signed' then 'int signed'
+                    when ty.typname='int unsigned' then 'int unsigned'
+                    when ty.typname='int8' then 'bigint'
+                    when ty.typname='bigint signed' then 'bigint signed'
+                    when ty.typname='bigint unsigned' then 'bigint unsigned'
+                    when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
+                    when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
+                    when ty.typname='text' then 'text'
+                    when ty.typname='date' then 'date'
+                    when ty.typname='time' then 'time'
+                    when ty.typname='datetime' then 'datetime(6)'
+                    when ty.typname='timestamp' then (pg_catalog.concat('timestamp(', att.atttypmod, ')'))
+                    when ty.typname='bit' then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+                    when ty.typname='varbit' and att.atttypmod != -1 then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+                    when ty.typname='varbit' and att.atttypmod = -1 then 'bit(1)'
+                    when ty.typname='binary' then 'binary'
+                    when ty.typname='varbinary' then 'varbinary'
+                    when ty.typname='blob' then 'blob'
+                    when ty.typname='mediumblob' then 'mediumblob'
+                    when ty.typname='longblob' then 'longblob'
+                    when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
+                    when ty.typname='double' then 'double'
+                    when ty.typname='decimal' then 'decimal'
+                    when ty.oid='pg_catalog.numeric'::pg_catalog.regtype then mysql.decimal_column_type(att.atttypmod)
+                    when ty.typname='real' then 'double'
+                    when ty.typname='year_' then 'year'
+                    else ty.typname
+                end
+                from pg_catalog.pg_type ty
+                where att.atttypid = ty.oid)::varchar(64) as Type,
+            (select colla.collname from pg_catalog.pg_collation colla where colla.oid = att.attcollation)::varchar(256) as Collation,
+            (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
+            (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
+            (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
+            mysql.column_extra(att.attrelid, att.attnum)::text as Extra,
+            'select,insert,update,references'::varchar(256) as Privileges,
+            (case when col_description(att.attrelid, att.attnum) is not null then col_description(att.attrelid, att.attnum) else '' end)::varchar(512) as Comment
+        FROM pg_catalog.pg_attribute att
+        WHERE att.attrelid = tabOid and att.attname != 'tableoid' and att.attname != 'cmax' and
+                att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
+                att.attname != 'ctid' and att.attname not like '%pg.dropped.%'
+                order by att.attnum
+    LOOP
+        return next columns;
+    END LOOP;
+
+    return;
+END;
+$$
+IMMUTABLE LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION mysql.show_create_table_impl(pg_catalog.Oid, pg_catalog.Oid,
+                                                        pg_catalog.text, pg_catalog.text)
+RETURNS pg_catalog.text
+AS
+$$
+DECLARE
+    ret pg_catalog.text;
+    schOid pg_catalog.Oid;
+    tabOid pg_catalog.Oid;
+    schName pg_catalog.text;
+    tabName pg_catalog.text;
+    columnIndex pg_catalog.int4;
+    autoInc pg_catalog.int8;
+    tmp pg_catalog.int4;
+    tableComment pg_catalog.text;
+    columnNames pg_catalog.text;
+    columnNums pg_catalog.text;
+    records RECORD;
+BEGIN
+    schOid := $1;
+    tabOid := $2;
+    schName := $3;
+    tabName := $4;
+    columnIndex := 0;
+
+    ret := pg_catalog.concat('CREATE TABLE `', tabName, '` (');
+
+    FOR records IN
+        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) as extra, att.attname as column_name,
+                (pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adrelid = tabOid and ad.adnum = att.attnum and att.attgenerated = ''), tabOid)) as column_default,
+                mysql.column_generation(att.attrelid, att.attnum) as generation,
+                (case when att.attnotnull then 'NO' else 'YES' end) as is_nullable,
+                (select
+                    case
+                        when ty.typname='tinyint' then 'tinyint'
+                        when ty.typname='tinyint signed' then 'tinyint signed'
+                        when ty.typname='tinyint unsigned' then 'tinyint unsigned'
+                        when ty.typname='smallint' then 'smallint'
+                        when ty.typname='smallint signed' then 'smallint signed'
+                        when ty.typname='smallint unsigned' then 'smallint unsigned'
+                        when ty.typname='mediumint' then 'mediumint'
+                        when ty.typname='mediumint signed' then 'mediumint signed'
+                        when ty.typname='mediumint unsigned' then 'mediumint unsigned'
+                        when ty.typname='int4' then 'int(11)'
+                        when ty.typname='int signed' then 'int signed'
+                        when ty.typname='int unsigned' then 'int unsigned'
+                        when ty.typname='int8' then 'bigint'
+                        when ty.typname='bigint signed' then 'bigint signed'
+                        when ty.typname='bigint unsigned' then 'bigint unsigned'
+                        when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
+                        when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
+                        when ty.typname='text' then 'text'
+                        when ty.typname='date' then 'date'
+                        when ty.typname='time' then 'time'
+                        when ty.typname='datetime' then 'datetime(6)'
+                        when ty.typname='timestamp' then (pg_catalog.concat('timestamp(', att.atttypmod, ')'))
+                        when ty.typname='bit' then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+                        when ty.typname='varbit' and att.atttypmod != -1 then (pg_catalog.concat('bit(', att.atttypmod, ')'))
+                        when ty.typname='varbit' and att.atttypmod = -1 then 'bit(1)'
+                        when ty.typname='binary' then 'binary'
+                        when ty.typname='varbinary' then 'varbinary'
+                        when ty.typname='tinyblob' then 'tinyblob'
+                        when ty.typname='blob' then 'blob'
+                        when ty.typname='mediumblob' then 'mediumblob'
+                        when ty.typname='longblob' then 'longblob'
+                        when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
+                        when ty.typname='double' then 'double'
+                        when ty.typname='decimal' then 'decimal'
+                        when ty.oid='pg_catalog.numeric'::pg_catalog.regtype then mysql.decimal_column_type(att.atttypmod)
+                        when ty.typname='real' then 'double'
+                        when ty.typname='year_' then 'year'
+                        else ty.typname
+                    end
+                    from pg_catalog.pg_type ty
+                    where coalesce(mysql.column_domain(att.attrelid, att.attnum), att.atttypid) = ty.oid)::varchar(64) as column_type,
+                col_description(att.attrelid, att.attnum) as column_comment,
+                att.attnum::int4 as attnum,
+                (select coll.collname from pg_collation coll where coll.oid = att.attcollation)::varchar(128) as column_collation
+            from pg_catalog.pg_attribute att
+            WHERE att.attrelid = tabOid and 0 < att.attnum and att.attisdropped = false
+    LOOP
+        if (0 < records.attnum) then
+            if (0 < columnIndex) then
+                ret := pg_catalog.concat(ret, E',\n  ');
+            else
+                ret := pg_catalog.concat(ret, E'\n  ');
+            end if;
+
+            ret := pg_catalog.concat(ret, '`');
+            ret := pg_catalog.concat(ret, records.column_name);
+            ret := pg_catalog.concat(ret, '`');
+            ret := pg_catalog.concat(ret, ' ', records.column_type);
+            if (records.generation is not null) then
+                ret := pg_catalog.concat(ret, ' GENERATED ALWAYS AS (', records.generation, ') ',
+                    pg_catalog.split_part(records.extra, ' ', 1));
+            end if;
+            if (records.is_nullable = 'NO') then
+                ret := pg_catalog.concat(ret, ' NOT NULL');
+            end if;
+            if (records.identity != '') then
+                ret := pg_catalog.concat(ret, ' AUTO_INCREMENT');
+                BEGIN
+                    execute format('select last_value + case when is_called then 1 else 0 end from %s',
+                        pg_get_serial_sequence(format('%I.%I', schName, tabName), records.column_name)) into autoInc;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    autoInc := NULL;
+                END;
+            elsif (records.column_default is not null) then
+                if (0 < position('nextval(' in records.column_default)) then
+                    ret := pg_catalog.concat(ret, ' AUTO_INCREMENT');
+                    execute format('select max(%s) from %I.%I', records.column_name, schName, tabName)
+                    into autoInc;
+                else
+                    tmp := position('::character varying' in records.column_default);
+                    if (0 < tmp) then
+                        ret := pg_catalog.concat(ret, ' DEFAULT ', substring(records.column_default from 1 for (tmp - 1)));
+                    else
+                        ret := pg_catalog.concat(ret, ' DEFAULT ', records.column_default);
+                    end if;
+                end if;
+            else
+                if (records.is_nullable != 'NO' and records.generation is null) then
+                    ret := pg_catalog.concat(ret, ' DEFAULT NULL');
+                end if;
+            end if;
+
+            if (position('on update' in records.extra) > 0) then
+                ret := pg_catalog.concat(ret, ' ', substring(records.extra from position('on update' in records.extra)));
+            end if;
+            if (records.column_collation is not null) then
+                ret := pg_catalog.concat(ret, ' COLLATE ', records.column_collation);
+            end if;
+
+            if (records.column_comment is not null) then
+                ret := pg_catalog.concat(ret, ' COMMENT ''', replace(records.column_comment, '''', ''''''), '''');
+            end if;
+
+            columnIndex := columnIndex + 1;
+        end if;
+    END LOOP;
+
+    FOR records IN
+        --select cl.relname, ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary
+        --    from pg_class cl,
+        --        (select * from pg_index where indrelid = tabOid) ind
+        --    where cl.oid = ind.indexrelid
+        select ind.indexrelid, ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, mysql.index_key_name(ind.indexrelid) as indname
+            from pg_index ind where ind.indrelid = tabOid
+        --select ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, cl.relname
+        --    from pg_index ind join pg_class cl on ind.indrelid = cl.oid
+        --    where ind.indrelid = tabOid and cl.oid = tabOid
+    LOOP
+        select pg_catalog.string_agg(pg_catalog.concat('`', k.column_name, '`',
+                case when k.sub_part is not null then pg_catalog.concat('(', k.sub_part, ')') end), ',' order by k.seq)
+            from mysql.index_key_parts(records.indexrelid) k into columnNames;
+        continue when columnNames is null;
+        ret := pg_catalog.concat(ret, E',\n  ');
+        --execute format('select GROUP_CONCAT(attname separator \'`,`\')
+        --                    from pg_attribute
+        --                    where attrelid = %s and attnum in (%s)',
+        --               records.indrelid, columnNums)
+        if (records.indisprimary = 1) then
+            ret := pg_catalog.concat(ret, 'PRIMARY KEY (', columnNames, ')');
+        elsif (records.indisunique = 1) then
+            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', records.indname, '` (', columnNames, ')');
+        else
+            ret := pg_catalog.concat(ret, 'KEY `', records.indname, '` (', columnNames, ')');
+        end if;
+    END LOOP;
+
+    FOR records IN
+        select
+            cons.conname,
+            --(select group_concat(att.attname separator ',') from pg_attribute att where (0 < array_position(cons.conkey, att.attnum)) and (att.attrelid = tabOId)) as column_name,
+            (select pg_catalog.string_agg(att.attname, ',') from pg_attribute att where (0 < array_position(cons.conkey, att.attnum)) and (att.attrelid = tabOId)) as column_name,
+            (select cl.relname from pg_class cl where (cl.oid = cons.confrelid)) as ref_table_name,
+            --(select group_concat(att.attname separator ',') from pg_attribute att where (0 < array_position(cons.confkey, att.attnum)) and (att.attrelid = cons.confrelid)) as ref_column_name,
+            (select pg_catalog.string_agg(att.attname, ',') from pg_attribute att where (0 < array_position(cons.confkey, att.attnum)) and (att.attrelid = cons.confrelid)) as ref_column_name,
+            cons.confdeltype,
+            cons.confupdtype
+        from pg_constraint cons
+        where (cons.contype = 'f') and (cons.conrelid = tabOid)
+    LOOP
+        ret := pg_catalog.concat(ret, E',\n  ');
+        ret := pg_catalog.concat(ret, 'CONSTRAINT `');
+        ret := pg_catalog.concat(ret, records.conname);
+        ret := pg_catalog.concat(ret, '` FOREIGN KEY (`');
+        ret := pg_catalog.concat(ret, records.column_name);
+        ret := pg_catalog.concat(ret, '`) REFERENCES `');
+        ret := pg_catalog.concat(ret, records.ref_table_name);
+        ret := pg_catalog.concat(ret, '` (`');
+        ret := pg_catalog.concat(ret, records.ref_column_name);
+        ret := pg_catalog.concat(ret, '`) ON DELETE ');
+        if (records.confdeltype = 'a') then
+            ret := pg_catalog.concat(ret, 'NO ACTION ');
+        elsif (records.confdeltype = 'c') then
+            ret := pg_catalog.concat(ret, 'CASCADE ');
+        elsif (records.confdeltype = 'd') then
+            ret := pg_catalog.concat(ret, 'SET DEFAULT ');
+        elsif (records.confdeltype = 'n') then
+            ret := pg_catalog.concat(ret, 'SET NULL ');
+        else
+            ret := pg_catalog.concat(ret, 'RESTRICT ');
+        end if;
+        ret := pg_catalog.concat(ret, ' ON UPDATE ');
+        if (records.confupdtype = 'a') then
+            ret := pg_catalog.concat(ret, 'NO ACTION ');
+        elsif (records.confupdtype = 'c') then
+            ret := pg_catalog.concat(ret, 'CASCADE ');
+        elsif (records.confupdtype = 'd') then
+            ret := pg_catalog.concat(ret, 'SET DEFAULT ');
+        elsif (records.confupdtype = 'n') then
+            ret := pg_catalog.concat(ret, 'SET NULL ');
+        else
+            ret := pg_catalog.concat(ret, 'RESTRICT ');
+        end if;
+    END LOOP;
+
+    FOR records IN
+        select cons.conname, (select pg_get_constraintdef(cons.oid)) as consrc
+        from pg_constraint cons
+        where (cons.contype = 'c') and (cons.conrelid = tabOid) and cons.conname not like 'aux_mysql_domain_%'
+    LOOP
+        ret := pg_catalog.concat(ret, E',\n  ');
+        ret := pg_catalog.concat(ret, 'CONSTRAINT ');
+        ret := pg_catalog.concat(ret, records.conname);
+        ret := pg_catalog.concat(ret, ' ');
+        ret := pg_catalog.concat(ret, records.consrc);
+    END LOOP;
+
+    if (0 < autoInc) then
+        -- identity metadata already supplies the next value
+        ret := pg_catalog.concat(ret, E'\n) ENGINE=InnoDB AUTO_INCREMENT=', autoInc::text, ' DEFAULT CHARSET=utf8mb4');
+    else
+        ret := pg_catalog.concat(ret, E'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    end if;
+
+    ret := pg_catalog.concat(ret, ' COLLATE=', coalesce((select label from pg_catalog.pg_seclabel
+        where classoid = 'pg_class'::regclass and objoid = tabOid and objsubid = 0 and provider = 'aux_mysql'), 'case_insensitive'));
+    tableComment := '';
+    execute format('select ds.description from pg_description ds where ds.objoid = %s and objsubid = 0', tabOid) into tableComment;
+    if (tableComment != '') then
+        ret := pg_catalog.concat(ret, ' COMMENT ''', replace(tableComment, '''', ''''''), '''');
+    end if;
+
+    return ret;
+END;
+$$
+STABLE LANGUAGE plpgsql;

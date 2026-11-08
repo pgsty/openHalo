@@ -1251,6 +1251,76 @@ def _():
  eq(q(c,'select * from af_s order by id'),((1,3),(2,3)))
  fr.close();ms.close()
 
+@test('G01 generated columns: values, DEFAULT only, SHOW, replayed DDL, ALTER TABLE')
+def _():
+ def errno(f):
+  try: f()
+  except pymysql.err.MySQLError as e: return e.args[0]
+ # the short form is VIRTUAL; expressions PostgreSQL finds mutable (CONCAT, /, IFNULL);
+ # a generated column reading an earlier one; a case-insensitive comparison; a key
+ q(c,"""create table gc (id int primary key, v int, s varchar(20),
+  g int as (v * 2), st int generated always as (v + 1) stored not null,
+  h varchar(30) as (concat(s, '-', g)) stored comment 'hh', d decimal(10,2) as (v / 3),
+  n int as (ifnull(v, -1)), e int as (s = 'ABC'), key gc_h (h))""")
+ q(c,"insert into gc (id, v, s) values (1, 7, 'abc')")
+ q(c,"insert into gc values (2, 4, 'x', default, default, default, default, default, default), (3, 0, 'y', default, default, default, default, default, default)")
+ q(c,"insert into gc set id = 4, v = 10, s = 'ABC', g = default")
+ for bad in ("insert into gc (id, v, g) values (5, 1, 2)", "insert into gc set id = 5, v = 1, h = 'x'",
+             "update gc set g = 9 where id = 1", "replace into gc values (1, 1, 'a', 1, 1, 'a', 1, 1, 1)",
+             "insert into gc (id, v) values (1, 1) on duplicate key update g = 3"):
+  eq(errno(lambda:q(c,bad)),3105)
+ q(c,"update gc set g = default, v = 8 where id = 1")
+ q(c,"replace into gc (id, v, s) values (2, 5, 'Abc')")
+ q(c,"insert into gc (id, v) values (3, 1) on duplicate key update v = 6")
+ rows=((1,8,'abc',16,9,'abc-16','2.67',8,1),(2,5,'Abc',10,6,'Abc-10','1.67',5,1),
+       (3,6,'y',12,7,'y-12','2.00',6,0),(4,10,'ABC',20,11,'ABC-20','3.33',10,1))
+ sel='select id, v, s, g, st, h, cast(d as char), n, e from gc order by id'
+ eq(tuple(q(c,sel)),rows)
+ eq(q(c,'select id from gc where h = %s',('abc-16',)),((1,),))
+ # SHOW / information_schema as MySQL: no default, the kind in Extra (mysqldump leaves
+ # these columns out of its INSERTs), GENERATION_EXPRESSION
+ eq([(r[0],r[4],r[5]) for r in q(c,'show columns from gc')][3:],
+    [('g',None,'VIRTUAL GENERATED'),('st',None,'STORED GENERATED'),('h',None,'STORED GENERATED'),
+     ('d',None,'VIRTUAL GENERATED'),('n',None,'VIRTUAL GENERATED'),('e',None,'VIRTUAL GENERATED')])
+ eq(q(c,"select column_default, EXTRA, generation_expression from information_schema.columns where table_schema = 'abfix' and table_name = 'gc' and column_name in ('v', 'g') order by ordinal_position"),
+    ((None,'',''),(None,'VIRTUAL GENERATED','(`v` * 2)')))
+ ddl=q(c,'show create table gc')[0][1]
+ for line in ('`g` int(11) GENERATED ALWAYS AS ((`v` * 2)) VIRTUAL,','`st` int(11) GENERATED ALWAYS AS ((`v` + 1)) STORED NOT NULL,'):
+  assert line in ddl, ddl
+ q(c,ddl.replace('CREATE TABLE `gc`','CREATE TABLE `gc_copy`',1).replace('`gc_h`','`gc_copy_h`'))
+ q(c,"insert into gc_copy (id, v, s) select id, v, s from gc")
+ eq(tuple(q(c,sel.replace('gc','gc_copy'))),rows)
+ # mysqldump's DDL and INSERTs (generated columns left out)
+ q(c,"""CREATE TABLE `gc_dump` (
+  `id` int(11) NOT NULL,
+  `v` int(11) DEFAULT NULL,
+  `g` int(11) GENERATED ALWAYS AS ((`v` * 2)) VIRTUAL,
+  `st` int(11) GENERATED ALWAYS AS ((`v` + 1)) STORED NOT NULL,
+  `h` varchar(20) GENERATED ALWAYS AS (concat('x',`v`)) STORED COMMENT 'hh',
+  PRIMARY KEY (`id`),
+  KEY `gc_dump_st` (`st`)
+) ENGINE=InnoDB DEFAULT CHARSET=latin1""")
+ q(c,"INSERT INTO `gc_dump` (`id`, `v`) VALUES (1,10),(2,0)")
+ eq(tuple(q(c,'select * from gc_dump order by id')),((1,10,20,11,'x10'),(2,0,0,1,'x0')))
+ q(c,'create table gc_like like gc_dump');q(c,'insert into gc_like (id, v) values (1, 3)')
+ eq(q(c,'select g, h from gc_like'),((6,'x3'),))
+ eq([r[5] for r in q(c,'show columns from gc_like')][2:],['VIRTUAL GENERATED','STORED GENERATED','STORED GENERATED'])
+ # ALTER TABLE: the columns reading a redefined column follow it
+ q(c,'create table gc_alt (id int primary key, v int, a int as (v + 1), b int as (a * 2) stored)')
+ q(c,'insert into gc_alt (id, v) values (1, 5), (2, 123456)')
+ q(c,'alter table gc_alt modify a int as (v + 100)')
+ eq(tuple(q(c,'select a, b from gc_alt order by id')),((105,210),(123556,247112)))
+ q(c,'alter table gc_alt modify v bigint not null')
+ q(c,'insert into gc_alt (id, v) values (3, 7)')
+ q(c,"alter table gc_alt add column c varchar(20) as (concat(b, '/', v)) stored, add column f int as (id * 3)")
+ eq(tuple(q(c,'select a, b, c, f from gc_alt order by id')),
+    ((105,210,'210/5',3),(123556,247112,'247112/123456',6),(107,214,'214/7',9)))
+ q(c,'alter table gc_alt modify f bigint as (id * 4)')
+ eq(tuple(q(c,'select f from gc_alt order by id')),((4,),(8,),(12,)))
+ eq(errno(lambda:q(c,'alter table gc_alt change a a2 int as (v + 1)')),1054)
+ assert errno(lambda:q(c,'alter table gc_alt drop column a')) in (3108,1105)
+ eq(tuple(q(c,'select a, b from gc_alt order by id')),((105,210),(123556,247112),(107,214)))
+
 try:
     c.close()
     q(p,'reset role')
