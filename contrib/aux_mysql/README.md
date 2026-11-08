@@ -85,6 +85,13 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
 - `bigint unsigned` is an int8 domain (no values above 2^63-1); no zero dates; `'a' = 'A'` between two
   literals is case-sensitive (literals use the database collation); `1.5e0` is numeric, not DOUBLE.
 - No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
+- Every MySQL collation name in a table or column definition is accepted and mapped to the closest
+  aux_mysql collation, not reproduced (in expressions, `COLLATE utf8mb4_bin` is not mapped): `*_ci`
+  compares case-insensitively but, unlike MySQL's `*_general_ci` / `*_unicode_ci`, tells accents apart
+  (`'e' <> 'é'`); VARCHAR and TEXT do not pad trailing spaces as MySQL's PAD SPACE collations do
+  (`'a' <> 'a '`; CHAR(n) ignores them, as in MySQL); other weights follow ICU or code point order. So
+  rows MySQL treats as duplicates can coexist under a unique key, and `ON DUPLICATE KEY UPDATE` with
+  such a value inserts a new row where MySQL updates the existing one.
 - `SHOW CREATE TABLE` shows PostgreSQL collation names (`COLLATE case_insensitive`); they replay into
   aux_mysql, not into MySQL.
 - Foreign keys created before PostgreSQL 18 enforcement was enabled in aux_mysql are `NOT ENFORCED`
