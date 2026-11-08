@@ -1796,12 +1796,19 @@ rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt
 	}
 	if (replace)
 	{
-		/* REPLACE: overwrite every supplied column with the new values */
+		/*
+		 * REPLACE deletes the duplicate and inserts the new row: every column
+		 * takes the new row's value, also one the statement does not list.
+		 * excluded is that row as the INSERT built it, with column defaults
+		 * (the new AUTO_INCREMENT value when the duplicate is in another key)
+		 * and BEFORE INSERT triggers applied; DEFAULT would draw a second
+		 * AUTO_INCREMENT value.  Generated columns are computed again.  As
+		 * every column is assigned (update_cols), ON UPDATE CURRENT_TIMESTAMP
+		 * leaves the new row's values alone.
+		 */
 		oc->targetList = NIL;
 		foreach_ptr(char, name, columns)
 		{
-			if (insert_cols != NIL && !name_in_list(insert_cols, name))
-				continue;
 			oc->targetList = lappend(oc->targetList,
 									 make_target(pstrdup(name),
 												 make_colref("excluded", pstrdup(name))));

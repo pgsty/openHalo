@@ -865,6 +865,51 @@ def _():
           'select * from up_d order by id'),((1,'c'),(2,'y')))
  m.close()
 
+@test('U02 REPLACE with a column list gives the other columns their defaults')
+def _():
+ # expectations checked against MySQL 5.7.32: REPLACE deletes the duplicate and inserts the new row
+ from pymysql.constants import CLIENT
+ r=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),
+                   autocommit=True,database=SCHEMA,client_flag=CLIENT.MULTI_STATEMENTS)
+ q(r,"set sql_mode='STRICT_TRANS_TABLES'")
+ q(r,'create table rp_t (id int primary key, v int, w int, d int default 5)')
+ q(r,'insert into rp_t values (1,1,1,1),(2,2,2,2)')
+ q(r,'replace into rp_t (id, v) values (1, 7)');eq(q(r,'select * from rp_t where id = 1'),((1,7,None,5),))
+ q(r,'replace into rp_t set id = 2, v = 8');q(r,'replace into rp_t (id, v) values (3, 9), (1, 10)')
+ q(r,'replace into rp_t (id, w) select 2, 22')
+ eq(q(r,'select * from rp_t order by id'),((1,10,None,5),(2,None,22,5),(3,9,None,5)))
+ # AUTO_INCREMENT: a duplicate in another key gets the new row's id, and only that one value is spent
+ q(r,'create table rp_a (id int auto_increment primary key, u varchar(10) unique, v int, w int default 9)')
+ q(r,"insert into rp_a (u, v, w) values ('a',1,1),('b',2,2)")
+ with r.cursor() as t:
+  t.execute("replace into rp_a (u, v) values ('a', 3)");eq(t.lastrowid,3)
+ eq(val(r,'select last_insert_id()'),3)
+ q(r,"insert into rp_a (u) values ('c')");q(r,"replace into rp_a (id, u) values (1, 'z'), (2, 'zz')")
+ eq(q(r,'select * from rp_a order by id'),((1,'z',None,9),(2,'zz',None,9),(3,'a',3,9),(4,'c',None,9)))
+ # ON UPDATE CURRENT_TIMESTAMP columns: the new row's defaults, not the time of the update
+ q(r,'create table rp_ts (id int primary key, v int, t1 timestamp null default null on update current_timestamp,'
+     "t2 timestamp not null default '2000-01-01 00:00:00' on update current_timestamp,"
+     't3 timestamp not null default current_timestamp on update current_timestamp)')
+ q(r,"insert into rp_ts values (1, 1, '2001-01-01', '2001-01-01', '2001-01-01')")
+ q(r,'replace into rp_ts (id, v) values (1, 2)')
+ eq(q(r,"select v, t1, t2 = '2000-01-01 00:00:00', t3 > '2020-01-01' from rp_ts"),((2,None,1,1),))
+ # NOT NULL without a default: strict sql_mode refuses the new row and keeps the old one
+ q(r,'create table rp_nn (id int primary key, v int, w int not null)');q(r,'insert into rp_nn values (1, 1, 1)')
+ rejects(r,'replace into rp_nn (id, v) values (1, 7)');eq(q(r,'select * from rp_nn'),((1,1,1),))
+ # tables created earlier in the same packet, also by LIKE
+ def multi(sql,check):
+  with r.cursor() as t:
+   t.execute(sql)
+   while t.nextset(): pass
+  return q(r,check)
+ eq(multi("create table rp_b1 (id int auto_increment primary key, u varchar(10) unique, v int, w int default 3);"
+          "insert into rp_b1 (u, v, w) values ('a', 1, 1); replace into rp_b1 (u, v) values ('a', 2)",
+          'select * from rp_b1'),((2,'a',2,3),))
+ q(r,'create table rp_l (id int primary key, v int, w int)')
+ eq(multi('create table rp_b2 like rp_l; insert into rp_b2 values (1,1,1); replace into rp_b2 (id, v) values (1, 7)',
+          'select * from rp_b2'),((1,7,None),))
+ r.close()
+
 try:
     c.close()
     q(p,'reset role')
