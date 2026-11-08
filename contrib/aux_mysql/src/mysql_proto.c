@@ -156,6 +156,7 @@ static bool com_query = false;		/* the command is COM_QUERY */
 static bool trailing_comment_ok = false;	/* an OK follows the last statement */
 static bool trailing_ok_deferred = false;	/* ... of the last queued part */
 static bool last_queued_part = false;	/* running the last queued query */
+static uint64 upsert_rows[MYS_ROW_UNCHANGED + 1];	/* per MysUpsertRow */
 
 static MysStmtInfo *
 current_stmt_info(void)
@@ -1484,6 +1485,38 @@ mys_parse_query(const char *query_string)
 	return stmts;
 }
 
+/*
+ * MySQL's affected rows of INSERT ... ON DUPLICATE KEY UPDATE / REPLACE: 1
+ * per inserted row, 2 per updated or replaced row; a row ON DUPLICATE KEY
+ * UPDATE leaves unchanged counts 0, 1 for CLIENT_FOUND_ROWS clients; an
+ * identical row REPLACE leaves alone counts 1, 2 when it deletes and
+ * inserts.  nprocessed when the rows did not all reach mys_dr_receive().
+ */
+static uint64
+upsert_affected(MysUpsertKind kind, uint64 nprocessed)
+{
+	uint64		inserted = upsert_rows[MYS_ROW_INSERTED];
+	uint64		changed = upsert_rows[MYS_ROW_CHANGED];
+	uint64		unchanged = upsert_rows[MYS_ROW_UNCHANGED];
+
+	memset(upsert_rows, 0, sizeof(upsert_rows));
+	if (inserted + changed + unchanged != nprocessed)
+		return nprocessed;
+	switch (kind)
+	{
+		case MYS_UPSERT_UPDATE:
+			if (!(mys_client_caps & CLIENT_FOUND_ROWS))
+				unchanged = 0;
+			break;
+		case MYS_UPSERT_REPLACE_DELETE:
+			unchanged *= 2;
+			break;
+		default:
+			break;
+	}
+	return inserted + 2 * changed + unchanged;
+}
+
 static void
 end_statement(const QueryCompletion *qc)
 {
@@ -1532,6 +1565,9 @@ end_statement(const QueryCompletion *qc)
 		switch (qc->commandTag)
 		{
 			case CMDTAG_INSERT:
+				affected = info->upsert == MYS_UPSERT_NONE ? qc->nprocessed
+					: upsert_affected(info->upsert, qc->nprocessed);
+				break;
 			case CMDTAG_UPDATE:
 			case CMDTAG_DELETE:
 			case CMDTAG_MERGE:
@@ -1656,6 +1692,7 @@ typedef struct
 	bool		discard;		/* silent statement or hidden RETURNING */
 	bool		capture;		/* remember first value as LAST_INSERT_ID */
 	bool		captured;
+	bool		upsert;			/* count the last column's MysUpsertRow */
 	int			natts;
 	MysColumn  *cols;
 	StringInfoData row;
@@ -1908,9 +1945,12 @@ mys_dr_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	{
 		MysStmtInfo *info = current_stmt_info();
 
-		dr->discard = info->silent || info->capture_insert_id || info->suppress_response;
+		dr->discard = info->silent || info->capture_insert_id ||
+			info->upsert != MYS_UPSERT_NONE || info->suppress_response;
 		dr->capture = info->capture_insert_id;
 		dr->captured = false;
+		dr->upsert = info->upsert != MYS_UPSERT_NONE;
+		memset(upsert_rows, 0, sizeof(upsert_rows));
 	}
 
 	if (dr->portal && !dr->discard)
@@ -2179,6 +2219,13 @@ mys_dr_receive(TupleTableSlot *slot, DestReceiver *self)
 			cur_insert_id = strtou64(s, NULL, 10);
 			lastInsertID = (unsigned long) cur_insert_id;
 			dr->captured = true;
+		}
+		if (dr->upsert && dr->natts > 0 && !slot->tts_isnull[dr->natts - 1])
+		{
+			int32		row = DatumGetInt32(slot->tts_values[dr->natts - 1]);
+
+			if (row >= MYS_ROW_INSERTED && row <= MYS_ROW_UNCHANGED)
+				upsert_rows[row]++;
 		}
 		return true;
 	}

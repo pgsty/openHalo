@@ -36,6 +36,7 @@
 #include "mb/pg_wchar.h"
 #include "utils/formatting.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "parser/parse_type.h"
 #include "parser/parser.h"
 #include "catalog/pg_type.h"
@@ -1844,10 +1845,11 @@ name_in_list(List *names, const char *name)
  * its columns are supplied, else the first unique index whose columns are
  * all supplied, else the primary key, else the first unique index (a
  * column's default value can be a duplicate too).  A prefix key part counts
- * as its column; other expressions make an index unusable.
+ * as its column; other expressions make an index unusable.  *nkeys is
+ * incremented by the number of usable indexes.
  */
 static Oid
-choose_arbiter_index(Relation rel, List *insert_cols)
+choose_arbiter_index(Relation rel, List *insert_cols, int *nkeys)
 {
 	List	   *indexes = RelationGetIndexList(rel);
 	Oid			pk = InvalidOid;
@@ -1888,6 +1890,8 @@ choose_arbiter_index(Relation rel, List *insert_cols)
 				!name_in_list(insert_cols, get_attname(RelationGetRelid(rel), attnum, false)))
 				all = false;
 		}
+		if (usable)
+			(*nkeys)++;
 		if (usable && form->indisprimary)
 			pk = indexoid;
 		if (usable && !OidIsValid(first))
@@ -2159,31 +2163,146 @@ batch_infer_clause(BatchTable *bt, List *insert_cols)
 }
 
 /*
+ * ON DUPLICATE KEY UPDATE: a column name alone is the existing row's column
+ * (VALUES(col), the new row's, is already EXCLUDED.col), which PostgreSQL
+ * finds ambiguous between the table and EXCLUDED.  The grammar qualifies
+ * the operands of a top-level operator; qualify the others too, but not
+ * inside a subquery, which has tables of its own.
+ */
+static bool
+qualify_upsert_columns(Node *node, void *refname)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, ColumnRef))
+	{
+		ColumnRef  *cref = (ColumnRef *) node;
+
+		if (list_length(cref->fields) == 1 && IsA(linitial(cref->fields), String))
+			cref->fields = lcons(makeString(pstrdup(refname)), cref->fields);
+		return false;
+	}
+	if (IsA(node, SubLink) || nodeTag(node) >= T_MysNodeBase)
+		return false;
+	return raw_expression_tree_walker(node, qualify_upsert_columns, refname);
+}
+
+#define UPSERT_OLD	"aux_mysql_old_row"
+#define UPSERT_NEW	"aux_mysql_new_row"
+
+/*
+ * The hidden RETURNING column that tells a MysUpsertRow: no old row means
+ * an inserted row; otherwise the assigned columns changed or not, compared
+ * byte for byte as MySQL compares records ('a' -> 'A' changes a row under a
+ * case-insensitive collation).  Only the assigned columns are compared, and
+ * read: an ON UPDATE CURRENT_TIMESTAMP column moves only when another one
+ * changes (mys_on_update_trigger()).
+ */
+static ReturningClause *
+upsert_returning(List *targets)
+{
+	ReturningClause *rc = makeNode(ReturningClause);
+	ReturningOption *o = makeNode(ReturningOption);
+	ReturningOption *n = makeNode(ReturningOption);
+	CaseExpr   *kind = makeNode(CaseExpr);
+	CaseWhen   *inserted = makeNode(CaseWhen);
+	NullTest   *noold = makeNode(NullTest);
+	RowExpr    *oldrow = makeNode(RowExpr);
+	RowExpr    *newrow = makeNode(RowExpr);
+
+	o->option = RETURNING_OPTION_OLD;
+	o->value = UPSERT_OLD;
+	o->location = -1;
+	n->option = RETURNING_OPTION_NEW;
+	n->value = UPSERT_NEW;
+	n->location = -1;
+
+	noold->arg = (Expr *) make_colref(UPSERT_OLD, "ctid");
+	noold->nulltesttype = IS_NULL;
+	noold->location = -1;
+	inserted->expr = (Expr *) noold;
+	inserted->result = (Expr *) int_const(MYS_ROW_INSERTED);
+	inserted->location = -1;
+	kind->args = list_make1(inserted);
+	kind->defresult = (Expr *) int_const(MYS_ROW_UNCHANGED);
+	kind->location = -1;
+
+	foreach_node(ResTarget, rt, targets)
+	{
+		oldrow->args = lappend(oldrow->args, make_colref(UPSERT_OLD, pstrdup(rt->name)));
+		newrow->args = lappend(newrow->args, make_colref(UPSERT_NEW, pstrdup(rt->name)));
+	}
+	if (oldrow->args != NIL)
+	{
+		CaseWhen   *changed = makeNode(CaseWhen);
+
+		oldrow->row_format = newrow->row_format = COERCE_EXPLICIT_CALL;
+		oldrow->location = newrow->location = -1;
+		changed->expr = (Expr *) makeFuncCall(list_make2(makeString("pg_catalog"),
+														 makeString("record_image_ne")),
+											  list_make2(oldrow, newrow),
+											  COERCE_EXPLICIT_CALL, -1);
+		changed->result = (Expr *) int_const(MYS_ROW_CHANGED);
+		changed->location = -1;
+		kind->args = lappend(kind->args, changed);
+	}
+
+	rc->options = list_make2(o, n);
+	rc->exprs = list_make1(make_target(NULL, (Node *) kind));
+	return rc;
+}
+
+/* a row DELETE trigger, such as a foreign key's: MySQL's REPLACE deletes */
+static bool
+has_delete_triggers(Relation rel)
+{
+	return rel->trigdesc &&
+		(rel->trigdesc->trig_delete_before_row || rel->trigdesc->trig_delete_after_row);
+}
+
+/*
  * ON DUPLICATE KEY UPDATE / REPLACE: PostgreSQL's ON CONFLICT DO UPDATE
  * needs the unique index that finds the duplicate.  A table without a
  * PRIMARY KEY or UNIQUE key cannot have one, and MySQL simply inserts: so
  * does the statement, without its ON CONFLICT clause.  rel is NULL when the
  * catalog does not show the table; bt describes it when the batch creates
- * it.
+ * it.  With info, a hidden RETURNING tells inserted, updated and unchanged
+ * rows apart for the affected rows (info->upsert).
  */
 static void
-rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt)
+rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt,
+			   MysStmtInfo *info)
 {
 	OnConflictClause *oc = stmt->onConflictClause;
 	List	   *columns = NIL;
 	bool		replace;
+	bool		mysql_form;
+	int			nkeys = 0;
+	bool		deletes = false;
 
 	if (oc == NULL ||
 		(oc->action != ONCONFLICT_UPDATE && (int) oc->action != (int) ONCONFLICT_REPLACE))
 		return;
 	replace = (int) oc->action == (int) ONCONFLICT_REPLACE;
 	oc->action = ONCONFLICT_UPDATE;
+	/* not PostgreSQL's ON CONFLICT (...) DO UPDATE ... [WHERE] */
+	mysql_form = oc->infer == NULL && oc->whereClause == NULL;
+
+	if (mysql_form && !replace)
+	{
+		char	   *refname = stmt->relation->alias ? stmt->relation->alias->aliasname
+			: stmt->relation->relname;
+
+		foreach_node(ResTarget, rt, oc->targetList)
+			qualify_upsert_columns(rt->val, refname);
+	}
 
 	if (bt && bt->known && !OidIsValid(bt->like))
 	{
 		if (oc->infer == NULL)
 			oc->infer = batch_infer_clause(bt, insert_cols);
 		columns = bt->columns;
+		nkeys = (bt->primary != NIL) + list_length(bt->uniques);
 	}
 	else
 	{
@@ -2193,14 +2312,10 @@ rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt
 		if (keys)
 		{
 			TupleDesc	tupdesc = RelationGetDescr(keys);
+			Oid			arbiter = choose_arbiter_index(keys, insert_cols, &nkeys);
 
-			if (oc->infer == NULL)
-			{
-				Oid			arbiter = choose_arbiter_index(keys, insert_cols);
-
-				if (OidIsValid(arbiter))
-					oc->infer = make_infer_clause(keys, arbiter, keys != rel);
-			}
+			if (oc->infer == NULL && OidIsValid(arbiter))
+				oc->infer = make_infer_clause(keys, arbiter, keys != rel);
 			for (int i = 0; i < tupdesc->natts; i++)
 			{
 				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
@@ -2210,6 +2325,8 @@ rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt
 			}
 			if (keys != rel)
 				relation_close(keys, NoLock);
+			else
+				deletes = has_delete_triggers(rel);
 		}
 	}
 
@@ -2239,6 +2356,24 @@ rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt
 												 make_colref("excluded", pstrdup(name))));
 		}
 	}
+
+	if (info && mysql_form)
+	{
+		stmt->returningClause = upsert_returning(oc->targetList);
+		/*
+		 * MySQL's REPLACE leaves an identical row alone (1 affected row)
+		 * only when it found the row by the table's last unique key and no
+		 * foreign key or DELETE trigger needs a DELETE.  An identical row is
+		 * a duplicate in every unique key, the first one found: so that is
+		 * a table with a single unique key.
+		 */
+		if (!replace)
+			info->upsert = MYS_UPSERT_UPDATE;
+		else if (nkeys > 1 || deletes)
+			info->upsert = MYS_UPSERT_REPLACE_DELETE;
+		else
+			info->upsert = MYS_UPSERT_REPLACE;
+	}
 }
 
 static void
@@ -2250,6 +2385,8 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 	List	   *insert_cols = NIL;
 	OnConflictClause *oc = stmt->onConflictClause;
 	BatchTable *bt = find_batch_table(stmt->relation);
+	/* a RETURNING of the statement's own: no hidden one */
+	MysStmtInfo *hidden = stmt->returningClause == NULL ? info : NULL;
 
 	foreach_node(ResTarget, rt, stmt->cols)
 		insert_cols = lappend(insert_cols, rt->name);
@@ -2258,7 +2395,7 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 	if (!OidIsValid(relid))
 	{
 		/* table created earlier in the same batch: just its keys */
-		rewrite_upsert(stmt, insert_cols, NULL, bt);
+		rewrite_upsert(stmt, insert_cols, NULL, bt, hidden);
 		return;
 	}
 	rel = relation_open(relid, AccessShareLock);
@@ -2273,10 +2410,13 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 		literal_targets(oc->targetList, tupdesc);
 
 	/* ON DUPLICATE KEY UPDATE / REPLACE need an explicit arbiter in PG */
-	rewrite_upsert(stmt, insert_cols, rel, bt);
+	rewrite_upsert(stmt, insert_cols, rel, bt, hidden);
 
-	/* hidden RETURNING of the AUTO_INCREMENT column for LAST_INSERT_ID() */
-	if (stmt->returningClause == NULL)
+	/*
+	 * hidden RETURNING of the AUTO_INCREMENT column for LAST_INSERT_ID(),
+	 * the first column (before rewrite_upsert()'s)
+	 */
+	if (hidden)
 	{
 		for (int i = 0; i < tupdesc->natts; i++)
 		{
@@ -2284,10 +2424,12 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 
 			if (!att->attisdropped && att->attidentity != '\0')
 			{
-				ReturningClause *rc = makeNode(ReturningClause);
+				ReturningClause *rc = stmt->returningClause ? stmt->returningClause
+					: makeNode(ReturningClause);
 
-				rc->exprs = list_make1(make_target(NULL,
-												   make_colref(NULL, pstrdup(NameStr(att->attname)))));
+				rc->exprs = lcons(make_target(NULL,
+											  make_colref(NULL, pstrdup(NameStr(att->attname)))),
+								  rc->exprs);
 				stmt->returningClause = rc;
 				info->capture_insert_id = true;
 				break;

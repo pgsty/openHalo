@@ -629,6 +629,9 @@ describe_statement(const char *query, int nparams, const int *locs,
 					break;
 				case PORTAL_ONE_RETURNING:
 				case PORTAL_ONE_MOD_WITH:
+					/* ON DUPLICATE KEY UPDATE / REPLACE: hidden RETURNING */
+					if (last_info->upsert != MYS_UPSERT_NONE)
+						break;
 					*tlist = q->returningList;
 					*tupdesc = ExecCleanTypeFromTL(q->returningList);
 					break;

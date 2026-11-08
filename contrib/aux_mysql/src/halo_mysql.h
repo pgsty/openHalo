@@ -96,11 +96,32 @@ typedef enum MysTxnOp
 	MYS_TXNOP_RELEASE
 } MysTxnOp;
 
+/*
+ * INSERT ... ON DUPLICATE KEY UPDATE / REPLACE: the last column of the
+ * hidden RETURNING tells each row's MysUpsertRow, and the affected rows
+ * count as in MySQL (2 for an updated or replaced row).
+ */
+typedef enum MysUpsertKind
+{
+	MYS_UPSERT_NONE = 0,
+	MYS_UPSERT_UPDATE,			/* ON DUPLICATE KEY UPDATE */
+	MYS_UPSERT_REPLACE,			/* REPLACE: an identical row counts 1 */
+	MYS_UPSERT_REPLACE_DELETE	/* REPLACE that MySQL runs as DELETE + INSERT */
+} MysUpsertKind;
+
+typedef enum MysUpsertRow
+{
+	MYS_ROW_INSERTED = 0,
+	MYS_ROW_CHANGED,
+	MYS_ROW_UNCHANGED
+} MysUpsertRow;
+
 /* per-statement flags computed by mys_rewrite.c, consumed by mysql_proto.c */
 typedef struct MysStmtInfo
 {
 	bool		silent;				/* SET ...: send OK, not a result set */
 	bool		capture_insert_id;	/* hidden RETURNING of the AUTO_INCREMENT column */
+	uint8		upsert;				/* MysUpsertKind: hidden RETURNING of MysUpsertRow */
 	bool		suppress_response;	/* helper statement of a multi-statement rewrite */
 	bool		continued;			/* EXECUTE: its statement answers, as the next query */
 	bool		group_start;		/* first PG statement of a MySQL statement */

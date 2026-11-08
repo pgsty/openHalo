@@ -1057,6 +1057,95 @@ def _():
  eq(errno(lambda:q(c,'alter table kn_a add key KN_LEGACY (id)')),1061)
  q(c,'alter table kn_a rename index kn_legacy to kn_new');q(c,'drop index kn_new on kn_a')
  eq([k[0] for k in keys('kn_a')],['PRIMARY','uk_mail'])
+@test('U03 affected rows of ON DUPLICATE KEY UPDATE / REPLACE: 2 per updated row, 0 unchanged, CLIENT_FOUND_ROWS, ROW_COUNT()')
+def _():
+ # expectations checked against MySQL 5.7.32
+ from pymysql.constants import CLIENT
+ from pymysql.protocol import OKPacketWrapper
+ def conn(flags):
+  return pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),
+                         autocommit=True,database=SCHEMA,client_flag=flags)
+ fr=conn(CLIENT.FOUND_ROWS);ms=conn(CLIENT.MULTI_STATEMENTS)
+ def n(cn,sql):
+  with cn.cursor() as t: return t.execute(sql)
+ def rc(cn): return val(cn,'select row_count()')
+ # ON DUPLICATE KEY UPDATE: inserted 1, changed 2, unchanged 0 (CLIENT_FOUND_ROWS: 1); a column alone is the
+ # existing row's, also inside functions; a subquery's columns are its own tables'
+ q(c,"create table af_t (id int primary key, v int, s varchar(10) collate utf8mb4_general_ci, "
+     "t timestamp(6) null default null on update current_timestamp(6))")
+ q(c,'create table af_o (v int)');q(c,'insert into af_o values (7)')
+ for cn,same in ((c,0),(fr,1)):
+  q(c,'delete from af_t')
+  eq(n(cn,"insert into af_t (id,v,s) values (1,1,'a') on duplicate key update v=v+1"),1)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,1,'a') on duplicate key update v=v+1"),2);eq(rc(cn),2)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,1,'a') on duplicate key update v=v"),same);eq(rc(cn),same)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,1,'a') on duplicate key update id=id"),same)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,2,'a') on duplicate key update v=values(v), s=values(s)"),same)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,2,'A') on duplicate key update s=values(s)"),2)  # 'a' = 'A', other bytes
+  eq(n(cn,"insert into af_t (id,v,s) values (1,0,'A'),(2,2,'b'),(3,3,'c') on duplicate key update v=v"),2+same)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,5,'A'),(2,2,'b'),(4,4,'d') on duplicate key update v=values(v)"),3+same)
+  eq(n(cn,'insert into af_t (id,v,s) select id, v+1, s from af_t on duplicate key update v=values(v)'),8);eq(rc(cn),8)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,0,'A'),(2,0,'b'),(3,0,'c'),(4,0,'d') on duplicate key update v=coalesce(v,0)"),4*same)
+  eq(n(cn,"insert into af_t (id,v,s) values (1,9,'A') on duplicate key update v=if(v>0, v, 0)"),same)
+  eq(n(cn,"insert into af_t set id=1, v=9 on duplicate key update v=(select max(v) from af_o)"),2)
+  eq(n(cn,"insert ignore into af_t (id,v,s) values (1,1,'a'),(5,5,'e')"),1)
+  eq(q(c,'select id, v, s from af_t order by id'),((1,7,'A'),(2,3,'b'),(3,4,'c'),(4,5,'d'),(5,5,'e')))
+ # ON UPDATE CURRENT_TIMESTAMP moves only with a changed row
+ q(c,'update af_t set t = null')
+ eq(n(c,"insert into af_t (id,v,s) values (1,1,'a') on duplicate key update v=v"),0);eq(val(c,'select t from af_t where id=1'),None)
+ eq(n(c,"insert into af_t (id,v,s) values (1,1,'a') on duplicate key update v=v+1"),2)
+ assert val(c,'select t from af_t where id=1') is not None
+ # REPLACE: inserted 1, replaced 2; an identical row is left alone (1), unless MySQL deletes and inserts:
+ # with another unique key, or a foreign key referencing the table (2).  CLIENT_FOUND_ROWS changes nothing.
+ q(c,'create table af_r (id int primary key, v int)')
+ q(c,'create table af_u (id int primary key, k int, v int, unique key (k))')
+ q(c,'create table af_p (id int primary key, v int)');q(c,'create table af_c (pid int, foreign key (pid) references af_p (id))')
+ for cn in (c,fr):
+  for t in ('af_r','af_u','af_p'): q(c,'delete from '+t)
+  eq(n(cn,'replace into af_r values (1,1)'),1);eq(n(cn,'replace into af_r values (1,1)'),1)
+  eq(n(cn,'replace into af_r values (1,2)'),2);eq(rc(cn),2)
+  eq(n(cn,'replace into af_r values (1,2),(2,2),(3,3)'),3);eq(n(cn,'replace into af_r values (1,3),(2,2),(4,4)'),4)
+  eq(n(cn,'replace into af_r set id=4, v=5'),2);eq(n(cn,'replace into af_r select id, v from af_r where id < 3'),2)
+  eq(q(c,'select * from af_r order by id'),((1,3),(2,2),(3,3),(4,5)))
+  eq(n(cn,'replace into af_u values (1,1,1)'),1);eq(n(cn,'replace into af_u values (1,1,1)'),2)
+  eq(n(cn,'replace into af_u values (1,1,2)'),2)
+  eq(n(cn,'replace into af_p values (1,1)'),1);eq(n(cn,'replace into af_p values (1,1)'),2)
+ # with the AUTO_INCREMENT column's hidden RETURNING
+ q(c,'create table af_ai (id int primary key auto_increment, k int, v int, unique key (k))')
+ eq(n(c,'insert into af_ai (k,v) values (10,1),(20,1) on duplicate key update v=v+1'),2)
+ eq(n(c,'insert into af_ai (k,v) values (10,1),(30,1) on duplicate key update v=v+1'),3)
+ eq(n(fr,'insert into af_ai (k,v) values (10,2),(20,1) on duplicate key update v=v'),2)
+ eq(q(c,'select k, v from af_ai order by k'),((10,2),(20,1),(30,1)))
+ # a table created in the same packet; ROW_COUNT() of the statement before
+ def multi(sql):
+  out=[]
+  with ms.cursor() as t:
+   t.execute(sql);out.append(t.fetchall() if t.description else t.rowcount)
+   while t.nextset(): out.append(t.fetchall() if t.description else t.rowcount)
+  return out
+ eq(multi('create table af_b (id int primary key, v int); insert into af_b values (1,1) on duplicate key update v=v+1;'
+          'insert into af_b values (1,1),(2,2) on duplicate key update v=v+1; select row_count();'
+          'replace into af_b values (1,2),(3,3); replace into af_b values (1,2); select row_count()'),[0,1,3,((3,),),2,1,((1,),)])
+ # prepared statements (COM_STMT_PREPARE / EXECUTE): no result set, the same counts
+ def ps(cn,sql,params):
+  cn._execute_command(0x16,sql.encode())
+  sid,ncols,nparams=struct.unpack('<IHH',cn._read_packet().get_all_data()[1:9])
+  for _ in range(nparams+(nparams>0)+ncols+(ncols>0)): cn._read_packet()
+  payload=struct.pack('<IBI',sid,0,1)
+  if params:
+   payload+=bytes((len(params)+7)//8)+b'\x01'+b'\x08\x00'*len(params)+b''.join(struct.pack('<q',v) for v in params)
+  cn._execute_command(0x17,payload)
+  ok=OKPacketWrapper(cn._read_packet())
+  cn._execute_command(0x19,struct.pack('<I',sid))
+  return ncols,ok.affected_rows
+ q(c,'create table af_s (id int primary key, v int)')
+ sql='insert into af_s values (?,?) on duplicate key update v=values(v)'
+ eq(ps(c,sql,(1,1)),(0,1));eq(ps(c,sql,(1,2)),(0,2));eq(rc(c),2)
+ eq(ps(c,sql,(1,2)),(0,0));eq(rc(c),0);eq(ps(fr,sql,(1,2)),(0,1))
+ eq(ps(c,'insert into af_s values (?,?),(?,?) on duplicate key update v=v+1',(1,0,2,2)),(0,3))
+ eq(ps(c,'replace into af_s values (?,?),(?,?)',(1,3,2,2)),(0,2));eq(ps(c,'replace into af_s values (?,?)',(2,3)),(0,2))
+ eq(q(c,'select * from af_s order by id'),((1,3),(2,3)))
+ fr.close();ms.close()
 
 try:
     c.close()
