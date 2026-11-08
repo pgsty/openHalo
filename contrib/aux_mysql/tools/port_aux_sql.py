@@ -461,7 +461,182 @@ for prefix, terminator, edits in (
     s = s[:start] + f + s[end:]
     generated_definitions.append(f)
 
-prelude = r'''-- aux_mysql 1.8: openHalo's aux_mysql SQL layer, ported to PostgreSQL 18
+# 1.9 SHOW repairs. Historical definitions above must stay unchanged.
+# Share handwritten objects between fresh installs and the parent's 1.9 update.
+fix_dir = Path(__file__).resolve().parent.parent / 'sql'
+fix_helpers = (fix_dir / 'aux_mysql_fix_generated.sql').read_text(encoding='utf-8')
+fix_fk = (fix_dir / 'aux_mysql_fix_fk.sql').read_text(encoding='utf-8')
+fix_metadata = (fix_dir / 'aux_mysql_fix_metadata.sql').read_text(encoding='utf-8')
+show_fixes = []
+for name in ('show_create_table_impl', 'show_create_table', 'show_create_view'):
+    prefix = 'CREATE OR REPLACE FUNCTION mysql.%s(' % name
+    start = s.index(prefix)
+    terminator = ('STABLE' if name == 'show_create_table_impl' else 'IMMUTABLE') + ' LANGUAGE plpgsql;'
+    end = s.index(terminator, start) + len(terminator)
+    f = s[start:end]
+    if name == 'show_create_table_impl':
+        old = ("(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adrelid = tabOid "
+               "and ad.adnum = att.attnum and att.attgenerated = ''), tabOid)) as column_default")
+        assert f.count(old) == 1
+        f = f.replace(old, 'mysql.column_default(att.attrelid, att.attnum) as column_default')
+        # Preserve the declaration while its parent is absent. This lives in
+        # the 1.9 SHOW fragment only, after historical upgrades were captured.
+        old = "    FOR records IN\n        select cons.conname, (select pg_get_constraintdef(cons.oid)) as consrc"
+        assert f.count(old) == 1
+        f = f.replace(old, "    FOR records IN SELECT d AS definition FROM mysql.pending_fk_definitions(tabOid) d LOOP\n"
+                          "        ret := pg_catalog.concat(ret, E',\\n  ', records.definition);\n"
+                          "    END LOOP;\n\n" + old)
+        # Composite foreign keys must retain declared order and delimit each
+        # name. A reference to another schema must not bind to a local table.
+        for key, rel in (('conkey', 'tabOId'), ('confkey', 'cons.confrelid')):
+            old = ("(select pg_catalog.string_agg(att.attname, ',') from pg_attribute att where "
+                   "(0 < array_position(cons.%s, att.attnum)) and (att.attrelid = %s))" % (key, rel))
+            new = ("(select pg_catalog.string_agg(replace(att.attname, '`', '``'), '`,`' order by k.ord) "
+                   "from pg_catalog.unnest(cons.%s) with ordinality k(num,ord) "
+                   "join pg_catalog.pg_attribute att on att.attnum=k.num and att.attrelid=%s)" % (key, rel))
+            assert f.count(old) == 1
+            f = f.replace(old, new)
+        old = '(select cl.relname from pg_class cl where (cl.oid = cons.confrelid)) as ref_table_name'
+        new = ("(select pg_catalog.concat(replace(n.nspname, '`', '``'), '`.`', replace(cl.relname, '`', '``')) "
+               "from pg_catalog.pg_class cl join pg_catalog.pg_namespace n on n.oid=cl.relnamespace "
+               "where cl.oid=cons.confrelid) as ref_table_name")
+        assert f.count(old) == 1
+        f = f.replace(old, new)
+        f = f.replace("ret := pg_catalog.concat(ret, records.conname);",
+                      "ret := pg_catalog.concat(ret, replace(records.conname, '`', '``'));")
+        f = f.replace("ret := pg_catalog.concat(ret, 'NO ACTION ');",
+                      "ret := pg_catalog.concat(ret, 'RESTRICT ');")
+    f = f.replace('IMMUTABLE LANGUAGE plpgsql;', 'STABLE LANGUAGE plpgsql;')
+    # Keep fresh and upgrade definitions identical without importing the
+    # upstream SHOW bodies' trailing whitespace into the new 1.9 fragment.
+    f = '\n'.join(line.rstrip() for line in f.split('\n'))
+    s = s[:start] + f + s[end:]
+    show_fixes.append(f)
+
+# Keep new physical type names out of MySQL schema exports.  This pass comes
+# after capturing historical updates, so updating to 1.7/1.8 stays reproducible.
+for prefix, terminator in (
+        ('CREATE OR REPLACE VIEW mys_informa_schema.columns AS', 'order by att.attnum;'),
+        ('CREATE OR REPLACE FUNCTION mysql.show_table_columns(', 'IMMUTABLE LANGUAGE plpgsql;'),
+        ('CREATE OR REPLACE FUNCTION mysql.show_table_full_columns(', 'IMMUTABLE LANGUAGE plpgsql;'),
+        ('CREATE OR REPLACE FUNCTION mysql.show_create_table_impl(', 'STABLE LANGUAGE plpgsql;')):
+    start = s.index(prefix)
+    end = s.index(terminator, start) + len(terminator)
+    f = s[start:end]
+    for name in ('binary', 'varbinary'):
+        old = "when ty.typname='%s' then '%s'" % (name, name)
+        plain = "when ty.typname='%s_n' then '%s'\n            " % (name, name) + old
+        sized = ("when ty.typname='%s_n' then pg_catalog.concat('%s(', att.atttypmod, ')')\n            "
+                 % (name, name)) + old
+        if 'VIEW' in prefix:
+            pos = f.index(old)
+            f = f[:pos] + plain + f[pos + len(old):]
+            pos = f.rindex(old)
+            f = f[:pos] + sized + f[pos + len(old):]
+        else:
+            f = f.replace(old, sized)
+    f = f.replace("when ty.typname='text' then 'text'",
+                  "when ty.typname='text_string' then case att.atttypmod "
+                  "when 255 then 'tinytext' when 16777215 then 'mediumtext' "
+                  "when -1 then 'longtext' else 'text' end\n            "
+                  "when ty.typname='text' then 'text'")
+    if 'VIEW' in prefix:
+        for field, multiplier in (('CHARACTER_MAXIMUM_LENGTH', ''), ('CHARACTER_OCTET_LENGTH', ' * 4')):
+            f = f.replace('65535::bigint as ' + field,
+                          "(select case when ty.typname in ('binary_n','varbinary_n') then att.atttypmod "
+                          "when ty.typname='text_string' then case when att.atttypmod=-1 then 4294967295 "
+                          "else att.atttypmod end when ty.typname in ('varchar','bpchar') and att.atttypmod>=4 "
+                          "then (att.atttypmod-4)" + multiplier + " when ty.typname in ('text','blob') then 65535 "
+                          "end from pg_catalog.pg_type ty where ty.oid=att.atttypid)::bigint as " + field)
+        f = f.replace("when ty.typname='binary' then NULL",
+                      "when ty.typname in ('binary','binary_n','varbinary_n') then NULL")
+        f = f.replace("'utf8mb4'::varchar(256) as CHARACTER_SET_NAME",
+                      "(case when att.attcollation<>0 then 'utf8mb4' end)::varchar(256) as CHARACTER_SET_NAME")
+    s = s[:start] + f + s[end:]
+    show_fixes = [definition for definition in show_fixes if not definition.startswith(prefix)]
+    show_fixes.append(f)
+
+# The 1.9 AM uses btree pages with exact prefix rechecks. Expose MySQL's
+# BTREE spelling without modifying any historical update definitions.
+for prefix, terminator in (
+        ('CREATE OR REPLACE FUNCTION mysql.show_table_indexs(', 'STABLE LANGUAGE plpgsql;'),
+        ('CREATE OR REPLACE FUNCTION mysql.show_table_indexs_for_8(', 'STABLE LANGUAGE plpgsql;'),
+        ('drop view if exists mys_informa_schema.indexs cascade;\ncreate view mys_informa_schema.indexs as\n', "where (cons.contype = 'f');"),
+        ('create view mys_informa_schema.statistics as\n', "where tc.oid >= 16384 and tc.relkind in ('r', 'p');")):
+    start = s.index(prefix)
+    end = s.index(terminator, start) + len(terminator)
+    f = s[start:end]
+    mapped = "case when am.amname='mysql_prefix' then 'btree' else am.amname end"
+    f = f.replace('select am.amname', 'select ' + mapped)
+    f = f.replace('pg_catalog.upper(am.amname)', 'pg_catalog.upper(' + mapped + ')')
+    s = s[:start] + f + s[end:]
+    if prefix.startswith('drop view'):
+        f = f.replace(prefix, 'CREATE OR REPLACE VIEW mys_informa_schema.indexs AS\n')
+    elif prefix.startswith('create view'):
+        f = f.replace('create view', 'CREATE OR REPLACE VIEW', 1)
+    show_fixes.append(f)
+
+# Pending-FK carrier triggers are ordinary PG triggers for POST_DATA dump order,
+# but MySQL dumps already carry their declaration in SHOW CREATE TABLE. Exposing
+# the implementation again as a user trigger would produce invalid MySQL DDL.
+start = s.index('create or replace view mys_informa_schema.triggers as')
+end = s.index('\n\ncreate or replace function mysql.show_create_trigger', start)
+f = s[start:end]
+old = '          AND NOT t.tgisinternal\n'
+assert f.count(old) == 1
+f = f.replace(old, old +
+              "          AND NOT EXISTS (SELECT FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace ns ON ns.oid=p.pronamespace\n"
+              "                          WHERE p.oid=t.tgfoid AND ns.nspname='mysql' AND p.proname='pending_fk_guard')\n")
+s = s[:start] + f + s[end:]
+show_fixes.append(f)
+
+# Final 1.9 export repairs only; historical upgrade fragments are captured above.
+# MySQL dump clients request table status for views as well as base tables.
+start = s.index('create view mys_informa_schema.tables as\n')
+end = s.index('order by 1;', start) + len('order by 1;')
+f = s[start:end]
+f = f.replace("(cl.relkind = 'r' or cl.relkind = 'p')", "cl.relkind in ('r', 'p', 'v')")
+f = f.replace("'BASE TABLE'::varchar(256) as Table_Type",
+              "(case when cl.relkind='v' then 'VIEW' else 'BASE TABLE' end)::varchar(256) as Table_Type")
+# A view has no storage/engine status. Keep the existing output column types.
+for field, value, typ in (
+        ('Engine', "'InnoDB'", 'varchar(256)'),
+        ('Version', '10', 'bigint'),
+        ('Row_format', "'Dynamic'", 'varchar(256)'),
+        ('Table_Rows', 'cl.reltuples', 'bigint'),
+        ('Avg_row_length', '100', 'bigint'),
+        ('Data_length', '16384', 'bigint'),
+        ('Max_data_length', '16384', 'bigint'),
+        ('Index_length', '16384', 'bigint'),
+        ('Data_free', '16384', 'bigint'),
+        ('Auto_increment', "(select count(*) from pg_class where relname like concat(cl.relname, '%') and relkind = 'S')", 'bigint'),
+        ('Table_Collation', "'utf8mb4_general_ci'", 'varchar(256)'),
+        ('Create_options', "''", 'varchar(256)')):
+    old = f'{value}::{typ} as {field}'
+    assert f.count(old) == 1, field
+    f = f.replace(old, f"(case when cl.relkind<>'v' then {value} end)::{typ} as {field}")
+old = '(select ds.description from pg_description ds where ds.objoid = cl.oid and objsubid = 0)::varchar(512) as Table_Comment'
+assert f.count(old) == 1
+f = f.replace(old, "(case when cl.relkind='v' then 'VIEW' else " + old.split('::varchar')[0] +
+              ' end)::varchar(512) as Table_Comment')
+s = s[:start] + f + s[end:]
+show_fixes.append(f.replace('create view', 'CREATE OR REPLACE VIEW', 1))
+
+# Storage labels retain PG collation aliases; SHOW emits portable MySQL names.
+prefix = 'CREATE OR REPLACE FUNCTION mysql.show_create_table_impl('
+start = s.index(prefix)
+end = s.index('STABLE LANGUAGE plpgsql;', start) + len('STABLE LANGUAGE plpgsql;')
+f = s[start:end]
+old = "coalesce((select label from pg_catalog.pg_seclabel\n        where classoid = 'pg_class'::regclass and objoid = tabOid and objsubid = 0 and provider = 'aux_mysql'), 'case_insensitive')"
+assert f.count(old) == 1
+mapped = "case label when 'case_insensitive' then 'utf8mb4_general_ci' when 'case_sensitive' then 'utf8mb4_bin' else label end"
+f = f.replace(old, old.replace('select label', 'select ' + mapped).replace("), 'case_insensitive')", "), 'utf8mb4_general_ci')"))
+s = s[:start] + f + s[end:]
+show_fixes = [definition for definition in show_fixes if not definition.startswith(prefix)]
+show_fixes.append(f)
+
+
+prelude = r'''-- aux_mysql 1.9: openHalo's aux_mysql SQL layer, ported to PostgreSQL 18
 -- Generated by tools/port_aux_sql.py -- do not edit by hand.
 -- Hand-written objects go to sql/aux_mysql_additions.sql.
 \echo Use "CREATE EXTENSION aux_mysql" to load this file. \quit
@@ -515,12 +690,19 @@ def guard_cast(m):
 
 
 out, ncasts = cast_re.subn(guard_cast, prelude + '\n' + decimal_helpers + key_helpers + name_helpers +
-                          generated_helpers + s)
+                          generated_helpers + s + '\n' + fix_helpers + '\n' + fix_fk + '\n' + fix_metadata)
 if ncasts < 40:
     sys.exit("expected the aux_mysql casts, found %d" % ncasts)
 print("guarded %d casts" % ncasts)
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(out + '\n')
 print("extension script written to", dst)
+
+# A new fragment only; never patch a historical upgrade.
+show_fix_path = Path(dst).with_name('aux_mysql_fix_show.sql')
+show_fix_path.write_text('-- Generated by tools/port_aux_sql.py -- do not edit.\n'
+                        '-- Include in the 1.9 update after aux_mysql_fix_generated.sql.\n\n'
+                        + '\n\n'.join(show_fixes) + '\n', encoding='utf-8')
+print("SHOW repair fragment written to", show_fix_path)
 
 # 1.6 -> 1.7: only the DECIMAL and key part objects above, replaced in place (OIDs, ACLs
 # and dependent user views survive); never the initial script's DROPs.

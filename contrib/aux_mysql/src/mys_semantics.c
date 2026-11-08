@@ -24,6 +24,8 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -36,9 +38,12 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "parser/parser.h"
+#include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/acl.h"
 #include "utils/date.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -352,10 +357,42 @@ typedef struct AutoIncCache
 	Oid			typid;
 } AutoIncCache;
 
+/* Check the actual evaluated sequence OID, including computed arguments.
+ * Keep a relation lock through the write so persistence cannot change after
+ * this check.  The core functions still enforce sequence type, ACLs, parallel
+ * safety and the transaction's own access mode. */
+static void
+check_sequence_write(Oid seqoid)
+{
+	Relation	seqrel;
+
+	if (!mys_is_mysql_session() || !mys_server_read_only_applies())
+		return;
+	seqrel = relation_open(seqoid, RowExclusiveLock);
+	if (!seqrel->rd_islocaltemp)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("The MySQL server is running with the --read-only option so it cannot execute this statement")));
+	relation_close(seqrel, NoLock);
+}
+
+/* The core calls this after locking a sequence, before touching its cache
+ * or storage.  It also covers inlined SQL functions and computed arguments. */
+void
+mys_sequence_write(Relation sequence)
+{
+	if (mys_is_mysql_session() && mys_server_read_only_applies() &&
+		!sequence->rd_islocaltemp)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("The MySQL server is running with the --read-only option so it cannot execute this statement")));
+}
+
 /* Atomic with nextval; uses the core sequence page lock, ACLs and WAL. */
 static void
 sequence_advance(Oid seqoid, int64 value, bool is_called)
 {
+	check_sequence_write(seqoid);
 	SetSequenceValueAtLeast(seqoid, value, is_called);
 }
 
@@ -424,21 +461,40 @@ mys_autoinc_trigger(PG_FUNCTION_ARGS)
 		return PointerGetDatum(tuple);
 
 	d = heap_getattr(tuple, cache->attnum, desc, &isnull);
-	if (isnull)
+	if (isnull && !(mys_is_mysql_session() && TRIGGER_FIRED_BY_INSERT(td->tg_event)))
 		return PointerGetDatum(tuple);
 	switch (getBaseType(cache->typid))
 	{
 		case INT2OID:
-			value = DatumGetInt16(d);
+			value = isnull ? 0 : DatumGetInt16(d);
 			break;
 		case INT4OID:
-			value = DatumGetInt32(d);
+			value = isnull ? 0 : DatumGetInt32(d);
 			break;
 		case INT8OID:
-			value = DatumGetInt64(d);
+			value = isnull ? 0 : DatumGetInt64(d);
 			break;
 		default:
 			return PointerGetDatum(tuple);
+	}
+
+	/* The trigger also covers temporary tables and INSERT ... SELECT, whose
+	 * target may not be visible to the raw grammar's literal substitution. */
+	if (mys_is_mysql_session() && TRIGGER_FIRED_BY_INSERT(td->tg_event) &&
+		(isnull || (value == 0 && !(mys_sqlMode & MYS_MODE_NO_AUTO_VALUE_ON_ZERO))))
+	{
+		bool notnull = false;
+		int attnum = cache->attnum;
+
+		value = nextval_internal(cache->seqoid, false);
+		switch (getBaseType(cache->typid))
+		{
+			case INT2OID: d = Int16GetDatum((int16) value); break;
+			case INT4OID: d = Int32GetDatum((int32) value); break;
+			default: d = Int64GetDatum(value); break;
+		}
+		tuple = heap_modify_tuple_by_cols(tuple, desc, 1, &attnum, &d, &notnull);
+		return PointerGetDatum(tuple);
 	}
 
 	/*
@@ -575,8 +631,11 @@ mys_set_auto_increment(Oid relid, int64 next)
 		return;
 
 	if (empty)
+	{
+		check_sequence_write(seqoid);
 		DirectFunctionCall3(setval3_oid, ObjectIdGetDatum(seqoid),
 							Int64GetDatum(next), BoolGetDatum(false));
+	}
 	else
 		sequence_advance(seqoid, next, false);
 }
@@ -915,7 +974,7 @@ mys_column_extra(PG_FUNCTION_ARGS)
  * NO_BACKSLASH_ESCAPES.
  */
 static char *
-mysql_expression_text(const char *s, TupleDesc desc)
+mysql_expression_text(const char *s, TupleDesc desc, List *display_calls)
 {
 	StringInfoData buf;
 	bool		backslash_escapes = !(mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES);
@@ -923,8 +982,46 @@ mysql_expression_text(const char *s, TupleDesc desc)
 	initStringInfo(&buf);
 	while (*s)
 	{
-		if (*s == '\'')
+		/* Private deparse parameters stand for already-rendered MySQL calls.
+		 * Quoted literals/identifiers below are consumed whole, so a user's
+		 * '$1' or a column named "$1" is never substituted. */
+		if (*s == '$' && display_calls && isdigit((unsigned char) s[1]))
 		{
+			char *end;
+			long n = strtol(s + 1, &end, 10);
+
+			if (n > 0 && n <= list_length(display_calls))
+			{
+				appendStringInfoString(&buf, list_nth(display_calls, n - 1));
+				s = end;
+				continue;
+			}
+			appendStringInfoChar(&buf, *s++);
+		}
+		else if (*s == '\'')
+		{
+			/* PG prints typed text/bytea constants with a postfix cast.  MySQL
+			 * has text literals and X'hex'; retain explicit user typmods. */
+			if (s[1] == '\\' && s[2] == 'x')
+			{
+				const char *end = s + 3;
+				const char *after = NULL;
+
+				while (isxdigit((unsigned char) *end)) end++;
+				if (*end == '\'' && (end - (s + 3)) % 2 == 0)
+				{
+					if (strncmp(end + 1, "::bytea", 7) == 0) after = end + 8;
+					else if (strncmp(end + 1, "::\"bytea\"", 9) == 0) after = end + 10;
+				}
+				if (after && !isalnum((unsigned char) *after) && *after != '_')
+				{
+					appendStringInfoString(&buf, "X'");
+					appendBinaryStringInfo(&buf, s + 3, end - (s + 3));
+					appendStringInfoChar(&buf, '\'');
+					s = after;
+					continue;
+				}
+			}
 			appendStringInfoChar(&buf, *s++);
 			for (; *s; s++)
 			{
@@ -938,6 +1035,11 @@ mysql_expression_text(const char *s, TupleDesc desc)
 			}
 			if (*s)
 				appendStringInfoChar(&buf, *s++);
+			if (strncmp(s, "::text", 6) == 0 &&
+				!isalnum((unsigned char) s[6]) && s[6] != '_' && s[6] != '(')
+				s += 6;
+			else if (strncmp(s, "::\"text\"", 8) == 0 && s[8] != '(')
+				s += 8;
 		}
 		else if (*s == '"')
 		{
@@ -955,10 +1057,10 @@ mysql_expression_text(const char *s, TupleDesc desc)
 			}
 			if (*s)
 				s++;
-			for (int i = 0; i < desc->natts && !column; i++)
+			for (int i = 0; desc && i < desc->natts && !column; i++)
 				column = !TupleDescAttr(desc, i)->attisdropped &&
 					strcmp(NameStr(TupleDescAttr(desc, i)->attname), name.data) == 0;
-			if (!column && strcmp(quote_identifier(name.data), name.data) == 0)
+			if (desc && !column && strcmp(quote_identifier(name.data), name.data) == 0)
 				appendStringInfoString(&buf, name.data);
 			else
 			{
@@ -976,6 +1078,129 @@ mysql_expression_text(const char *s, TupleDesc desc)
 			appendStringInfoChar(&buf, *s++);
 	}
 	return buf.data;
+}
+
+/* Apply the current writer's mode, including writes from prepared plans and
+ * ALTER rewrites.  Do not bake CREATE TABLE's sql_mode into the expression. */
+static bool
+generated_assignment_strict(void)
+{
+	MysStmtInfo *info;
+
+	if (!mys_is_mysql_session()) return true;
+	info = mys_current_stmt_info();
+	return (mys_sqlMode & (MYS_MODE_STRICT_TRANS_TABLES | MYS_MODE_STRICT_ALL_TABLES)) &&
+		!(info && info->ignore);
+}
+
+PG_FUNCTION_INFO_V1(mys_generated_varchar);
+Datum
+mys_generated_varchar(PG_FUNCTION_ARGS)
+{
+	text *value = PG_GETARG_TEXT_PP(0);
+	int limit = PG_GETARG_INT32(1);
+	bool bpchar = PG_GETARG_BOOL(2);
+	char *data = VARDATA_ANY(value);
+	int len = VARSIZE_ANY_EXHDR(value);
+	int cut = pg_mbcharcliplen(data, len, limit);
+	bool significant = false;
+
+	for (int i = cut; i < len; i++)
+		if (data[i] != ' ')
+			significant = true;
+	if (cut < len)
+	{
+		if ((!bpchar || significant) && generated_assignment_strict())
+			ereport(ERROR, (errcode(MAKE_SQLSTATE('M','1','2','6','5')),
+								errmsg("Data truncated for generated column")));
+		/* MySQL CHAR silently discards trailing spaces; VARCHAR warns. */
+		if (!bpchar || significant)
+			mys_add_warning(1265, "Data truncated for generated column");
+		PG_RETURN_TEXT_P(cstring_to_text_with_len(data, cut));
+	}
+	PG_RETURN_TEXT_P(value);
+}
+
+/* Generated DECIMAL(p,s) uses assignment range rules at execution time, even
+ * for an immutable source expression. Round before checking the signed range. */
+PG_FUNCTION_INFO_V1(mys_generated_numeric);
+Datum
+mys_generated_numeric(PG_FUNCTION_ARGS)
+{
+	Numeric value = PG_GETARG_NUMERIC(0);
+	int32 typmod = PG_GETARG_INT32(1);
+	int precision, scale, k = 0;
+	Datum rounded, maximum, minimum, clipped;
+	char *limit;
+
+	if (typmod < (int32) VARHDRSZ) PG_RETURN_NUMERIC(value);
+	precision = ((typmod - VARHDRSZ) >> 16) & 0xffff;
+	scale = (((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024;
+	/* Native PG-only typmods keep their native conversion semantics. */
+	if (precision < 1 || scale < 0 || scale > precision)
+		PG_RETURN_DATUM(DirectFunctionCall2(numeric, NumericGetDatum(value), Int32GetDatum(typmod)));
+	rounded = DirectFunctionCall2(numeric_round, NumericGetDatum(value), Int32GetDatum(scale));
+	limit = palloc(precision + 3);
+	for (int i = 0; i < precision - scale; i++) limit[k++] = '9';
+	if (precision == scale) limit[k++] = '0';
+	if (scale > 0)
+	{
+		limit[k++] = '.';
+		for (int i = 0; i < scale; i++) limit[k++] = '9';
+	}
+	limit[k] = '\0';
+	maximum = DirectFunctionCall3(numeric_in, CStringGetDatum(limit),
+		ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	minimum = DirectFunctionCall1(numeric_uminus, maximum);
+	if (DatumGetBool(DirectFunctionCall2(numeric_gt, rounded, maximum)))
+		clipped = maximum;
+	else if (DatumGetBool(DirectFunctionCall2(numeric_lt, rounded, minimum)))
+		clipped = minimum;
+	else
+		PG_RETURN_DATUM(rounded);
+	if (generated_assignment_strict())
+		ereport(ERROR, (errcode(MAKE_SQLSTATE('M','1','2','6','4')),
+						errmsg("Out of range value for generated column")));
+	mys_add_warning(1264, "Out of range value for generated column");
+	PG_RETURN_DATUM(clipped);
+}
+
+/* Only peel our conversion envelope.  User-written casts inside the marker
+ * remain part of the expression, including when ALTER/LIKE reparses it. */
+static Node *
+generation_source(Node *node)
+{
+	Node *original = node;
+
+	while (node)
+	{
+		if (IsA(node, FuncExpr))
+		{
+			FuncExpr *f = (FuncExpr *) node;
+			char *name = get_func_name(f->funcid);
+			bool ours = name &&
+				strcmp(get_namespace_name(get_func_namespace(f->funcid)), "mysql") == 0;
+
+			if (ours && strcmp(name, "generated_value") == 0)
+				return linitial(f->args);
+			if (f->funcformat == COERCE_EXPLICIT_CAST ||
+				f->funcformat == COERCE_IMPLICIT_CAST ||
+				(ours && (strcmp(name, "generated_varchar") == 0 ||
+						  strcmp(name, "generated_numeric") == 0)))
+				node = linitial(f->args);
+			else
+				break;
+		}
+		else if (IsA(node, CoerceToDomain))
+			node = (Node *) ((CoerceToDomain *) node)->arg;
+		else if (IsA(node, CoerceViaIO))
+			node = (Node *) ((CoerceViaIO *) node)->arg;
+		else if (IsA(node, RelabelType))
+			node = (Node *) ((RelabelType *) node)->arg;
+		else
+			break;
+	}
+	return original; /* a pre-1.9 generator has no conversion marker */
 }
 
 /* a generator's parameters are the arguments of its call */
@@ -1021,7 +1246,7 @@ mys_unwrap_generator(Node *expr)
 	ReleaseSysCache(tup);
 	if (query == NULL || !IsA(query, Query) || list_length(((Query *) query)->targetList) != 1)
 		return expr;
-	return generator_arguments((Node *) linitial_node(TargetEntry, ((Query *) query)->targetList)->expr,
+	return generator_arguments(generation_source((Node *) linitial_node(TargetEntry, ((Query *) query)->targetList)->expr),
 							   ((FuncExpr *) call)->args);
 }
 
@@ -1061,6 +1286,155 @@ generated_refs_to_columns(Node *node, void *context)
  * column as SHOW CREATE TABLE and information_schema.COLUMNS show it, NULL
  * for another column.  aux_mysql reads it back as the same expression.
  */
+static Node *
+generated_display_constants(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Const) && !mys_is_text_string(((Const *) node)->consttype) &&
+		mys_binary_base_type(((Const *) node)->consttype) == BYTEAOID)
+	{
+		Const *constant = copyObject((Const *) node);
+
+		/* binary_n / varbinary_n share bytea's layout.  Emit their actual
+		 * bytes as MySQL X'hex'.  text_string must retain its type and hex
+		 * external input/output, or replay would change overload selection. */
+		constant->consttype = BYTEAOID;
+		constant->consttypmod = -1;
+		constant->constcollid = InvalidOid;
+		return (Node *) constant;
+	}
+	return expression_tree_mutator(node, generated_display_constants, context);
+}
+
+static FuncExpr *
+generated_helper(Node *node, const char *name, int nargs)
+{
+	FuncExpr *f;
+	char *actual;
+
+	if (node == NULL || !IsA(node, FuncExpr)) return NULL;
+	f = (FuncExpr *) node;
+	if (nargs >= 0 && list_length(f->args) != nargs) return NULL;
+	actual = get_func_name(f->funcid);
+	if (!actual || strcmp(actual, name) != 0 ||
+		strcmp(get_namespace_name(get_func_namespace(f->funcid)), "mysql") != 0)
+		return NULL;
+	return f;
+}
+
+/* A concat_one boundary retains a nested user CONCAT as one argument. */
+static bool
+generated_concat_args(Node *node, List **args)
+{
+	FuncExpr *f = generated_helper(node, "concat_one", 1);
+
+	if (f)
+	{
+		*args = lappend(*args, linitial(f->args));
+		return true;
+	}
+	f = generated_helper(node, "concat_pair", 2);
+	return f && generated_concat_args(linitial(f->args), args) &&
+		generated_concat_args(lsecond(f->args), args);
+}
+
+/* Recognize only the CASE constructed by mys_binary_func_call for ELT. */
+static List *
+generated_elt_args(Node *node)
+{
+	CaseExpr *choice;
+	FuncExpr *index;
+	List *args;
+	int ordinal = 0;
+
+	if (!IsA(node, CaseExpr)) return NIL;
+	choice = (CaseExpr *) node;
+	index = generated_helper((Node *) choice->arg, "elt_index", 1);
+	if (!index || !IsA(choice->defresult, Const) ||
+		!((Const *) choice->defresult)->constisnull) return NIL;
+	args = list_copy(index->args);
+	foreach_node(CaseWhen, branch, choice->args)
+	{
+		OpExpr *test;
+		Const *number;
+		FuncExpr *value = generated_helper((Node *) branch->result, "raw_bytes", 1);
+
+		if (!value || !IsA(branch->expr, OpExpr)) return NIL;
+		test = (OpExpr *) branch->expr;
+		if (list_length(test->args) != 2 || get_opcode(test->opno) != F_INT4EQ ||
+			!IsA(linitial(test->args), CaseTestExpr) || !IsA(lsecond(test->args), Const)) return NIL;
+		number = lsecond_node(Const, test->args);
+		if (number->consttype != INT4OID || number->constisnull ||
+			DatumGetInt32(number->constvalue) != ++ordinal) return NIL;
+		args = lappend(args, linitial(value->args));
+	}
+	return ordinal ? args : NIL;
+}
+
+typedef struct GeneratedDisplay
+{
+	List *namespace;
+	TupleDesc desc;
+	List *calls;
+} GeneratedDisplay;
+
+/* Display only: these private Param nodes are never planned, stored, or used
+ * by ALTER/LIKE. Keeping their original result types lets PG deparse the rest
+ * of the expression, while MySQL function names need no PG overload/schema. */
+static Node *
+generated_display_calls(Node *node, void *context)
+{
+	GeneratedDisplay *display = context;
+	const char *name = NULL;
+	List *args = NIL;
+	FuncExpr *f;
+
+	if (node == NULL) return NULL;
+	if (generated_concat_args(node, &args))
+		name = "CONCAT";
+	else if ((f = generated_helper(node, "string_result", 2)) != NULL)
+	{
+		FuncExpr *ws = generated_helper(lsecond(f->args), "concat_ws_bytes", -1);
+
+		args = ws ? ws->args : generated_elt_args(lsecond(f->args));
+		if (args) name = ws ? "CONCAT_WS" : "ELT";
+	}
+	if (name)
+	{
+		StringInfoData sql;
+		Param *placeholder = makeNode(Param);
+		bool first = true;
+
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "%s(", name);
+		foreach_ptr(Node, arg, args)
+		{
+			Node *shown = generated_display_calls(arg, display);
+			char *text;
+
+			if (!first) appendStringInfoString(&sql, ", ");
+			/* A VARIADIC "any" argument can retain UNKNOWNOID. MySQL's bare
+			 * NULL needs no PostgreSQL ::unknown cast. */
+			text = IsA(shown, Const) && ((Const *) shown)->constisnull &&
+				((Const *) shown)->consttype == UNKNOWNOID ? "NULL" :
+				deparse_expression(shown, display->namespace, false, false);
+			appendStringInfoString(&sql, mysql_expression_text(text, display->desc, display->calls));
+			first = false;
+		}
+		appendStringInfoChar(&sql, ')');
+		display->calls = lappend(display->calls, sql.data);
+		placeholder->paramkind = PARAM_EXTERN;
+		placeholder->paramid = list_length(display->calls);
+		placeholder->paramtype = exprType(node);
+		placeholder->paramtypmod = exprTypmod(node);
+		placeholder->paramcollid = exprCollation(node);
+		placeholder->location = -1;
+		return (Node *) placeholder;
+	}
+	return expression_tree_mutator(node, generated_display_calls, context);
+}
+
 PG_FUNCTION_INFO_V1(mys_column_generation);
 
 Datum
@@ -1074,6 +1448,7 @@ mys_column_generation(PG_FUNCTION_ARGS)
 	char	   *text;
 	bool		save_quote = quote_all_identifiers;
 	bool		save_strings = standard_conforming_strings;
+	GeneratedDisplay display = {0};
 
 	if (rel == NULL)
 		PG_RETURN_NULL();
@@ -1090,15 +1465,17 @@ mys_column_generation(PG_FUNCTION_ARGS)
 	}
 
 	expr = generated_refs_to_columns(expr, rel);
+	expr = generated_display_constants(expr, NULL);
 
 	/* every identifier delimited; literals with plain backslashes */
 	quote_all_identifiers = true;
 	standard_conforming_strings = true;
 	PG_TRY();
 	{
-		text = deparse_expression(expr,
-								  deparse_context_for(RelationGetRelationName(rel), relid),
-								  false, false);
+		display.namespace = deparse_context_for(RelationGetRelationName(rel), relid);
+		display.desc = RelationGetDescr(rel);
+		expr = generated_display_calls(expr, &display);
+		text = deparse_expression(expr, display.namespace, false, false);
 	}
 	PG_FINALLY();
 	{
@@ -1106,7 +1483,233 @@ mys_column_generation(PG_FUNCTION_ARGS)
 		standard_conforming_strings = save_strings;
 	}
 	PG_END_TRY();
-	text = mysql_expression_text(text, RelationGetDescr(rel));
+	text = mysql_expression_text(text, RelationGetDescr(rel), display.calls);
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_TEXT_P(cstring_to_text(text));
+}
+
+/* Normalize the grammar's SELECT for SHOW CREATE after catalog access is safe
+ * (in mys_rewrite_raw_stmts, never in the raw grammar).  Both SHOW spellings
+ * must describe a view with the same four VARCHAR result columns. */
+Node *
+mys_rewrite_show_create(Node *stmt)
+{
+	SelectStmt *select;
+	ResTarget *target;
+	FuncCall *call;
+	bool view;
+
+	if (stmt == NULL || !IsA(stmt, SelectStmt))
+		return stmt;
+	select = (SelectStmt *) stmt;
+	if (list_length(select->targetList) != 2 && list_length(select->targetList) != 4)
+		return stmt;
+	target = lsecond_node(ResTarget, select->targetList);
+	if (!target->name || !IsA(target->val, FuncCall))
+		return stmt;
+	call = (FuncCall *) target->val;
+	if (list_length(call->funcname) != 2 || list_length(call->args) != 2 ||
+		strcmp(strVal(linitial(call->funcname)), "mysql") != 0)
+		return stmt;
+	view = strcmp(target->name, "Create View") == 0 &&
+		strcmp(strVal(lsecond(call->funcname)), "show_create_view") == 0;
+	if (!view && strcmp(target->name, "Create Table") == 0 &&
+		strcmp(strVal(lsecond(call->funcname)), "show_create_table") == 0)
+	{
+		A_Const *schema;
+		A_Const *name;
+		Oid relid;
+
+		if (!IsA(linitial(call->args), A_Const) || !IsA(lsecond(call->args), A_Const))
+			return stmt;
+		schema = linitial_node(A_Const, call->args);
+		name = lsecond_node(A_Const, call->args);
+		if (name->isnull || !IsA(&name->val, String) ||
+			(!schema->isnull && !IsA(&schema->val, String)))
+			return stmt;
+		relid = RangeVarGetRelid(makeRangeVar(schema->isnull ? NULL : strVal(&schema->val),
+											strVal(&name->val), -1), AccessShareLock, true);
+		view = OidIsValid(relid) && get_rel_relkind(relid) == RELKIND_VIEW;
+		if (view)
+		{
+			linitial_node(ResTarget, select->targetList)->name = pstrdup("View");
+			target->name = pstrdup("Create View");
+			for (int i = 0; i < 2; i++)
+			{
+				ResTarget *extra = makeNode(ResTarget);
+
+				extra->name = pstrdup(i ? "collation_connection" : "character_set_client");
+				extra->val = (Node *) makeStringConst(i ? "utf8mb4_general_ci" : "utf8mb4", -1);
+				select->targetList = lappend(select->targetList, extra);
+			}
+		}
+	}
+	else if (!view)
+		return stmt;
+	foreach_node(ResTarget, field, select->targetList)
+	{
+		TypeCast *cast = makeNode(TypeCast);
+
+		cast->arg = field->val;
+		cast->typeName = makeTypeNameFromOid(VARCHAROID, -1);
+		cast->location = -1;
+		field->val = (Node *) cast;
+	}
+	return stmt;
+}
+
+/* Catalog default -> replayable MySQL literal.  Folding only immutable
+ * constants is essential: SHOW must never advance a sequence or evaluate a
+ * volatile default.  bytea_out's '\x...' is a PG literal, not a MySQL one. */
+PG_FUNCTION_INFO_V1(mys_column_default);
+Datum
+mys_column_default(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	int attnum = PG_GETARG_INT32(1);
+	Relation rel = try_relation_open(relid, AccessShareLock);
+	Node *expr = NULL;
+	char *result;
+	bool save_strings = standard_conforming_strings;
+
+	if (rel == NULL)
+		PG_RETURN_NULL();
+	if (attnum > 0 && attnum <= RelationGetDescr(rel)->natts &&
+		!TupleDescAttr(RelationGetDescr(rel), attnum - 1)->attgenerated && rel->rd_att->constr)
+		for (int i = 0; i < rel->rd_att->constr->num_defval; i++)
+			if (rel->rd_att->constr->defval[i].adnum == attnum)
+				expr = stringToNode(rel->rd_att->constr->defval[i].adbin);
+	if (expr == NULL)
+	{
+		relation_close(rel, AccessShareLock);
+		PG_RETURN_NULL();
+	}
+	/* A column default already has its destination's character/binary type.
+	 * X'...' preserves NUL and non-UTF8 bytes across SHOW and replay. */
+	if (mys_binary_base_type(exprType(expr)) == BYTEAOID)
+	{
+		Node *constant = strip_implicit_coercions(eval_const_expressions(NULL, expr));
+
+		while (IsA(constant, CoerceToDomain))
+			constant = strip_implicit_coercions((Node *) ((CoerceToDomain *) constant)->arg);
+		if (IsA(constant, Const) && !((Const *) constant)->constisnull &&
+			mys_binary_base_type(((Const *) constant)->consttype) == BYTEAOID)
+		{
+			bytea *value = DatumGetByteaPP(((Const *) constant)->constvalue);
+			int len = VARSIZE_ANY_EXHDR(value);
+			StringInfoData buf;
+			static const char hex[] = "0123456789abcdef";
+			unsigned char *bytes = (unsigned char *) VARDATA_ANY(value);
+
+			initStringInfo(&buf);
+			appendStringInfoString(&buf, "X'");
+			for (int i = 0; i < len; i++)
+			{
+				appendStringInfoChar(&buf, hex[bytes[i] >> 4]);
+				appendStringInfoChar(&buf, hex[bytes[i] & 15]);
+			}
+			appendStringInfoChar(&buf, '\'');
+			relation_close(rel, AccessShareLock);
+			PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+		}
+	}
+	standard_conforming_strings = true;
+	PG_TRY();
+	{
+		result = deparse_expression(expr, deparse_context_for(RelationGetRelationName(rel), relid), false, false);
+	}
+	PG_FINALLY();
+	{
+		standard_conforming_strings = save_strings;
+	}
+	PG_END_TRY();
+	result = mysql_expression_text(result, RelationGetDescr(rel), NIL);
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/* Domain-to-bytea relabels are representation-only casts inserted by PG for
+ * functions such as HEX(blob). A native dump replays them as explicit casts.
+ * Strip these byte-preserving relabels from a display copy only; conversions
+ * that change values and the stored view remain unchanged. */
+static Node *
+view_display_casts(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Query))
+		return (Node *) query_tree_mutator((Query *) node, view_display_casts, context, 0);
+	if (IsA(node, RelabelType))
+	{
+		RelabelType *cast = (RelabelType *) node;
+
+		if (cast->resulttype == BYTEAOID &&
+			mys_binary_base_type(exprType((Node *) cast->arg)) == BYTEAOID)
+			return view_display_casts((Node *) cast->arg, context);
+	}
+	return expression_tree_mutator(node, view_display_casts, context);
+}
+
+/* Preserve the parsed query, including operators, commas, literals, aliases,
+ * joins and predicates.  The old whitespace splitter destroyed all of these. */
+PG_FUNCTION_INFO_V1(mys_show_create_view);
+Datum
+mys_show_create_view(PG_FUNCTION_ARGS)
+{
+	char *schema = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	Oid relid = RangeVarGetRelid(makeRangeVar(schema, name, -1), AccessShareLock, false);
+	HeapTuple tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Form_pg_class cl = (Form_pg_class) GETSTRUCT(tuple);
+	char *owner = GetUserNameFromId(cl->relowner, false);
+	Relation view;
+	Query *query;
+	char *definition;
+	StringInfoData buf;
+	bool save_quote = quote_all_identifiers;
+	bool save_strings = standard_conforming_strings;
+
+	if (cl->relkind != RELKIND_VIEW)
+		ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE), errmsg("%s is not a view", name)));
+	ReleaseSysCache(tuple);
+	view = relation_open(relid, AccessShareLock);
+	query = (Query *) view_display_casts((Node *) get_view_query(view), NULL);
+	/* ALTER VIEW RENAME COLUMN changes the descriptor, not the stored target
+	 * aliases. pg_get_querydef has no result-descriptor argument. */
+	foreach_node(TargetEntry, target, query->targetList)
+		if (!target->resjunk && target->resno > 0 &&
+			target->resno <= RelationGetDescr(view)->natts)
+			target->resname = pstrdup(NameStr(TupleDescAttr(RelationGetDescr(view),
+														 target->resno - 1)->attname));
+	quote_all_identifiers = true;
+	standard_conforming_strings = true;
+	PG_TRY();
+	{
+		definition = pg_get_querydef(query, false);
+	}
+	PG_FINALLY();
+	{
+		quote_all_identifiers = save_quote;
+		standard_conforming_strings = save_strings;
+	}
+	PG_END_TRY();
+	relation_close(view, AccessShareLock);
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "CREATE ALGORITHM=UNDEFINED DEFINER=`");
+	for (char *p = owner; *p; p++)
+	{
+		if (*p == '`') appendStringInfoChar(&buf, '`');
+		appendStringInfoChar(&buf, *p);
+	}
+	appendStringInfoString(&buf, "`@`%` SQL SECURITY DEFINER VIEW `");
+	for (char *p = name; *p; p++)
+	{
+		if (*p == '`') appendStringInfoChar(&buf, '`');
+		appendStringInfoChar(&buf, *p);
+	}
+	appendStringInfoString(&buf, "` AS ");
+	if (*definition && definition[strlen(definition) - 1] == ';')
+		definition[strlen(definition) - 1] = '\0';
+	appendStringInfoString(&buf, mysql_expression_text(definition, NULL, NIL));
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }

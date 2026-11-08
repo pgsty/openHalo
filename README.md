@@ -4,13 +4,13 @@
 OpenHalo 18 is openHalo's MySQL compatibility on **PostgreSQL 18.6**: MySQL applications, drivers and the
 `mysql` CLI talk to it on port 3306, PostgreSQL clients on 5432, against the same data.
 
-It is built as PostgreSQL 18.6, plus a small, generic patch that lets an extension serve another wire
-protocol, plus the `aux_mysql` extension (`contrib/aux_mysql`) that carries all of the MySQL protocol,
-dialect and semantics. The kernel also exports an atomic sequence-advancement function.
-Parse nodes and catalogs keep their PG18 layouts. `ClientSocket`, an installed server-header
-structure, is larger; extensions that use it require review/rebuild. Sample PGDG binaries
-(PostGIS, pgvector, Citus, TimescaleDB and pg_cron) passed smoke tests on EL9 aarch64;
-this is not a blanket ABI guarantee. See [migration and support boundaries](contrib/aux_mysql/MIGRATION.md).
+It is built as PostgreSQL 18.6 with protocol and execution hooks, plus the `aux_mysql` extension
+(`contrib/aux_mysql`) for MySQL protocol, dialect and semantics. Kernel support includes atomic
+sequence advancement, conflict handling, foreign-key callbacks and collation hooks.
+Catalog layouts remain PG18-compatible, but protocol, parse and plan node structures have changed.
+Build the kernel and extension together; rebuild and validate third-party extensions against these
+headers. Earlier PGDG binary smoke tests do not establish ABI compatibility with this revision.
+See [migration and support boundaries](contrib/aux_mysql/MIGRATION.md).
 
 openHalo provides the capability for PostgreSQL to work with applications written for MySQL but provides much more better performance than MySQL!
 
@@ -35,7 +35,7 @@ openHalo supports commonly used SQL dialect and communication protocol of MySQL.
 ![image](how%20it%20works.png)
 
 ```
-PostgreSQL 18.6 + protocol hooks + atomic sequence advancement
+PostgreSQL 18.6 + protocol/execution hooks + atomic sequence advancement
   postmaster: also listens on 3306 -> regular backends (max_connections, pg_stat_activity, pg_hba.conf, cancel)
   backend:    handshake -> authenticate -> read command -> parse -> analyze/plan/execute -> results / OK / ERR
        |
@@ -49,9 +49,9 @@ aux_mysql (contrib/aux_mysql)
 
 | | openHalo 1.0 (branch `pg14`, tag `v1.0-pg14`) | OpenHalo 18 (this branch) |
 |---|---|---|
-| Kernel | PostgreSQL 14.18, ~320 kernel files modified | PostgreSQL 18.6 + protocol hooks and sequence API |
+| Kernel | PostgreSQL 14.18, ~320 kernel files modified | PostgreSQL 18.6 + protocol/execution hooks and sequence API |
 | MySQL compatibility | inside the kernel (forked analyzer/executor) | extension `aux_mysql`, preloaded by default |
-| Extension ABI | differs from PostgreSQL (`DestReceiver`, `pg_proc`, ACL bits) | sample PG18 binaries tested; ClientSocket layout differs |
+| Extension ABI | differs from PostgreSQL (`DestReceiver`, `pg_proc`, ACL bits) | protocol/parse/plan structs differ; rebuild and validate extensions |
 | Authentication | `mysql_native_password` | `caching_sha2_password` (MySQL 8 default) over TLS or RSA, verified against the PostgreSQL password; `mysql_clear_password` on request |
 | Setup | `CREATE EXTENSION aux_mysql` by hand | installed synchronously on the first superuser MySQL connection |
 | Settings | `mysql.listener_on`, `mysql.port`, `mysql.halo_mysql_version`, ... in the core | same names, defined by `aux_mysql` (plus `mysql.database`, `mysql.default_authentication_plugin`, ...); `database_compat_mode` does not exist |
@@ -140,8 +140,8 @@ mysql -h <Server IP> -P 3306 -u test -p
 `contrib/aux_mysql/README.md` documents the `mysql.*` parameters, what is supported and the known gaps.
 
 ### Source layout
-- PostgreSQL 18.6 with the protocol hooks, atomic sequence advancement API, and an explicit rejection of unsupported OpenHalo14 physical upgrades (see `README.postgresql.md`, `COPYRIGHT`).
-- Commit "add generic protocol extension hooks": the kernel patch, nothing MySQL specific in it.
+- PostgreSQL 18.6 with protocol/execution hooks, atomic sequence advancement, and an explicit rejection of unsupported OpenHalo14 physical upgrades (see `README.postgresql.md`, `COPYRIGHT`).
+- The original generic protocol hooks are supplemented by the compatibility execution and collation support used by aux_mysql 1.9.
 - `contrib/aux_mysql`: the extension, its tests (`tests/`) and the tools that port openHalo's grammar and
   SQL (`tools/`).
 - OpenHalo defaults: `src/backend/utils/misc/postgresql.conf.sample`, `GNUmakefile.in` (builds aux_mysql

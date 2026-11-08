@@ -3,8 +3,9 @@
  * mys_txn.c
  *	  MySQL transaction rules on top of PostgreSQL transaction blocks.
  *
- *	- autocommit = 0: the first statement that is not SET / SHOW / transaction
- *	  control starts a transaction, which lasts until COMMIT / ROLLBACK.
+ *	- autocommit = 0: a statement gets a provisional PG block.  It becomes
+ *	  a MySQL transaction when it opens an application table; otherwise the
+ *	  unused block is closed without consuming SET TRANSACTION's defaults.
  *	- implicit commit before BEGIN / START TRANSACTION, before DDL, and when
  *	  autocommit goes from 0 to 1 (an aborted transaction is rolled back,
  *	  which is what COMMIT does to it in PostgreSQL).
@@ -250,6 +251,13 @@ emit_txn(List **stmts, List **infos, TransactionStmtKind kind, int location)
 	*infos = lappend(*infos, info);
 }
 
+static void
+emit_idle_commit(List **stmts, List **infos, int location)
+{
+	emit_txn(stmts, infos, TRANS_STMT_COMMIT, location);
+	((MysStmtInfo *) llast(*infos))->txn_op = MYS_TXNOP_COMMIT_IDLE;
+}
+
 /*
  * Insert the hidden BEGIN / COMMIT statements.  "stmts" and "infos" are the
  * rewritten statements; group_start marks the first PG statement of each
@@ -267,6 +275,15 @@ mys_txn_apply(List *stmts, List **infos)
 	int			n = list_length(stmts);
 	int			i = 0;
 
+	/* A failed statement can leave a provisional block behind.  End it
+	 * before planning another statement, so its snapshot/isolation cannot
+	 * prevent a subsequent SET TRANSACTION from applying to the first table. */
+	if (in_block && !mys_transaction_active())
+	{
+		emit_idle_commit(&out, &out_infos, 0);
+		in_block = false;
+	}
+
 	foreach_ptr(MysStmtInfo, info, *infos)
 	{
 		if (info->group_start)
@@ -274,7 +291,7 @@ mys_txn_apply(List *stmts, List **infos)
 	}
 
 	/* the common case: one statement, autocommit, no transaction rules */
-	if (ngroups <= 1 && autocommit && !in_block && n > 0)
+	if (ngroups <= 1 && autocommit && !in_block && out == NIL && n > 0)
 	{
 		MysStmtInfo *first = linitial(*infos);
 
@@ -300,7 +317,7 @@ mys_txn_apply(List *stmts, List **infos)
 		}
 
 		/* autocommit = 0: implicit begin */
-		if (!in_block && !autocommit &&
+		if (!autocommit &&
 			(kind == MYS_TXN_REGULAR || kind == MYS_TXN_SAVEPOINT))
 		{
 			emit_txn(&out, &out_infos, TRANS_STMT_BEGIN, loc);
@@ -342,6 +359,12 @@ mys_txn_apply(List *stmts, List **infos)
 				break;
 		}
 
+		/* Runtime table access decides whether the provisional BEGIN stays.
+		 * The next BEGIN/SAVEPOINT is conditional too: a packet can contain
+		 * any mixture of table reads, table-free SELECTs, SET and EXECUTE. */
+		if (in_block && !autocommit)
+			emit_idle_commit(&out, &out_infos, loc);
+
 		/*
 		 * Outside a transaction, a statement of a multi-statement query is
 		 * committed on its own (and DDL always is).
@@ -352,6 +375,24 @@ mys_txn_apply(List *stmts, List **infos)
 
 	*infos = out_infos;
 	return out;
+}
+
+/* Called only for our top-level hidden TransactionStmt, before execution. */
+bool
+mys_txn_skip_control(MysStmtInfo *info)
+{
+	if (info->txn_op == MYS_TXNOP_COMMIT_IDLE)
+		return mys_transaction_active();
+	if (info->txn_op == MYS_TXNOP_BEGIN)
+		return mys_transaction_has_block();
+	if ((info->txn_op == MYS_TXNOP_SAVEPOINT || info->txn_op == MYS_TXNOP_RELEASE) &&
+		!mys_transaction_has_block())
+	{
+		/* No savepoint was made; end_command must not record one. */
+		info->txn_op = MYS_TXNOP_NONE;
+		return true;
+	}
+	return false;
 }
 
 /* end_command of every statement: track the hidden savepoint */

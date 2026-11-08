@@ -12,6 +12,7 @@
 #define HALO_MYSQL_H
 
 #include "nodes/pg_list.h"
+#include "mys_binary.h"
 #ifndef HALO_BABELFISH_API
 #include "postmaster/protocol_extension.h"
 #endif
@@ -48,12 +49,15 @@ extern bool mys_foreign_key_checks(void);
 extern void mys_sync_foreign_key_checks(void);
 extern void mys_sync_session_state(void);
 extern void mys_start_implicit_transaction(bool ddl);
-extern const char *mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only);
+extern const char *mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only,
+										 bool explicit_begin);
+extern bool mys_transaction_active(void);
+extern bool mys_transaction_has_block(void);
 extern void mys_statement_done(bool end, bool next_ddl);
 extern void mys_statement_touched_tables(void);
 extern bool mys_server_read_only;
 extern bool mys_server_read_only_applies(void);
-extern void mys_flush_rewrite_warnings(void);
+extern void mys_flush_rewrite_warnings(List *warnings);
 extern void mys_discard_rewrite_warnings(void);
 extern bool mys_index_prefix(Node *expr, AttrNumber *attnum, int *length, bool *bytes,
 							 bool *digest);
@@ -73,6 +77,7 @@ extern Node *mys_name_keys(Node *stmt);
 #define MYS_ERRCODE_DUP_KEYNAME			MAKE_SQLSTATE('M','1','0','6','1')
 #define MYS_ERRCODE_KEY_DOES_NOT_EXIST	MAKE_SQLSTATE('M','1','1','7','6')
 #define MYS_ERRCODE_WRONG_NAME_FOR_INDEX	MAKE_SQLSTATE('M','1','2','8','0')
+#define MYS_ERRCODE_TXN_CHARACTERISTICS	MAKE_SQLSTATE('M','1','5','6','8')
 
 /* how a MySQL statement interacts with transactions (mys_txn.c) */
 typedef enum MysTxnKind
@@ -92,6 +97,7 @@ typedef enum MysTxnOp
 	MYS_TXNOP_NONE = 0,
 	MYS_TXNOP_BEGIN,
 	MYS_TXNOP_COMMIT,
+	MYS_TXNOP_COMMIT_IDLE,	/* finish an unused autocommit=0 block */
 	MYS_TXNOP_SAVEPOINT,		/* statement-level rollback point */
 	MYS_TXNOP_RELEASE
 } MysTxnOp;
@@ -131,13 +137,17 @@ typedef struct MysStmtInfo
 	int8		set_autocommit;		/* SET autocommit = 0 / 1, -1 unknown */
 	bool		is_commit;			/* the client's COMMIT */
 	bool		is_write;			/* INSERT / UPDATE (strict mode rules) */
+	bool		ignore;				/* INSERT IGNORE: lenient assignments */
 	bool		diagnostic;			/* SHOW WARNINGS / ERRORS preserves diagnostics */
 	List	   *update_cols;		/* columns assigned by UPDATE / ON DUPLICATE KEY */
+	List	   *rewrite_warnings;	/* diagnostics belonging to this statement */
 } MysStmtInfo;
 
 /* mysql_proto.c */
 extern MysStmtInfo *mys_current_stmt_info(void);
 extern void mys_add_warning(uint16 code, const char *message);
+extern uint64 mys_upsert_row(struct TupleTableSlot *oldslot,
+						   struct TupleTableSlot *newslot, uint64 deleted);
 
 /*
  * MySQL errors that have no PostgreSQL SQLSTATE: mys_errno() maps these
@@ -153,18 +163,21 @@ extern int64 mys_release_user_locks(void);
 extern bool mys_hexlit_available;
 extern void mys_binary_session_init(void);
 extern Oid	mys_binary_base_type(Oid typid);
+extern bool mys_is_text_string(Oid typid);
 extern Node *mys_fold_hexlit_default(Node *expr, Oid typid);
 extern void mys_hexlit_columns_binary(Node *query);
 
 /* mys_semantics.c */
 extern void mys_set_auto_increment(Oid relid, int64 next);
 extern void mys_sync_auto_increment(Oid relid);
+extern void mys_sequence_write(struct RelationData *sequence);
 
 /* mys_rewrite.c: ENGINE= / ENCRYPTION= -> table access method, or NULL */
 struct DefElem;
 struct ColumnDef;
 extern char *mys_engine_access_method(struct DefElem *d);
-extern void mys_rectify_column_collation(struct ColumnDef *col, const char *collation);
+extern void mys_rectify_column_collation(struct ColumnDef *col, const char *collation,
+										 bool rewriting);
 extern const char *mys_table_default_collation(Oid relid);
 
 /* mys_utility.c: per-table setup after MySQL DDL (triggers) */
@@ -184,6 +197,7 @@ extern bool halo_mysql_statement_rollback;
 extern void mys_txn_classify(Node *stmt, MysStmtInfo *info);
 extern List *mys_txn_apply(List *stmts, List **infos);
 extern void mys_txn_stmt_done(MysStmtInfo *info);
+extern bool mys_txn_skip_control(MysStmtInfo *info);
 extern void mys_txn_recover(void);
 extern List *mys_txn_deferred_error(ErrorData *edata);
 extern bool mys_txn_is_deferred_error(Node *stmt);
@@ -237,6 +251,12 @@ extern bool mys_sql_ps_utility(Node *parsetree, const char *queryString);
 
 /* mysql_proto.c: queries to run before the next command is read */
 extern void mys_queue_query(const char *query, const MysTextMap *map, const char *rest);
+
+/* SHOW CREATE metadata, called by mys_rewrite_raw_stmts inside a transaction. */
+extern Node *mys_rewrite_show_create(Node *stmt);
+/* Implemented by the binary worker; includes the new bytea-layout base types. */
+extern bool mys_is_text_string(Oid type);
+extern Oid mys_binary_base_type(Oid type);
 
 /* mys_rewrite.c */
 extern List *mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string,

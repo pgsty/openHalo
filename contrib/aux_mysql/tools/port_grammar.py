@@ -9,11 +9,13 @@ Every transformation is an exact-text (or tightly anchored) replacement that
 asserts its expected match count, so upstream changes fail loudly instead of
 silently producing a broken grammar.
 """
+import difflib
 import re
 import sys
 
 src, dst = sys.argv[1], sys.argv[2]
 s = open(src, encoding='utf-8', errors='surrogateescape').read()
+upstream_lines = s.splitlines(keepends=True)
 
 
 def rep(old, new, count=1):
@@ -592,24 +594,81 @@ rep('''			| BCONST
 \t\t\t\t}''')
 rep('''static Node *makeRegexSubject(Node *arg);''', '''static Node *makeRegexSubject(Node *arg);
 static Node *makeHexLitConst(char *str, bool binary, int location);''')
-# SHOW CREATE TABLE prints a VARBINARY column without its length (which the
-# grammar drops, see README): accept that spelling back.
-rep('''            | VARBINARY '(' Iconst ')'              {
-                //$$ = SystemTypeName("bytea");
-                $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-                                                         makeString("varbinary")));
-                //$$->typmods = list_make1(makeIntConst($3, -1));
-                }''', '''            | VARBINARY '(' Iconst ')'              {
-                //$$ = SystemTypeName("bytea");
-                $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-                                                         makeString("varbinary")));
-                //$$->typmods = list_make1(makeIntConst($3, -1));
-                }
-\t\t\t| VARBINARY
+rep('#include "utils/lsyscache.h"', '#include "utils/lsyscache.h"\n#include "mys_binary.h"')
+# 1.9: preserve byte lengths after the SQL update, while binaries paired
+# with older SQL keep the old domains. The helper refreshes only dirty caches.
+for token, oldtype, newtype, n in (
+        ('BINARY', 'binary', 'binary_n', '1'),
+        ('BINARY', 'binary', 'binary_n', '$3'),
+        ('VARBINARY', 'varbinary', 'varbinary_n', '$3')):
+    production = token if n == '1' else token + " '(' Iconst ')'"
+    pattern = (r'            \| ' + re.escape(production) + r' +\{\n'
+               r'                //\$\$ = SystemTypeName\("bytea"\);\n'
+               r'                \$\$ = makeTypeNameFromNameList\(list_make2\(makeString\("mysql"\),\n'
+               r' +makeString\("' + oldtype + r'"\)\)\);\n'
+               r'                //\$\$->typmods = list_make1\(makeIntConst\(' + re.escape(n) + r', -1\)\);\n'
+               r'                \}')
+    replacement = ('\t\t\t| ' + production + '\n\t\t\t\t{\n'
+                   '\t\t\t\t\t$$ = mys_binary_type_name("' + newtype + '", ' + n + ', @1);\n'
+                   '\t\t\t\t}')
+    resub(pattern, replacement, expect=1)
+# Legacy SHOW output omitted a VARBINARY length; keep accepting it as a
+# legacy domain. Newly declared VARBINARY(n) uses the new type after upgrade.
+rep('''            | YEAR_P opt_field_length opt_field_option''', '''\t\t\t| VARBINARY
 \t\t\t\t{
-\t\t\t\t\t$$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t makeString("varbinary")));
-\t\t\t\t}''')
+\t\t\t\t\t$$ = makeTypeNameFromNameList(list_make2(makeString("mysql"), makeString("varbinary")));
+\t\t\t\t}
+            | YEAR_P opt_field_length opt_field_option''')
+
+# CAST AS BINARY without a length does not pad; BINARY(n) does after 1.9.
+rep('''            | BINARY
+                {
+\t\t\t\t\t$$ = SystemTypeName("bytea");
+\t\t\t\t\t$$->location = @1;
+                }''', '''            | BINARY
+                {
+                    $$ = mys_binary_types_available ? mys_binary_type_name("binary_n", -1, @1) : SystemTypeName("bytea");
+                    $$->location = @1;
+                }
+            | BINARY '(' Iconst ')'
+                {
+                    $$ = mys_binary_types_available ? mys_binary_type_name("binary_n", $3, @1) : SystemTypeName("bytea");
+                    $$->location = @1;
+                }''')
+
+for token, following, limit in (
+        ('TINYTEXT', 'TEXT_P', 255), ('TEXT_P', 'MEDIUMTEXT', 65535),
+        ('MEDIUMTEXT', 'LONGTEXT', 16777215), ('LONGTEXT', 'LONG', -1)):
+    start = s.index('            | ' + token + ' opt_')
+    end = s.index('            | ' + following + ' ', start)
+    block = s[start:end]
+    old = '                    $$ = SystemTypeName("text");'
+    assert block.count(old) == 1
+    block = block.replace(old,
+        '                    $$ = mys_binary_type_name("text_string", %d, @1);' % limit)
+    s = s[:start] + block + s[end:]
+
+# Arithmetic must assign unknown strings their string type before the
+# operator resolver's exact-(hexlit,hexlit) shortcut.
+start = s.index('\na_expr:')
+end = s.index('\nc_expr:', start)
+block = s[start:end]
+assert 'makeSimpleA_Expr(AEXPR_OP, "+", $1, $3, @2)' in block
+block = block.replace('makeSimpleA_Expr(AEXPR_OP,', 'mys_hexlit_operator(AEXPR_OP,')
+s = s[:start] + block + s[end:]
+
+# TRIM dispatch must reach the overloads for binary and NUL-safe strings.
+# Existing native text overloads remain available through search_path.
+for trim_name in ('btrim', 'ltrim', 'rtrim'):
+    rep('SystemFuncName("' + trim_name + '")',
+        'list_make1(makeString("' + trim_name + '"))',
+        count=2 if trim_name == 'btrim' else 1)
+
+# Only ordinary calls: aggregate syntax and generated SHOW code are untouched.
+rep('''                    n->agg_order = $4;'''.replace('                    ', '\t\t\t\t\t') +
+    '\n\t\t\t\t\t$$ = (Node *)n;',
+    '\t\t\t\t\tn->agg_order = $4;\n\t\t\t\t\t$$ = mys_binary_func_call(n);')
+
 rep('''static Node *
 makeRegexSubject(Node *arg)
 {''', '''/*
@@ -1121,6 +1180,46 @@ s = s.rstrip('\n') + '\n' + (
     '\t}\n'
     '\treturn (Node *) stmt;\n'
     '}\n')
+
+# INSERT IGNORE has per-row foreign-key failures, unlike DO NOTHING.
+rep('onconflict->action = ONCONFLICT_NOTHING;',
+    'onconflict->action = ONCONFLICT_NOTHING;\n'
+    '\t\t\t\t\tonconflict->allIndexes = true;\n'
+    '\t\t\t\t\tonconflict->ignoreFailure = true;', 4)
+
+# DATABASE is a schema in MySQL mode. Accept the same charset/collation
+# options already accepted by CREATE SCHEMA, including mysqldump output.
+rep('createdb_opt_item:\n\t\t\t',
+    'createdb_opt_item:\n'
+    '\t\t\tcharacter_set_collate\n'
+    '\t\t\t\t{ $$ = makeDefElem("mysql_database_option", NULL, @1); }\n'
+    '\t\t\t| ')
+
+# The empty column list is MySQL's spelling of DEFAULT VALUES.
+for token in ('VALUES', 'VALUE_P'):
+    old = "            | " + token + " '(' ')'"
+    new = ("\t\t\t| '(' ')' " + token + " '(' ')'\n"
+           "\t\t\t\t{\n"
+           "\t\t\t\t\t$$ = makeNode(InsertStmt);\n"
+           "\t\t\t\t\t$$->selectStmt = NULL;\n"
+           "\t\t\t\t}\n" + old)
+    rep(old, new)
+
+# Keep untouched upstream formatting. Normalize only generated replacement
+# lines to PostgreSQL's four-column tab style, including inherited indentation
+# on rewritten expressions. This is deterministic from the PG14 input alone.
+output_lines = s.splitlines(keepends=True)
+for tag, _, _, start, end in difflib.SequenceMatcher(
+        None, upstream_lines, output_lines, autojunk=False).get_opcodes():
+    if tag == 'equal':
+        continue
+    for i in range(start, end):
+        line = output_lines[i]
+        indent = re.match(r'[ \t]*', line).group()
+        width = len(indent.expandtabs(4))
+        body = line[len(indent):].rstrip(' \t\n')
+        output_lines[i] = '\t' * (width // 4) + ' ' * (width % 4) + body + ('\n' if line.endswith('\n') else '')
+s = ''.join(output_lines)
 
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 print("ported grammar written to", dst)

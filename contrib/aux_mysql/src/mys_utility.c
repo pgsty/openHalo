@@ -20,6 +20,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/dependency.h"
+#include "catalog/indexing.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attrdef.h"
@@ -59,7 +60,9 @@
 #include "miscadmin.h"
 
 #include "halo_mysql.h"
+#include "mys_fk.h"
 #include "mys_parsenodes.h"
+#include "mys_generated_policy.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
@@ -83,6 +86,41 @@ static void detach_generated_readers(Oid relid, AttrNumber attnum, GenAlter *gen
 static void refresh_generated(AlterTableStmt *stmt, Oid relid, GenAlter *gen,
 							  PlannedStmt *pstmt, const char *queryString,
 							  ParamListInfo params, QueryEnvironment *queryEnv);
+
+/*
+ * Bootstrap SET EXPRESSION for an ordinary column, without dropping its
+ * identity (attnum), indexes, privileges or dependants.  The caller holds
+ * AccessExclusiveLock and immediately runs SET EXPRESSION: PG18 performs the
+ * rewrite and rebuilds/rechecks indexes and constraints.  The placeholder is
+ * never used to write rows.  A failed rewrite rolls all catalog changes back.
+ */
+static void
+make_column_generated(Oid relid, const char *name)
+{
+	Relation attrs = table_open(AttributeRelationId, RowExclusiveLock);
+	HeapTuple tuple = SearchSysCacheCopyAttName(relid, name);
+	Form_pg_attribute att;
+	AttrNumber attnum;
+	Node *placeholder;
+	Relation rel;
+
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "column %s does not exist", name);
+	att = (Form_pg_attribute) GETSTRUCT(tuple);
+	Assert(!att->attgenerated && !att->attidentity && !att->atthasdef);
+	attnum = att->attnum;
+	placeholder = (Node *) makeNullConst(att->atttypid, att->atttypmod,
+										 att->attcollation);
+	att->attgenerated = ATTRIBUTE_GENERATED_STORED;
+	CatalogTupleUpdate(attrs, &tuple->t_self, tuple);
+	heap_freetuple(tuple);
+	table_close(attrs, RowExclusiveLock);
+	CommandCounterIncrement();
+	rel = table_open(relid, NoLock);
+	StoreAttrDefault(rel, attnum, placeholder, true);
+	table_close(rel, NoLock);
+	CommandCounterIncrement();
+}
 
 /*
  * Store the table default in PostgreSQL's provider-owned object labels.
@@ -341,17 +379,6 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	}
 
 	/*
-	 * Generated columns.  PostgreSQL keeps a generated column's values when
-	 * it becomes an ordinary column (MySQL: a STORED one), but cannot turn
-	 * an existing column into a generated one (MySQL recomputes it).
-	 */
-	if (generated && !was_generated)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot turn column \"%s\" into a generated column", colname),
-				 errhint("Add a generated column and drop this one.")));
-
-	/*
 	 * Drop the old default first: it may not be castable to the new type.
 	 * An identity column has no default; drop the identity instead when the
 	 * new definition has no AUTO_INCREMENT.  A generated column keeps its
@@ -374,7 +401,7 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	 * even to the same type: keep the type when MODIFY does, else set those
 	 * columns aside until refresh_generated().
 	 */
-	if (column_used_by_generated(relid, attnum))
+	if (generated || column_used_by_generated(relid, attnum))
 	{
 		Oid			typid;
 		int32		typmod;
@@ -386,7 +413,7 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 		typenameTypeIdAndMod(NULL, def->typeName, &new_typid, &new_typmod);
 		keep_type = new_typid == typid && new_typmod == typmod &&
 			GetColumnDefCollation(NULL, def, new_typid) == collid;
-		if (!keep_type)
+		if (!keep_type && column_used_by_generated(relid, attnum))
 			detach_generated_readers(relid, attnum, gen, cmds);
 	}
 	/* Remove only our domain guard for this attribute, including after CHANGE. */
@@ -443,10 +470,19 @@ modify_column(AlterTableStmt *orig, Oid relid, char *colname, ColumnDef *def,
 	tdef->colname = colname;
 	tdef->typeName = def->typeName;
 	tdef->collClause = def->collClause;
-	/* a generated column takes the type of its expression, no USING */
-	tdef->raw_default = generated ? NULL : (Node *) using;
+	/* MySQL still converts existing ordinary values when MODIFY changes their
+	 * type, before recomputing the generated values.  An already generated
+	 * column instead takes its type from its expression, without USING. */
+	tdef->raw_default = generated && was_generated ? NULL : (Node *) using;
 	if (!keep_type)
 		*cmds = lappend(*cmds, make_cmd(AT_AlterColumnType, colname, (Node *) tdef));
+	if (generated && !was_generated)
+	{
+		if (!notnull && !column_in_primary_key(relid, colname))
+			*cmds = lappend(*cmds, make_cmd(AT_DropNotNull, colname, NULL));
+		flush_cmds(orig, cmds, pstmt, queryString, params, queryEnv);
+		make_column_generated(relid, colname);
+	}
 	if (generated)
 		*cmds = lappend(*cmds, make_cmd(AT_SetExpression, colname, generated->raw_expr));
 
@@ -746,10 +782,13 @@ gen_column_expression(GenColumn *c)
 
 		for (int i = 0; constr && i < constr->num_defval; i++)
 			if (constr->defval[i].adnum == c->attnum)
+			{
+				gen_policy_check(stringToNode(constr->defval[i].adbin), true);
 				text = deparse_expression(mys_unwrap_generator(stringToNode(constr->defval[i].adbin)),
 										  deparse_context_for(RelationGetRelationName(rel),
 															  c->relid),
 										  false, false);
+			}
 		relation_close(rel, AccessShareLock);
 		if (text)
 		{
@@ -1003,7 +1042,15 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 	StringInfoData key;
 	char		name[NAMEDATALEN];
 	int			n = 0;
+	Oid			target;
+	Oid			base;
+	int32		typmod;
+	TypeCast   *cast;
+	Oid			marker_arg = ANYELEMENTOID;
+	bool		has_conversion_helpers;
+	bool		row_anchor;
 
+	(void) gen_policy_raw(raw, NULL);
 	(void) collect_column_refs(raw, &names);
 	foreach_ptr(char, colname, names)
 		if (find_gen_column(columns, colname))
@@ -1021,13 +1068,93 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 	sql_fn_parser_setup(pstate, pinfo);
 	expr = transformExpr(pstate, copyObject(raw), EXPR_KIND_GENERATED_COLUMN);
 	free_parsestate(pstate);
-	if (!contain_mutable_functions_after_planning((Expr *) expr))
+	gen_policy_check(expr, false);
+	typenameTypeIdAndMod(NULL, type, &target, &typmod);
+	base = getBaseTypeAndTypmod(target, &typmod);
+	if (!contain_mutable_functions(expr) &&
+		!((base == VARCHAROID || base == BPCHAROID || base == NUMERICOID) && typmod >= VARHDRSZ))
 		return raw;
 
-	/* named after what it computes: search_path resolves the names in it */
+	/* SQL function RETURN uses implicit coercion, whereas a generated column
+	 * uses assignment coercion.  Cast explicitly inside the wrapper so domain
+	 * (notably BLOB) and typmod conversion happens before SQL RETURN checking.
+	 * The marker lets SHOW/ALTER recover the original expression losslessly. */
+	/* A binary upgrade precedes ALTER EXTENSION. Keep the legacy expression
+	 * form while the 1.9 SQL helpers are absent; invalidate naturally by
+	 * looking them up for each generated-column DDL operation. */
+	has_conversion_helpers = OidIsValid(LookupFuncName(
+		list_make2(makeString("mysql"), makeString("generated_value")),
+		1, &marker_arg, true));
 	body = collate_params(copyObject(raw), columns);
+	/* A bare string/NULL is UNKNOWN until assignment.  The polymorphic source
+	 * marker needs a concrete type, without applying the target typmod yet. */
+	if (exprType(expr) == UNKNOWNOID)
+	{
+		cast = makeNode(TypeCast);
+		cast->arg = body;
+		cast->typeName = makeTypeNameFromOid(TEXTOID, -1);
+		cast->location = -1;
+		body = (Node *) cast;
+	}
+	if (has_conversion_helpers)
+		body = (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString("generated_value")),
+									 list_make1(body), COERCE_EXPLICIT_CALL, -1);
+	if (has_conversion_helpers && (base == VARCHAROID || base == BPCHAROID) && typmod >= VARHDRSZ)
+	{
+		A_Const *limit = makeNode(A_Const);
+		A_Const *bpchar = makeNode(A_Const);
+
+		limit->val.ival.type = T_Integer;
+		limit->val.ival.ival = typmod - VARHDRSZ;
+		limit->location = -1;
+		bpchar->val.boolval.type = T_Boolean;
+		bpchar->val.boolval.boolval = base == BPCHAROID;
+		bpchar->location = -1;
+		cast = makeNode(TypeCast);
+		cast->arg = body;
+		cast->typeName = makeTypeNameFromOid(TEXTOID, -1);
+		cast->location = -1;
+		body = (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString("generated_varchar")),
+			list_make3(cast, limit, bpchar), COERCE_EXPLICIT_CALL, -1);
+	}
+	else if (has_conversion_helpers && base == NUMERICOID && typmod >= VARHDRSZ)
+	{
+		Oid helper_args[2] = {NUMERICOID, INT4OID};
+
+		/* Keep binary-before-SQL upgrades usable when this helper is absent. */
+		if (OidIsValid(LookupFuncName(list_make2(makeString("mysql"), makeString("generated_numeric")),
+			2, helper_args, true)))
+		{
+			A_Const *limit = makeNode(A_Const);
+
+			limit->val.ival.type = T_Integer;
+			limit->val.ival.ival = typmod;
+			limit->location = -1;
+			cast = makeNode(TypeCast);
+			cast->arg = body;
+			cast->typeName = makeTypeNameFromOid(NUMERICOID, -1);
+			cast->location = -1;
+			body = (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString("generated_numeric")),
+				list_make2(cast, limit), COERCE_EXPLICIT_CALL, -1);
+		}
+	}
+	cast = makeNode(TypeCast);
+	cast->arg = body;
+	cast->typeName = copyObject(type);
+	cast->location = -1;
+	body = (Node *) cast;
+	/* Even a constant source must run its assignment conversion for each row
+	 * in the writer's current sql_mode/IGNORE context.  A zero-argument
+	 * IMMUTABLE wrapper is otherwise folded at plan creation.  tableoid is
+	 * PG's permitted generated-column system Var; the body need not read it.
+	 * SET search_path below also prevents SQL function inlining. */
+	row_anchor = n == 0;
+	if (row_anchor)
+		argtypes[n++] = OIDOID;
+
+	/* named after what it computes, including the typmod and conversion */
 	initStringInfo(&key);
-	appendStringInfo(&key, "1|%s|%s|%u", nodeToString(body),	/* 1: its definition */
+	appendStringInfo(&key, "2|%s|%s|%u", nodeToString(body),
 					 GetConfigOption("search_path", false, false),
 					 typenameTypeId(NULL, type));
 	for (int i = 0; i < n; i++)
@@ -1049,6 +1176,15 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 
 			p->name = colname;
 			p->argType = copyObject(find_gen_column(columns, colname)->type);
+			p->mode = FUNC_PARAM_IN;
+			p->location = -1;
+			f->parameters = lappend(f->parameters, p);
+		}
+		if (row_anchor)
+		{
+			FunctionParameter *p = makeNode(FunctionParameter);
+
+			p->argType = makeTypeNameFromOid(OIDOID, -1);
 			p->mode = FUNC_PARAM_IN;
 			p->location = -1;
 			f->parameters = lappend(f->parameters, p);
@@ -1075,6 +1211,14 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 		ColumnRef  *cr = makeNode(ColumnRef);
 
 		cr->fields = list_make1(makeString(colname));
+		cr->location = -1;
+		args = lappend(args, cr);
+	}
+	if (row_anchor)
+	{
+		ColumnRef *cr = makeNode(ColumnRef);
+
+		cr->fields = list_make1(makeString("tableoid"));
 		cr->location = -1;
 		args = lappend(args, cr);
 	}
@@ -1342,7 +1486,7 @@ check_generated_readers(Oid relid, const char *name, bool drop, List *dropped)
 			continue;
 		if (drop)
 			ereport(ERROR,
-					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+					(errcode(MAKE_SQLSTATE('M','3','1','0','8')),
 					 errmsg("Column '%s' has a generated column dependency.", name)));
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_COLUMN),
@@ -1757,67 +1901,6 @@ bool_const(bool value)
 	return (Node *) n;
 }
 
-/*
- * FOREIGN_KEY_CHECKS=0: PostgreSQL refuses TRUNCATE of a table that another
- * table's foreign key references, also under session_replication_role =
- * replica.  MySQL empties just that table: delete its rows instead (no RI
- * action fires in replica mode).  TRUNCATE does not reset AUTO_INCREMENT
- * here either.
- */
-static bool
-truncate_referenced_tables(TruncateStmt *stmt)
-{
-	List	   *relids = NIL;
-
-	if (mys_foreign_key_checks() || stmt->restart_seqs || stmt->behavior != DROP_RESTRICT)
-		return false;
-	foreach_node(RangeVar, rv, stmt->relations)
-	{
-		Oid			relid = RangeVarGetRelid(rv, NoLock, true);
-
-		if (!OidIsValid(relid))
-			return false;		/* TRUNCATE reports it */
-		relids = lappend_oid(relids, relid);
-	}
-	if (heap_truncate_find_FKs(relids) == NIL)
-		return false;
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
-	foreach_node(RangeVar, rv, stmt->relations)
-	{
-		Relation	rel = table_openrv(rv, RowExclusiveLock);
-		Oid			relid = RelationGetRelid(rel);
-		AclResult	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_TRUNCATE);
-		Oid			save_userid;
-		int			save_sec_context;
-		char	   *sql;
-
-		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, get_relkind_objtype(rel->rd_rel->relkind),
-						   RelationGetRelationName(rel));
-		sql = psprintf("DELETE FROM %s%s", rv->inh ? "" : "ONLY ",
-					   quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
-												  RelationGetRelationName(rel)));
-
-		/*
-		 * TRUNCATE semantics: the TRUNCATE privilege checked above suffices
-		 * and no row is filtered out, so delete as the owner with row level
-		 * security bypassed, as the RI triggers do.  An error restores the
-		 * user at abort.
-		 */
-		GetUserIdAndSecContext(&save_userid, &save_sec_context);
-		SetUserIdAndSecContext(rel->rd_rel->relowner,
-							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
-							   SECURITY_NOFORCE_RLS);
-		if (SPI_execute(sql, false, 0) != SPI_OK_DELETE)
-			elog(ERROR, "could not empty table \"%s\"", RelationGetRelationName(rel));
-		SetUserIdAndSecContext(save_userid, save_sec_context);
-		table_close(rel, NoLock);
-	}
-	SPI_finish();
-	return true;
-}
-
 /* a relation in the session's temporary schema */
 static bool
 is_temp_rangevar(RangeVar *rv)
@@ -1842,6 +1925,10 @@ temp_table_utility(Node *stmt)
 			return ((CreateStmt *) stmt)->relation->relpersistence == RELPERSISTENCE_TEMP;
 		case T_CreateTableAsStmt:
 			return ((CreateTableAsStmt *) stmt)->into->rel->relpersistence == RELPERSISTENCE_TEMP;
+		case T_CreateSeqStmt:
+			return ((CreateSeqStmt *) stmt)->sequence->relpersistence == RELPERSISTENCE_TEMP;
+		case T_AlterSeqStmt:
+			return is_temp_rangevar(((AlterSeqStmt *) stmt)->sequence);
 		case T_AlterTableStmt:
 			return is_temp_rangevar(((AlterTableStmt *) stmt)->relation);
 		case T_IndexStmt:
@@ -1866,7 +1953,8 @@ temp_table_utility(Node *stmt)
 					return false;
 			return true;
 		case T_DropStmt:
-			if (((DropStmt *) stmt)->removeType != OBJECT_TABLE)
+			if (((DropStmt *) stmt)->removeType != OBJECT_TABLE &&
+				((DropStmt *) stmt)->removeType != OBJECT_SEQUENCE)
 				return false;
 			foreach_node(List, name, ((DropStmt *) stmt)->objects)
 			{
@@ -1886,30 +1974,124 @@ temp_table_utility(Node *stmt)
 }
 
 /*
- * GLOBAL read_only / super_read_only for a utility statement: whether to run
- * it read-only, so that PostgreSQL refuses what modifies the database,
- * reported as 1290.  Checked per statement, so a COMMIT earlier in the packet
- * cannot open a writable transaction, and for that statement alone, so a USE
- * does not stop a later CREATE TEMPORARY TABLE.  Commands aux_mysql or
- * PostgreSQL issue for a statement already checked (an AUTO_INCREMENT
- * column's sequence), and temporary tables, are exempt.
+ * Check writes directly, without changing XactReadOnly.  A temporary override
+ * can register a SERIALIZABLE snapshot as read-only, be restored by subxact
+ * cleanup while a utility is still running, or survive across a utility's
+ * internal COMMIT.  None of those is a transaction access-mode change.
+ *
+ * DDL tags follow PG18's ClassifyUtilityCommandAsReadOnly (which is static).
+ * Executable containers (EXPLAIN, DO, CALL, EXECUTE) are checked when their
+ * inner commands run.  Maintenance commands keep PG's read-only allowance.
  */
 static bool
 server_read_only_utility(Node *stmt, ProcessUtilityContext context)
 {
-	return internal_utility_depth == 0 && context != PROCESS_UTILITY_SUBCOMMAND &&
-		!IsA(stmt, TransactionStmt) && mys_server_read_only_applies() && !XactReadOnly &&
-		!temp_table_utility(stmt);
+	if (!mys_server_read_only_applies() || internal_utility_depth != 0 ||
+		context == PROCESS_UTILITY_SUBCOMMAND || temp_table_utility(stmt))
+		return false;
+
+	switch (nodeTag(stmt))
+	{
+		case T_AlterCollationStmt:
+		case T_AlterDatabaseRefreshCollStmt:
+		case T_AlterDatabaseSetStmt:
+		case T_AlterDatabaseStmt:
+		case T_AlterDefaultPrivilegesStmt:
+		case T_AlterDomainStmt:
+		case T_AlterEnumStmt:
+		case T_AlterEventTrigStmt:
+		case T_AlterExtensionContentsStmt:
+		case T_AlterExtensionStmt:
+		case T_AlterFdwStmt:
+		case T_AlterForeignServerStmt:
+		case T_AlterFunctionStmt:
+		case T_AlterObjectDependsStmt:
+		case T_AlterObjectSchemaStmt:
+		case T_AlterOpFamilyStmt:
+		case T_AlterOperatorStmt:
+		case T_AlterOwnerStmt:
+		case T_AlterPolicyStmt:
+		case T_AlterPublicationStmt:
+		case T_AlterRoleSetStmt:
+		case T_AlterRoleStmt:
+		case T_AlterSeqStmt:
+		case T_AlterStatsStmt:
+		case T_AlterSubscriptionStmt:
+		case T_AlterTSConfigurationStmt:
+		case T_AlterTSDictionaryStmt:
+		case T_AlterTableMoveAllStmt:
+		case T_AlterTableSpaceOptionsStmt:
+		case T_AlterTableStmt:
+		case T_AlterTypeStmt:
+		case T_AlterUserMappingStmt:
+		case T_CommentStmt:
+		case T_CompositeTypeStmt:
+		case T_CreateAmStmt:
+		case T_CreateCastStmt:
+		case T_CreateConversionStmt:
+		case T_CreateDomainStmt:
+		case T_CreateEnumStmt:
+		case T_CreateEventTrigStmt:
+		case T_CreateExtensionStmt:
+		case T_CreateFdwStmt:
+		case T_CreateForeignServerStmt:
+		case T_CreateForeignTableStmt:
+		case T_CreateFunctionStmt:
+		case T_CreateOpClassStmt:
+		case T_CreateOpFamilyStmt:
+		case T_CreatePLangStmt:
+		case T_CreatePolicyStmt:
+		case T_CreatePublicationStmt:
+		case T_CreateRangeStmt:
+		case T_CreateRoleStmt:
+		case T_CreateSchemaStmt:
+		case T_CreateSeqStmt:
+		case T_CreateStatsStmt:
+		case T_CreateStmt:
+		case T_CreateSubscriptionStmt:
+		case T_CreateTableAsStmt:
+		case T_CreateTableSpaceStmt:
+		case T_CreateTransformStmt:
+		case T_CreateTrigStmt:
+		case T_CreateUserMappingStmt:
+		case T_CreatedbStmt:
+		case T_DefineStmt:
+		case T_DropOwnedStmt:
+		case T_DropRoleStmt:
+		case T_DropStmt:
+		case T_DropSubscriptionStmt:
+		case T_DropTableSpaceStmt:
+		case T_DropUserMappingStmt:
+		case T_DropdbStmt:
+		case T_GrantRoleStmt:
+		case T_GrantStmt:
+		case T_ImportForeignSchemaStmt:
+		case T_IndexStmt:
+		case T_ReassignOwnedStmt:
+		case T_RefreshMatViewStmt:
+		case T_RenameStmt:
+		case T_RuleStmt:
+		case T_SecLabelStmt:
+		case T_TruncateStmt:
+		case T_ViewStmt:
+			return true;
+		case T_CopyStmt:
+			return ((CopyStmt *) stmt)->is_from &&
+				((CopyStmt *) stmt)->relation != NULL &&
+				!is_temp_rangevar(((CopyStmt *) stmt)->relation);
+		default:
+			return false;
+	}
 }
 
 /* GLOBAL read_only for DML, as ExecCheckXactReadOnly(): temp tables stay writable */
 static void
 check_server_read_only_dml(PlannedStmt *stmt)
 {
-	if (stmt->commandType == CMD_SELECT && !stmt->hasModifyingCTE && stmt->rowMarks == NIL)
-		return;					/* SELECT ... FOR UPDATE is refused, as in MySQL */
 	if (!mys_server_read_only_applies())
 		return;
+	if (stmt->commandType == CMD_SELECT && !stmt->hasModifyingCTE && stmt->rowMarks == NIL)
+		return;					/* SELECT ... FOR UPDATE is refused, as in MySQL */
 	foreach_node(RTEPermissionInfo, perminfo, stmt->permInfos)
 	{
 		if ((perminfo->requiredPerms & ~ACL_SELECT) == 0 ||
@@ -1961,23 +2143,34 @@ mys_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	if (mysql)
 	{
 		mys_sync_foreign_key_checks();
-		check_server_read_only_dml(queryDesc->plannedstmt);
+		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+			check_server_read_only_dml(queryDesc->plannedstmt);
 	}
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
-	if (mysql && uses_application_table(queryDesc->plannedstmt->rtable))
+	if (mysql && !(eflags & EXEC_FLAG_EXPLAIN_ONLY) &&
+		uses_application_table(queryDesc->plannedstmt->rtable))
 		mys_statement_touched_tables();
 }
 
 static void
-process_utility(PlannedStmt *pstmt, const char *queryString,
+process_utility_impl(PlannedStmt *pstmt, const char *queryString,
 				bool readOnlyTree, ProcessUtilityContext context,
 				ParamListInfo params, QueryEnvironment *queryEnv,
 				DestReceiver *dest, QueryCompletion *qc)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
+	MysStmtInfo *info = mys_current_stmt_info();
+
+	if (context == PROCESS_UTILITY_TOPLEVEL && IsA(parsetree, TransactionStmt) &&
+		info != NULL && info->txn_control && mys_txn_skip_control(info))
+	{
+		if (qc)
+			SetQueryCompletion(qc, CreateCommandTag(parsetree), 0);
+		return;
+	}
 
 	/* Do not change bare SECURITY LABEL semantics in ordinary PG sessions. */
 	if (IsA(parsetree, SecLabelStmt) &&
@@ -1990,7 +2183,49 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 	}
 
 	if (mys_is_mysql_session())
+	{
 		mys_sync_foreign_key_checks();
+		/* mysqldump issues both DROP TABLE IF EXISTS and DROP VIEW IF EXISTS
+		 * for view placeholders. MySQL treats the other kind as absent.
+		 * Keep the FK DDL fence before relation locks to preserve lock order. */
+		if (IsA(pstmt->utilityStmt, DropStmt))
+		{
+			DropStmt *drop = (DropStmt *) pstmt->utilityStmt;
+
+			if (drop->missing_ok && (drop->removeType == OBJECT_TABLE ||
+									drop->removeType == OBJECT_VIEW))
+			{
+				List *objects = NIL;
+
+				foreach_node(List, name, drop->objects)
+				{
+					RangeVar *rv = makeRangeVarFromNameList(name);
+					Oid relid = RangeVarGetRelid(rv, AccessExclusiveLock, true);
+					char kind = OidIsValid(relid) ? get_rel_relkind(relid) : '\0';
+					bool mismatch = drop->removeType == OBJECT_TABLE ?
+						kind == RELKIND_VIEW :
+						(kind == RELKIND_RELATION || kind == RELKIND_PARTITIONED_TABLE ||
+						 kind == RELKIND_FOREIGN_TABLE);
+
+					if (mismatch)
+						mys_add_warning(1051, psprintf("Unknown table '%s.%s'",
+							get_namespace_name(get_rel_namespace(relid)), rv->relname));
+					else
+						objects = lappend(objects, name);
+				}
+				if (objects == NIL)
+				{
+					if (qc)
+						SetQueryCompletion(qc, CreateCommandTag(pstmt->utilityStmt), 0);
+					return;
+				}
+				pstmt = copyObject(pstmt);
+				((DropStmt *) pstmt->utilityStmt)->objects = copyObject(objects);
+				parsetree = pstmt->utilityStmt;
+				readOnlyTree = false;
+			}
+		}
+	}
 
 	/* keys that ALTER TABLE / CREATE INDEX add get their names now */
 	if (IsA(parsetree, IndexStmt) || IsA(parsetree, AlterTableStmt))
@@ -2020,7 +2255,7 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 					 (int) cmd->subtype == AT_ChangeColumn))
 				{
 					mys_rectify_column_collation((ColumnDef *) cmd->def,
-												mys_table_default_collation(relid));
+												mys_table_default_collation(relid), false);
 					defs = lappend(defs, cmd->def);
 				}
 				/* FOREIGN_KEY_CHECKS=0: MySQL does not check existing rows */
@@ -2036,6 +2271,14 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 		if (OidIsValid(relid))
 		{
 			List	   *dropped = NIL;
+			List	   *replaced = NIL;
+
+			foreach_node(AlterTableCmd, cmd, alter->cmds)
+				if (cmd->subtype == AT_DropColumn || cmd->subtype == AT_SetExpression ||
+					cmd->subtype == AT_DropExpression || (int) cmd->subtype == AT_ModifyColumn ||
+					(int) cmd->subtype == AT_ChangeColumn)
+					replaced = lappend(replaced, cmd->name);
+			gen_policy_table(relid, replaced);
 
 			/* generated columns other generated columns read stay */
 			foreach_node(AlterTableCmd, cmd, alter->cmds)
@@ -2072,6 +2315,11 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 		List	   *defs = NIL;
 
 		foreach_ptr(Node, elt, create->tableElts)
+			if (IsA(elt, TableLikeClause) &&
+				(((TableLikeClause *) elt)->options & CREATE_TABLE_LIKE_GENERATED))
+				gen_policy_table(RangeVarGetRelid(((TableLikeClause *) elt)->relation,
+												AccessShareLock, false), NIL);
+		foreach_ptr(Node, elt, create->tableElts)
 			if (IsA(elt, ColumnDef) && generated_constraint((ColumnDef *) elt))
 				defs = lappend(defs, elt);
 		if (defs != NIL &&
@@ -2101,10 +2349,6 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 
 	/* SQL PREPARE / EXECUTE / DEALLOCATE PREPARE (mys_stmt.c) */
 	if (mys_sql_ps_utility(parsetree, queryString))
-		return;
-
-	if (mys_is_mysql_session() && IsA(parsetree, TruncateStmt) &&
-		truncate_referenced_tables((TruncateStmt *) parsetree))
 		return;
 
 	if (is_table_setup(parsetree))
@@ -2159,7 +2403,8 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 					 IsA(opt->arg, A_Const) && IsA(&((A_Const *) opt->arg)->val, Integer))
 				explicit_read_only = intVal(&((A_Const *) opt->arg)->val) != 0;
 		}
-		level = mys_transaction_start(explicit_read_only, &snapshot, &read_only);
+		level = mys_transaction_start(explicit_read_only, &snapshot, &read_only,
+									  info == NULL || !info->txn_control);
 		if (!isolation)
 			start->options = lappend(start->options,
 									 makeDefElem("transaction_isolation",
@@ -2189,39 +2434,49 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 								params, queryEnv, dest, qc);
 }
 
-/* GLOBAL read_only applies to this utility statement alone */
+/* Pending declarations are maintained inside the read-only utility guard. */
+static void
+process_utility(PlannedStmt *pstmt, const char *queryString,
+				bool readOnlyTree, ProcessUtilityContext context,
+				ParamListInfo params, QueryEnvironment *queryEnv,
+				DestReceiver *dest, QueryCompletion *qc)
+{
+	MysFKUtility *fk = mys_fk_before_utility(&pstmt);
+
+	process_utility_impl(pstmt, queryString, fk ? false : readOnlyTree,
+						 context, params, queryEnv, dest, qc);
+	mys_fk_after_utility(fk);
+}
+
+/* GLOBAL read_only is a statement restriction, never a GUC override. */
 static void
 mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				   bool readOnlyTree, ProcessUtilityContext context,
 				   ParamListInfo params, QueryEnvironment *queryEnv,
 				   DestReceiver *dest, QueryCompletion *qc)
 {
-	bool		saved = XactReadOnly;
 	List	   *generators = NIL;
 
 	if (mys_is_mysql_session())
-		generators = statement_generators(pstmt->utilityStmt);
-	if (!mys_is_mysql_session() || !server_read_only_utility(pstmt->utilityStmt, context))
-		process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
-	else
 	{
-		XactReadOnly = true;
-		PG_TRY();
-		{
-			process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
-		}
-		PG_FINALLY();
-		{
-			XactReadOnly = saved;
-		}
-		PG_END_TRY();
+		if (server_read_only_utility(pstmt->utilityStmt, context))
+			ereport(ERROR,
+					(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+					 errmsg("The MySQL server is running with the --read-only option so it cannot execute this statement")));
+
+		generators = statement_generators(pstmt->utilityStmt);
 	}
+	process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+	if (mys_is_mysql_session() && IsA(pstmt->utilityStmt, CreateStmt) &&
+		((CreateStmt *) pstmt->utilityStmt)->relation->relpersistence == RELPERSISTENCE_TEMP)
+		mys_statement_touched_tables();
 	drop_unused_generators(generators);
 }
 
 void
 mysql_utility_init(void)
 {
+	mys_fk_init();
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = mys_ProcessUtility;
 	prev_ExecutorStart = ExecutorStart_hook;

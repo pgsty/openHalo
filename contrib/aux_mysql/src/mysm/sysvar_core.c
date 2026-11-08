@@ -214,6 +214,19 @@ GlobalSystemVariablesShmemInit(void)
 static bool
 getVersionVariable(const char *varName, char **varValue)
 {
+	/* PostgreSQL WAL is not a MySQL GTID stream. In particular mysqldump
+	 * treats any value other than the exact enum OFF as GTIDs enabled. */
+	if (pg_strcasecmp(varName, "gtid_mode") == 0)
+	{
+		*varValue = pstrdup("OFF");
+		return true;
+	}
+	if (pg_strcasecmp(varName, "gtid_executed") == 0 ||
+		pg_strcasecmp(varName, "gtid_purged") == 0)
+	{
+		*varValue = pstrdup("");
+		return true;
+	}
     if (pg_strcasecmp(varName, "max_allowed_packet") == 0)
     {
         *varValue = psprintf("%d", halo_mysql_max_allowed_packet);
@@ -296,6 +309,7 @@ static int	pending_read_only = -1;		/* -1 none, else 0 / 1 */
 static bool pending_armed = false;	/* the running transaction got them */
 static bool txn_used = false;		/* a statement of it touched a table */
 static bool txn_explicit = false;	/* START TRANSACTION / BEGIN started it */
+static bool txn_started = false;	/* real PG BEGIN, including our lazy BEGIN */
 static bool stmt_touched = false;	/* the running statement touched a table */
 bool		mys_server_read_only = false;	/* GLOBAL read_only applies now */
 
@@ -471,7 +485,7 @@ new_transaction(void)
 {
 	if (pending_armed && (txn_used || stmt_touched || txn_explicit))
 		spend_one_shot();
-	txn_used = stmt_touched = txn_explicit = false;
+	txn_used = stmt_touched = txn_explicit = txn_started = false;
 	pending_armed = have_pending();
 }
 
@@ -480,6 +494,20 @@ void
 mys_statement_touched_tables(void)
 {
 	stmt_touched = true;
+}
+
+/* PG's COM_QUERY implicit block is not a MySQL transaction.  A hidden
+ * BEGIN only becomes visible when an application table has been opened. */
+bool
+mys_transaction_has_block(void)
+{
+	return txn_started && IsTransactionBlock();
+}
+
+bool
+mys_transaction_active(void)
+{
+	return mys_transaction_has_block() && (txn_explicit || txn_used || stmt_touched);
 }
 
 /* default_transaction_isolation / _read_only: what the next transaction gets */
@@ -549,12 +577,14 @@ mys_start_implicit_transaction(bool ddl)
  * in MySQL it is ignored with warning 138 otherwise.
  */
 const char *
-mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only)
+mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only,
+					  bool explicit_begin)
 {
 	const char *level;
 
 	new_transaction();
-	txn_explicit = true;
+	txn_started = true;
+	txn_explicit = explicit_begin;
 	level = next_transaction(read_only);
 	if (explicit_read_only >= 0)
 		*read_only = explicit_read_only == 1;
@@ -626,24 +656,11 @@ mys_foreign_key_checks(void)
 	return !found || !foreign_key_checks_off(var->varConfValue);
 }
 
-/*
- * FOREIGN_KEY_CHECKS=0: as in InnoDB, foreign keys are neither checked nor
- * acted on (no CASCADE).  PostgreSQL fires RI triggers only while
- * session_replication_role is origin or local; like the MySQL variable, any
- * MySQL user may change it.  The GUC is transactional and MySQL session
- * variables are not, so a rolled back SET would leave the two apart: this
- * runs on SET and again before every MySQL statement.
- */
+/* RI trigger and TRUNCATE hooks consult the session variable directly. */
 void
 mys_sync_foreign_key_checks(void)
 {
-	bool		off = !mys_foreign_key_checks();
-
-	if (off != (SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA))
-		(void) set_config_option("session_replication_role",
-								 off ? "replica" : "origin",
-								 PGC_SUSET, PGC_S_SESSION,
-								 GUC_ACTION_SET, true, 0, false);
+	/* Kept for callers across transaction/reset paths; no global GUC mutation. */
 }
 
 static void
@@ -669,6 +686,21 @@ setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar
 
     lowerSystemVarName(varName);
 
+	/* Never advertise successful GTID tracking without a binlog. Accept
+	 * the disabled setting used by migration tools, and reject activation
+	 * because it would make replication/backup positions untrustworthy. */
+	if (strcmp(varName, "gtid_mode") == 0)
+	{
+		if (varValue && (pg_strcasecmp(varValue, "OFF") == 0 ||
+						strcmp(varValue, "0") == 0 || pg_strcasecmp(varValue, "DEFAULT") == 0))
+			return;
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("MySQL GTID replication is unavailable; transactions have no MySQL GTID")));
+	}
+	if (strcmp(varName, "gtid_executed") == 0 || strcmp(varName, "gtid_purged") == 0)
+		ereport(ERROR, (errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
+						errmsg("Variable '%s' is read only", varName)));
+
 	/* SET TRANSACTION without a scope: the next transaction only */
 	if (strncmp(varName, "next_", 5) == 0 &&
 		(is_isolation_var(varName + 5) || is_tx_read_only_var(varName + 5)))
@@ -676,6 +708,10 @@ setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar
 		const char *value = is_isolation_var(varName + 5) ?
 			canonical_isolation(varValue) : canonical_flag(varValue);
 
+		if (mys_transaction_active())
+			ereport(ERROR,
+					(errcode(MYS_ERRCODE_TXN_CHARACTERISTICS),
+					 errmsg("Transaction characteristics can't be changed while a transaction is in progress")));
 		if (value == NULL)
 			elog(ERROR, "Variable '%s' can't be set to the value of '%s'",
 				 varName + 5, varValue ? varValue : "NULL");
@@ -1298,7 +1334,8 @@ resetSessionSystemVariables(void)
 	/* COM_RESET_CONNECTION also drops SET TRANSACTION's one-shot values */
 	pending_isolation[0] = '\0';
 	pending_read_only = -1;
-	pending_armed = txn_used = txn_explicit = stmt_touched = false;
+	pending_armed = txn_used = txn_explicit = txn_started = stmt_touched = false;
+	mys_server_read_only = false;
     if (sessionSystemVars == NULL)
         initSystemVariables();
     old = MemoryContextSwitchTo(TopMemoryContext);

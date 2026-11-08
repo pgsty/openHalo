@@ -16,6 +16,9 @@ OBJS = \
 	src/mysql_parser.o \
 	src/mys_compat.o \
 	src/mys_lock.o \
+	src/mys_dml.o \
+	src/mys_prefix.o \
+	src/mys_fk.o \
 	src/mys_rewrite.o \
 	src/mys_utility.o \
 	src/mys_binary.o \
@@ -46,10 +49,10 @@ OBJS = \
 EXTENSION = aux_mysql
 # extension script = openHalo aux_mysql SQL layer (tools/port_aux_sql.py)
 #                    + hand-written objects (sql/aux_mysql_additions.sql)
-#                    + binary strings of 1.8 (sql/aux_mysql_binary.sql)
+#                    + binary strings and 1.9 corrections
 # 1.7 -> 1.8 update = generated objects (sql/aux_mysql_update18.sql, tools/port_aux_sql.py)
 #                    + sql/aux_mysql_binary.sql
-DATA_built = sql/aux_mysql--1.8.sql sql/aux_mysql--1.7--1.8.sql
+DATA_built = sql/aux_mysql--1.9.sql sql/aux_mysql--1.7--1.8.sql sql/aux_mysql--1.8--1.9.sql
 DATA = sql/aux_mysql--1.5--1.6.sql sql/aux_mysql--1.6--1.7.sql
 PGFILEDESC = "aux_mysql - MySQL compatibility (openHalo)"
 
@@ -81,11 +84,15 @@ endif
 # TLS and RSA key exchange for caching_sha2_password
 SHLIB_LINK += $(filter -lssl -lcrypto, $(LIBS))
 
-sql/aux_mysql--1.8.sql: sql/aux_mysql.sql sql/aux_mysql_additions.sql sql/aux_mysql_binary.sql
+sql/aux_mysql--1.9.sql: sql/aux_mysql.sql sql/aux_mysql_additions.sql sql/aux_mysql_binary.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql
 	@$(MKDIR_P) sql
 	cat $^ > $@
 
 sql/aux_mysql--1.7--1.8.sql: sql/aux_mysql_update18.sql sql/aux_mysql_binary.sql
+	@$(MKDIR_P) sql
+	cat $^ > $@
+
+sql/aux_mysql--1.8--1.9.sql: sql/aux_mysql_update19.sql sql/aux_mysql_fix_generated.sql sql/aux_mysql_fix_fk.sql sql/aux_mysql_fix_show.sql sql/aux_mysql_fix_metadata.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql
 	@$(MKDIR_P) sql
 	cat $^ > $@
 
@@ -109,4 +116,7 @@ src/mysql_parser.o src/mys_stmt.o src/parser/mys_gram.o src/parser/mys_scan.o sr
 
 # PGXS tracks header dependencies only with --enable-depend: the shared
 # structs (MysStmtInfo, mys_yy_extra_type, ...) must not get out of sync between objects.
-$(OBJS): src/halo_mysql.h src/mys_proto.h src/parser/mys_gramparse.h
+$(OBJS): src/halo_mysql.h src/mys_proto.h src/mys_binary.h src/parser/mys_gramparse.h
+src/mys_prefix.o src/mys_rewrite.o src/mys_binary.o src/halo_mysql.o: src/mys_prefix.h
+src/mys_prefix.o: src/mys_general_ci_weights.h
+src/mys_fk.o src/mys_utility.o: src/mys_fk.h

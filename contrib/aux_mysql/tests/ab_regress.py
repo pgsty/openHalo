@@ -196,15 +196,17 @@ def _():
  q(c,'alter table coll_rename rename to renamed');q(c,'alter table renamed add b varchar(10)')
  q(c,"insert into renamed values('a','a')");assert q(c,"select a='A',b='A' from renamed")==((0,0),)
  assert q(p,"select label from pg_seclabel where provider='aux_mysql' and objoid='extra.renamed'::regclass")==[('case_sensitive',)]
-@test('F11 nonbinary invalid UTF8 keeps its bytes as in MySQL; TEXT columns still reject it')
+@test('F11 invalid UTF8 remains binary; strict TEXT rejects it but preserves valid NUL characters')
 def _():
  eq(val(c,b"select '\xff'"),b'\xff')
  q(c,'create table badtext(t text)')
- for lit in (b"'\xff'",b"_binary'\xff'",b"'a\\0b'"):
+ for lit in (b"'\xff'",b"_binary'\xff'"):
   try:q(c,b'insert into badtext values ('+lit+b')')
   except pymysql.MySQLError as e:assert e.args[0]==1366,e
   else:raise AssertionError('not text, stored in TEXT: %r'%lit)
  assert q(c,'select count(*) from badtext')==((0,),)
+ q(c,b"insert into badtext values ('a\\0b')")
+ eq(q(c,'select hex(t),length(t) from badtext'),(('610062',3),))
 @test('B01 binary strings keep every byte: literal forms, escapes, NULs, prepared statements, mysqldump')
 def _():
  import random
@@ -373,12 +375,12 @@ def _():
      " v varchar(4) default 'A', bl varbinary(8) default _binary 'AB')")
  ddl=q(c,'show create table hexdef')[0][1]
  eq(ddl,q(c,'show create table hexplain')[0][1].replace('`hexplain`','`hexdef`',1))
- q(c,'insert into hexdef values ()');eq(q(c,'select b, i, hex(bt), v, bl from hexdef'),((b'\0',16,'1','A',b'AB'),))
- # (a replayed BLOB / BINARY default is wrong for plain literals too: README Known gaps)
+ q(c,'insert into hexdef values ()');eq(q(c,'select b, i, hex(bt), v, bl from hexdef'),((b'\0'*4,16,'1','A',b'AB'),))
+ # Replayed BINARY and VARBINARY defaults must keep their exact bytes.
  q(c,ddl.replace('`hexdef`','`hexdef2`',1))
- q(c,'insert into hexdef2 values ()');eq(q(c,'select i, hex(bt), v from hexdef2'),((16,'1','A'),))
+ q(c,'insert into hexdef2 values ()');eq(q(c,'select b, i, hex(bt), v, bl from hexdef2'),((b'\0'*4,16,'1','A',b'AB'),))
  q(c,'alter table hexdef alter column i set default 0x20');q(c,'insert into hexdef (b) values (0x01)')
- eq(val(c,"select i from hexdef where b = 0x01"),32)
+ eq(val(c,"select i from hexdef where b = 0x01000000"),32)
  # CREATE TABLE ... AS: a literal column is a binary string
  q(c,"create table hexctas as select 0x41 as a, b'101' as b, X'' as c")
  eq(q(c,'select a, b, c from hexctas'),((b'A',b'\x05',b''),))
@@ -681,16 +683,19 @@ def _():
   try: f()
   except pymysql.err.MySQLError as e: return e.args[0]
  q(c,'create table pk_t (id int primary key, a varchar(255), b text, c varchar(2000), key ka (a(191)), key kb (b(100)), key kbc (id, b(50)), unique key ua (a(10)))')
- assert any('whole column' in str(w[2]) for w in q(c,'show warnings')), q(c,'show warnings')
+ assert not any('whole column' in str(w[2]) for w in q(c,'show warnings'))
  q(c,'alter table pk_t add column d text, add key kd (d(20))');q(c,'create index kc on pk_t (c(30))')
- defs=dict(q(p,"select mysql.index_key_name(indexrelid), regexp_replace(pg_get_indexdef(indexrelid), '.* USING ', '') from pg_index where indrelid='abfix.pk_t'::regclass"))
- eq((defs['ka'],defs['kb'],defs['kc'],defs['kd'],defs['ua']),('btree (a)','hash (b)','hash (c)','hash (d)','btree (a)'))
- assert '"left"(b, 50)' in defs['kbc'], defs['kbc']
+ parts=[tuple(r[2:5])+(r[7],) for r in q(c,'show index from pk_t')]
+ for part in [('ka',1,'a',191),('kb',1,'b',100),('kc',1,'c',30),('kd',1,'d',20),
+              ('ua',1,'a',10),('kbc',1,'id',None),('kbc',2,'b',50)]:
+  assert part in parts,(part,parts)
  big=''.join(random.choice(string.ascii_letters) for _ in range(20000))
  q(c,'insert into pk_t values (1, %s, %s, %s, %s)',('x',big,big[:2000],big))
  eq(val(c,'select id from pk_t where b = %s and c = %s and d = %s',(big,big[:2000],big)),1)
  keys=[l.strip().rstrip(',') for l in q(c,'show create table pk_t')[0][1].split('\n') if 'KEY' in l]
  assert 'KEY `kbc` (`id`,`b`(50))' in keys, keys
+ q(c,"insert into pk_t(id,a) values(2,'abcdefghij1')")
+ eq(errno(lambda:q(c,"insert into pk_t(id,a) values(3,'abcdefghij2')")),1062)
  # a UNIQUE prefix of a long column: same prefix is a duplicate, ON DUPLICATE KEY / REPLACE find the row
  q(c,'create table pk_u (b text, v int, unique key pk_ub (b(20)))');q(c,'insert into pk_u values (%s, 1)',(big,))
  eq(errno(lambda:q(c,'insert into pk_u values (%s, 2)',(big[:20]+'x',))),1062)
@@ -699,13 +704,13 @@ def _():
  q(c,'replace into pk_u values (%s, 5)',(big[:20]+'z',))
  eq(tuple(q(c,'select v, length(b) from pk_u')),((5,21),))
  assert ('pk_ub',1,'b',20) in [tuple(r[2:5])+(r[7],) for r in q(c,'show index from pk_u')]
- eq({r[10] for r in q(c,'show index from pk_u')},{'BTREE','HASH'})   # MySQL's spelling
- # MODIFY / CHANGE and a key on the new type in one ALTER; a later part is capped
+ eq({r[10] for r in q(c,'show index from pk_u')},{'BTREE'})
+ # MODIFY / CHANGE and a key on the new type in one ALTER; no prefix is capped
  q(c,'create table pk_m (id int primary key, c varchar(100))')
  q(c,'alter table pk_m modify c text, add key pk_mc (c(100))');q(c,'insert into pk_m values (1, %s)',(big,))
  q(c,'alter table pk_m change c d text, add unique key pk_md (d(30))')
  q(c,'create index pk_mi on pk_m (id, d(700))');q(c,'insert into pk_m values (2, %s)',(big[1:],))
- # ASC / DESC on a part that becomes a hash index; a lookup index never takes a key's name
+ # Long compound binary prefixes retain every declared key part.
  q(c,'create table pk_h (b text, e blob, key pk_hb (b(20) desc), unique key pk_hu (e(3000)), key pk_h_e_idx (e(30)))')
  bigb=big.encode()
  q(c,'insert into pk_h values (%s, %s)',(big,bigb));eq(errno(lambda:q(c,'insert into pk_h values (%s, %s)',('x',bigb[:3000]+b'y'))),1062)
