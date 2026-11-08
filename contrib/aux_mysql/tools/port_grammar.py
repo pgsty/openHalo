@@ -728,5 +728,57 @@ rep(s[start:end], (
     '\t\t\t\t\t$$ = NULL;\n'
     '\t\t\t\t}\n'))
 
+# ---------------------------------------------------------------------------
+# DECIMAL
+# ---------------------------------------------------------------------------
+# MySQL's DECIMAL / DEC / NUMERIC column without a precision is DECIMAL(10,0);
+# PostgreSQL's bare numeric is unbounded, so such a column kept 1.2345 where
+# MySQL stores 1.  A precision of 0 means 10 (also in CAST, where PostgreSQL
+# rejects numeric(0)).  CAST(x AS DECIMAL) without one stays unbounded: MySQL
+# clamps an out-of-range value there with a warning, an error would be new.
+rep('static Node *makeIntConst(int val, int location);\n',
+    'static Node *makeIntConst(int val, int location);\n'
+    'static TypeName *makeMysqlDecimalType(List *mods, int location, bool column);\n')
+rep(' opt_type_modifiers opt_field_option\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\t$$ = SystemTypeName("numeric");\n'
+    '\t\t\t\t\t$$->typmods = $2;\n'
+    '\t\t\t\t\t$$->location = @1;\n',
+    ' opt_type_modifiers opt_field_option\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\t$$ = makeMysqlDecimalType($2, @1, true);\n', 3)
+rep('\t\t\t| DECIMAL_P opt_type_modifiers\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\t$$ = SystemTypeName("numeric");\n'
+    '\t\t\t\t\t$$->typmods = $2;\n'
+    '\t\t\t\t\t$$->location = @1;\n',
+    '\t\t\t| DECIMAL_P opt_type_modifiers\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\t$$ = makeMysqlDecimalType($2, @1, false);\n')
+s = s.rstrip('\n') + '\n' + (
+    '\n'
+    '/*\n'
+    ' * MySQL DECIMAL type: a column without a precision is DECIMAL(10,0), and\n'
+    ' * a precision of 0 means 10.\n'
+    ' */\n'
+    'static TypeName *\n'
+    'makeMysqlDecimalType(List *mods, int location, bool column)\n'
+    '{\n'
+    '\tTypeName   *result = SystemTypeName("numeric");\n'
+    '\n'
+    '\tif (mods == NIL && column)\n'
+    '\t\tmods = list_make1(makeIntConst(10, location));\n'
+    '\telse if (mods != NIL && IsA(linitial(mods), A_Const) &&\n'
+    '\t\t\t IsA(&((A_Const *) linitial(mods))->val, Integer) &&\n'
+    '\t\t\t intVal(&((A_Const *) linitial(mods))->val) == 0)\n'
+    '\t{\n'
+    '\t\tmods = list_copy(mods);\n'
+    '\t\tlinitial(mods) = makeIntConst(10, location);\n'
+    '\t}\n'
+    '\tresult->typmods = mods;\n'
+    '\tresult->location = location;\n'
+    '\treturn result;\n'
+    '}\n')
+
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 print("ported grammar written to", dst)

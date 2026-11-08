@@ -198,6 +198,7 @@ static Node *makeTypeCast(Node *arg, TypeName *typename, int location);
 static Node *makeStringConst(char *str, int location);
 static Node *makeStringConstCast(char *str, int location, TypeName *typename);
 static Node *makeIntConst(int val, int location);
+static TypeName *makeMysqlDecimalType(List *mods, int location, bool column);
 static Node *makeFloatConst(char *str, int location);
 static Node *makeBitStringConst(char *str, int location);
 static Node *makeByteaStringConst(char *str, int location);
@@ -18110,21 +18111,15 @@ Numeric:
 				}
 			| DECIMAL_P opt_type_modifiers opt_field_option
 				{
-					$$ = SystemTypeName("numeric");
-					$$->typmods = $2;
-					$$->location = @1;
+					$$ = makeMysqlDecimalType($2, @1, true);
 				}
 			| DEC opt_type_modifiers opt_field_option
 				{
-					$$ = SystemTypeName("numeric");
-					$$->typmods = $2;
-					$$->location = @1;
+					$$ = makeMysqlDecimalType($2, @1, true);
 				}
 			| NUMERIC opt_type_modifiers opt_field_option
 				{
-					$$ = SystemTypeName("numeric");
-					$$->typmods = $2;
-					$$->location = @1;
+					$$ = makeMysqlDecimalType($2, @1, true);
 				}
 			| BOOL_P
 				{
@@ -18231,9 +18226,7 @@ MySQLConvertType:
                 }
 			| DECIMAL_P opt_type_modifiers
 				{
-					$$ = SystemTypeName("numeric");
-					$$->typmods = $2;
-					$$->location = @1;
+					$$ = makeMysqlDecimalType($2, @1, false);
 				}
             | ConstDatetime
                 {
@@ -24358,4 +24351,27 @@ makeLimitedModifyQual(RangeVar *relation, Node *whereClause,
 	link->subselect = (Node *) sub;
 	link->location = location;
 	return (Node *) link;
+}
+
+/*
+ * MySQL DECIMAL type: a column without a precision is DECIMAL(10,0), and
+ * a precision of 0 means 10.
+ */
+static TypeName *
+makeMysqlDecimalType(List *mods, int location, bool column)
+{
+	TypeName   *result = SystemTypeName("numeric");
+
+	if (mods == NIL && column)
+		mods = list_make1(makeIntConst(10, location));
+	else if (mods != NIL && IsA(linitial(mods), A_Const) &&
+			 IsA(&((A_Const *) linitial(mods))->val, Integer) &&
+			 intVal(&((A_Const *) linitial(mods))->val) == 0)
+	{
+		mods = list_copy(mods);
+		linitial(mods) = makeIntConst(10, location);
+	}
+	result->typmods = mods;
+	result->location = location;
+	return result;
 }

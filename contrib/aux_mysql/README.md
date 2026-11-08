@@ -1,6 +1,6 @@
 # aux_mysql
 
-openHalo's MySQL Supplementary Extension (version 1.6, same name and settings as in openHalo 1.0) on
+openHalo's MySQL Supplementary Extension (version 1.7, same name and settings as in openHalo 1.0) on
 PostgreSQL 18. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
 aux_mysql held the SQL layer; here aux_mysql carries all of it, on top of the kernel's generic protocol
 extension hooks and its atomic sequence-advancement API. Other kernels need both APIs and separate validation. It must be
@@ -38,7 +38,10 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   mode), case-insensitive string columns by default (`*_ci`; `*_bin` and a non-`_ci` table `COLLATE=` stay
   case-sensitive), lenient conversions when `sql_mode` is not strict, `ON UPDATE CURRENT_TIMESTAMP`,
   AUTO_INCREMENT (identity columns: explicit values advance the counter, `ALTER TABLE ... AUTO_INCREMENT`,
-  MODIFY / CHANGE keeping, adding or dropping it).
+  MODIFY / CHANGE keeping, adding or dropping it). `DECIMAL` without a precision is `DECIMAL(10,0)`;
+  `SHOW COLUMNS`, `SHOW CREATE TABLE` and `information_schema.COLUMNS` report `decimal(p,s)`. A numeric
+  MySQL cannot type (no typmod, from expressions, views or PostgreSQL DDL) is reported as `decimal(65,30)`
+  with a warning: replayed, it keeps values of up to 35 integer and 30 fractional digits.
 - **Foreign keys**: enforced with their ON DELETE / ON UPDATE actions, as in InnoDB.
   `FOREIGN_KEY_CHECKS=0` turns off both checking and actions for the session, as in MySQL: it sets
   `session_replication_role = replica` (aux_mysql's own AUTO_INCREMENT and ON UPDATE triggers keep
@@ -79,7 +82,8 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
     END LOOP; END $$;
   ```
   After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
-  AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0`.
+  AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0` (1.6)
+  and SHOW / information_schema report DECIMAL precision and scale (1.7).
   With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
   table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
   fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION

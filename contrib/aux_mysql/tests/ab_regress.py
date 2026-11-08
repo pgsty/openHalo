@@ -270,6 +270,30 @@ def _():
   eq(val(c,'select v from cs_t'),before);eq(val(c,'select v from cs_t'),before);q(c,'commit')
  rejects(c,'start transaction with foo snapshot')
  o.close()
+@test('X02 DECIMAL(p,s) survives a SHOW CREATE TABLE replay; unbounded numeric does not break metadata')
+def _():
+ from decimal import Decimal
+ q(c,'create table dec_src (n decimal(8,2), b decimal)')
+ ddl=q(c,'show create table dec_src')[0][1]
+ assert 'decimal(8,2)' in ddl and 'decimal(10,0)' in ddl, ddl
+ q(c,ddl.replace('dec_src','dec_copy',1))
+ for t in ('dec_src','dec_copy'):
+  q(c,'insert into %s values (1.2345, 1.5)'%t)
+  eq(q(c,'select n, b from %s'%t),((Decimal('1.23'),Decimal('2')),))
+  rejects(c,'insert into %s (n) values (1234567.89)'%t)
+ q(p,'create table abfix.dec_pg (u numeric, s numeric(5,-2))')
+ q(c,'create view dec_sum as select sum(n) as total from dec_src')
+ eq({r[1] for r in q(c,'show full columns from dec_src')},{'decimal(8,2)','decimal(10,0)'})
+ # numeric MySQL cannot type: decimal(65,30), with a warning, and values in its range replay
+ q(p,'insert into abfix.dec_pg values (1.5, 12300)')
+ ddl=q(c,'show create table dec_pg')[0][1]
+ assert ddl.count('decimal(65,30)')==2, ddl
+ assert any('decimal(65,30)' in str(w[2]) for w in q(c,'show warnings')), q(c,'show warnings')
+ q(c,ddl.replace('dec_pg','dec_pg_copy',1));q(c,'insert into dec_pg_copy select * from dec_pg')
+ eq(q(c,'select u, s from dec_pg_copy'),((Decimal('1.5'),Decimal('12300')),))
+ for t in ('dec_pg','dec_sum'):
+  eq({r[0] for r in q(c,"select column_type from information_schema.columns where table_schema=database() and table_name='%s'"%t)},{'decimal(65,30)'})
+
 @test('X03 FOREIGN_KEY_CHECKS=0 keeps MySQL session semantics and aux_mysql triggers')
 def _():
  import datetime

@@ -7,3 +7,4 @@
 # built from sql/aux_mysql.sql + sql/aux_mysql_additions.sql
 /sql/aux_mysql--1.5.sql
 /sql/aux_mysql--1.6.sql
+/sql/aux_mysql--1.7.sql

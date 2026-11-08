@@ -755,6 +755,36 @@ mys_lenient_varchar(PG_FUNCTION_ARGS)
 }
 
 /* Catalog-derived metadata shared by SHOW COLUMNS and SHOW CREATE TABLE. */
+/*
+ * mysql.decimal_column_type(typmod): the MySQL column type of a numeric.
+ * One MySQL cannot type (no typmod, scale < 0 or > 30 or above the
+ * precision, precision > 65) is shown as DECIMAL(65,30), MySQL's widest,
+ * with a warning: values with more than 35 integer or 30 fractional digits
+ * would not survive a replay.
+ */
+PG_FUNCTION_INFO_V1(mys_decimal_column_type);
+
+Datum
+mys_decimal_column_type(PG_FUNCTION_ARGS)
+{
+	int32		typmod = PG_GETARG_INT32(0);
+	int			precision = -1;
+	int			scale = -1;
+
+	if (typmod >= (int32) VARHDRSZ)
+	{
+		precision = ((typmod - VARHDRSZ) >> 16) & 0xffff;
+		scale = ((((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024);
+	}
+	if (precision < 1 || precision > 65 || scale < 0 || scale > 30 || scale > precision)
+	{
+		mys_add_warning(1105, "numeric column without a MySQL precision shown as decimal(65,30)");
+		precision = 65;
+		scale = 30;
+	}
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("decimal(%d,%d)", precision, scale)));
+}
+
 PG_FUNCTION_INFO_V1(mys_column_extra);
 Datum
 mys_column_extra(PG_FUNCTION_ARGS)
