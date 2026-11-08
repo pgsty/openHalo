@@ -53,6 +53,10 @@ extern void mys_statement_done(bool end, bool next_ddl);
 extern void mys_statement_touched_tables(void);
 extern bool mys_server_read_only;
 extern bool mys_server_read_only_applies(void);
+extern void mys_flush_rewrite_warnings(void);
+extern void mys_discard_rewrite_warnings(void);
+extern bool mys_index_prefix(Node *expr, AttrNumber *attnum, int *length, bool *bytes,
+							 bool *digest);
 
 /* how a MySQL statement interacts with transactions (mys_txn.c) */
 typedef enum MysTxnKind

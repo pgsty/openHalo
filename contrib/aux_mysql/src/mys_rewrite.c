@@ -39,6 +39,7 @@
 #include "parser/parser.h"
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -480,6 +481,289 @@ make_identity_column(ColumnDef *col, Constraint *c)
 	return NULL;
 }
 
+static Node *int_const(int32 v);
+
+/*
+ * Warnings found while rewriting: the diagnostics area is reset after the
+ * packet is rewritten (it depends on whether it is SHOW WARNINGS), so they
+ * are kept here until mys_flush_rewrite_warnings().
+ */
+static List *rewrite_warnings = NIL;
+
+static void
+add_rewrite_warning(const char *message)
+{
+	rewrite_warnings = lappend(rewrite_warnings, pstrdup(message));
+}
+
+void
+mys_flush_rewrite_warnings(void)
+{
+	foreach_ptr(char, message, rewrite_warnings)
+		mys_add_warning(1105, message);
+	rewrite_warnings = NIL;
+}
+
+/* a statement rewritten only to describe it (COM_STMT_PREPARE) */
+void
+mys_discard_rewrite_warnings(void)
+{
+	rewrite_warnings = NIL;
+}
+
+/* type of a column defined in this statement, or else in the catalog */
+static bool
+key_column_type(const char *name, List *coldefs, Oid relid, Oid *typid, int32 *typmod)
+{
+	foreach_ptr(Node, n, coldefs)
+	{
+		ColumnDef  *col = (ColumnDef *) n;
+
+		if (IsA(n, ColumnDef) && col->typeName && strcmp(col->colname, name) == 0)
+		{
+			Type		t = LookupTypeName(NULL, col->typeName, typmod, true);
+
+			if (t == NULL)
+				return false;
+			*typid = typeTypeId(t);
+			ReleaseSysCache(t);
+			return true;
+		}
+	}
+	if (OidIsValid(relid))
+	{
+		AttrNumber	attnum = get_attnum(relid, name);
+		Oid			collid;
+
+		if (attnum != InvalidAttrNumber)
+		{
+			get_atttypetypmodcoll(relid, attnum, typid, typmod, &collid);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * pg_catalog.left(col, n) / pg_catalog.substr(col, 1, n): the prefix of a
+ * column; digest: its pg_catalog.md5(), for UNIQUE BLOB prefixes that may not
+ * fit a btree entry together (MySQL allows 3072 bytes).
+ */
+static Node *
+prefix_expr(const char *column, bool bytes, int length, bool digest)
+{
+	ColumnRef  *ref = makeNode(ColumnRef);
+	Node	   *prefix;
+
+	ref->fields = list_make1(makeString(pstrdup(column)));
+	ref->location = -1;
+	prefix = (Node *) makeFuncCall(list_make2(makeString("pg_catalog"),
+											  makeString(bytes ? "substr" : "left")),
+								   bytes ? list_make3(ref, int_const(1), int_const(length)) :
+								   list_make2(ref, int_const(length)),
+								   COERCE_EXPLICIT_CALL, -1);
+	if (!digest)
+		return prefix;
+	return (Node *) makeFuncCall(list_make2(makeString("pg_catalog"), makeString("md5")),
+								 list_make1(prefix), COERCE_EXPLICIT_CALL, -1);
+}
+
+/*
+ * MySQL prefix key parts, col(n), marked by the grammar.  A btree entry holds
+ * ~2.7kB, so a key must not index whole values of a "long" column (TEXT,
+ * BLOB, VARCHAR / CHAR over 600 characters), or a long value would fail an
+ * INSERT that MySQL accepts:
+ *
+ * - A non-unique key starting with a long column, prefixed or (TEXT / BLOB,
+ *   where MySQL wants a prefix) not, becomes a hash index on that column: it
+ *   serves = lookups on it, as the key did.  Other long parts become
+ *   left(col, n), the n of all of them together at most 600 characters.
+ * - A UNIQUE key enforces the prefix of a long column as MySQL does, on
+ *   left(col, n) (ON DUPLICATE KEY infers it as its arbiter); when the
+ *   prefixes of a key may exceed 2000 bytes together, its BLOB prefixes are
+ *   compared by MD5 (text keeps its collation's comparison).  When the key starts with one, the
+ *   column is returned: the caller adds a hash index on it for = lookups,
+ *   which left(col, n) cannot serve.
+ * - Values of other columns fit an entry, and they are indexed whole: lookups
+ *   and foreign keys keep using the key, but a UNIQUE or PRIMARY KEY prefix
+ *   shorter than the column then accepts rows that differ only after it; a
+ *   warning says so.  A PRIMARY KEY, which cannot have expressions, is
+ *   always indexed whole.
+ */
+static char *
+prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
+				 Oid relid, List *coldefs)
+{
+	int			nparts = list_length(*params);
+	int		   *length = palloc(sizeof(int) * Max(nparts, 1));
+	Oid		   *base = palloc0(sizeof(Oid) * Max(nparts, 1));
+	bool	   *is_long = palloc0(sizeof(bool) * Max(nparts, 1));
+	int			ncut = 0;
+	int			unique_bytes = 0;
+	int			i = 0;
+	char	   *lookup = NULL;
+
+	foreach_node(IndexElem, ie, *params)
+	{
+		DefElem    *prefix = NULL;
+		Oid			typid;
+		int32		typmod = -1;
+
+		length[i] = -1;
+		foreach_node(DefElem, opt, ie->opclassopts)
+			if (strcmp(opt->defname, "mysql_prefix") == 0)
+				prefix = opt;
+		if (prefix)
+		{
+			ie->opclassopts = list_delete_ptr(ie->opclassopts, prefix);
+			length[i] = intVal(prefix->arg);
+		}
+		if (ie->name && key_column_type(ie->name, coldefs, relid, &typid, &typmod))
+		{
+			base[i] = getBaseTypeAndTypmod(typid, &typmod);
+			is_long[i] = base[i] == TEXTOID || base[i] == BYTEAOID ||
+				((base[i] == VARCHAROID || base[i] == BPCHAROID) &&
+				 (typmod < (int32) VARHDRSZ || typmod - VARHDRSZ > 600));
+			/* a prefix as long as the column is the whole column */
+			if (typmod >= (int32) VARHDRSZ && length[i] >= typmod - VARHDRSZ)
+				length[i] = -1;
+		}
+		if (is_long[i] && (length[i] > 0 ||
+						   (!unique && (base[i] == TEXTOID || base[i] == BYTEAOID))))
+			ncut++;
+		/* the most bytes this key's prefixes take (UTF-8: 4 per character) */
+		if (unique && is_long[i] && length[i] > 0)
+			unique_bytes += base[i] == BYTEAOID ? length[i] : length[i] * 4;
+		i++;
+	}
+	if (access_method && strcmp(*access_method, DEFAULT_INDEX_TYPE) != 0)
+		return NULL;
+
+	i = 0;
+	foreach_node(IndexElem, ie, *params)
+	{
+		bool		cut = is_long[i] && (length[i] > 0 ||
+										 (!unique && (base[i] == TEXTOID || base[i] == BYTEAOID)));
+		int			n = length[i];
+
+		i++;
+		if (!cut || (unique && primary))
+		{
+			if (unique && n > 0)
+				add_rewrite_warning(psprintf("prefix of unique key part \"%s\" is enforced on the whole column",
+											 ie->name));
+			continue;
+		}
+		if (!unique && i == 1 && access_method)
+		{
+			/* the key's first part: a hash index on that column alone (no ASC / DESC) */
+			ie->ordering = SORTBY_DEFAULT;
+			ie->nulls_ordering = SORTBY_NULLS_DEFAULT;
+			ie->opclass = NIL;
+			*params = list_make1(ie);
+			*access_method = "hash";
+			return NULL;
+		}
+		if (!unique)
+			n = Min(n > 0 ? n : 600, Max(600 / ncut, 1));
+		else if (i == 1)
+			lookup = pstrdup(ie->name);
+		ie->expr = prefix_expr(ie->name, base[i - 1] == BYTEAOID, n,
+							   unique && base[i - 1] == BYTEAOID && unique_bytes > 2000);
+		ie->indexcolname = ie->name;
+		ie->name = NULL;
+	}
+	return lookup;
+}
+
+/*
+ * A key part prefix_key_parts() made: pg_catalog.left(col, n) or
+ * pg_catalog.substr(col, 1, n) of an index expression, or its md5()
+ * (*digest).
+ */
+bool
+mys_index_prefix(Node *expr, AttrNumber *attnum, int *length, bool *bytes, bool *digest)
+{
+	FuncExpr   *f = (FuncExpr *) expr;
+	Node	   *arg;
+	Const	   *n;
+
+	*digest = false;
+	if (expr != NULL && IsA(expr, FuncExpr) &&
+		(f->funcid == F_MD5_TEXT || f->funcid == F_MD5_BYTEA) && list_length(f->args) == 1)
+	{
+		*digest = true;
+		f = (FuncExpr *) linitial(f->args);
+		expr = (Node *) f;
+	}
+	if (expr == NULL || !IsA(expr, FuncExpr) ||
+		!((f->funcid == F_LEFT && list_length(f->args) == 2) ||
+		  (f->funcid == F_SUBSTR_BYTEA_INT4_INT4 && list_length(f->args) == 3)))
+		return false;
+	arg = linitial(f->args);
+	while (IsA(arg, RelabelType))
+		arg = (Node *) ((RelabelType *) arg)->arg;
+	n = (Const *) llast(f->args);
+	if (!IsA(arg, Var) || !IsA(n, Const) || n->consttype != INT4OID || n->constisnull)
+		return false;
+	if (f->funcid == F_SUBSTR_BYTEA_INT4_INT4)
+	{
+		Const	   *from = (Const *) lsecond(f->args);
+
+		if (!IsA(from, Const) || from->consttype != INT4OID || from->constisnull ||
+			DatumGetInt32(from->constvalue) != 1)
+			return false;
+	}
+	*attnum = ((Var *) arg)->varattno;
+	*length = DatumGetInt32(n->constvalue);
+	*bytes = f->funcid == F_SUBSTR_BYTEA_INT4_INT4;
+	return true;
+}
+
+/*
+ * Lookup indexes go after the statement's other keys, so that they cannot
+ * take the name of one (PostgreSQL picks a free name), and are left out when
+ * a non-unique key of the statement starts with the same column.
+ */
+static List *
+add_lookup_indexes(List *indexes, List *lookups)
+{
+	foreach_node(IndexStmt, lookup, lookups)
+	{
+		char	   *column = linitial_node(IndexElem, lookup->indexParams)->name;
+		bool		served = false;
+
+		foreach_ptr(Node, n, indexes)
+		{
+			IndexStmt  *idx = (IndexStmt *) n;
+
+			if (IsA(n, IndexStmt) && !idx->unique && idx->indexParams != NIL &&
+				linitial_node(IndexElem, idx->indexParams)->name &&
+				strcmp(linitial_node(IndexElem, idx->indexParams)->name, column) == 0)
+				served = true;
+		}
+		if (!served)
+			indexes = lappend(indexes, lookup);
+	}
+	return indexes;
+}
+
+/* a hash index on a column, for = lookups that a prefix key cannot serve */
+static Node *
+make_lookup_index(RangeVar *rel, char *column)
+{
+	IndexStmt  *idx = makeNode(IndexStmt);
+	IndexElem  *ie = makeNode(IndexElem);
+
+	ie->name = column;
+	ie->ordering = SORTBY_DEFAULT;
+	ie->nulls_ordering = SORTBY_NULLS_DEFAULT;
+	idx->relation = copyObject(rel);
+	idx->accessMethod = "hash";
+	idx->indexParams = list_make1(ie);
+	return (Node *) idx;
+}
+
 static Node *
 make_index_stmt(RangeVar *rel, Constraint *c)
 {
@@ -539,11 +823,26 @@ normalize_index_constraint(Constraint *c, RangeVar *rel, List **indexes)
 	return true;
 }
 
+/* columns an ALTER TABLE adds or redefines, for keys defined in the same statement */
+static List *
+alter_added_columns(AlterTableStmt *stmt)
+{
+	List	   *cols = NIL;
+
+	foreach_node(AlterTableCmd, cmd, stmt->cmds)
+		if ((cmd->subtype == AT_AddColumn || (int) cmd->subtype == AT_ModifyColumn ||
+			 (int) cmd->subtype == AT_ChangeColumn) &&
+			cmd->def && IsA(cmd->def, ColumnDef) && ((ColumnDef *) cmd->def)->colname)
+			cols = lappend(cols, cmd->def);
+	return cols;
+}
+
 static List *
 rewrite_create_stmt(CreateStmt *stmt)
 {
 	List	   *elts = NIL;
 	List	   *indexes = NIL;
+	List	   *lookups = NIL;
 	List	   *comments = NIL;
 	List	   *options = NIL;
 	List	   *on_update = NIL;
@@ -612,12 +911,25 @@ rewrite_create_stmt(CreateStmt *stmt)
 			indexes = lappend(indexes, make_index_stmt(stmt->relation, (Constraint *) elt));
 		else if (IsA(elt, Constraint))
 		{
-			if (normalize_index_constraint((Constraint *) elt, stmt->relation, &indexes))
+			Constraint *c = (Constraint *) elt;
+			char	   *lookup = NULL;
+
+			if (c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE)
+				lookup = prefix_key_parts(&c->keys, true, c->contype == CONSTR_PRIMARY, NULL,
+										  InvalidOid, stmt->tableElts);
+			if (normalize_index_constraint(c, stmt->relation, &indexes))
 				elts = lappend(elts, elt);
+			if (lookup)
+				lookups = lappend(lookups, make_lookup_index(stmt->relation, lookup));
 		}
 		else
 			elts = lappend(elts, elt);
 	}
+	foreach_ptr(Node, n, indexes)
+		if (IsA(n, IndexStmt) && !((IndexStmt *) n)->unique)
+			prefix_key_parts(&((IndexStmt *) n)->indexParams, false, false,
+							 &((IndexStmt *) n)->accessMethod, InvalidOid, stmt->tableElts);
+	indexes = add_lookup_indexes(indexes, lookups);
 	stmt->tableElts = elts;
 
 	/* MySQL table options */
@@ -672,6 +984,7 @@ rewrite_alter_table(AlterTableStmt *stmt)
 {
 	List	   *cmds = NIL;
 	List	   *indexes = NIL;
+	List	   *lookups = NIL;
 	List	   *on_update_add = NIL;
 	List	   *on_update_drop = NIL;
 	bool		setup = false;
@@ -748,18 +1061,31 @@ rewrite_alter_table(AlterTableStmt *stmt)
 		else if (cmd->subtype == AT_AddConstraint && cmd->def && IsA(cmd->def, Constraint))
 		{
 			Constraint *c = (Constraint *) cmd->def;
+			char	   *lookup = NULL;
 
 			if (c->contype == CONSTR_KEY)
 			{
-				indexes = lappend(indexes, make_index_stmt(stmt->relation, c));
+				IndexStmt  *idx = (IndexStmt *) make_index_stmt(stmt->relation, c);
+
+				prefix_key_parts(&idx->indexParams, false, false, &idx->accessMethod,
+								 RangeVarGetRelid(stmt->relation, NoLock, true),
+								 alter_added_columns(stmt));
+				indexes = lappend(indexes, idx);
 				continue;
 			}
+			if (c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE)
+				lookup = prefix_key_parts(&c->keys, true, c->contype == CONSTR_PRIMARY, NULL,
+										  RangeVarGetRelid(stmt->relation, NoLock, true),
+										  alter_added_columns(stmt));
+			if (lookup)
+				lookups = lappend(lookups, make_lookup_index(stmt->relation, lookup));
 			if (!normalize_index_constraint(c, stmt->relation, &indexes))
 				continue;
 		}
 		cmds = lappend(cmds, cmd);
 	}
 	stmt->cmds = cmds;
+	indexes = add_lookup_indexes(indexes, lookups);
 	if (setup)
 		indexes = lappend(indexes, make_table_setup(stmt->relation, on_update_add, on_update_drop));
 	return indexes;
@@ -1001,7 +1327,8 @@ name_in_list(List *names, const char *name)
 /*
  * Pick the unique index MySQL would most likely hit: the primary key if all
  * its columns are supplied, else the first unique index whose columns are
- * all supplied, else the primary key.
+ * all supplied, else the primary key.  A prefix key part counts as its
+ * column; other expressions make an index unusable.
  */
 static Oid
 choose_arbiter_index(Relation rel, List *insert_cols)
@@ -1019,11 +1346,22 @@ choose_arbiter_index(Relation rel, List *insert_cols)
 		bool		usable = form->indisunique && form->indimmediate &&
 			heap_attisnull(idx->rd_indextuple, Anum_pg_index_indpred, NULL);
 		bool		all = usable;
+		List	   *exprs = usable ? RelationGetIndexExpressions(idx) : NIL;
+		ListCell   *expr = list_head(exprs);
 
 		for (int i = 0; usable && i < form->indnkeyatts; i++)
 		{
 			AttrNumber	attnum = form->indkey.values[i];
+			int			length;
+			bool		bytes;
+			bool		digest;
 
+			if (attnum == 0 && expr != NULL)
+			{
+				if (!mys_index_prefix(lfirst(expr), &attnum, &length, &bytes, &digest))
+					attnum = 0;
+				expr = lnext(exprs, expr);
+			}
 			if (attnum <= 0)
 			{
 				usable = all = false;
@@ -1054,12 +1392,26 @@ make_infer_clause(Relation rel, Oid indexoid)
 	else
 	{
 		Relation	idx = index_open(indexoid, AccessShareLock);
+		List	   *exprs = RelationGetIndexExpressions(idx);
+		ListCell   *expr = list_head(exprs);
 
 		for (int i = 0; i < idx->rd_index->indnkeyatts; i++)
 		{
 			IndexElem  *ie = makeNode(IndexElem);
+			AttrNumber	attnum = idx->rd_index->indkey.values[i];
+			int			length;
+			bool		bytes;
+			bool		digest;
 
-			ie->name = get_attname(RelationGetRelid(rel), idx->rd_index->indkey.values[i], false);
+			/* a prefix key part (choose_arbiter_index() took no other expression) */
+			if (attnum == 0 && mys_index_prefix(lfirst(expr), &attnum, &length, &bytes, &digest))
+			{
+				ie->expr = prefix_expr(get_attname(RelationGetRelid(rel), attnum, false),
+									   bytes, length, digest);
+				expr = lnext(exprs, expr);
+			}
+			else
+				ie->name = get_attname(RelationGetRelid(rel), attnum, false);
 			ie->ordering = SORTBY_DEFAULT;
 			ie->nulls_ordering = SORTBY_NULLS_DEFAULT;
 			infer->indexElems = lappend(infer->indexElems, ie);
@@ -1165,6 +1517,7 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 	ListCell   *lc;
 
 	*infos = NIL;
+	rewrite_warnings = NIL;
 	foreach(lc, raw_stmts)
 	{
 		RawStmt    *rs = lfirst_node(RawStmt, lc);
@@ -1256,6 +1609,19 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 				foreach_node(ResTarget, rt, ((UpdateStmt *) rs->stmt)->targetList)
 					info->update_cols = lappend(info->update_cols, rt->name);
 				break;
+			case T_IndexStmt:
+				{
+					IndexStmt  *idx = (IndexStmt *) rs->stmt;
+
+					char	   *lookup;
+
+					lookup = prefix_key_parts(&idx->indexParams, idx->unique, false,
+											  &idx->accessMethod,
+											  RangeVarGetRelid(idx->relation, NoLock, true), NIL);
+					if (lookup)
+						extra = list_make1(make_lookup_index(idx->relation, lookup));
+					break;
+				}
 			case T_AlterTableStmt:
 				extra = rewrite_alter_table((AlterTableStmt *) rs->stmt);
 				if (((AlterTableStmt *) rs->stmt)->cmds == NIL && extra != NIL)

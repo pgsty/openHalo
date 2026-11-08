@@ -155,6 +155,69 @@ RETURNS pg_catalog.text
 AS '$libdir/aux_mysql', 'mys_decimal_column_type'
 LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
 '''
+key_definitions = []
+# Prefix key parts: SHOW INDEX and SHOW CREATE TABLE listed index columns by
+# attnum and skipped expressions, so a prefix key part, which aux_mysql indexes
+# as left(col, n) / substr(col, 1, n), vanished (a key of such parts alone
+# printed as "KEY `k`(``)", a replay error), columns came in table order, not
+# key order, and Sub_part was always NULL.  Read the key parts, in order, from
+# mysql.index_key_parts().  Part of the 1.6 -> 1.7 update below.
+key_helpers = r"""-- the MySQL key parts of an index, in order: a column, or a prefix col(n)
+CREATE OR REPLACE FUNCTION mysql.index_key_parts(pg_catalog.oid, OUT seq pg_catalog.int4,
+    OUT column_name pg_catalog.text, OUT sub_part pg_catalog.int4)
+RETURNS SETOF record
+AS '$libdir/aux_mysql', 'mys_index_key_parts'
+LANGUAGE C STABLE STRICT;
+"""
+for name in ('show_table_indexs', 'show_table_indexs_for_8'):
+    prefix = 'CREATE OR REPLACE FUNCTION mysql.%s(' % name
+    assert s.count(prefix) == 1, prefix
+    start = s.index(prefix)
+    end = s.index('IMMUTABLE LANGUAGE plpgsql;', start) + len('IMMUTABLE LANGUAGE plpgsql;')
+    f = s[start:end]
+    for old, new in (
+            ("        keys := string_to_array(records.indkey::text, ' ');\n"
+             "        FOREACH element IN ARRAY keys LOOP\n", ''),
+            ('(mysql.get_seq_in_index(att.attnum::pg_catalog.text, records.indkey))::int as Seq_in_index',
+             'k.seq::int as Seq_in_index'),
+            ('\n                    NULL::int as Sub_part', '\n                    k.sub_part::int as Sub_part'),
+            ('                from pg_catalog.pg_attribute att\n'
+             '                where att.attrelid = tabOid and att.attnum = element\n',
+             '                from mysql.index_key_parts(records.indexrelid) k\n'
+             '                    join pg_catalog.pg_attribute att on att.attrelid = tabOid and att.attname = k.column_name\n'
+             '                order by k.seq\n'),
+            ('            END LOOP;\n        END LOOP;\n    END LOOP;', '            END LOOP;\n    END LOOP;'),
+            ('IMMUTABLE LANGUAGE plpgsql;', 'STABLE LANGUAGE plpgsql;')):
+        assert f.count(old) == 1, (name, old)
+        f = f.replace(old, new)
+    s = s[:start] + f + s[end:]
+    key_definitions.append(f)
+
+start = s.index('CREATE OR REPLACE FUNCTION mysql.show_create_table_impl(')
+end = s.index('STABLE LANGUAGE plpgsql;', start) + len('STABLE LANGUAGE plpgsql;')
+f = s[start:end]
+for old, new in (
+        ('        select ind.indrelid, ind.indkey, ind.indnatts,',
+         '        select ind.indexrelid, ind.indrelid, ind.indkey, ind.indnatts,'),
+        ("""        ret := pg_catalog.concat(ret, E',\\n  ');
+        columnNums := pg_catalog.replace(records.indkey::pg_catalog.text, ' '::pg_catalog.text, ','::pg_catalog.text);
+""", """        select pg_catalog.string_agg(pg_catalog.concat('`', k.column_name, '`',
+                case when k.sub_part is not null then pg_catalog.concat('(', k.sub_part, ')') end), ',' order by k.seq)
+            from mysql.index_key_parts(records.indexrelid) k into columnNames;
+        continue when columnNames is null;
+        ret := pg_catalog.concat(ret, E',\\n  ');
+"""),
+        ("""        execute format('select pg_catalog.string_agg(attname, ''`,`'') from pg_attribute where attrelid = %s and attnum in (%s)',
+                       records.indrelid, columnNums)
+            into columnNames;
+""", ''),
+        ("'PRIMARY KEY (`', columnNames, '`)'", "'PRIMARY KEY (', columnNames, ')'"),
+        ("'UNIQUE KEY `', records.indname, '`(`', columnNames, '`)'", "'UNIQUE KEY `', records.indname, '`(', columnNames, ')'"),
+        ("'KEY `', records.indname, '`(`', columnNames, '`)'", "'KEY `', records.indname, '`(', columnNames, ')'")):
+    assert f.count(old) == 1, old
+    f = f.replace(old, new)
+s = s[:start] + f + s[end:]
+
 decimal_definitions = []
 old_type = "when ty.typname='numeric' then 'decimal'"
 new_type = "when ty.oid='pg_catalog.numeric'::pg_catalog.regtype then mysql.decimal_column_type(att.atttypmod)"
@@ -237,22 +300,22 @@ def guard_cast(m):
             "END $cast$;" % (indent, q(src), q(dst), stmt, src.replace("'", "''"), dst.replace("'", "''")))
 
 
-out, ncasts = cast_re.subn(guard_cast, prelude + '\n' + decimal_helpers + s)
+out, ncasts = cast_re.subn(guard_cast, prelude + '\n' + decimal_helpers + key_helpers + s)
 if ncasts < 40:
     sys.exit("expected the aux_mysql casts, found %d" % ncasts)
 print("guarded %d casts" % ncasts)
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(out + '\n')
 print("extension script written to", dst)
 
-# 1.6 -> 1.7: only the DECIMAL objects above, replaced in place (OIDs, ACLs
+# 1.6 -> 1.7: only the DECIMAL and key part objects above, replaced in place (OIDs, ACLs
 # and dependent user views survive); never the initial script's DROPs.
 upgrade = r'''-- Generated by tools/port_aux_sql.py -- do not edit by hand.
--- aux_mysql 1.6 -> 1.7: DECIMAL(p,s) in SHOW and information_schema.
+-- aux_mysql 1.6 -> 1.7: DECIMAL(p,s) and prefix key parts in SHOW and information_schema.
 \echo Use "ALTER EXTENSION aux_mysql UPDATE TO '1.7'" to load this file. \quit
 SET LOCAL search_path = mysql, pg_catalog, public;
 SET LOCAL check_function_bodies = off;
 
-''' + decimal_helpers + '\n' + '\n\n'.join(decimal_definitions) + '\n'
+''' + decimal_helpers + '\n' + key_helpers + '\n' + '\n\n'.join(decimal_definitions + key_definitions) + '\n'
 upgrade_path = Path(dst).with_name('aux_mysql--1.6--1.7.sql')
 upgrade_path.write_text(upgrade, encoding='utf-8')
 print("extension update written to", upgrade_path)

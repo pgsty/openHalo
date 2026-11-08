@@ -30,6 +30,7 @@
 #include "commands/trigger.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
@@ -40,6 +41,7 @@
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
@@ -783,6 +785,63 @@ mys_decimal_column_type(PG_FUNCTION_ARGS)
 		scale = 30;
 	}
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf("decimal(%d,%d)", precision, scale)));
+}
+
+/*
+ * mysql.index_key_parts(index): its key parts as MySQL shows them, in key
+ * order: (seq, column_name, sub_part), sub_part the n of a prefix col(n)
+ * aux_mysql indexes as left(col, n) / substr(col, 1, n).  Other expressions,
+ * which MySQL 5.7 cannot show, are left out.
+ */
+PG_FUNCTION_INFO_V1(mys_index_key_parts);
+
+Datum
+mys_index_key_parts(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	idx;
+	List	   *exprs;
+	ListCell   *expr;
+	int			seq = 0;
+
+	InitMaterializedSRF(fcinfo, 0);
+	idx = try_relation_open(PG_GETARG_OID(0), AccessShareLock);
+	if (idx == NULL)
+		return (Datum) 0;
+	if (idx->rd_index == NULL)
+	{
+		relation_close(idx, AccessShareLock);
+		return (Datum) 0;
+	}
+	exprs = RelationGetIndexExpressions(idx);
+	expr = list_head(exprs);
+	for (int i = 0; i < idx->rd_index->indnkeyatts; i++)
+	{
+		AttrNumber	attnum = idx->rd_index->indkey.values[i];
+		int			length = -1;
+		bool		bytes;
+		bool		digest;
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
+
+		if (attnum == 0)
+		{
+			if (expr == NULL)
+				break;
+			if (!mys_index_prefix(lfirst(expr), &attnum, &length, &bytes, &digest))
+				attnum = 0;
+			expr = lnext(exprs, expr);
+		}
+		if (attnum <= 0)
+			continue;
+		values[0] = Int32GetDatum(++seq);
+		values[1] = CStringGetTextDatum(get_attname(idx->rd_index->indrelid, attnum, false));
+		values[2] = Int32GetDatum(length);
+		nulls[2] = length < 0;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+	relation_close(idx, AccessShareLock);
+	return (Datum) 0;
 }
 
 PG_FUNCTION_INFO_V1(mys_column_extra);

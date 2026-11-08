@@ -1246,6 +1246,7 @@ mys_parse_query(const char *query_string)
 	if (halo_mysql_parser == MYS_PARSER_POSTGRES)
 	{
 		stmts = raw_parser(query_string, RAW_PARSE_DEFAULT);
+		mys_discard_rewrite_warnings();
 		stmt_infos = NIL;
 		for (int i = 0; i < list_length(stmts); i++)
 			stmt_infos = lappend(stmt_infos, palloc0(sizeof(MysStmtInfo)));
@@ -1299,6 +1300,7 @@ mys_parse_query(const char *query_string)
 			diagnostics_pending = false;
 		break;
 	}
+	mys_flush_rewrite_warnings();
 
 	/* a statement transaction starts now, a START TRANSACTION at execution */
 	if (!IsAbortedTransactionBlockState() &&

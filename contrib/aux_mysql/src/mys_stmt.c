@@ -560,6 +560,8 @@ describe_statement(const char *query, int nparams, const int *locs,
 
 		mys_text_map = &map;
 		raw = mys_rewrite_raw_stmts(mysql_raw_parser(text.data), text.data, &infos);
+		/* EXECUTE rewrites it again and reports them */
+		mys_discard_rewrite_warnings();
 		forboth(lc, raw, lc2, infos)
 		{
 			MysStmtInfo *info = (MysStmtInfo *) lfirst(lc2);
@@ -616,6 +618,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 		ErrorData  *edata;
 
 		mys_text_map = NULL;
+		mys_discard_rewrite_warnings();
 		MemoryContextSwitchTo(oldcxt);
 		edata = CopyErrorData();
 		FlushErrorState();

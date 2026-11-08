@@ -11057,10 +11057,12 @@ index_elem: ColId index_elem_options
 					$$->name = $1;
 				}
 			| ColId '(' Iconst ')' index_elem_options
-                {
-                    $$ = $5;
+				{
+					$$ = $5;
 					$$->name = $1;
-                }
+					$$->opclassopts = lappend($$->opclassopts,
+											   makeDefElem("mysql_prefix", (Node *) makeInteger($3), @3));
+				}
 			| '(' a_expr ')' index_elem_options
 				{
 					$$ = $4;

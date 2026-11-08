@@ -53,6 +53,12 @@ CREATE OR REPLACE FUNCTION mysql.decimal_column_type(pg_catalog.int4)
 RETURNS pg_catalog.text
 AS '$libdir/aux_mysql', 'mys_decimal_column_type'
 LANGUAGE C STABLE STRICT PARALLEL RESTRICTED;
+-- the MySQL key parts of an index, in order: a column, or a prefix col(n)
+CREATE OR REPLACE FUNCTION mysql.index_key_parts(pg_catalog.oid, OUT seq pg_catalog.int4,
+    OUT column_name pg_catalog.text, OUT sub_part pg_catalog.int4)
+RETURNS SETOF record
+AS '$libdir/aux_mysql', 'mys_index_key_parts'
+LANGUAGE C STABLE STRICT;
 
 -- ==== from aux_mysql--1.1.sql ====
 
@@ -34609,29 +34615,27 @@ BEGIN
     FOR records IN
         select ind.indexrelid, ind.indkey, ind.indisunique FROM pg_catalog.pg_index ind WHERE ind.indrelid = tabOid
     LOOP
-        keys := string_to_array(records.indkey::text, ' ');
-        FOREACH element IN ARRAY keys LOOP
             FOR subRecords IN
                 select
                     (select cl.relname from pg_class cl where (cl.oid = tabOid))::varchar(256) as table_name,
                     (case when records.indisunique = 1 then 0 else 1 end)::int as Non_unique,
                     (select case when right(cl.relname, 5) = '_pkey' then 'PRIMARY' else cl.relname end from pg_class cl where (cl.oid = records.indexrelid))::varchar(256) as key_name,
-                    (mysql.get_seq_in_index(att.attnum::pg_catalog.text, records.indkey))::int as Seq_in_index,
+                    k.seq::int as Seq_in_index,
                     att.attname::varchar(256) as Column_name,
                     'A'::varchar(256) as Collation,
                     0::int as Cardinality,
-                    NULL::int as Sub_part,
+                    k.sub_part::int as Sub_part,
                     NULL::varchar(256) as Packed,
                     (case when att.attnotnull then '' else 'YES' end)::varchar(8) as _null,
                     (select am.amname from pg_am am where am.oid = (select cl.relam from pg_class cl where cl.oid = records.indexrelid))::varchar(256) as Index_type,
                     ''::varchar(512) as _comment,
                     ''::varchar(512) as Index_comment
-                from pg_catalog.pg_attribute att
-                where att.attrelid = tabOid and att.attnum = element
+                from mysql.index_key_parts(records.indexrelid) k
+                    join pg_catalog.pg_attribute att on att.attrelid = tabOid and att.attname = k.column_name
+                order by k.seq
             LOOP
                 return next subRecords;
             END LOOP;
-        END LOOP;
     END LOOP;
 
     --XFOR records IN
@@ -34664,7 +34668,7 @@ BEGIN
     return;
 END;
 $$
-IMMUTABLE LANGUAGE plpgsql;
+STABLE LANGUAGE plpgsql;
 
 DROP FUNCTION IF EXISTS mysql.show_create_table_impl(pg_catalog.Oid, pg_catalog.Oid,
                                                         pg_catalog.text, pg_catalog.text) cascade;
@@ -34810,27 +34814,27 @@ BEGIN
         --    from pg_class cl,
         --        (select * from pg_index where indrelid = tabOid) ind
         --    where cl.oid = ind.indexrelid
-        select ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, (select cl.relname from pg_class cl where cl.oid = ind.indexrelid) as indname
+        select ind.indexrelid, ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, (select cl.relname from pg_class cl where cl.oid = ind.indexrelid) as indname
             from pg_index ind where ind.indrelid = tabOid
         --select ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, cl.relname
         --    from pg_index ind join pg_class cl on ind.indrelid = cl.oid
         --    where ind.indrelid = tabOid and cl.oid = tabOid
     LOOP
+        select pg_catalog.string_agg(pg_catalog.concat('`', k.column_name, '`',
+                case when k.sub_part is not null then pg_catalog.concat('(', k.sub_part, ')') end), ',' order by k.seq)
+            from mysql.index_key_parts(records.indexrelid) k into columnNames;
+        continue when columnNames is null;
         ret := pg_catalog.concat(ret, E',\n  ');
-        columnNums := pg_catalog.replace(records.indkey::pg_catalog.text, ' '::pg_catalog.text, ','::pg_catalog.text);
         --execute format('select GROUP_CONCAT(attname separator \'`,`\')
         --                    from pg_attribute
         --                    where attrelid = %s and attnum in (%s)',
         --               records.indrelid, columnNums)
-        execute format('select pg_catalog.string_agg(attname, ''`,`'') from pg_attribute where attrelid = %s and attnum in (%s)',
-                       records.indrelid, columnNums)
-            into columnNames;
         if (records.indisprimary = 1) then
-            ret := pg_catalog.concat(ret, 'PRIMARY KEY (`', columnNames, '`)');
+            ret := pg_catalog.concat(ret, 'PRIMARY KEY (', columnNames, ')');
         elsif (records.indisunique = 1) then
-            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', records.indname, '`(`', columnNames, '`)');
+            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', records.indname, '`(', columnNames, ')');
         else
-            ret := pg_catalog.concat(ret, 'KEY `', records.indname, '`(`', columnNames, '`)');
+            ret := pg_catalog.concat(ret, 'KEY `', records.indname, '`(', columnNames, ')');
         end if;
     END LOOP;
 
@@ -34963,18 +34967,16 @@ BEGIN
     FOR records IN
         select ind.indexrelid, ind.indkey, ind.indisunique FROM pg_catalog.pg_index ind WHERE ind.indrelid = tabOid
     LOOP
-        keys := string_to_array(records.indkey::text, ' ');
-        FOREACH element IN ARRAY keys LOOP
             FOR subRecords IN
                 select
                     (select cl.relname from pg_class cl where (cl.oid = tabOid))::varchar(256) as table_name,
                     (case when records.indisunique = 1 then 0 else 1 end)::int as Non_unique,
                     (select case when right(cl.relname, 5) = '_pkey' then 'PRIMARY' else cl.relname end from pg_class cl where (cl.oid = records.indexrelid))::varchar(256) as key_name,
-                    (mysql.get_seq_in_index(att.attnum::pg_catalog.text, records.indkey))::int as Seq_in_index,
+                    k.seq::int as Seq_in_index,
                     att.attname::varchar(256) as Column_name,
                     'A'::varchar(256) as Collation,
                     0::int as Cardinality,
-                    NULL::int as Sub_part,
+                    k.sub_part::int as Sub_part,
                     NULL::varchar(256) as Packed,
                     (case when att.attnotnull then '' else 'YES' end)::varchar(8) as _null,
                     (select am.amname from pg_am am where am.oid = (select cl.relam from pg_class cl where cl.oid = records.indexrelid))::varchar(256) as Index_type,
@@ -34982,12 +34984,12 @@ BEGIN
                     ''::varchar(512) as Index_comment,
                     'YES'::varchar(64) as Visible,
                     NULL::varchar(512) as Expression
-                from pg_catalog.pg_attribute att
-                where att.attrelid = tabOid and att.attnum = element
+                from mysql.index_key_parts(records.indexrelid) k
+                    join pg_catalog.pg_attribute att on att.attrelid = tabOid and att.attname = k.column_name
+                order by k.seq
             LOOP
                 return next subRecords;
             END LOOP;
-        END LOOP;
     END LOOP;
 
     --XFOR records IN
@@ -35020,7 +35022,7 @@ BEGIN
     return;
 END;
 $$
-IMMUTABLE LANGUAGE plpgsql;
+STABLE LANGUAGE plpgsql;
 
 drop table if exists mys_informa_schema.routines;
 create view mys_informa_schema.routines as

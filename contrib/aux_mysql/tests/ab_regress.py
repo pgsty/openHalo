@@ -465,6 +465,45 @@ def _():
  q(n,'insert into tx_n values (3)');q(n,'drop table tx_n');n.close()
  q(p,'drop owned by %s'%user);q(p,'drop role %s'%user)
 
+@test('X06 prefix key parts: long values never fail an INSERT; UNIQUE prefixes as in MySQL; SHOW')
+def _():
+ import random, string
+ def errno(f):
+  try: f()
+  except pymysql.err.MySQLError as e: return e.args[0]
+ q(c,'create table pk_t (id int primary key, a varchar(255), b text, c varchar(2000), key ka (a(191)), key kb (b(100)), key kbc (id, b(50)), unique key ua (a(10)))')
+ assert any('whole column' in str(w[2]) for w in q(c,'show warnings')), q(c,'show warnings')
+ q(c,'alter table pk_t add column d text, add key kd (d(20))');q(c,'create index kc on pk_t (c(30))')
+ defs=dict(q(p,"select indexname, regexp_replace(indexdef, '.* USING ', '') from pg_indexes where schemaname='abfix' and tablename='pk_t'"))
+ eq((defs['ka'],defs['kb'],defs['kc'],defs['kd'],defs['ua']),('btree (a)','hash (b)','hash (c)','hash (d)','btree (a)'))
+ assert '"left"(b, 50)' in defs['kbc'], defs['kbc']
+ big=''.join(random.choice(string.ascii_letters) for _ in range(20000))
+ q(c,'insert into pk_t values (1, %s, %s, %s, %s)',('x',big,big[:2000],big))
+ eq(val(c,'select id from pk_t where b = %s and c = %s and d = %s',(big,big[:2000],big)),1)
+ keys=[l.strip().rstrip(',') for l in q(c,'show create table pk_t')[0][1].split('\n') if 'KEY' in l]
+ assert 'KEY `kbc`(`id`,`b`(50))' in keys, keys
+ # a UNIQUE prefix of a long column: same prefix is a duplicate, ON DUPLICATE KEY / REPLACE find the row
+ q(c,'create table pk_u (b text, v int, unique key pk_ub (b(20)))');q(c,'insert into pk_u values (%s, 1)',(big,))
+ eq(errno(lambda:q(c,'insert into pk_u values (%s, 2)',(big[:20]+'x',))),1062)
+ q(c,'insert into pk_u values (%s, 1) on duplicate key update v = v + 10',(big[:20]+'y',))
+ eq(tuple(q(c,'select v, length(b) from pk_u')),((11,20000),))
+ q(c,'replace into pk_u values (%s, 5)',(big[:20]+'z',))
+ eq(tuple(q(c,'select v, length(b) from pk_u')),((5,21),))
+ assert ('pk_ub',1,'b',20) in [tuple(r[2:5])+(r[7],) for r in q(c,'show index from pk_u')]
+ # MODIFY / CHANGE and a key on the new type in one ALTER; a later part is capped
+ q(c,'create table pk_m (id int primary key, c varchar(100))')
+ q(c,'alter table pk_m modify c text, add key pk_mc (c(100))');q(c,'insert into pk_m values (1, %s)',(big,))
+ q(c,'alter table pk_m change c d text, add unique key pk_md (d(30))')
+ q(c,'create index pk_mi on pk_m (id, d(700))');q(c,'insert into pk_m values (2, %s)',(big[1:],))
+ # ASC / DESC on a part that becomes a hash index; a lookup index never takes a key's name
+ q(c,'create table pk_h (b text, e blob, key pk_hb (b(20) desc), unique key pk_hu (e(3000)), key pk_h_e_idx (e(30)))')
+ bigb=big.encode()
+ q(c,'insert into pk_h values (%s, %s)',(big,bigb));eq(errno(lambda:q(c,'insert into pk_h values (%s, %s)',('x',bigb[:3000]+b'y'))),1062)
+ q(c,'insert into pk_h values (%s, %s) on duplicate key update b = %s',('y',bigb[:3000]+b'z','z'))
+ eq(val(c,'select b from pk_h'),'z')
+ q(c,'create table pk_h2 (a blob, b blob, unique key pk_h2u (a(1500), b(1500)))')
+ q(c,'insert into pk_h2 values (%s, %s)',(bigb,bigb[1:]));eq(errno(lambda:q(c,'insert into pk_h2 values (%s, %s)',(bigb[:1500],bigb[1:1501]))),1062)
+
 try:
     c.close()
     q(p,'reset role')

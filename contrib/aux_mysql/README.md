@@ -65,6 +65,13 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   access method of that name, `ENCRYPTION='Y'` to `tde_heap` when pg_tde is installed. Executable comments
   `/*! ... */` and `/*!NNNNN ... */` run as SQL when NNNNN is not newer than `mysql.halo_mysql_version`
   (mysqldump's `SET NAMES`, `FOREIGN_KEY_CHECKS`, `TIME_ZONE`, `SQL_MODE` and view definitions).
+- **Prefix key parts** `KEY (col(n))`: a column that may hold values beyond a btree entry (TEXT, BLOB,
+  VARCHAR over 600 characters) is not indexed whole, so long values insert as in MySQL. A key starting
+  with one becomes a hash index on that column, which serves `=` lookups (also for TEXT / BLOB keys
+  without a prefix, which MySQL refuses); a later part becomes `left(col, n)`, at most 600 characters
+  in all. A UNIQUE key enforces such a prefix as MySQL does (also for ON DUPLICATE KEY and REPLACE),
+  with a hash index for lookups when it is the first part. Other columns are indexed whole.
+  `SHOW CREATE TABLE` / `SHOW INDEX` show `col(n)` and `Sub_part` for `left(col, n)` parts.
 - **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
 
 ## Known gaps
@@ -93,13 +100,19 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   ```
   After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
   AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0` (1.6)
-  and SHOW / information_schema report DECIMAL precision and scale (1.7).
+  and SHOW / information_schema report DECIMAL precision and scale, SHOW prefix key parts (1.7).
   With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
   table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
   fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION
   reports 1452 (MySQL: 1451), RESTRICT reports 1451.
 - A read-write REPEATABLE READ transaction does not keep one snapshot for its plain SELECTs (see above);
   set `READ ONLY` or `WITH CONSISTENT SNAPSHOT` where a stable view matters.
+- A UNIQUE prefix of a column whose values fit a btree entry, and any PRIMARY KEY prefix, is enforced on
+  the whole column (a warning says so), which accepts rows that differ only after the prefix; a long
+  PRIMARY KEY value can then fail. A key turned into a hash index shows no prefix length. When the
+  prefixes of a UNIQUE key may exceed 2000 bytes, its BLOB prefixes are compared by MD5; long
+  multi-byte TEXT prefixes can still exceed a btree entry, and so can whole VARCHAR parts of a
+  composite key together (~2.7kB after compression), which are not shortened.
 - With `autocommit = 0`, a `SET TRANSACTION` issued after the transaction began (even with a SELECT
   without tables) does not reach that transaction.
 - PostgreSQL's MVCC differs from InnoDB locking reads for concurrent delete + insert of the same key

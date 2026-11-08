@@ -648,6 +648,26 @@ rep(fragment, fragment.replace(line, '\t' * 6 +
     'argList = list_make2(makeStringConst(psprintf("next_%s", defElem->defname), -1),\n'))
 
 # ---------------------------------------------------------------------------
+# Prefix key parts, col(n)
+# ---------------------------------------------------------------------------
+# The length was dropped, so a key on a TEXT column indexed whole values and
+# an INSERT of a long value failed on btree's entry limit.  Keep it as an
+# opclass option that mys_rewrite.c turns into the index definition (an
+# unconsumed marker fails loudly: btree's opclasses take no options).
+rep('\t\t\t| ColId \'(\' Iconst \')\' index_elem_options\n'
+    '                {\n'
+    '                    $$ = $5;\n'
+    '\t\t\t\t\t$$->name = $1;\n'
+    '                }',
+    '\t\t\t| ColId \'(\' Iconst \')\' index_elem_options\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\t$$ = $5;\n'
+    '\t\t\t\t\t$$->name = $1;\n'
+    '\t\t\t\t\t$$->opclassopts = lappend($$->opclassopts,\n'
+    '\t\t\t\t\t\t\t\t\t\t\t   makeDefElem("mysql_prefix", (Node *) makeInteger($3), @3));\n'
+    '\t\t\t\t}')
+
+# ---------------------------------------------------------------------------
 # START TRANSACTION WITH CONSISTENT SNAPSHOT
 # ---------------------------------------------------------------------------
 # mysqldump --single-transaction sends START TRANSACTION /*!40100 WITH
