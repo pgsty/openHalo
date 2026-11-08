@@ -81,8 +81,8 @@ wrong_lock_name(const char *name)
 
 /*
  * The text of an argument of type "any": bytes of a binary string, the
- * output of any other type.  A bit string (the type of a 0x41 literal) is a
- * binary string, as in MySQL: b'101' is the byte 0x05.
+ * output of any other type.  A 0x41 literal (mysql.hexlit) or a bit string
+ * is a binary string, as in MySQL: b'101' is the byte 0x05.
  */
 static char *
 any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
@@ -95,7 +95,7 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 
 	if (!OidIsValid(type))
 		elog(ERROR, "could not determine the type of argument %d", argno + 1);
-	base = getBaseType(type);
+	base = mys_binary_base_type(type);	/* a 0x41 literal: its bytes */
 	*binary = base == BYTEAOID || base == BITOID || base == VARBITOID;
 	if (base == BYTEAOID)
 	{
@@ -188,6 +188,8 @@ timeout_arg(FunctionCallInfo fcinfo, int argno)
 	if (PG_ARGISNULL(argno))
 		return 0;
 	type = getBaseType(get_fn_expr_argtype(fcinfo->flinfo, argno));
+	if (type != BYTEAOID && mys_binary_base_type(type) == BYTEAOID)
+		type = BITOID;			/* a 0x0a literal is a number, as a bit string */
 	switch (type)
 	{
 		case INT2OID:

@@ -1040,6 +1040,7 @@ def _():
   eq(q(b,"select is_free_lock('abfix_ä'), is_free_lock('%s_STRASSE'), is_free_lock('abfix_sp '), is_free_lock(' abfix_ä')"%up),((0,1,1,1),))
   hexname='0x'+(SCHEMA+'_H').encode().hex()
   eq(q(c,"select get_lock(918273645, 0), is_used_lock('918273645') = %d, release_lock(%s), get_lock(%s, 0), release_lock('abfix_h'), release_all_locks()"%(ida,hexname,hexname)),((1,1,None,1,1,3),))
+  eq(q(c,"select get_lock(%s, 0x00), release_lock('%s_h')"%(hexname,SCHEMA)),((1,1),))   # a 0x.. timeout is a number
   for name in ("''","NULL","repeat('n', 65)","repeat('é', 65)"):
    for f in ('get_lock(%s, 0)','release_lock(%s)','is_free_lock(%s)','is_used_lock(%s)'):
     eq(lock_errno(lambda:q(c,'select '+f%name)),3057)
