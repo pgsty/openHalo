@@ -27,22 +27,27 @@ BEGIN
 END $types$;
 
 DO $casts$
-DECLARE t text; src text; cfun text;
+DECLARE t text; src text; dst text; cfun text;
 BEGIN
     FOREACH t IN ARRAY ARRAY['binary_n', 'varbinary_n'] LOOP
         cfun := 'mys_binary_coerce';
         EXECUTE format('CREATE CAST (mysql.%I AS bytea) WITHOUT FUNCTION AS IMPLICIT', t);
-        FOREACH src IN ARRAY ARRAY['bytea', 'text', 'varchar', 'mysql.hexlit',
+        FOREACH src IN ARRAY ARRAY['bytea', 'text', 'varchar', 'bpchar', 'mysql.hexlit',
                                    'mysql.binary_n', 'mysql.varbinary_n'] LOOP
             EXECUTE format($f$CREATE FUNCTION mysql.%1$I(%2$s, int4, bool) RETURNS mysql.%3$I
                 AS '$libdir/aux_mysql', %4$L LANGUAGE C STABLE STRICT PARALLEL RESTRICTED$f$,
                 t, src, t, cfun);
             EXECUTE format('CREATE CAST (%1$s AS mysql.%2$I) WITH FUNCTION mysql.%2$I(%1$s, int4, bool) AS ASSIGNMENT', src, t);
         END LOOP;
-        -- Explicit only: native PG text cannot contain NUL or invalid encoding.
-        EXECUTE format($f$CREATE FUNCTION mysql.%1$I(mysql.%2$I) RETURNS text
-            AS '$libdir/aux_mysql', 'mys_hexlit_text' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE$f$, t||'_text',t);
-        EXECUTE format('CREATE CAST (mysql.%1$I AS text) WITH FUNCTION mysql.%2$I(mysql.%1$I)', t,t||'_text');
+        -- Assignment casts prevent CoerceViaIO from exposing byteaout's
+        -- escape syntax. Keep these out of implicit operator resolution.
+        FOREACH dst IN ARRAY ARRAY['text','varchar','bpchar'] LOOP
+            EXECUTE format($f$CREATE FUNCTION mysql.%1$I(mysql.%2$I) RETURNS %3$s
+                AS '$libdir/aux_mysql', 'mys_hexlit_text' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE$f$,
+                t||'_'||dst,t,dst);
+            EXECUTE format('CREATE CAST (mysql.%1$I AS %2$s) WITH FUNCTION mysql.%3$I(mysql.%1$I) AS ASSIGNMENT',
+                t,dst,t||'_'||dst);
+        END LOOP;
     END LOOP;
 END $casts$;
 
@@ -219,3 +224,15 @@ CREATE FUNCTION mysql.cast_char("any",int4) RETURNS text
     AS '$libdir/aux_mysql','mys_cast_char' LANGUAGE C STABLE STRICT PARALLEL SAFE;
 CREATE FUNCTION mysql.convert_using("any",text) RETURNS text
     AS '$libdir/aux_mysql','mys_convert_using' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+
+-- GROUP_CONCAT arrays preserve their element payload and binary result type.
+-- Include the old bytea domains: upgraded application columns keep those OIDs.
+DO $group_concat$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['bytea','mysql.blob','mysql.binary','mysql.varbinary',
+                             'mysql.hexlit','mysql.binary_n','mysql.varbinary_n'] LOOP
+        EXECUTE format($f$CREATE FUNCTION mysql.array_to_string_for_mysql(%s[],text) RETURNS bytea
+            AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE$f$,t);
+    END LOOP;
+END $group_concat$;

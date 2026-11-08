@@ -796,7 +796,12 @@ PG_FUNCTION_INFO_V1(mys_binary_coerce);
 Datum
 mys_binary_coerce(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BYTEA_P(binary_sized(PG_GETARG_BYTEA_PP(0), PG_GETARG_INT32(1),
+	bytea *b = PG_GETARG_BYTEA_PP(0);
+
+	if (getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID &&
+		!(mys_sqlMode & MYS_MODE_PAD_CHAR_TO_FULL_LENGTH))
+		b = (bytea *) DatumGetTextPP(DirectFunctionCall1(rtrim1, PointerGetDatum(b)));
+	PG_RETURN_BYTEA_P(binary_sized(b, PG_GETARG_INT32(1),
 								  is_mysql_type(get_fn_expr_rettype(fcinfo->flinfo), "binary_n"),
 								  PG_GETARG_BOOL(2)));
 }
@@ -1704,4 +1709,34 @@ Datum
 mys_string_instr(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT32(string_position(fcinfo, true));
+}
+
+/* The SQL overload fixes the return type before the expression is analyzed. */
+PG_FUNCTION_INFO_V1(mys_group_concat_binary);
+Datum
+mys_group_concat_binary(PG_FUNCTION_ARGS)
+{
+	ArrayType *array = PG_GETARG_ARRAYTYPE_P(0);
+	text *sep = PG_GETARG_TEXT_PP(1);
+	ArrayIterator iterator = array_create_iterator(array, 0, NULL);
+	StringInfoData out;
+	Datum value;
+	bool isnull;
+	bool first = true;
+
+	initStringInfo(&out);
+	while (array_iterate(iterator, &value, &isnull))
+	{
+		bytea *b;
+
+		if (isnull) continue;
+		b = DatumGetByteaPP(value);
+		if (!first)
+			appendBinaryStringInfo(&out, VARDATA_ANY(sep), VARSIZE_ANY_EXHDR(sep));
+		appendBinaryStringInfo(&out, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
+		first = false;
+	}
+	array_free_iterator(iterator);
+	if (first) PG_RETURN_NULL();
+	PG_RETURN_BYTEA_P((bytea *) cstring_to_text_with_len(out.data, out.len));
 }

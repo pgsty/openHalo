@@ -891,8 +891,18 @@ setSystemVariableDatum(char *varName, Datum varConfValue,
         Oid	typoutput;
 	    bool typIsVarlena;
 
-        getTypeOutputInfo(varValueType, &typoutput, &typIsVarlena);
-        varValue = OidOutputFunctionCall(typoutput, varConfValue);
+		if (mys_is_mysql_session() && mys_binary_base_type(varValueType) == BYTEAOID)
+		{
+			bytea *b = DatumGetByteaPP(varConfValue);
+
+			pg_verifymbstr(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), false);
+			varValue = pnstrdup(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
+		}
+		else
+		{
+			getTypeOutputInfo(varValueType, &typoutput, &typIsVarlena);
+			varValue = OidOutputFunctionCall(typoutput, varConfValue);
+		}
     }
     else 
     {

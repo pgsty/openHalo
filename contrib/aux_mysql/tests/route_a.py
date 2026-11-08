@@ -38,7 +38,7 @@ class Checks:
         self.schema = 'route_a_' + uuid.uuid4().hex[:12]
         self.count = 0
         for s in (self.oh, self.my):
-            s.q('CREATE DATABASE ' + self.schema)
+            s.q('CREATE DATABASE ' + self.schema + ' CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci')
             s.q('USE ' + self.schema)
             s.q("SET sql_mode=''")
 
@@ -118,11 +118,69 @@ class Checks:
             self.oh.q('DROP TABLE names')
 
 
+    def binary(self):
+        self.both("SET sql_mode=CAST('ANSI_QUOTES' AS BINARY)")
+        self.both('SELECT @@sql_mode')
+        self.both("SET sql_mode=''")
+        for typ in ('VARBINARY(8)', 'BINARY(5)'):
+            self.both('CREATE TABLE src(id INT,s '+typ+',v VARCHAR(20),c CHAR(20),t TEXT)')
+            self.both("INSERT INTO src(id,s) VALUES(1,'Hello'),(2,'éabc')")
+            self.both('SELECT CAST(s AS CHAR),HEX(CAST(s AS CHAR)) FROM src ORDER BY id')
+            self.both('UPDATE src SET v=s,c=s,t=s')
+            self.both('SELECT v,HEX(v),c,HEX(c),t,HEX(t) FROM src ORDER BY id')
+            self.both('CREATE TABLE dst(v VARCHAR(20),c CHAR(20),t TEXT)')
+            self.both('INSERT INTO dst SELECT s,s,s FROM src ORDER BY id')
+            self.both('SELECT v,HEX(v),c,HEX(c),t,HEX(t) FROM dst ORDER BY v')
+            self.both('SET @bytes=(SELECT s FROM src WHERE id=1)')
+            self.both('SELECT HEX(@bytes)')
+            self.both("PREPARE p FROM 'SELECT HEX(?)'")
+            self.both('EXECUTE p USING @bytes')
+            # EXECUTE expressions are an OpenHalo extension; the result must
+            # equal the standard MySQL variable-bound execution above.
+            assert self.oh.q("EXECUTE p USING CAST('Hello' AS BINARY(5))") == (('48656C6C6F',),)
+            self.both('DEALLOCATE PREPARE p')
+            self.both('ALTER TABLE src MODIFY s VARCHAR(10)')
+            self.both('SELECT s,HEX(s) FROM src ORDER BY id')
+            self.both('DROP TABLE src')
+            self.both('DROP TABLE dst')
+        for typ in ('BLOB', 'VARBINARY(10)', 'BINARY(4)'):
+            self.both('CREATE TABLE concat_bytes(id INT,s '+typ+')')
+            self.both("INSERT INTO concat_bytes VALUES(1,0x4100ff),(2,0x00c3a9),(3,NULL),(4,X'')")
+            self.both('SELECT GROUP_CONCAT(s ORDER BY id),HEX(GROUP_CONCAT(s ORDER BY id)) FROM concat_bytes')
+            self.both("SELECT HEX(GROUP_CONCAT(s ORDER BY id SEPARATOR '!')) FROM concat_bytes")
+            self.both('SELECT GROUP_CONCAT(s) FROM concat_bytes WHERE id=3')
+            self.both('DROP TABLE concat_bytes')
+        self.both('CREATE TABLE chars(c CHAR(5),v VARBINARY(5),b BINARY(5))')
+        self.both("INSERT INTO chars(c) VALUES('x'),('é')")
+        self.both('INSERT INTO chars(v,b) SELECT c,c FROM chars')
+        self.both('SELECT HEX(v),HEX(b) FROM chars WHERE c IS NULL ORDER BY v')
+        self.both('UPDATE chars SET v=c,b=c WHERE c IS NOT NULL')
+        self.both('SELECT HEX(v),HEX(b) FROM chars ORDER BY v')
+        for typ in ('VARBINARY(4)', 'BINARY(4)'):
+            self.oh.q('CREATE TABLE bad(s '+typ+',v VARCHAR(10),c CHAR(10),t TEXT)')
+            for value in ('0x410042ff', '0x41ff4243'):
+                for mode in ('','STRICT_TRANS_TABLES'):
+                    self.oh.q("SET sql_mode='"+mode+"'")
+                    self.oh.q('DELETE FROM bad')
+                    self.oh.q('INSERT INTO bad(s) VALUES('+value+')')
+                    for statement in ['SELECT CAST(s AS CHAR) FROM bad',
+                            'UPDATE bad SET v=s', 'UPDATE bad SET c=s', 'UPDATE bad SET t=s',
+                            'INSERT IGNORE INTO bad(v) SELECT s FROM bad',
+                            'ALTER TABLE bad MODIFY s VARCHAR(10)']:
+                        assert self.oh.result(statement) == ('error',1366), statement
+                        self.count += 1
+            self.oh.q('DROP TABLE bad')
+        self.oh.q('CREATE TABLE padded(s BINARY(4))')
+        self.oh.q("INSERT INTO padded VALUES('x')")
+        assert self.oh.result('SELECT CAST(s AS CHAR) FROM padded') == ('error',1366)
+        self.count += 1
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

@@ -6,6 +6,9 @@ lib=sys.argv[1]
 s='''DROP SCHEMA IF EXISTS mysql CASCADE;
 DROP SCHEMA IF EXISTS review_fix_binary CASCADE;
 CREATE SCHEMA mysql;
+CREATE DOMAIN mysql.blob AS bytea;
+CREATE DOMAIN mysql.binary AS bytea;
+CREATE DOMAIN mysql.varbinary AS bytea;
 SET search_path=mysql,pg_catalog;
 CREATE FUNCTION mysql.str_to_double(text) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT $1::float8';
 CREATE FUNCTION mysql.mys_div_float8(float8,float8) RETURNS float8 LANGUAGE sql IMMUTABLE AS 'SELECT $1 / NULLIF($2,0)';

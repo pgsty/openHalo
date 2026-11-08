@@ -1,4 +1,4 @@
-/* MySQL 1.9 length-aware binary and NUL-safe character strings. */
+/* MySQL 1.9 length-aware binary strings and character conversions. */
 #ifndef MYS_BINARY_H
 #define MYS_BINARY_H
 #include "nodes/parsenodes.h"

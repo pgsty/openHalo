@@ -95,7 +95,7 @@ partListColumns(PG_FUNCTION_ARGS)
         {
             Datum value = PG_GETARG_DATUM(i);
             Oid valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
-            Oid valBaseType = getBaseType(valtype);
+			Oid valBaseType = mys_binary_base_type(valtype);
 
             if (valBaseType != BYTEAOID)
             {

@@ -1301,7 +1301,7 @@ append_using_value(StringInfo buf, Node *arg, ParseState *pstate)
 
 	expr = transformExpr(pstate, arg, EXPR_KIND_EXECUTE_PARAMETER);
 	assign_expr_collations(pstate, expr);
-	type = getBaseType(exprType(expr));
+	type = mys_binary_base_type(exprType(expr));
 	estate = CreateExecutorState();
 	exprstate = ExecPrepareExpr((Expr *) expr, estate);
 	value = ExecEvalExprSwitchContext(exprstate, GetPerTupleExprContext(estate), &isnull);
