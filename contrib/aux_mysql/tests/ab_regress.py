@@ -909,6 +909,84 @@ def _():
  eq(multi('create table rp_b2 like rp_l; insert into rp_b2 values (1,1,1); replace into rp_b2 (id, v) values (1, 7)',
           'select * from rp_b2'),((1,7,None),))
  r.close()
+def lock_errno(f):
+ try: f()
+ except pymysql.err.MySQLError as e: return e.args[0]
+@test('L01 GET_LOCK excludes other sessions; RELEASE_LOCK, IS_FREE_LOCK, IS_USED_LOCK, RELEASE_ALL_LOCKS as in MySQL 5.7')
+def _():
+ # MySQL 5.7.32 gives the same results; 1.7 returned 1 from every GET_LOCK and RELEASE_LOCK
+ b=my();ida=val(c,'select connection_id()');idb=val(b,'select connection_id()');q(c,'select release_all_locks()')
+ up=SCHEMA.upper()
+ try:
+  eq(val(c,"select get_lock('abfix_l', 0)"),1)
+  eq(q(b,"select get_lock('%s_L', 0), is_free_lock('abfix_l'), is_used_lock('%s_l') = %d, release_lock('abfix_l')"%(up,SCHEMA.capitalize(),ida)),((0,0,1,0),))
+  eq(q(b,"select release_lock('abfix_nobody'), is_used_lock('abfix_nobody'), is_free_lock('abfix_nobody')"),((None,None,1),))
+  assert q(p,"select count(*) from pg_locks where locktype = 'advisory' and objsubid = 19801 and granted and pid = %s",(ida,))==[(1,)]
+  # held twice: two releases; other names are separate locks
+  eq(q(c,"select get_lock('abfix_l', 0), get_lock('abfix_l2', 0), release_lock('abfix_l')"),((1,1,1),))
+  eq(val(b,"select get_lock('abfix_l', 0)"),0)
+  eq(q(c,"select release_lock('abfix_l'), release_lock('abfix_l')"),((1,None),))
+  eq(q(b,"select get_lock('abfix_l', 0), is_used_lock('abfix_l') = %d, is_used_lock('abfix_l2') = %d"%(idb,ida)),((1,1,1),))
+  eq(q(c,"select get_lock('abfix_m', 0), get_lock('abfix_m', 0), release_all_locks(), release_all_locks()"),((1,1,3,0),))
+  eq(q(b,"select release_all_locks(), is_free_lock('abfix_l2')"),((1,1),))
+  # names: case-insensitive, compared as lower-cased characters; any argument type
+  eq(q(c,"select get_lock('abfix_Ä', 0), get_lock('abfix_Straße', 0)"),((1,1),))
+  eq(q(b,"select is_free_lock('abfix_ä'), is_free_lock('%s_STRASSE'), is_free_lock('abfix_sp '), is_free_lock(' abfix_ä')"%up),((0,1,1,1),))
+  hexname='0x'+(SCHEMA+'_H').encode().hex()
+  eq(q(c,"select get_lock(918273645, 0), is_used_lock('918273645') = %d, release_lock(%s), get_lock(%s, 0), release_lock('abfix_h'), release_all_locks()"%(ida,hexname,hexname)),((1,1,None,1,1,3),))
+  for name in ("''","NULL","repeat('n', 65)","repeat('é', 65)"):
+   for f in ('get_lock(%s, 0)','release_lock(%s)','is_free_lock(%s)','is_used_lock(%s)'):
+    eq(lock_errno(lambda:q(c,'select '+f%name)),3057)
+  eq(q(c,"select get_lock(repeat('é', 64), 0), release_lock(repeat('É', 64))"),((1,1),))
+  with c.cursor() as t:
+   t.execute("select get_lock('abfix_t', 0), is_free_lock('abfix_t'), is_used_lock('abfix_t'), release_lock('abfix_t'), release_all_locks()")
+   eq([d[1] for d in t.description],[8]*5)
+ finally:
+  b.close();q(c,'select release_all_locks()')
+@test('L02 GET_LOCK timeout, wait, deadlock; locks outlive transactions, end with RESET CONNECTION and disconnect')
+def _():
+ b=my();ida=val(c,'select connection_id()');idb=val(b,'select connection_id()');q(c,'select release_all_locks()')
+ def timed(cn,sql):
+  t0=time.time();r=q(cn,sql);return r,time.time()-t0
+ try:
+  eq(val(c,"select get_lock('abfix_t', 0)"),1)
+  r,t=timed(b,"select get_lock('abfix_t', 1)");eq(r,((0,),));assert 0.9<t<5,t
+  # MySQL rounds 0.4 to 0, reads a string's integer prefix (warning 1292); NULL is 0
+  r,t=timed(b,"select get_lock('abfix_t', 0.4), get_lock('abfix_t', NULL), get_lock('abfix_t', '0abc')");eq(r,((0,0,0),));assert t<0.9,t
+  eq([w[1] for w in q(b,'show warnings')],[1292])
+  # a negative timeout waits until the lock is released
+  with concurrent.futures.ThreadPoolExecutor(1) as pool:
+   f=pool.submit(timed,b,"select get_lock('abfix_t', -1)");time.sleep(0.5);assert not f.done()
+   eq(val(c,"select release_lock('abfix_t')"),1);r,t=f.result(10)
+  eq(r,((1,),));eq(val(c,"select is_used_lock('abfix_t')"),idb)
+  # transactions neither take nor drop the locks
+  q(c,'begin');eq(val(c,"select get_lock('abfix_x', 0)"),1);q(c,'rollback')
+  eq(val(b,"select is_used_lock('abfix_x')"),ida)
+  q(c,'begin');eq(val(c,"select release_lock('abfix_x')"),1);q(c,'rollback')
+  eq(val(b,"select is_free_lock('abfix_x')"),1)
+  # deadlock: the session that closes the cycle gets ER_USER_LOCK_DEADLOCK and keeps its locks
+  eq(val(b,"select release_all_locks()"),1)
+  eq(val(c,"select get_lock('abfix_d1', 0)"),1);eq(val(b,"select get_lock('abfix_d2', 0)"),1)
+  q(b,'begin')
+  with concurrent.futures.ThreadPoolExecutor(1) as pool:
+   f=pool.submit(timed,c,"select get_lock('abfix_d2', 10)");time.sleep(0.5)
+   t0=time.time();eq(lock_errno(lambda:q(b,"select get_lock('abfix_d1', 10)")),3058);assert time.time()-t0<5
+   eq(val(b,"select is_used_lock('abfix_d2')"),idb);assert b.server_status & 1,b.server_status
+   q(b,'rollback')
+   eq(val(b,"select release_lock('abfix_d2')"),1);r,t=f.result(10)
+  eq(r,((1,),));eq(val(c,"select release_all_locks()"),2)
+  # COM_RESET_CONNECTION and the end of the session release the locks
+  eq(q(b,"select get_lock('abfix_r', 0), get_lock('abfix_r', 0)"),((1,1),))
+  b._execute_command(0x1f,b'');b._read_ok_packet()
+  eq(q(c,"select is_free_lock('abfix_r'), get_lock('abfix_r', 0), release_lock('abfix_r')"),((1,1,1),))
+  eq(val(b,"select release_all_locks()"),0)
+  eq(val(b,"select get_lock('abfix_e', 0)"),1);b.close()
+  for _ in range(50):
+   if val(c,"select is_free_lock('abfix_e')"): break
+   time.sleep(0.1)
+  eq(val(c,"select get_lock('abfix_e', 0) + release_lock('abfix_e')"),2)
+ finally:
+  b.close() if b.open else None;q(c,'select release_all_locks()')
 
 try:
     c.close()

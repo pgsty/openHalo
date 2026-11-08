@@ -1,6 +1,6 @@
 # aux_mysql
 
-openHalo's MySQL Supplementary Extension (version 1.7, same name and settings as in openHalo 1.0) on
+openHalo's MySQL Supplementary Extension (version 1.8, same name and settings as in openHalo 1.0) on
 PostgreSQL 18. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
 aux_mysql held the SQL layer; here aux_mysql carries all of it, on top of the kernel's generic protocol
 extension hooks and its atomic sequence-advancement API. Other kernels need both APIs and separate validation. It must be
@@ -86,6 +86,13 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   in all. A UNIQUE key enforces such a prefix as MySQL does (also for ON DUPLICATE KEY and REPLACE),
   with a hash index for lookups when it is the first part. Other columns are indexed whole.
   `SHOW CREATE TABLE` / `SHOW INDEX` show `col(n)` and `Sub_part` for `left(col, n)` parts.
+- **User-level locks**: `GET_LOCK`, `RELEASE_LOCK`, `IS_FREE_LOCK`, `IS_USED_LOCK` and `RELEASE_ALL_LOCKS`
+  as in MySQL 5.7: a session can hold several locks, and one lock several times; names are compared
+  case-insensitively (at most 64 characters, else error 3057); the timeout is in seconds, a negative one
+  waits forever; transactions neither take nor release the locks, `COM_RESET_CONNECTION` and the end of
+  the session do; the session that closes a cycle of waits gets error 3058. They are session-level
+  advisory locks (`pg_locks`: `locktype = 'advisory'`, `objsubid = 19801`) of the MySQL database, and
+  take room in the shared lock table (`max_locks_per_transaction`).
 - **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
 
 ## Known gaps
@@ -134,7 +141,9 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   ```
   After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
   AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0` (1.6)
-  and SHOW / information_schema report DECIMAL precision and scale, SHOW prefix key parts (1.7).
+  and SHOW / information_schema report DECIMAL precision and scale, SHOW prefix key parts (1.7), and
+  `GET_LOCK()` locks (1.8: in 1.7 it, `RELEASE_LOCK()`, `IS_FREE_LOCK()` and `IS_USED_LOCK()` were stubs
+  that let every session "hold" every lock).
   With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
   table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
   fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION

@@ -102,6 +102,16 @@ typedef struct MysStmtInfo
 extern MysStmtInfo *mys_current_stmt_info(void);
 extern void mys_add_warning(uint16 code, const char *message);
 
+/*
+ * MySQL errors that have no PostgreSQL SQLSTATE: mys_errno() maps these
+ * implementation-defined subclasses, and the client gets MySQL's SQLSTATE.
+ */
+#define ERRCODE_MYS_USER_LOCK_WRONG_NAME	MAKE_SQLSTATE('4','2','M','5','7')	/* 3057, 42000 */
+#define ERRCODE_MYS_USER_LOCK_DEADLOCK		MAKE_SQLSTATE('4','0','M','5','8')	/* 3058, 40001 */
+
+/* mys_lock.c: GET_LOCK() and friends */
+extern int64 mys_release_user_locks(void);
+
 /* mys_semantics.c */
 extern void mys_set_auto_increment(Oid relid, int64 next);
 extern void mys_sync_auto_increment(Oid relid);

@@ -15,6 +15,7 @@ OBJS = \
 	src/mys_semantics.o \
 	src/mysql_parser.o \
 	src/mys_compat.o \
+	src/mys_lock.o \
 	src/mys_rewrite.o \
 	src/mys_utility.o \
 	src/parser/mys_gram.o \
@@ -44,8 +45,8 @@ OBJS = \
 EXTENSION = aux_mysql
 # extension script = openHalo aux_mysql SQL layer (tools/port_aux_sql.py)
 #                    + hand-written objects (sql/aux_mysql_additions.sql)
-DATA_built = sql/aux_mysql--1.7.sql
-DATA = sql/aux_mysql--1.5--1.6.sql sql/aux_mysql--1.6--1.7.sql
+DATA_built = sql/aux_mysql--1.8.sql
+DATA = sql/aux_mysql--1.5--1.6.sql sql/aux_mysql--1.6--1.7.sql sql/aux_mysql--1.7--1.8.sql
 PGFILEDESC = "aux_mysql - MySQL compatibility (openHalo)"
 
 # generated grammar / keyword headers live in the build directory
@@ -76,7 +77,7 @@ endif
 # TLS and RSA key exchange for caching_sha2_password
 SHLIB_LINK += $(filter -lssl -lcrypto, $(LIBS))
 
-sql/aux_mysql--1.7.sql: sql/aux_mysql.sql sql/aux_mysql_additions.sql
+sql/aux_mysql--1.8.sql: sql/aux_mysql.sql sql/aux_mysql_additions.sql
 	@$(MKDIR_P) sql
 	cat $^ > $@
 

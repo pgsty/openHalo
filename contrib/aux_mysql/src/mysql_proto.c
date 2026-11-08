@@ -558,8 +558,27 @@ mys_errno(int sqlerrcode)
 			return 1835;		/* ER_MALFORMED_PACKET */
 		case ERRCODE_INVALID_CURSOR_STATE:
 			return 1421;		/* ER_STMT_HAS_NO_OPEN_CURSOR */
+		case ERRCODE_MYS_USER_LOCK_WRONG_NAME:
+			return 3057;		/* ER_USER_LOCK_WRONG_NAME */
+		case ERRCODE_MYS_USER_LOCK_DEADLOCK:
+			return 3058;		/* ER_USER_LOCK_DEADLOCK */
 		default:
 			return 1105;		/* ER_UNKNOWN_ERROR */
+	}
+}
+
+/* SQLSTATE of the ERR packet: MySQL's own for the aux_mysql-only codes */
+static const char *
+mys_sqlstate(int sqlerrcode)
+{
+	switch (sqlerrcode)
+	{
+		case ERRCODE_MYS_USER_LOCK_WRONG_NAME:
+			return "42000";
+		case ERRCODE_MYS_USER_LOCK_DEADLOCK:
+			return "40001";
+		default:
+			return unpack_sql_state(sqlerrcode);
 	}
 }
 
@@ -570,7 +589,7 @@ mys_errno(int sqlerrcode)
 void
 mys_send_error(int sqlerrcode, const char *msg)
 {
-	mys_send_err(mys_errno(sqlerrcode), unpack_sql_state(sqlerrcode), msg);
+	mys_send_err(mys_errno(sqlerrcode), mys_sqlstate(sqlerrcode), msg);
 }
 
 #ifdef HALO_BABELFISH_API
@@ -1300,6 +1319,8 @@ mys_process_command(int firstchar, StringInfo inBuf)
 				clearUserVars();
 				StartTransactionCommand();
 				PushActiveSnapshot(GetTransactionSnapshot());
+				/* GET_LOCK() locks (DISCARD ALL drops every advisory lock) */
+				(void) mys_release_user_locks();
 				discard.type = T_DiscardStmt;
 				discard.target = DISCARD_ALL;
 				DiscardCommand(&discard, true);
@@ -1562,7 +1583,7 @@ mys_send_message(ErrorData *edata)
 
 	msg = edata->message ? edata->message : "missing error text";
 	mys_send_err(mys_errno(edata->sqlerrcode),
-				 unpack_sql_state(edata->sqlerrcode), msg);
+				 mys_sqlstate(edata->sqlerrcode), msg);
 	mys_flush();
 	resultset_active = false;
 	stmt_infos = NIL;
