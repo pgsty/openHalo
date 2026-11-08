@@ -327,6 +327,12 @@ for name in ('show_table_indexs', 'show_table_indexs_for_8', 'show_create_table_
     else:
         assert f.count(old_key) == 1, name
         f = f.replace(old_key, new_key)
+        # Index_type in MySQL's spelling (BTREE, HASH), as information_schema
+        old_type = ('(select am.amname from pg_am am where am.oid = (select cl.relam from pg_class cl '
+                    'where cl.oid = records.indexrelid))::varchar(256) as Index_type')
+        assert f.count(old_type) == 1, name
+        f = f.replace(old_type, 'pg_catalog.upper(' + old_type.replace('::varchar(256) as Index_type', ')')
+                      + '::varchar(256) as Index_type')
     s = s[:start] + f + s[end:]
     name_definitions.append(f)
 
@@ -342,6 +348,13 @@ old = ("    (select case when right(cl_sub.relname, 5) = '_pkey' then 'PRIMARY' 
        "        )::varchar(256) as key_name,\n")
 assert f.count(old) == 1
 f = f.replace(old, '    mysql.index_key_name(ind.indexrelid)::varchar(256) as key_name,\n')
+old = ('    (select am.amname\n'
+       '        from pg_am am, pg_class cl_sub\n'
+       '        where am.oid = cl_sub.relam and cl_sub.oid = ind.indexrelid\n'
+       '        )::varchar(256) as Index_type,\n')
+assert f.count(old) == 1
+f = f.replace(old, old.replace('(select am.amname', 'pg_catalog.upper((select am.amname')
+              .replace(')::varchar(256) as Index_type', '))::varchar(256) as Index_type'))
 s = s[:start] + f + s[end:]
 name_definitions.append(f.replace(prefix, 'CREATE OR REPLACE VIEW mys_informa_schema.indexs AS\n'))
 

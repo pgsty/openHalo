@@ -105,7 +105,7 @@ BEGIN
                     k.sub_part::int as Sub_part,
                     NULL::varchar(256) as Packed,
                     (case when att.attnotnull then '' else 'YES' end)::varchar(8) as _null,
-                    (select am.amname from pg_am am where am.oid = (select cl.relam from pg_class cl where cl.oid = records.indexrelid))::varchar(256) as Index_type,
+                    pg_catalog.upper((select am.amname from pg_am am where am.oid = (select cl.relam from pg_class cl where cl.oid = records.indexrelid)))::varchar(256) as Index_type,
                     ''::varchar(512) as _comment,
                     ''::varchar(512) as Index_comment
                 from mysql.index_key_parts(records.indexrelid) k
@@ -209,7 +209,7 @@ BEGIN
                     k.sub_part::int as Sub_part,
                     NULL::varchar(256) as Packed,
                     (case when att.attnotnull then '' else 'YES' end)::varchar(8) as _null,
-                    (select am.amname from pg_am am where am.oid = (select cl.relam from pg_class cl where cl.oid = records.indexrelid))::varchar(256) as Index_type,
+                    pg_catalog.upper((select am.amname from pg_am am where am.oid = (select cl.relam from pg_class cl where cl.oid = records.indexrelid)))::varchar(256) as Index_type,
                     ''::varchar(512) as _comment,
                     ''::varchar(512) as Index_comment,
                     'YES'::varchar(64) as Visible,
@@ -521,10 +521,10 @@ select
     NULL::int as Sub_part,
     NULL::varchar(256) as Packed,
     (case when att.attnotnull then '' else 'YES' end) as _null,
-    (select am.amname
+    pg_catalog.upper((select am.amname
         from pg_am am, pg_class cl_sub
         where am.oid = cl_sub.relam and cl_sub.oid = ind.indexrelid
-        )::varchar(256) as Index_type,
+        ))::varchar(256) as Index_type,
     ''::varchar(256) as _comment,
     (select ds.description
         from pg_description ds

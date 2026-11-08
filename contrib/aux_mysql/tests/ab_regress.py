@@ -699,6 +699,7 @@ def _():
  q(c,'replace into pk_u values (%s, 5)',(big[:20]+'z',))
  eq(tuple(q(c,'select v, length(b) from pk_u')),((5,21),))
  assert ('pk_ub',1,'b',20) in [tuple(r[2:5])+(r[7],) for r in q(c,'show index from pk_u')]
+ eq({r[10] for r in q(c,'show index from pk_u')},{'BTREE','HASH'})   # MySQL's spelling
  # MODIFY / CHANGE and a key on the new type in one ALTER; a later part is capped
  q(c,'create table pk_m (id int primary key, c varchar(100))')
  q(c,'alter table pk_m modify c text, add key pk_mc (c(100))');q(c,'insert into pk_m values (1, %s)',(big,))
