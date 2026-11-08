@@ -165,7 +165,7 @@ def main():
         with (work/'ab.log').open('w') as stream:
             subprocess.run([sys.executable,str(tests/'ab_regress.py')],env=env,stdout=stream,stderr=subprocess.STDOUT,check=True)
         with (work/'route-a.log').open('w') as stream:
-            for wp in ('text','binary','char','collation','numeric_cast','uint64','prefix_nul'):
+            for wp in ('text','binary','char','collation','numeric_cast','uint64','prefix_nul','hints'):
                 subprocess.run([sys.executable,str(tests/'route_a.py'),'--port',str(a.mysql_port),
                                 '--reference-port',str(a.reference_port),'--wp',wp],env=env,
                                stdout=stream,stderr=subprocess.STDOUT,check=True)

@@ -175,7 +175,7 @@ from `pg14` in a temporary directory and compares their bytes.
 asserts character functions, mixed expressions, value/HEX assignments, and the
 intentional 1366 boundary for NUL in every character family and write mode.
 The other work packages are selected with `--wp binary`, `char`, `collation`,
-`numeric_cast`, `uint64`, and `prefix_nul`. The numeric CAST check also uses
+`numeric_cast`, `uint64`, `prefix_nul`, and `hints`. The numeric CAST check also uses
 `PSQL` (or psql on PATH) over PG at the MySQL port plus 2000.
 The standalone expression harness omits executor-only conflict node assignments
 when compiled against stock PG18 headers; production parser byte identity is

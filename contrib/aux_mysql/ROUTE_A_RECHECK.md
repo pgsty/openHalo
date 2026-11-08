@@ -161,7 +161,7 @@ on 3804/5804. `tests/route_a.py --port 3804 --wp prefix_nul`: 19 assertions
 against 3771 passed, covering the character 1366 boundary and byte-preserving
 binary ODKU/REPLACE with distinct NUL-containing prefix keys.
 
-## WP8 — real released 1.5 upgrade
+## WP8 — real released 1.5 upgrade (`0dc12fe`)
 
 Built unmodified tag v18.6 (`5086d18f03af2794b69c87c784768a7aeb5d43e9`)
 outside the repository. The repeatable test initializes with its binaries and
@@ -200,3 +200,22 @@ Debug validation:
   the separate same-session 1.8→1.9 refresh test.
 
 Release build repetition and final full acceptance are still pending.
+
+## WP9 — ignored index hints
+
+The generator accepts USE/IGNORE/FORCE, INDEX/KEY, optional FOR JOIN/ORDER BY/
+GROUP BY, multiple/quoted/PRIMARY names, repeated hints, aliases and empty USE
+lists. All hints are discarded. UPDATE and DELETE share the alias/hint boundary.
+The existing MySQL `DELETE FROM target USING table_references` form also needs a
+distinct PG target alias when the USING list includes the target; the generator
+now correlates it by ctid and tableoid, retaining all join conditions. This
+prevents an otherwise valid hinted multi-table DELETE from failing with 1105.
+The generated alias avoids existing aliases. Native PG grammar is untouched.
+
+Debug rebuilt; bison still accepts exactly 47 expected conflicts. The Route A
+`--wp hints` scan covers each hint spelling/scope/name list, SELECT aliases,
+both JOIN operands, comma/JOIN UPDATE and USING DELETE (aliases, left/right join
+operands and alias collision), plus INSERT IGNORE and USE database regression.
+All 315 assertions passed against 3771. `release_dml.py` passed its SQL,
+concurrency, trigger and privilege cases, including reference-port repetition.
+Generator byte identity passed.

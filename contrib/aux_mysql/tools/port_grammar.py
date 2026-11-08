@@ -1215,6 +1215,118 @@ for token in ('VALUES', 'VALUE_P'):
            "\t\t\t\t}\n" + old)
     rep(old, new)
 
+# MySQL index hints are accepted and ignored, as the original FORCE INDEX was.
+# Keep hint lists nonempty at the alias boundary; the parenthesized index-name
+# list can be empty. PRIMARY is a reserved word, but a valid index name here.
+rep("force_index:\n        FORCE INDEX '(' ColId ')'\n        ;", '''force_index:
+            mysql_index_hint_kind mysql_index_hint_key mysql_index_hint_scope '(' mysql_index_hint_names ')'
+        ;
+mysql_index_hint_kind: USE | IGNORE | FORCE ;
+mysql_index_hint_key: INDEX | KEY ;
+mysql_index_hint_scope:
+            /*EMPTY*/ | FOR JOIN | FOR ORDER BY | FOR GROUP_P BY
+        ;
+mysql_index_hint_names:
+            /*EMPTY*/ | mysql_index_hint_name_list
+        ;
+mysql_index_hint_name_list:
+            mysql_index_hint_name | mysql_index_hint_name_list ',' mysql_index_hint_name
+        ;
+mysql_index_hint_name: ColId | PRIMARY ;''')
+
+# UPDATE/DELETE use a separate relation production from SELECT/JOIN. Share its
+# alias handling with the UPDATE list rather than duplicating hint reductions.
+begin = s.index('\nrelation_expr_opt_alias:')
+end = s.index('\nrelation_expr_opt_aliass:', begin)
+block = s[begin:end]
+assert block.count('\n\t\t;') == 1
+block = block.replace('\n\t\t;', '''
+            | relation_expr opt_force_index_clause
+                { $$ = $1; }
+            | relation_expr ColId opt_force_index_clause
+                { $1->alias = makeAlias($2, NIL); $$ = $1; }
+            | relation_expr AS ColId opt_force_index_clause
+                { $1->alias = makeAlias($3, NIL); $$ = $1; }
+        ;''')
+s = s[:begin] + block + s[end:]
+begin = s.index('\nrelation_expr_opt_aliass:')
+end = s.index('\n\t\t;', begin) + len('\n\t\t;')
+s = s[:begin] + '''
+relation_expr_opt_aliass:
+            relation_expr_opt_alias { $$ = list_make1($1); }
+        ;''' + s[end:]
+
+# MySQL's DELETE FROM target USING table_references includes the target again
+# in that list. PG needs a separate target alias and a physical-row identity
+# join; otherwise its namespace rejects an otherwise valid hinted statement.
+rep('static ReturningClause *makeReturningClauseFromList(List *exprs);',
+    'static ReturningClause *makeReturningClauseFromList(List *exprs);\n'
+    'static void makeMysqlDeleteUsing(DeleteStmt *stmt, int location);')
+begin = s.index('\nDeleteStmt:')
+end = s.index('\ndelete_options:',begin)
+block = s[begin:end]
+assert block.count('$$ = (Node *)n;') == 2
+block = block.replace('$$ = (Node *)n;', 'makeMysqlDeleteUsing(n, @1);\n\t\t\t\t\t$$ = (Node *)n;')
+s = s[:begin]+block+s[end:]
+s += '''
+
+static RangeVar *
+mysqlDeleteSource(Node *node, const char *name, const char *schema)
+{
+    if (IsA(node, RangeVar))
+    {
+        RangeVar *r = (RangeVar *) node;
+        if (strcmp(r->alias ? r->alias->aliasname : r->relname, name) == 0 &&
+            (schema == NULL || (r->schemaname && strcmp(schema, r->schemaname) == 0)))
+            return r;
+    }
+    else if (IsA(node, JoinExpr))
+    {
+        JoinExpr *j = (JoinExpr *) node;
+        RangeVar *r = mysqlDeleteSource(j->larg, name, schema);
+        return r ? r : mysqlDeleteSource(j->rarg, name, schema);
+    }
+    return NULL;
+}
+
+static void
+makeMysqlDeleteUsing(DeleteStmt *stmt, int location)
+{
+    RangeVar *source = NULL;
+    const char *name = stmt->relation->alias ? stmt->relation->alias->aliasname : stmt->relation->relname;
+    char *target_alias;
+    int suffix = 0;
+    bool occupied;
+    List *quals = stmt->whereClause ? list_make1(stmt->whereClause) : NIL;
+
+    foreach_ptr(Node, item, stmt->usingClause)
+    {
+        source = mysqlDeleteSource(item, name, stmt->relation->schemaname);
+        if (source) break;
+    }
+    if (!source) return;
+    do
+    {
+        target_alias = psprintf("__aux_delete_%d", suffix++);
+        occupied = false;
+        foreach_ptr(Node, item, stmt->usingClause)
+            occupied |= mysqlDeleteSource(item, target_alias, NULL) != NULL;
+    } while (occupied);
+    stmt->relation = copyObject(source);
+    stmt->relation->alias = makeAlias(target_alias, NIL);
+    for (int i = 0; i < 2; i++)
+    {
+        const char *column = i == 0 ? "ctid" : "tableoid";
+        ColumnRef *left = makeNode(ColumnRef), *right = makeNode(ColumnRef);
+        left->fields = list_make2(makeString(target_alias), makeString(pstrdup(column)));
+        right->fields = list_make2(makeString(pstrdup(name)), makeString(pstrdup(column)));
+        left->location = right->location = location;
+        quals = lappend(quals, makeSimpleA_Expr(AEXPR_OP, "=", (Node *) left, (Node *) right, location));
+    }
+    stmt->whereClause = (Node *) makeBoolExpr(AND_EXPR, quals, location);
+}
+'''
+
 # Keep untouched upstream formatting. Normalize only generated replacement
 # lines to PostgreSQL's four-column tab style, including inherited indentation
 # on rewritten expressions. This is deterministic from the PG14 input alone.

@@ -195,6 +195,39 @@ class Checks:
         self.count += 1
 
 
+    def hints(self):
+        for t in ('hint_a','hint_b'):
+            self.both('CREATE TABLE '+t+'(id INT PRIMARY KEY,v INT,w INT,KEY iv(v),KEY iw(w))')
+            self.both('INSERT INTO '+t+' VALUES(1,10,11),(2,20,21)')
+        for kind in ('USE','IGNORE','FORCE'):
+            for keyword in ('INDEX','KEY'):
+                for scope in ('',' FOR JOIN',' FOR ORDER BY',' FOR GROUP BY'):
+                    for names in ('iv','iv,iw','PRIMARY','`iv`,`iw`'):
+                        hint = kind+' '+keyword+scope+' ('+names+')'
+                        for alias in ('',' x',' AS x'):
+                            self.both('SELECT id,v,HEX(v) FROM hint_a'+alias+' '+hint+' ORDER BY id')
+        for hint in ('USE INDEX ()','USE KEY FOR JOIN ()',
+                     'USE INDEX (iv) USE INDEX (iw) IGNORE KEY (iv)',
+                     'FORCE INDEX FOR ORDER BY (iv,iw) IGNORE INDEX FOR JOIN (iv)'):
+            self.both('SELECT id,v FROM hint_a AS x '+hint+' ORDER BY id')
+        self.both('SELECT x.id,y.v FROM hint_a AS x USE INDEX (iv,iw) JOIN hint_b y FORCE KEY FOR JOIN (PRIMARY) ON x.id=y.id ORDER BY x.id')
+        self.both('UPDATE hint_a x USE INDEX (iv),hint_b y IGNORE KEY (iw) SET x.v=y.v+1 WHERE x.id=y.id')
+        self.both('SELECT id,v,HEX(v) FROM hint_a ORDER BY id')
+        self.both('UPDATE hint_a x FORCE INDEX (iv,iw) JOIN hint_b y USE KEY (PRIMARY) ON x.id=y.id SET x.v=y.v+2')
+        self.both('SELECT id,v,HEX(v) FROM hint_a ORDER BY id')
+        self.both('DELETE FROM hint_a USING hint_a USE INDEX (iv),hint_b IGNORE KEY (iw) WHERE hint_a.id=hint_b.id AND hint_a.id=1')
+        self.both('SELECT id,v FROM hint_a ORDER BY id')
+        for target,tables in (
+            ('x','hint_a AS x USE INDEX () JOIN hint_b y FORCE INDEX (iv,iw) ON x.id=y.id'),
+            ('__aux_delete_0','hint_a __aux_delete_0 IGNORE KEY (iw) LEFT JOIN hint_b y USE INDEX (iv) ON __aux_delete_0.id=y.id'),
+            ('x','hint_b y USE KEY (iv) JOIN hint_a x FORCE INDEX (PRIMARY) ON x.id=y.id')):
+            self.both('DELETE FROM '+target+' USING '+tables+' WHERE '+target+'.id=2')
+            self.both('SELECT id,v FROM hint_a ORDER BY id')
+            self.both('INSERT INTO hint_a VALUES(2,22,21)')
+        self.both('INSERT IGNORE INTO hint_a VALUES(2,99,99)')
+        self.both('USE '+self.schema)
+        self.both('SELECT id,v FROM hint_a ORDER BY id')
+
     def prefix_nul(self):
         for coll in ('utf8mb4_bin','utf8mb4_general_ci'):
             self.both('CREATE TABLE prefix_nul(id INT,s TEXT COLLATE '+coll+',UNIQUE KEY sk(s(3)))')
@@ -386,7 +419,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast', 'uint64', 'prefix_nul'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast', 'uint64', 'prefix_nul', 'hints'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

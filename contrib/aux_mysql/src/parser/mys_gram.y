@@ -186,6 +186,7 @@ static Node *makeUserVarRefCall(char *name, int location);
 static Node *makeUserVarAssignCall(char *name, Node *expr, int location);
 static Node *makeSysVarRefCall(char *name, int location);
 static ReturningClause *makeReturningClauseFromList(List *exprs);
+static void makeMysqlDeleteUsing(DeleteStmt *stmt, int location);
 static List *makePublicationTables(List *rels);
 static PartitionStrategy parsePartitionStrategy(char *strategy, int location,
 												core_yyscan_t yyscanner);
@@ -15592,6 +15593,7 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $8, $9, @1);
 					n->returningClause = makeReturningClauseFromList($10);
 					n->withClause = $1;
+					makeMysqlDeleteUsing(n, @1);
 					$$ = (Node *)n;
 				}
             | DELETE_P delete_options FROM relation_expr_opt_alias using_clause
@@ -15605,6 +15607,7 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $7, $8, @1);
 					n->returningClause = makeReturningClauseFromList($9);
 					n->withClause = NULL;
+					makeMysqlDeleteUsing(n, @1);
 					$$ = (Node *)n;
 				}
 		;
@@ -17016,8 +17019,20 @@ from_list:
 		;
 
 force_index:
-        FORCE INDEX '(' ColId ')'
+			mysql_index_hint_kind mysql_index_hint_key mysql_index_hint_scope '(' mysql_index_hint_names ')'
         ;
+mysql_index_hint_kind: USE | IGNORE | FORCE ;
+mysql_index_hint_key: INDEX | KEY ;
+mysql_index_hint_scope:
+			/*EMPTY*/ | FOR JOIN | FOR ORDER BY | FOR GROUP_P BY
+		;
+mysql_index_hint_names:
+			/*EMPTY*/ | mysql_index_hint_name_list
+		;
+mysql_index_hint_name_list:
+			mysql_index_hint_name | mysql_index_hint_name_list ',' mysql_index_hint_name
+		;
+mysql_index_hint_name: ColId | PRIMARY ;
 
 opt_force_index_clause:
 			force_index								
@@ -17467,27 +17482,16 @@ relation_expr_opt_alias: relation_expr					%prec UMINUS
 					$1->alias = alias;
 					$$ = $1;
 				}
+			| relation_expr opt_force_index_clause
+				{ $$ = $1; }
+			| relation_expr ColId opt_force_index_clause
+				{ $1->alias = makeAlias($2, NIL); $$ = $1; }
+			| relation_expr AS ColId opt_force_index_clause
+				{ $1->alias = makeAlias($3, NIL); $$ = $1; }
 		;
 
 relation_expr_opt_aliass:
-                relation_expr					%prec UMINUS
-				{
-					$$ = list_make1($1);
-				}
-			| relation_expr ColId
-				{
-					Alias *alias = makeNode(Alias);
-					alias->aliasname = $2;
-					$1->alias = alias;
-					$$ = list_make1($1);
-				}
-			| relation_expr AS ColId
-				{
-					Alias *alias = makeNode(Alias);
-					alias->aliasname = $3;
-					$1->alias = alias;
-					$$ = list_make1($1);
-				}
+			relation_expr_opt_alias { $$ = list_make1($1); }
 		;
 
 
@@ -24453,4 +24457,61 @@ makeMysqlDropIndex(ObjectType type, List *names, RangeVar *table, int location,
 		stmt->cmds = lappend(stmt->cmds, cmd);
 	}
 	return (Node *) stmt;
+}
+
+
+static RangeVar *
+mysqlDeleteSource(Node *node, const char *name, const char *schema)
+{
+	if (IsA(node, RangeVar))
+	{
+		RangeVar *r = (RangeVar *) node;
+		if (strcmp(r->alias ? r->alias->aliasname : r->relname, name) == 0 &&
+			(schema == NULL || (r->schemaname && strcmp(schema, r->schemaname) == 0)))
+			return r;
+	}
+	else if (IsA(node, JoinExpr))
+	{
+		JoinExpr *j = (JoinExpr *) node;
+		RangeVar *r = mysqlDeleteSource(j->larg, name, schema);
+		return r ? r : mysqlDeleteSource(j->rarg, name, schema);
+	}
+	return NULL;
+}
+
+static void
+makeMysqlDeleteUsing(DeleteStmt *stmt, int location)
+{
+	RangeVar *source = NULL;
+	const char *name = stmt->relation->alias ? stmt->relation->alias->aliasname : stmt->relation->relname;
+	char *target_alias;
+	int suffix = 0;
+	bool occupied;
+	List *quals = stmt->whereClause ? list_make1(stmt->whereClause) : NIL;
+
+	foreach_ptr(Node, item, stmt->usingClause)
+	{
+		source = mysqlDeleteSource(item, name, stmt->relation->schemaname);
+		if (source) break;
+	}
+	if (!source) return;
+	do
+	{
+		target_alias = psprintf("__aux_delete_%d", suffix++);
+		occupied = false;
+		foreach_ptr(Node, item, stmt->usingClause)
+			occupied |= mysqlDeleteSource(item, target_alias, NULL) != NULL;
+	} while (occupied);
+	stmt->relation = copyObject(source);
+	stmt->relation->alias = makeAlias(target_alias, NIL);
+	for (int i = 0; i < 2; i++)
+	{
+		const char *column = i == 0 ? "ctid" : "tableoid";
+		ColumnRef *left = makeNode(ColumnRef), *right = makeNode(ColumnRef);
+		left->fields = list_make2(makeString(target_alias), makeString(pstrdup(column)));
+		right->fields = list_make2(makeString(pstrdup(name)), makeString(pstrdup(column)));
+		left->location = right->location = location;
+		quals = lappend(quals, makeSimpleA_Expr(AEXPR_OP, "=", (Node *) left, (Node *) right, location));
+	}
+	stmt->whereClause = (Node *) makeBoolExpr(AND_EXPR, quals, location);
 }
