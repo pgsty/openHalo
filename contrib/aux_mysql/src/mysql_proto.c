@@ -186,6 +186,72 @@ mys_add_warning(uint16 code, const char *message)
 		mys_record_diagnostic(false, code, message);
 }
 
+/*
+ * Queries that run before the next command is read, as parts of the current
+ * one: the statement of an EXECUTE, then the rest of its packet (mys_stmt.c).
+ * An error ends the packet and drops them.
+ */
+typedef struct MysQueuedQuery
+{
+	char	   *query;
+	MysTextMap *map;			/* EXECUTE: names columns after the text with '?' */
+} MysQueuedQuery;
+
+static List *queued_queries = NIL;
+static MemoryContext queue_context = NULL;
+
+static MysTextMap *
+copy_text_map(const MysTextMap *map)
+{
+	MysTextMap *copy = palloc(sizeof(MysTextMap));
+	int		   *locs = palloc(sizeof(int) * 3 * Max(map->nparams, 1));
+
+	memcpy(locs, map->orig_loc, sizeof(int) * map->nparams);
+	memcpy(locs + map->nparams, map->new_loc, sizeof(int) * map->nparams);
+	memcpy(locs + 2 * map->nparams, map->new_len, sizeof(int) * map->nparams);
+	copy->orig = pstrdup(map->orig);
+	copy->nparams = map->nparams;
+	copy->orig_loc = locs;
+	copy->new_loc = locs + map->nparams;
+	copy->new_len = locs + 2 * map->nparams;
+	return copy;
+}
+
+/* run query (then rest, if any) before anything queued so far */
+void
+mys_queue_query(const char *query, const MysTextMap *map, const char *rest)
+{
+	MemoryContext oldcxt;
+	MysQueuedQuery *q;
+	List	   *add;
+
+	if (queue_context == NULL)
+		queue_context = AllocSetContextCreate(TopMemoryContext, "aux_mysql queued queries",
+											  ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(queue_context);
+	q = palloc0(sizeof(MysQueuedQuery));
+	q->query = pstrdup(query);
+	if (map)
+		q->map = copy_text_map(map);
+	add = list_make1(q);
+	if (rest)
+	{
+		q = palloc0(sizeof(MysQueuedQuery));
+		q->query = pstrdup(rest);
+		add = lappend(add, q);
+	}
+	queued_queries = list_concat(add, queued_queries);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+static void
+discard_queued_queries(void)
+{
+	queued_queries = NIL;
+	if (queue_context)
+		MemoryContextReset(queue_context);
+}
+
 /* does a later statement of this COM_QUERY send its own response? */
 static bool
 more_visible_results(void)
@@ -195,7 +261,7 @@ more_visible_results(void)
 		if (!((MysStmtInfo *) list_nth(stmt_infos, i))->suppress_response)
 			return true;
 	}
-	return trailing_comment_ok;
+	return trailing_comment_ok || queued_queries != NIL;
 }
 
 /*
@@ -394,6 +460,8 @@ mys_send_err(uint16 code, const char *sqlstate, const char *msg)
 	StringInfoData b;
 
 	mys_record_diagnostic(true, code, msg);
+	/* nothing of the command runs after its error, as in MySQL */
+	discard_queued_queries();
 
 	initStringInfo(&b);
 	put_int1(&b, 0xff);
@@ -482,6 +550,10 @@ mys_errno(int sqlerrcode)
 			return 1091;		/* ER_CANT_DROP_FIELD_OR_KEY */
 		case ERRCODE_UNDEFINED_PSTATEMENT:
 			return 1243;		/* ER_UNKNOWN_STMT_HANDLER */
+		case ERRCODE_UNDEFINED_PARAMETER:
+			return 1210;		/* ER_WRONG_ARGUMENTS: EXECUTE ... USING */
+		case ERRCODE_INVALID_PSTATEMENT_DEFINITION:
+			return 1295;		/* ER_UNSUPPORTED_PS */
 		case ERRCODE_PROTOCOL_VIOLATION:
 			return 1835;		/* ER_MALFORMED_PACKET */
 		case ERRCODE_INVALID_CURSOR_STATE:
@@ -1115,6 +1187,23 @@ mys_read_command(StringInfo inBuf)
 	uint8		cmd;
 
 	deferred_error = NULL;
+	if (queued_queries != NIL)
+	{
+		/* the next part of the current command (see mys_queue_query) */
+		MysQueuedQuery *q = linitial(queued_queries);
+
+		resetStringInfo(inBuf);
+		appendBinaryStringInfo(inBuf, q->query, strlen(q->query) + 1);	/* with the NUL */
+		if (q->map)
+			mys_text_map = copy_text_map(q->map);
+		queued_queries = list_delete_first(queued_queries);
+		if (queued_queries == NIL)
+			MemoryContextReset(queue_context);
+		diagnostics_pending = true;
+		stmt_infos = NIL;
+		stmt_index = 0;
+		return PqMsg_Query;
+	}
 	if (mys_read_packet(inBuf) == EOF)
 		return EOF;
 
@@ -1370,7 +1459,7 @@ end_statement(const QueryCompletion *qc)
 	/* SET TRANSACTION's one-shot values; the next transaction's defaults */
 	mys_statement_done(info->txn_kind == MYS_TXN_END && !info->txn_control,
 					   following != NULL && following->txn_kind == MYS_TXN_IMPLICIT_COMMIT);
-	if (info->suppress_response)
+	if (info->suppress_response || info->continued)
 	{
 		resultset_active = false;
 		return;
@@ -1437,8 +1526,11 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 {
 	end_statement(qc);
 
-	/* after the last statement, the empty one of a trailing comment */
-	if (trailing_comment_ok && stmt_index >= list_length(stmt_infos))
+	/*
+	 * after the last statement, the empty one of a trailing comment (an
+	 * EXECUTE queued the rest of the packet: the comment is answered there)
+	 */
+	if (trailing_comment_ok && stmt_index >= list_length(stmt_infos) && queued_queries == NIL)
 	{
 		trailing_comment_ok = false;
 		/* a statement of its own: it clears the warnings, as in MySQL */
@@ -1482,6 +1574,7 @@ static void
 mys_comm_reset(void)
 {
 	resultset_active = false;
+	discard_queued_queries();
 #ifdef HALO_BABELFISH_API
 	/* receivers of aborted portals are gone */
 	list_free_deep(bf_receivers);

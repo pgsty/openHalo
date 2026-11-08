@@ -86,6 +86,7 @@ typedef struct MysStmtInfo
 	bool		silent;				/* SET ...: send OK, not a result set */
 	bool		capture_insert_id;	/* hidden RETURNING of the AUTO_INCREMENT column */
 	bool		suppress_response;	/* helper statement of a multi-statement rewrite */
+	bool		continued;			/* EXECUTE: its statement answers, as the next query */
 	bool		group_start;		/* first PG statement of a MySQL statement */
 	bool		txn_control;		/* hidden statement (mys_txn.c) */
 	uint8		txn_op;				/* MysTxnOp of a hidden statement */
@@ -167,6 +168,13 @@ typedef struct MysTextMap
 
 /* mys_stmt.c: set while a prepared statement's text is parsed */
 extern MysTextMap *mys_text_map;
+
+/* mys_stmt.c: SQL PREPARE / EXECUTE / DEALLOCATE PREPARE */
+extern Node *mys_sql_ps_marker(Node *stmt, const char *rest);
+extern bool mys_sql_ps_utility(Node *parsetree, const char *queryString);
+
+/* mysql_proto.c: queries to run before the next command is read */
+extern void mys_queue_query(const char *query, const MysTextMap *map, const char *rest);
 
 /* mys_rewrite.c */
 extern List *mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string,

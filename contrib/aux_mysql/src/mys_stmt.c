@@ -30,6 +30,9 @@
  * values decide them at EXECUTE time; syntax errors and unknown objects are,
  * as in MySQL.
  *
+ * SQL PREPARE / EXECUTE / DEALLOCATE PREPARE (at the end of this file) keep
+ * their statements by name and use the same text, marker and literal rules.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -37,16 +40,22 @@
 #include <math.h>
 
 #include "access/xact.h"
+#include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "parser/analyze.h"
+#include "parser/parse_collate.h"
+#include "parser/parse_expr.h"
 #include "pgstat.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
@@ -54,7 +63,9 @@
 #include "halo_mysql.h"
 #include "mys_proto.h"
 #include "mys_gramparse.h"
+#include "mys_parsenodes.h"
 #include "adapter/mysql/systemVar.h"
+#include "commands/mysql/mys_uservar.h"
 
 /* MySQL's default max_prepared_stmt_count, applied per session here */
 #define MYS_MAX_PREPARED_STMTS	16382
@@ -75,6 +86,10 @@ typedef struct MysPrepStmt
 
 static HTAB *stmt_hash = NULL;
 static uint32 next_stmt_id = 1;
+
+/* SQL PREPARE: statements by name (see the end of this file) */
+static HTAB *sql_stmt_hash = NULL;
+static void sql_stmt_drop_all(void);
 
 bool		mys_binary_resultset = false;
 MysTextMap *mys_text_map = NULL;
@@ -122,6 +137,15 @@ drop_stmt(MysPrepStmt *stmt)
 	MemoryContextDelete(cxt);
 }
 
+/* max_prepared_stmt_count counts protocol and SQL statements together */
+static long
+prepared_stmt_count(void)
+{
+	return (stmt_hash ? hash_get_num_entries(stmt_hash) : 0) +
+		(sql_stmt_hash ? hash_get_num_entries(sql_stmt_hash) : 0);
+}
+
+/* COM_RESET_CONNECTION: all prepared statements, protocol and SQL */
 void
 mys_stmt_close_all(void)
 {
@@ -130,6 +154,7 @@ mys_stmt_close_all(void)
 	List	   *ids = NIL;
 	ListCell   *lc;
 
+	sql_stmt_drop_all();
 	if (stmt_hash == NULL)
 		return;
 	hash_seq_init(&seq, stmt_hash);
@@ -486,6 +511,8 @@ param_type_is_binary(uint16 ptype)
  * ----------------------------------------------------------------
  */
 
+static const char *ps_marker_name(Node *stmt);
+
 /* errors that MySQL also reports at PREPARE time */
 static bool
 prepare_time_error(int sqlerrcode)
@@ -499,6 +526,7 @@ prepare_time_error(int sqlerrcode)
 		case ERRCODE_INVALID_SCHEMA_NAME:
 		case ERRCODE_INSUFFICIENT_PRIVILEGE:
 		case ERRCODE_FEATURE_NOT_SUPPORTED:
+		case ERRCODE_INVALID_PSTATEMENT_DEFINITION:
 			return true;
 		default:
 			return false;
@@ -523,6 +551,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 	int			prev = 0;
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
+	MysTextMap *saved_map = mys_text_map;
 	bool		result = false;
 
 	initStringInfo(&text);
@@ -566,6 +595,10 @@ describe_statement(const char *query, int nparams, const int *locs,
 		{
 			MysStmtInfo *info = (MysStmtInfo *) lfirst(lc2);
 
+			if (ps_marker_name(lfirst_node(RawStmt, lc)->stmt))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PSTATEMENT_DEFINITION),
+						 errmsg("This command is not supported in the prepared statement protocol yet")));
 			if (info->suppress_response)
 				continue;
 			visible++;
@@ -607,7 +640,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 			}
 			result = (*tupdesc != NULL);
 		}
-		mys_text_map = NULL;
+		mys_text_map = saved_map;
 
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
@@ -617,7 +650,7 @@ describe_statement(const char *query, int nparams, const int *locs,
 	{
 		ErrorData  *edata;
 
-		mys_text_map = NULL;
+		mys_text_map = saved_map;
 		mys_discard_rewrite_warnings();
 		MemoryContextSwitchTo(oldcxt);
 		edata = CopyErrorData();
@@ -679,7 +712,7 @@ mys_stmt_prepare(StringInfo pkt)
 	ErrorData  *volatile error = NULL;
 
 	init_hash();
-	if (hash_get_num_entries(stmt_hash) >= MYS_MAX_PREPARED_STMTS)
+	if (prepared_stmt_count() >= MYS_MAX_PREPARED_STMTS)
 	{
 		mys_send_error(ERRCODE_PROGRAM_LIMIT_EXCEEDED,
 					   psprintf("Can't create more than max_prepared_stmt_count statements (current value: %d)",
@@ -968,4 +1001,411 @@ mys_stmt_send_long_data(StringInfo pkt)
 	appendBinaryStringInfo(stmt->long_data[param], pkt->data + pkt->cursor,
 						   pkt->len - pkt->cursor);
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/* ----------------------------------------------------------------
+ * SQL PREPARE / EXECUTE / DEALLOCATE PREPARE
+ *
+ * The grammar builds PostgreSQL's nodes for them, but PostgreSQL's prepared
+ * statements hold analyzed queries with typed parameters, while MySQL's hold
+ * text whose '?' markers take the values of user variables like literals.
+ * So mys_rewrite.c turns them into marker statements that run here.  PREPARE
+ * checks the text as COM_STMT_PREPARE does and keeps it by name; EXECUTE
+ * renders the values into it, as COM_STMT_EXECUTE does, and has
+ * mysql_proto.c run the result as the next query (followed by the rest of
+ * the packet), so the client gets the statement's own result.
+ * ----------------------------------------------------------------
+ */
+#define PS_PREPARE_MARKER		"aux_mysql_prepare"
+#define PS_EXECUTE_MARKER		"aux_mysql_execute"
+#define PS_DEALLOCATE_MARKER	"aux_mysql_deallocate"
+
+typedef struct MysSqlStmt
+{
+	char		name[NAMEDATALEN];	/* hash key, in lower case */
+	MemoryContext cxt;
+	char	   *query;			/* text with '?' markers */
+	int			nparams;
+	int		   *param_loc;		/* byte offset of each marker */
+} MysSqlStmt;
+
+/* statement names are case-insensitive in MySQL */
+static void
+sql_stmt_key(const char *name, char *key)
+{
+	int			i;
+
+	for (i = 0; name[i] != '\0' && i < NAMEDATALEN - 1; i++)
+		key[i] = pg_ascii_tolower((unsigned char) name[i]);
+	key[i] = '\0';
+}
+
+static MysSqlStmt *
+sql_stmt_lookup(const char *name)
+{
+	char		key[NAMEDATALEN];
+
+	if (sql_stmt_hash == NULL)
+		return NULL;
+	sql_stmt_key(name, key);
+	return hash_search(sql_stmt_hash, key, HASH_FIND, NULL);
+}
+
+static bool
+sql_stmt_drop(const char *name)
+{
+	MysSqlStmt *stmt = sql_stmt_lookup(name);
+	char		key[NAMEDATALEN];
+	MemoryContext cxt;
+
+	if (stmt == NULL)
+		return false;
+	cxt = stmt->cxt;
+	strlcpy(key, stmt->name, NAMEDATALEN);
+	hash_search(sql_stmt_hash, key, HASH_REMOVE, NULL);
+	MemoryContextDelete(cxt);
+	return true;
+}
+
+static void
+sql_stmt_drop_all(void)
+{
+	HASH_SEQ_STATUS seq;
+	MysSqlStmt *stmt;
+
+	if (sql_stmt_hash == NULL)
+		return;
+	hash_seq_init(&seq, sql_stmt_hash);
+	while ((stmt = hash_seq_search(&seq)) != NULL)
+		MemoryContextDelete(stmt->cxt);
+	hash_destroy(sql_stmt_hash);
+	sql_stmt_hash = NULL;
+}
+
+static void
+sql_stmt_store(const char *name, const char *query, int nparams, const int *locs)
+{
+	char		key[NAMEDATALEN];
+	MemoryContext cxt;
+	char	   *text;
+	int		   *loc;
+	MysSqlStmt *stmt;
+	bool		found;
+
+	if (sql_stmt_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = NAMEDATALEN;
+		ctl.entrysize = sizeof(MysSqlStmt);
+		ctl.hcxt = TopMemoryContext;
+		sql_stmt_hash = hash_create("aux_mysql SQL prepared statements", 16, &ctl,
+									HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+	sql_stmt_key(name, key);
+
+	cxt = AllocSetContextCreate(TopMemoryContext, "aux_mysql SQL prepared statement",
+								ALLOCSET_SMALL_SIZES);
+	text = MemoryContextStrdup(cxt, query);
+	loc = MemoryContextAlloc(cxt, sizeof(int) * Max(nparams, 1));
+	memcpy(loc, locs, sizeof(int) * nparams);
+
+	stmt = hash_search(sql_stmt_hash, key, HASH_ENTER, &found);
+	if (found)
+		MemoryContextDelete(stmt->cxt);
+	stmt->cxt = cxt;
+	stmt->query = text;
+	stmt->nparams = nparams;
+	stmt->param_loc = loc;
+}
+
+/* the marker statement's kind, or NULL if it is no such marker */
+static const char *
+ps_marker_name(Node *stmt)
+{
+	const char *name;
+
+	if (!IsA(stmt, DoStmt) || ((DoStmt *) stmt)->args == NIL)
+		return NULL;
+	name = linitial_node(DefElem, ((DoStmt *) stmt)->args)->defname;
+	if (strcmp(name, PS_PREPARE_MARKER) == 0 || strcmp(name, PS_EXECUTE_MARKER) == 0 ||
+		strcmp(name, PS_DEALLOCATE_MARKER) == 0)
+		return name;
+	return NULL;
+}
+
+/*
+ * The marker statement for a PrepareStmt, ExecuteStmt or DeallocateStmt of
+ * the MySQL grammar (other statements are returned as they are).  rest is
+ * the text of the packet after an EXECUTE, or NULL.
+ */
+Node *
+mys_sql_ps_marker(Node *stmt, const char *rest)
+{
+	DoStmt	   *d = makeNode(DoStmt);
+
+	switch ((int) nodeTag(stmt))
+	{
+		case T_PrepareStmt:
+			{
+				PrepareStmt *p = (PrepareStmt *) stmt;
+				DefElem    *src;
+
+				/* FROM 'text', or FROM @var: its value when PREPARE runs */
+				if (IsA(p->query, String))
+					src = makeDefElem("text", p->query, -1);
+				else if ((int) nodeTag(p->query) == T_UserVarRef)
+					src = makeDefElem("uservar",
+									  (Node *) makeString(((UserVarRef *) p->query)->userVarName), -1);
+				else
+					return stmt;
+				d->args = list_make2(makeDefElem(PS_PREPARE_MARKER,
+												 (Node *) makeString(p->name), -1),
+									 src);
+				break;
+			}
+		case T_ExecuteStmt:
+			{
+				ExecuteStmt *e = (ExecuteStmt *) stmt;
+
+				d->args = list_make2(makeDefElem(PS_EXECUTE_MARKER,
+												 (Node *) makeString(e->name), -1),
+									 makeDefElem("using", (Node *) e->params, -1));
+				if (rest)
+					d->args = lappend(d->args,
+									  makeDefElem("rest", (Node *) makeString(pstrdup(rest)), -1));
+				break;
+			}
+		case T_DeallocateStmt:
+			{
+				DeallocateStmt *x = (DeallocateStmt *) stmt;
+
+				/* no name: DEALLOCATE ALL (PostgreSQL syntax) */
+				d->args = list_make1(makeDefElem(PS_DEALLOCATE_MARKER,
+												 x->name ? (Node *) makeString(x->name) : NULL,
+												 -1));
+				break;
+			}
+		default:
+			return stmt;
+	}
+	return (Node *) d;
+}
+
+static void
+sql_prepare(DoStmt *d)
+{
+	const char *name = strVal(linitial_node(DefElem, d->args)->arg);
+	DefElem    *src = lsecond_node(DefElem, d->args);
+	const char *text;
+	int			len;
+	char	   *query;
+	int		   *locs;
+	int			nparams;
+	TupleDesc	tupdesc;
+	List	   *tlist;
+	ErrorData  *error;
+
+	if (strcmp(src->defname, "uservar") == 0)
+	{
+		bytea	   *value = mysGetUserVarValueInternal(strVal(src->arg));
+
+		/* MySQL takes an unset variable for the text NULL: a syntax error */
+		text = value ? VARDATA_ANY(value) : "NULL";
+		len = value ? VARSIZE_ANY_EXHDR(value) : 4;
+	}
+	else
+	{
+		text = strVal(src->arg);
+		len = strlen(text);
+	}
+
+	/* as in MySQL, a statement of that name is gone even if this one fails */
+	sql_stmt_drop(name);
+	if (prepared_stmt_count() >= MYS_MAX_PREPARED_STMTS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("Can't create more than max_prepared_stmt_count statements (current value: %d)",
+						MYS_MAX_PREPARED_STMTS)));
+
+	query = mys_normalize_query(text, len);
+	nparams = find_markers(query, &locs);
+	(void) describe_statement(query, nparams, locs, &tupdesc, &tlist, &error);
+	if (error)
+		ReThrowError(error);
+	sql_stmt_store(name, query, nparams, locs);
+}
+
+/* the name of an @variable as the grammar emits it, mysql.get_user_var('name') */
+static const char *
+user_var_name(Node *n)
+{
+	FuncCall   *fc = (FuncCall *) n;
+	A_Const    *arg;
+
+	if (!IsA(n, FuncCall) || list_length(fc->funcname) != 2 || list_length(fc->args) != 1 ||
+		strcmp(strVal(linitial(fc->funcname)), "mysql") != 0 ||
+		strcmp(strVal(lsecond(fc->funcname)), "get_user_var") != 0 ||
+		!IsA(linitial(fc->args), A_Const))
+		return NULL;
+	arg = linitial_node(A_Const, fc->args);
+	if (arg->isnull || !IsA(&arg->val, String))
+		return NULL;
+	return strVal(&arg->val);
+}
+
+static void
+append_number_or_string(StringInfo buf, const char *s, int len)
+{
+	if (is_decimal_text(s, len))
+	{
+		appendStringInfoChar(buf, '(');
+		appendBinaryStringInfo(buf, s, len);
+		appendStringInfoChar(buf, ')');
+	}
+	else
+		append_string_literal(buf, s, len, false);
+}
+
+/*
+ * One EXECUTE ... USING value as a literal.  An @variable keeps its kind,
+ * number or string, as in MySQL.  MySQL accepts nothing else; any other
+ * expression is evaluated and rendered by its type.
+ */
+static void
+append_using_value(StringInfo buf, Node *arg, ParseState *pstate)
+{
+	const char *var = user_var_name(arg);
+	Node	   *expr;
+	Oid			type;
+	EState	   *estate;
+	ExprState  *exprstate;
+	Datum		value;
+	bool		isnull;
+
+	if (var)
+	{
+		bytea	   *v = mysGetUserVarValueInternal((char *) var);
+
+		if (v == NULL)
+			appendStringInfoString(buf, "NULL");
+		else if (varValueIsDigit(PointerGetDatum(v), BYTEAOID))
+			append_number_or_string(buf, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v));
+		else
+			append_string_literal(buf, VARDATA_ANY(v), VARSIZE_ANY_EXHDR(v), false);
+		return;
+	}
+
+	expr = transformExpr(pstate, arg, EXPR_KIND_EXECUTE_PARAMETER);
+	assign_expr_collations(pstate, expr);
+	type = getBaseType(exprType(expr));
+	estate = CreateExecutorState();
+	exprstate = ExecPrepareExpr((Expr *) expr, estate);
+	value = ExecEvalExprSwitchContext(exprstate, GetPerTupleExprContext(estate), &isnull);
+	if (isnull)
+		appendStringInfoString(buf, "NULL");
+	else if (type == BYTEAOID)
+	{
+		bytea	   *b = DatumGetByteaPP(value);
+
+		append_string_literal(buf, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), true);
+	}
+	else if (type == BOOLOID)
+		appendStringInfoString(buf, DatumGetBool(value) ? "(1)" : "(0)");
+	else
+	{
+		Oid			output;
+		bool		varlena;
+		char		category;
+		bool		preferred;
+		char	   *s;
+
+		getTypeOutputInfo(exprType(expr), &output, &varlena);
+		s = OidOutputFunctionCall(output, value);
+		get_type_category_preferred(type, &category, &preferred);
+		if (category == TYPCATEGORY_NUMERIC)
+			append_number_or_string(buf, s, strlen(s));
+		else
+			append_string_literal(buf, s, strlen(s), false);
+	}
+	FreeExecutorState(estate);
+}
+
+static void
+sql_execute(DoStmt *d, const char *queryString)
+{
+	const char *name = strVal(linitial_node(DefElem, d->args)->arg);
+	List	   *args = (List *) lsecond_node(DefElem, d->args)->arg;
+	DefElem    *rest = list_length(d->args) > 2 ? lthird_node(DefElem, d->args) : NULL;
+	MysSqlStmt *stmt = sql_stmt_lookup(name);
+	ParseState *pstate;
+	StringInfoData q;
+	MysTextMap	map;
+	int		   *new_loc;
+	int		   *new_len;
+	int			prev = 0;
+
+	if (stmt == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_PSTATEMENT),
+				 errmsg("Unknown prepared statement handler (%s) given to EXECUTE", name)));
+	if (list_length(args) != stmt->nparams)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_PARAMETER),
+				 errmsg("Incorrect arguments to EXECUTE")));
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = queryString;
+	new_loc = palloc(sizeof(int) * Max(stmt->nparams, 1));
+	new_len = palloc(sizeof(int) * Max(stmt->nparams, 1));
+	initStringInfo(&q);
+	for (int i = 0; i < stmt->nparams; i++)
+	{
+		appendBinaryStringInfo(&q, stmt->query + prev, stmt->param_loc[i] - prev);
+		new_loc[i] = q.len;
+		append_using_value(&q, list_nth(args, i), pstate);
+		new_len[i] = q.len - new_loc[i];
+		prev = stmt->param_loc[i] + 1;
+	}
+	appendStringInfoString(&q, stmt->query + prev);
+	free_parsestate(pstate);
+
+	/* result columns are named after the text with '?', as in MySQL */
+	map.orig = stmt->query;
+	map.nparams = stmt->nparams;
+	map.orig_loc = stmt->param_loc;
+	map.new_loc = new_loc;
+	map.new_len = new_len;
+	mys_queue_query(q.data, &map, rest ? strVal(rest->arg) : NULL);
+}
+
+static void
+sql_deallocate(DoStmt *d)
+{
+	Node	   *name = linitial_node(DefElem, d->args)->arg;
+
+	if (name == NULL)
+		sql_stmt_drop_all();
+	else if (!sql_stmt_drop(strVal(name)))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_PSTATEMENT),
+				 errmsg("Unknown prepared statement handler (%s) given to DEALLOCATE PREPARE",
+						strVal(name))));
+}
+
+/* ProcessUtility: run a marker statement of mys_sql_ps_marker() */
+bool
+mys_sql_ps_utility(Node *parsetree, const char *queryString)
+{
+	const char *marker = ps_marker_name(parsetree);
+
+	if (marker == NULL)
+		return false;
+	if (strcmp(marker, PS_PREPARE_MARKER) == 0)
+		sql_prepare((DoStmt *) parsetree);
+	else if (strcmp(marker, PS_EXECUTE_MARKER) == 0)
+		sql_execute((DoStmt *) parsetree, queryString);
+	else
+		sql_deallocate((DoStmt *) parsetree);
+	return true;
 }

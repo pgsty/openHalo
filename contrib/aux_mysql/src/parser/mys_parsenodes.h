@@ -29,6 +29,7 @@
 #define T_MysVariableSetStmt	((NodeTag) (T_MysNodeBase + 4))
 #define T_MysSelectIntoStmt		((NodeTag) (T_MysNodeBase + 5))
 #define T_ByteaString			((NodeTag) (T_MysNodeBase + 6))
+#define T_MysDoStmt				((NodeTag) (T_MysNodeBase + 7))
 
 /*
  * MySQL-only variants of core enums, carried inside standard nodes.  They
@@ -89,6 +90,14 @@ typedef struct MysSelectIntoStmt
     List *target;
     Node *expr;   /* Ä¿Ç°ÊÇSelectStmt */
 } MysSelectIntoStmt;
+
+
+/* DO expr [, expr] ...: evaluate the expressions, discard the values */
+typedef struct MysDoStmt
+{
+	NodeTag		type;
+	List	   *exprs;
+} MysDoStmt;
 
 
 #endif							/* MYS_PARSENODES_H */

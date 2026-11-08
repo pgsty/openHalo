@@ -31,6 +31,8 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   and `ALTER ROLE ... PASSWORD` invalidates the cache; TLS through PostgreSQL's `ssl_*` settings,
   `hostssl` and `pg_stat_ssl`; `pg_hba.conf`; `USE` / `COM_INIT_DB`.
 - **Prepared statements**: `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA` with binary result sets;
+  SQL `PREPARE name FROM 'text' | @var`, `EXECUTE name [USING @a, ...]`, `DEALLOCATE | DROP PREPARE name`
+  (names are case-insensitive, a new PREPARE replaces the statement, `USING` also takes other expressions);
   `COM_RESET_CONNECTION` rolls back, clears variables/prepared statements/temp tables and resets session settings.
 - **Transactions**: `autocommit=0`, implicit commits before BEGIN / DDL / `SET autocommit=1`, statement-level
   rollback, a COMMIT of an aborted transaction reports an error. `SET [GLOBAL | SESSION] TRANSACTION`,
@@ -61,7 +63,8 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
 - **Dialect**: openHalo's MySQL grammar (backquotes, `LIMIT m,n`, `"strings"`, `UPDATE ... JOIN`, inline
   `KEY`, `COMMENT`, `ALTER TABLE MODIFY/CHANGE/ADD INDEX/DROP PRIMARY KEY`, `ON DUPLICATE KEY UPDATE`,
   `REPLACE`, `INSERT IGNORE`, `CREATE USER ... IDENTIFIED BY`, `SHOW DATABASES/TABLES/COLUMNS/INDEX/CREATE TABLE/
-  CHARACTER SET`, user and system variables, MySQL functions from aux_mysql), `ENGINE=` mapped to a table
+  CHARACTER SET`, user and system variables, `DO expr, ...`, MySQL functions from aux_mysql; PostgreSQL's
+  `DO 'block'` needs its `LANGUAGE` clause, a bare string is a MySQL expression), `ENGINE=` mapped to a table
   access method of that name, `ENCRYPTION='Y'` to `tde_heap` when pg_tde is installed. Executable comments
   `/*! ... */` and `/*!NNNNN ... */` run as SQL when NNNNN is not newer than `mysql.halo_mysql_version`
   (mysqldump's `SET NAMES`, `FOREIGN_KEY_CHECKS`, `TIME_ZONE`, `SQL_MODE` and view definitions).

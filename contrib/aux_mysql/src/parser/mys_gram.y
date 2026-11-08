@@ -474,7 +474,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 				using_clause returning_clause
 				opt_enum_val_list enum_val_list table_func_column_list
 				create_generic_options alter_generic_options
-				relation_expr_list dostmt_opt_list
+				relation_expr_list
 				transform_element_list
 				TriggerTransitions TriggerReferencing
 				vacuum_relation_list opt_vacuum_relation_list
@@ -494,7 +494,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 %type <list>    select_var_list
 %type <node>    select_var
 
-%type <defelt>	createfunc_opt_item common_func_opt_item dostmt_opt_item
+%type <defelt>	createfunc_opt_item common_func_opt_item
 %type <fun_param> func_arg func_arg_with_default table_func_column aggr_arg
 %type <fun_param_mode> arg_class
 %type <typnam>	func_return func_type
@@ -11896,34 +11896,27 @@ operator_with_argtypes:
 
 /*****************************************************************************
  *
- *		DO <anonymous code block> [ LANGUAGE language ]
+ *		DO expr [, expr] ...				(MySQL: the values are discarded)
+ *		DO <anonymous code block> LANGUAGE language
  *
- * We use a DefElem list for future extensibility, and to allow flexibility
- * in the clause order.
+ * A bare string is a MySQL expression; a PostgreSQL DO block needs LANGUAGE.
  *
  *****************************************************************************/
 
-DoStmt: DO dostmt_opt_list
+DoStmt: DO expr_list
+				{
+					MysDoStmt *n = makeNode(MysDoStmt);
+
+					n->exprs = $2;
+					$$ = (Node *) n;
+				}
+			| DO Sconst LANGUAGE NonReservedWord_or_Sconst
 				{
 					DoStmt *n = makeNode(DoStmt);
-					n->args = $2;
-					$$ = (Node *)n;
-				}
-		;
 
-dostmt_opt_list:
-			dostmt_opt_item						{ $$ = list_make1($1); }
-			| dostmt_opt_list dostmt_opt_item	{ $$ = lappend($1, $2); }
-		;
-
-dostmt_opt_item:
-			Sconst
-				{
-					$$ = makeDefElem("as", (Node *)makeString($1), @1);
-				}
-			| LANGUAGE NonReservedWord_or_Sconst
-				{
-					$$ = makeDefElem("language", (Node *)makeString($2), @1);
+					n->args = list_make2(makeDefElem("as", (Node *) makeString($2), @2),
+										 makeDefElem("language", (Node *) makeString($4), @3));
+					$$ = (Node *) n;
 				}
 		;
 

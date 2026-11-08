@@ -173,6 +173,10 @@ mys_txn_classify(Node *stmt, MysStmtInfo *info)
 
 		case T_VariableSetStmt:
 		case T_VariableShowStmt:
+			/* EXECUTE: its statement is classified when it runs */
+		case T_PrepareStmt:
+		case T_ExecuteStmt:
+		case T_DeallocateStmt:
 			info->txn_kind = MYS_TXN_NEUTRAL;
 			break;
 

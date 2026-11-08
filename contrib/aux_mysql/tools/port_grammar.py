@@ -811,5 +811,46 @@ s = s.rstrip('\n') + '\n' + (
     '\treturn result;\n'
     '}\n')
 
+# ---------------------------------------------------------------------------
+# DO expr [, expr] ...
+# ---------------------------------------------------------------------------
+# MySQL evaluates the expressions and discards the values (DO SLEEP(n),
+# DO GET_LOCK(...), DO @v := ...).  Only PostgreSQL's DO block was parsed, so
+# these were syntax errors.  mys_rewrite.c runs a MysDoStmt as a SELECT that
+# answers OK.  A bare string is an expression, as in MySQL; a PostgreSQL DO
+# block needs its LANGUAGE clause.
+rep('\t\t\t\trelation_expr_list dostmt_opt_list\n', '\t\t\t\trelation_expr_list\n')
+rep('%type <defelt>\tcreatefunc_opt_item common_func_opt_item dostmt_opt_item\n',
+    '%type <defelt>\tcreatefunc_opt_item common_func_opt_item\n')
+rep(' *\t\tDO <anonymous code block> [ LANGUAGE language ]\n'
+    ' *\n'
+    ' * We use a DefElem list for future extensibility, and to allow flexibility\n'
+    ' * in the clause order.\n',
+    ' *\t\tDO expr [, expr] ...\t\t\t\t(MySQL: the values are discarded)\n'
+    ' *\t\tDO <anonymous code block> LANGUAGE language\n'
+    ' *\n'
+    ' * A bare string is a MySQL expression; a PostgreSQL DO block needs LANGUAGE.\n')
+start = s.index('DoStmt: DO dostmt_opt_list\n')
+end = s.index('/*****', start)
+assert s[start:end].count('dostmt_opt_item:\n') == 1, s[start:end]
+rep(s[start:end], (
+    'DoStmt: DO expr_list\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\tMysDoStmt *n = makeNode(MysDoStmt);\n'
+    '\n'
+    '\t\t\t\t\tn->exprs = $2;\n'
+    '\t\t\t\t\t$$ = (Node *) n;\n'
+    '\t\t\t\t}\n'
+    '\t\t\t| DO Sconst LANGUAGE NonReservedWord_or_Sconst\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\tDoStmt *n = makeNode(DoStmt);\n'
+    '\n'
+    '\t\t\t\t\tn->args = list_make2(makeDefElem("as", (Node *) makeString($2), @2),\n'
+    '\t\t\t\t\t\t\t\t\t\t makeDefElem("language", (Node *) makeString($4), @3));\n'
+    '\t\t\t\t\t$$ = (Node *) n;\n'
+    '\t\t\t\t}\n'
+    '\t\t;\n'
+    '\n'))
+
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 print("ported grammar written to", dst)

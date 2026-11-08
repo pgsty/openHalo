@@ -708,6 +708,92 @@ def _():
   t.execute('select 1--1, 2 --\t1\n, 3 -- c\r, 4\n, a--1, 1 + 1--1 from dc')
   eq([d[0] for d in t.description],['1--1','2','3','a--1','1 + 1--1'])
   eq(t.fetchall(),((2,2,3,8,3),))
+@test('X07 SQL PREPARE / EXECUTE [USING] / DEALLOCATE PREPARE behave as in MySQL')
+def _():
+ from pymysql.constants import CLIENT
+ def errno(f):
+  try: f()
+  except pymysql.err.MySQLError as e: return e.args[0]
+ def run(conn,sql):
+  with conn.cursor() as t:
+   t.execute(sql);return t.fetchall(),[d[0] for d in t.description or ()]
+ q(c,'create table ps_t (id int, v varchar(20))');q(c,"insert into ps_t values (1,'a'),(2,'b')")
+ # was: 1105 unrecognized node type (a crash on cassert builds); columns are named as in MySQL
+ q(c,'prepare ps_count from "select count(*) from ps_t"')
+ eq(run(c,'execute ps_count'),(((2,),),['count(*)']))
+ q(c,"prepare ps_sel from 'select v, ? + 1, ? from ps_t where id = ?'")
+ q(c,"set @a = 2, @c = 1.5, @s = 'x''y\\\\z'")
+ rows,names=run(c,'execute ps_sel using @c, @s, @a')
+ eq((rows[0][0],str(rows[0][1]),rows[0][2]),('b','2.5',"x'y\\z"));eq(names,['v','? + 1','?'])
+ eq(run(c,'execute ps_sel using @a, @s, @unset')[0],())
+ eq(errno(lambda:q(c,'execute ps_sel using @a')),1210)
+ eq(errno(lambda:q(c,'execute ps_nosuch')),1243)
+ # a value cannot leave its literal
+ q(c,"set @evil = '1''); drop table ps_t; select (''', @nul = NULL")
+ eq(run(c,"execute ps_sel using @a, @evil, @a")[0],(('b',3,"1'); drop table ps_t; select ('"),))
+ eq(run(c,"execute ps_sel using @nul, @nul, @a")[0],(('b',None,None),))
+ # DML: affected rows; names are case-insensitive; PREPARE FROM @var
+ q(c,"set @sql = 'insert into ps_t values (?, ?)'");q(c,'prepare PS_Ins from @sql')
+ q(c,"set @i = 3, @v = 'c'")
+ with c.cursor() as t: eq(t.execute('execute ps_ins using @i, @v'),1)
+ eq(val(c,"select v from ps_t where id = 3"),'c')
+ # re-PREPARE replaces; a failing one leaves no statement of that name
+ q(c,"prepare ps_count from 'select 42'");eq(run(c,'execute ps_count')[0],((42,),))
+ eq(errno(lambda:q(c,"prepare ps_count from 'select * from ps_missing'")),1146)
+ eq(errno(lambda:q(c,'execute ps_count')),1243)
+ eq(errno(lambda:q(c,"prepare ps_x from 'select 1; select 2'")),1064)
+ eq(errno(lambda:q(c,"prepare ps_x from 'execute ps_sel'")),1295)
+ # DEALLOCATE PREPARE / DROP PREPARE
+ q(c,'deallocate prepare ps_ins');eq(errno(lambda:q(c,'execute ps_ins using @i, @v')),1243)
+ eq(errno(lambda:q(c,'deallocate prepare ps_ins')),1243)
+ q(c,'drop prepare ps_sel');eq(errno(lambda:q(c,'execute ps_sel using @a, @a, @a')),1243)
+ # one packet: each statement sees what the earlier ones did; an error ends it
+ m=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),
+                   autocommit=True,database=SCHEMA,client_flag=CLIENT.MULTI_STATEMENTS)
+ def multi(sql):
+  out=[]
+  with m.cursor() as t:
+   try:
+    t.execute(sql)
+    while True:
+     out.append(t.fetchall() if t.description else t.rowcount)
+     if not t.nextset(): break
+   except pymysql.err.MySQLError as e: out.append(('ERR',e.args[0]))
+  return out
+ eq(multi("set @p = 5; prepare ps_m from 'select ? + 1'; execute ps_m using @p; set @p = 7; execute ps_m using @p; select 99"),
+    [0,0,((6,),),0,((8,),),((99,),)])
+ eq(multi("execute ps_m using @p; execute ps_nosuch; select 'not reached'"),[((8,),),('ERR',1243)])
+ eq(multi("select 'still in sync'"),[(('still in sync',),)])
+ # a failed EXECUTE inside a transaction rolls back only itself
+ q(m,"prepare ps_t_ins from 'insert into ps_t values (?, null)'");q(m,'set @k = 10')
+ eq(multi("begin; execute ps_t_ins using @k; execute ps_nosuch"),[0,1,('ERR',1243)])
+ q(m,'execute ps_t_ins using @k');q(m,'commit')
+ eq(val(c,'select count(*) from ps_t where id = 10'),2)
+ m.close()
+
+@test('X08 DO evaluates expressions for their side effects and answers OK')
+def _():
+ def errno(f):
+  try: f()
+  except pymysql.err.MySQLError as e: return e.args[0]
+ with c.cursor() as t:
+  eq(t.execute('do 1 + 1, sleep(0)'),0);assert t.description is None
+ q(c,'do @dov := 41 + 1');eq(int(val(c,'select @dov')),42)
+ q(c,"do 'a bare string is an expression'")
+ # the functions run: one that writes
+ q(p,'create table abfix.do_t (x int)')
+ q(p,"create function abfix.do_log(x int) returns int language sql as 'insert into abfix.do_t values (x) returning x'")
+ q(c,'do do_log(1), do_log(2)');eq(val(c,'select count(*) from do_t'),2)
+ q(c,"do get_lock('abfix_do', 0)");q(c,"do release_lock('abfix_do')")
+ # with autocommit = 0, as in MySQL, a write made by DO is rolled back
+ q(c,'set autocommit = 0');q(c,'do do_log(3)');q(c,'rollback');q(c,'set autocommit = 1')
+ eq(val(c,'select count(*) from do_t'),2)
+ q(c,'do 1/0');eq([tuple(w[1:]) for w in q(c,'show warnings')],[(1365,'Division by 0')])
+ eq(errno(lambda:q(c,'do ps_no_such_function()')),1305)
+ # prepared, and a PostgreSQL DO block with LANGUAGE
+ q(c,"prepare do_ps from 'do do_log(?)'");q(c,'set @d = 4');q(c,'execute do_ps using @d')
+ q(c,"do 'begin insert into do_t values (5); end' language plpgsql")
+ eq(q(c,'select x from do_t order by x'),((1,),(2,),(4,),(5,)))
 
 try:
     c.close()

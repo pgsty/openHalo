@@ -1605,6 +1605,7 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 {
 	List	   *result = NIL;
 	ListCell   *lc;
+	bool		stop = false;
 
 	*infos = NIL;
 	rewrite_warnings = NIL;
@@ -1643,6 +1644,37 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 				rs->stmt = ((MysVariableSetStmt *) rs->stmt)->varSetStmt;
 				info->silent = true;
 				break;
+			case T_MysDoStmt:
+				{
+					/* DO: evaluate the expressions, answer OK as SET does */
+					SelectStmt *sel = makeNode(SelectStmt);
+
+					foreach_ptr(Node, expr, ((MysDoStmt *) rs->stmt)->exprs)
+						sel->targetList = lappend(sel->targetList, make_target(NULL, expr));
+					rs->stmt = (Node *) sel;
+					info->silent = true;
+					break;
+				}
+			case T_PrepareStmt:
+			case T_DeallocateStmt:
+				rs->stmt = mys_sql_ps_marker(rs->stmt, NULL);
+				break;
+			case T_ExecuteStmt:
+				{
+					/*
+					 * The prepared statement runs as a query of its own after
+					 * this one, followed by the rest of the packet: what comes
+					 * after EXECUTE is parsed once it has run.
+					 */
+					ListCell   *next = lnext(raw_stmts, lc);
+
+					rs->stmt = mys_sql_ps_marker(rs->stmt, next ?
+												 query_string + lfirst_node(RawStmt, next)->stmt_location :
+												 NULL);
+					info->continued = true;
+					stop = true;
+					break;
+				}
 			case T_SelectStmt:
 				if (rewrite_select_into_vars((SelectStmt *) rs->stmt))
 					info->silent = true;
@@ -1747,6 +1779,8 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 			*infos = lappend(*infos, einfo);
 			info = einfo;
 		}
+		if (stop)
+			break;
 	}
 	return result;
 }

@@ -965,6 +965,10 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 	if (mys_txn_is_deferred_error(parsetree))
 		mys_txn_raise_deferred_error();
 
+	/* SQL PREPARE / EXECUTE / DEALLOCATE PREPARE (mys_stmt.c) */
+	if (mys_sql_ps_utility(parsetree, queryString))
+		return;
+
 	if (mys_is_mysql_session() && IsA(parsetree, TruncateStmt) &&
 		truncate_referenced_tables((TruncateStmt *) parsetree))
 		return;
