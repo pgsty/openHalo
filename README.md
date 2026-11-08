@@ -1,8 +1,6 @@
 # ![image](logo.png) OpenHalo 18
-### [Let's Discord: https://discord.gg/Ex5sK6CW]
-
 OpenHalo 18 is openHalo's MySQL compatibility on **PostgreSQL 18.6**: MySQL applications, drivers and the
-`mysql` CLI talk to it on port 3306, PostgreSQL clients on 5432, against the same data.
+`mysql` CLI talk to it on port 3306, PostgreSQL clients on 5432, against the same data. Maintained fork of PGSTY
 
 It is built as PostgreSQL 18.6, plus a small, generic patch that lets an extension serve another wire
 protocol, plus the `aux_mysql` extension (`contrib/aux_mysql`) that carries all of the MySQL protocol,
