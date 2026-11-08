@@ -103,7 +103,7 @@ three historical aliases. Values, HEX and warning codes compared to 3771;
 unicode_ci's existing approximate mapping emits 1105 at DDL. Historical aliases
 have no namesake in MySQL and are asserted against their documented behavior.
 
-## WP5 — decimal interpretation of binary CAST sources
+## WP5 — decimal interpretation of binary CAST sources (`3f26bed`)
 
 The MySQL CAST/CONVERT lowering now dispatches exact binary sources through a
 length-aware decimal parser, retaining numeric hex literals and all nonbinary
@@ -122,3 +122,24 @@ sources consistently get 1292. Reference 3771 emits no tail warning for BLOB or
 UNHEX, 1292 for VARBINARY/BINARY, and 1366 (plus 1292 for VARBINARY/BINARY) when
 there is no numeric prefix. Values agree; the assertions record these distinct
 reference warning sequences. Full uint64 expression results remain out of scope.
+
+## WP6 — prevent loss of legal uint64 values
+
+The lenient integer assignment helper distinguishes the representable int8 bound
+from MySQL's uint64 bound. A value in the legal uint64 high half raises 1264,
+including IGNORE; it cannot collapse distinct keys onto INT64_MAX. Strict and
+expression/INSERT SELECT paths already raise 1264 through their int8 conversion.
+Binary parameters are expanded before this same rewrite and conversion path.
+The generator also accepts IGNORE combined with ODKU (previously 1064), for all
+four VALUES/SET and optional-INTO forms, retaining both behaviors.
+
+Debug rebuilt; `tests/route_a.py --port 3804 --wp uint64`: 115 assertions passed
+against 3771. INSERT, IGNORE, INSERT SELECT, expression/string inputs, UPDATE,
+REPLACE, ODKU and unsigned binary prepared parameters are covered in three modes;
+every representation error leaves existing rows unchanged. Generator byte check
+passed and bison's expected conflict count did not increase.
+
+Out-of-MySQL-range literals retain the requested existing lenient clipping with
+1264: negatives become 0; values above UINT64_MAX become the representable
+INT64_MAX, whereas MySQL stores UINT64_MAX. This remaining boundary difference
+requires full uint64 storage to eliminate. Legal high-half values never clip.

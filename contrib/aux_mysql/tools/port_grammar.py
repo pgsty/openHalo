@@ -1182,6 +1182,21 @@ rep('onconflict->action = ONCONFLICT_NOTHING;',
     '\t\t\t\t\tonconflict->allIndexes = true;\n'
     '\t\t\t\t\tonconflict->ignoreFailure = true;', 4)
 
+# IGNORE also applies to ODKU. Keep the update clause instead of rejecting
+# this combination before its value-conversion safeguards can run.
+for tail, conflict_arg in [('INTO insert_target insert_rest', 7),
+                           ('insert_target insert_rest', 6),
+                           ('INTO insert_target SET set_clause_list_for_mysql', 8),
+                           ('insert_target SET set_clause_list_for_mysql', 7)]:
+    rule = 'INSERT insert_low_priority_delayed IGNORE ' + tail
+    rep(rule + '\n', rule + ' opt_on_conflict\n')
+    begin = s.index('onconflict->action = ONCONFLICT_NOTHING;', s.index(rule))
+    end = s.index('onconflict->location = @1;', begin) + len('onconflict->location = @1;')
+    init = s[begin:end].replace('\n\t\t\t\t\tonconflict->ignoreFailure = true;', '')
+    s = (s[:begin] + 'if ($%d) *onconflict = *$%d;\n' % (conflict_arg, conflict_arg) +
+         '\t\t\t\t\telse {\n\t\t\t\t\t\t' + init + '\n\t\t\t\t\t}\n' +
+         '\t\t\t\t\tonconflict->ignoreFailure = true;' + s[end:])
+
 # DATABASE is a schema in MySQL mode. Accept the same charset/collation
 # options already accepted by CREATE SCHEMA, including mysqldump output.
 rep('createdb_opt_item:\n\t\t\t',

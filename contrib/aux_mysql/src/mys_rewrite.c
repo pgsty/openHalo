@@ -1872,6 +1872,8 @@ integer_range(Oid typid, Oid base, int64 *lo, int64 *hi)
 		{"mediumint", -8388608, 8388607}, {"mediumint signed", -8388608, 8388607},
 		{"mediumint unsigned", 0, 16777215},
 		{"int unsigned", 0, PG_UINT32_MAX}, {"integer unsigned", 0, PG_UINT32_MAX},
+		/* Representable bounds only; lenient_int separately checks the
+		 * legal uint64 range before allowing an upper-bound clip. */
 		{"bigint unsigned", 0, PG_INT64_MAX},
 		{NULL, 0, 0}
 	};

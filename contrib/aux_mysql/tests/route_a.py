@@ -8,6 +8,7 @@ warning codes. Explicit representation boundaries are asserted separately.
 import argparse
 import os
 import subprocess
+import struct
 import uuid
 import pymysql
 
@@ -31,6 +32,23 @@ class Session:
             return ('error', e.args[0])
         warnings = tuple(row[1] for row in self.q('SHOW WARNINGS'))
         return (rows, warnings)
+
+    def execute_u64(self, sql, value):
+        """One MYSQL_TYPE_LONGLONG parameter with the unsigned flag set."""
+        c = self.conn
+        c._execute_command(0x16,sql.encode())
+        sid,cols,params = struct.unpack('<IHH',c._read_packet().get_all_data()[1:9])
+        assert params == 1 and cols == 0, (cols,params)
+        for _ in range(params+1):
+            c._read_packet()
+        try:
+            c._execute_command(0x17,struct.pack('<IBI',sid,0,1)+b'\0\1\x08\x80'+struct.pack('<Q',value))
+            assert c._read_packet().get_all_data()[0] == 0
+            return ((),tuple(w[1] for w in self.q('SHOW WARNINGS')))
+        except pymysql.MySQLError as e:
+            return ('error',e.args[0])
+        finally:
+            c._execute_command(0x19,struct.pack('<I',sid))
 
 
 class Checks:
@@ -177,6 +195,65 @@ class Checks:
         self.count += 1
 
 
+    def uint64(self):
+        self.both('CREATE TABLE u64(id INT PRIMARY KEY,u BIGINT UNSIGNED UNIQUE)')
+        for mode in ('','STRICT_TRANS_TABLES','STRICT_ALL_TABLES'):
+            for session in (self.oh,self.my):
+                session.q("SET sql_mode='"+mode+"'")
+            for value in (9223372036854775808,18446744073709551615):
+                for statement in (
+                    'INSERT INTO u64 VALUES(2,{v})',
+                    'INSERT IGNORE INTO u64 VALUES(2,{v})',
+                    'INSERT INTO u64 SELECT 2,{v}',
+                    'INSERT IGNORE INTO u64 SELECT 2,{v}',
+                    'INSERT INTO u64 VALUES(2,{v}+0)',
+                    'INSERT INTO u64 VALUES(2,\'{v}\')',
+                    'UPDATE u64 SET u={v} WHERE id=1',
+                    'REPLACE INTO u64 VALUES(1,{v})',
+                    'INSERT INTO u64 VALUES(1,7) ON DUPLICATE KEY UPDATE u={v}',
+                    'INSERT IGNORE INTO u64 VALUES(1,7) ON DUPLICATE KEY UPDATE u={v}',
+                    'INSERT INTO u64 VALUES(1,{v}) ON DUPLICATE KEY UPDATE u=VALUES(u)'):
+                    for s in (self.oh,self.my):
+                        s.q('TRUNCATE u64');s.q('INSERT INTO u64 VALUES(1,7)')
+                    sql = statement.format(v=value)
+                    actual = self.oh.result(sql)
+                    assert actual == ('error',1264), (mode,sql,actual,self.oh.q('SELECT * FROM u64'))
+                    assert self.my.result(sql) == ((),()), (mode,sql)
+                    assert self.oh.q('SELECT * FROM u64') == ((1,7),), (mode,sql)
+                    self.count += 1
+                for statement in ('INSERT INTO u64 VALUES(2,?)',
+                                  'INSERT IGNORE INTO u64 VALUES(2,?)',
+                                  'UPDATE u64 SET u=? WHERE id=1',
+                                  'REPLACE INTO u64 VALUES(1,?)',
+                                  'INSERT INTO u64 VALUES(1,7) ON DUPLICATE KEY UPDATE u=?'):
+                    for s in (self.oh,self.my):
+                        s.q('TRUNCATE u64');s.q('INSERT INTO u64 VALUES(1,7)')
+                    assert self.oh.execute_u64(statement,value) == ('error',1264), (mode,statement,value)
+                    assert self.my.execute_u64(statement,value) == ((),()), (mode,statement,value)
+                    assert self.oh.q('SELECT * FROM u64') == ((1,7),)
+                    self.count += 1
+            for s in (self.oh,self.my):
+                s.q('TRUNCATE u64')
+            self.both('INSERT INTO u64 VALUES(1,9223372036854775807),(2,0)')
+            self.both('SELECT u,HEX(u) FROM u64 ORDER BY id')
+        for s in (self.oh,self.my):
+            s.q("SET sql_mode=''")
+        for value in (-1,18446744073709551616):
+            for ignore in ('','IGNORE '):
+                for s in (self.oh,self.my):
+                    s.q('TRUNCATE u64')
+                sql = 'INSERT '+ignore+'INTO u64 VALUES(1,'+str(value)+')'
+                assert self.oh.result(sql) == self.my.result(sql) == ((),(1264,))
+                assert self.oh.q('SELECT u FROM u64') == ((0 if value<0 else 9223372036854775807,),)
+                assert self.my.q('SELECT u FROM u64') == ((0 if value<0 else 18446744073709551615,),)
+                self.count += 1
+        for s in (self.oh,self.my):
+            s.q('TRUNCATE u64');s.q('INSERT INTO u64 VALUES(1,7)')
+        for form in ('INTO u64 VALUES(1,8)','u64 VALUES(1,8)',
+                     'INTO u64 SET id=1,u=8','u64 SET id=1,u=8'):
+            self.both('INSERT IGNORE '+form+' ON DUPLICATE KEY UPDATE u=VALUES(u)')
+            self.both('SELECT u FROM u64')
+
     def numeric_cast(self):
         for mode in ('','STRICT_TRANS_TABLES'):
             for session in (self.oh,self.my):
@@ -289,7 +366,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast', 'uint64'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

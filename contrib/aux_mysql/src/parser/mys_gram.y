@@ -15167,16 +15167,19 @@ MysInsertStmt:
 					insertRest->withClause = NULL;
 					$$ = (Node *) insertRest;
                 }
-	|   INSERT insert_low_priority_delayed IGNORE INTO insert_target insert_rest
+	|   INSERT insert_low_priority_delayed IGNORE INTO insert_target insert_rest opt_on_conflict
                 {
                     OnConflictClause *onconflict = makeNode(OnConflictClause);
-                    onconflict->action = ONCONFLICT_NOTHING;
+					if ($7) *onconflict = *$7;
+					else {
+						onconflict->action = ONCONFLICT_NOTHING;
 					onconflict->allIndexes = true;
-					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
                     onconflict->location = @1;
+					}
+					onconflict->ignoreFailure = true;
 
                     $6->relation = $5;
                     $6->onConflictClause = onconflict;
@@ -15184,16 +15187,19 @@ MysInsertStmt:
                     $6->withClause = NULL;
                     $$ = (Node *) $6;
                 }
-        |   INSERT insert_low_priority_delayed IGNORE insert_target insert_rest
+		|   INSERT insert_low_priority_delayed IGNORE insert_target insert_rest opt_on_conflict
                 {
                     OnConflictClause *onconflict = makeNode(OnConflictClause);
-                    onconflict->action = ONCONFLICT_NOTHING;
+					if ($6) *onconflict = *$6;
+					else {
+						onconflict->action = ONCONFLICT_NOTHING;
 					onconflict->allIndexes = true;
-					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
                     onconflict->location = @1;
+					}
+					onconflict->ignoreFailure = true;
 
                     $5->relation = $4;
                     $5->onConflictClause = onconflict;
@@ -15201,7 +15207,7 @@ MysInsertStmt:
                     $5->withClause = NULL;
                     $$ = (Node *) $5;
                 }
-        |   INSERT insert_low_priority_delayed IGNORE INTO insert_target SET set_clause_list_for_mysql
+		|   INSERT insert_low_priority_delayed IGNORE INTO insert_target SET set_clause_list_for_mysql opt_on_conflict
                 {
                     OnConflictClause *onconflict = makeNode(OnConflictClause);
                     InsertStmt* insertRest;
@@ -15211,13 +15217,16 @@ MysInsertStmt:
                     List* values;
                     int i;
 
-                    onconflict->action = ONCONFLICT_NOTHING;
+					if ($8) *onconflict = *$8;
+					else {
+						onconflict->action = ONCONFLICT_NOTHING;
 					onconflict->allIndexes = true;
-					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
                     onconflict->location = @1;
+					}
+					onconflict->ignoreFailure = true;
 
                     insertRest = makeNode(InsertStmt);
                     insertColumnList = NIL;
@@ -15261,7 +15270,7 @@ MysInsertStmt:
 					insertRest->withClause = NULL;
 					$$ = (Node *) insertRest;
                 }
-        |   INSERT insert_low_priority_delayed IGNORE insert_target SET set_clause_list_for_mysql
+		|   INSERT insert_low_priority_delayed IGNORE insert_target SET set_clause_list_for_mysql opt_on_conflict
                 {
                     OnConflictClause *onconflict = makeNode(OnConflictClause);
                     InsertStmt* insertRest;
@@ -15271,13 +15280,16 @@ MysInsertStmt:
                     List* values;
                     int i;
 
-                    onconflict->action = ONCONFLICT_NOTHING;
+					if ($7) *onconflict = *$7;
+					else {
+						onconflict->action = ONCONFLICT_NOTHING;
 					onconflict->allIndexes = true;
-					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
                     onconflict->location = @1;
+					}
+					onconflict->ignoreFailure = true;
 
                     insertRest = makeNode(InsertStmt);
                     insertColumnList = NIL;
