@@ -634,6 +634,20 @@ rep('VariableShowStmt:\n', '''VariableShowStmt:
 ''')
 
 # ---------------------------------------------------------------------------
+# SET TRANSACTION without a scope
+# ---------------------------------------------------------------------------
+# MySQL applies it to the next transaction only, SET SESSION TRANSACTION to
+# the session.  Both called set_system_session_variable() with the same name;
+# mark the one-shot form so the variable code can tell them apart.
+start = s.index('            | SET TRANSACTION transaction_mode_list\n')
+end = s.index('            | SET SESSION TRANSACTION transaction_mode_list\n', start)
+fragment = s[start:end]
+line = ' ' * 24 + 'argList = list_make2(makeStringConst(pstrdup(defElem->defname), -1),\n'
+assert fragment.count(line) == 1
+rep(fragment, fragment.replace(line, '\t' * 6 +
+    'argList = list_make2(makeStringConst(psprintf("next_%s", defElem->defname), -1),\n'))
+
+# ---------------------------------------------------------------------------
 # START TRANSACTION WITH CONSISTENT SNAPSHOT
 # ---------------------------------------------------------------------------
 # mysqldump --single-transaction sends START TRANSACTION /*!40100 WITH

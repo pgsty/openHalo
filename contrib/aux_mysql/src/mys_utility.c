@@ -14,10 +14,13 @@
 
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_trigger.h"
@@ -35,6 +38,7 @@
 #include "utils/syscache.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/acl.h"
 #include "miscadmin.h"
 
@@ -43,6 +47,8 @@
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+/* utility commands aux_mysql runs itself to implement a MySQL statement */
+static int	internal_utility_depth = 0;
 static bool collation_provider_registered = false;
 
 /* row triggers maintained by mysql_table_setup() */
@@ -103,8 +109,17 @@ run_utility(Node *stmt, PlannedStmt *orig, const char *queryString,
 	 * file is encrypted in its ddl_command_start trigger, so as a
 	 * SUBCOMMAND an ALTER of an encrypted table would write plaintext.
 	 */
-	ProcessUtility(wrapper, queryString, false, PROCESS_UTILITY_QUERY,
-				   params, queryEnv, None_Receiver, NULL);
+	internal_utility_depth++;
+	PG_TRY();
+	{
+		ProcessUtility(wrapper, queryString, false, PROCESS_UTILITY_QUERY,
+					   params, queryEnv, None_Receiver, NULL);
+	}
+	PG_FINALLY();
+	{
+		internal_utility_depth--;
+	}
+	PG_END_TRY();
 	CommandCounterIncrement();
 }
 
@@ -658,19 +673,24 @@ has_mysql_subcommands(AlterTableStmt *stmt)
 	return false;
 }
 
-/* START TRANSACTION WITH CONSISTENT SNAPSHOT (see port_grammar.py) */
+/* START TRANSACTION / BEGIN */
 static bool
-is_consistent_snapshot_start(Node *stmt)
+is_transaction_start(Node *stmt)
 {
-	TransactionStmt *start = (TransactionStmt *) stmt;
+	return IsA(stmt, TransactionStmt) &&
+		(((TransactionStmt *) stmt)->kind == TRANS_STMT_START ||
+		 ((TransactionStmt *) stmt)->kind == TRANS_STMT_BEGIN);
+}
 
-	if (!IsA(stmt, TransactionStmt) ||
-		(start->kind != TRANS_STMT_START && start->kind != TRANS_STMT_BEGIN))
-		return false;
-	foreach_node(DefElem, opt, start->options)
-		if (strcmp(opt->defname, "mysql_consistent_snapshot") == 0)
-			return true;
-	return false;
+static Node *
+bool_const(bool value)
+{
+	A_Const    *n = makeNode(A_Const);
+
+	n->val.ival.type = T_Integer;
+	n->val.ival.ival = value;
+	n->location = -1;
+	return (Node *) n;
 }
 
 /*
@@ -734,27 +754,164 @@ truncate_referenced_tables(TruncateStmt *stmt)
 	return true;
 }
 
+/* a relation in the session's temporary schema */
+static bool
+is_temp_rangevar(RangeVar *rv)
+{
+	Oid			relid;
+
+	if (rv == NULL)
+		return false;
+	if (rv->relpersistence == RELPERSISTENCE_TEMP)
+		return true;
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	return OidIsValid(relid) && isTempNamespace(get_rel_namespace(relid));
+}
+
+/* MySQL's read_only still allows temporary tables */
+static bool
+temp_table_utility(Node *stmt)
+{
+	switch (nodeTag(stmt))
+	{
+		case T_CreateStmt:
+			return ((CreateStmt *) stmt)->relation->relpersistence == RELPERSISTENCE_TEMP;
+		case T_CreateTableAsStmt:
+			return ((CreateTableAsStmt *) stmt)->into->rel->relpersistence == RELPERSISTENCE_TEMP;
+		case T_AlterTableStmt:
+			return is_temp_rangevar(((AlterTableStmt *) stmt)->relation);
+		case T_IndexStmt:
+			return is_temp_rangevar(((IndexStmt *) stmt)->relation);
+		case T_RenameStmt:
+			return is_temp_rangevar(((RenameStmt *) stmt)->relation);
+		case T_CommentStmt:
+			{
+				CommentStmt *comment = (CommentStmt *) stmt;
+				List	   *name = (List *) comment->object;
+
+				/* TABLE t / COLUMN t.c, as CREATE TEMPORARY TABLE ... COMMENT makes */
+				if (comment->objtype == OBJECT_COLUMN)
+					name = list_truncate(list_copy(name), list_length(name) - 1);
+				else if (comment->objtype != OBJECT_TABLE)
+					return false;
+				return is_temp_rangevar(makeRangeVarFromNameList(name));
+			}
+		case T_TruncateStmt:
+			foreach_node(RangeVar, rv, ((TruncateStmt *) stmt)->relations)
+				if (!is_temp_rangevar(rv))
+					return false;
+			return true;
+		case T_DropStmt:
+			if (((DropStmt *) stmt)->removeType != OBJECT_TABLE)
+				return false;
+			foreach_node(List, name, ((DropStmt *) stmt)->objects)
+			{
+				RangeVar   *rv = makeRangeVarFromNameList(name);
+				Oid			relid = RangeVarGetRelid(rv, NoLock, true);
+
+				if (OidIsValid(relid) && !isTempNamespace(get_rel_namespace(relid)))
+					return false;
+			}
+			return true;
+		case T_DoStmt:
+			return is_table_setup(stmt) &&
+				is_temp_rangevar((RangeVar *) linitial_node(DefElem, ((DoStmt *) stmt)->args)->arg);
+		default:
+			return false;
+	}
+}
+
 /*
- * session_replication_role follows @@foreign_key_checks before every
- * statement, also within a multi-statement packet (a ROLLBACK earlier in the
- * packet may have restored the GUC).
+ * GLOBAL read_only / super_read_only for a utility statement: whether to run
+ * it read-only, so that PostgreSQL refuses what modifies the database,
+ * reported as 1290.  Checked per statement, so a COMMIT earlier in the packet
+ * cannot open a writable transaction, and for that statement alone, so a USE
+ * does not stop a later CREATE TEMPORARY TABLE.  Commands aux_mysql or
+ * PostgreSQL issue for a statement already checked (an AUTO_INCREMENT
+ * column's sequence), and temporary tables, are exempt.
+ */
+static bool
+server_read_only_utility(Node *stmt, ProcessUtilityContext context)
+{
+	return internal_utility_depth == 0 && context != PROCESS_UTILITY_SUBCOMMAND &&
+		!IsA(stmt, TransactionStmt) && mys_server_read_only_applies() && !XactReadOnly &&
+		!temp_table_utility(stmt);
+}
+
+/* GLOBAL read_only for DML, as ExecCheckXactReadOnly(): temp tables stay writable */
+static void
+check_server_read_only_dml(PlannedStmt *stmt)
+{
+	if (stmt->commandType == CMD_SELECT && !stmt->hasModifyingCTE && stmt->rowMarks == NIL)
+		return;					/* SELECT ... FOR UPDATE is refused, as in MySQL */
+	if (!mys_server_read_only_applies())
+		return;
+	foreach_node(RTEPermissionInfo, perminfo, stmt->permInfos)
+	{
+		if ((perminfo->requiredPerms & ~ACL_SELECT) == 0 ||
+			isTempNamespace(get_rel_namespace(perminfo->relid)))
+			continue;
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("The MySQL server is running with the --read-only option so it cannot execute this statement")));
+	}
+}
+
+/*
+ * A table of the application's, not one of aux_mysql's that SHOW and
+ * information_schema read: MySQL's equivalents start no InnoDB transaction.
+ */
+static bool
+uses_application_table(List *rtable)
+{
+	foreach_node(RangeTblEntry, rte, rtable)
+	{
+		char	   *nsp;
+
+		if (rte->rtekind != RTE_RELATION || rte->relkind == RELKIND_VIEW ||
+			rte->relkind == RELKIND_SEQUENCE ||
+			rte->relid < FirstNormalObjectId)
+			continue;
+		nsp = get_namespace_name(get_rel_namespace(rte->relid));
+		if (nsp == NULL || strcmp(nsp, "mysql") == 0 || strcmp(nsp, "mys_informa_schema") == 0 ||
+			strcmp(nsp, "performance_schema") == 0 || strcmp(nsp, "mys_sys") == 0)
+			continue;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * Before every statement, also within a multi-statement packet:
+ * session_replication_role follows @@foreign_key_checks (a ROLLBACK earlier
+ * in the packet may have restored the GUC), and GLOBAL read_only applies.
+ * Once the executor has opened its tables (a write in a read-only transaction
+ * fails before), note that the statement used its transaction: that spends
+ * SET TRANSACTION's one-shot values (sysvar_core.c).
  */
 static void
 mys_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	if (mys_is_mysql_session())
+	bool		mysql = mys_is_mysql_session();
+
+	if (mysql)
+	{
 		mys_sync_foreign_key_checks();
+		check_server_read_only_dml(queryDesc->plannedstmt);
+	}
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+	if (mysql && uses_application_table(queryDesc->plannedstmt->rtable))
+		mys_statement_touched_tables();
 }
 
 static void
-mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
-				   bool readOnlyTree, ProcessUtilityContext context,
-				   ParamListInfo params, QueryEnvironment *queryEnv,
-				   DestReceiver *dest, QueryCompletion *qc)
+process_utility(PlannedStmt *pstmt, const char *queryString,
+				bool readOnlyTree, ProcessUtilityContext context,
+				ParamListInfo params, QueryEnvironment *queryEnv,
+				DestReceiver *dest, QueryCompletion *qc)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
 
@@ -827,22 +984,43 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	}
 
 	/*
-	 * START TRANSACTION WITH CONSISTENT SNAPSHOT: one snapshot for the whole
-	 * transaction (REPEATABLE READ), taken now as InnoDB creates its read
-	 * view at START, not at the first query: parallel dumpers rely on that.
+	 * START TRANSACTION / BEGIN: the characteristics of the new transaction,
+	 * decided now rather than when the packet was parsed, so a SET earlier in
+	 * the packet counts.  (A multi-statement packet runs in an implicit block,
+	 * so IsTransactionBlock() is no test; MySQL's implicit COMMIT before START
+	 * leaves a transaction without a snapshot.)  WITH CONSISTENT SNAPSHOT
+	 * takes the snapshot at START, as InnoDB creates its read view then, not
+	 * at the first query: parallel dumpers rely on that.
 	 */
-	if (is_consistent_snapshot_start(parsetree))
+	if (mys_is_mysql_session() && is_transaction_start(parsetree) &&
+		!FirstSnapshotSet && !IsSubTransaction())
 	{
 		TransactionStmt *start = copyObject((TransactionStmt *) parsetree);
+		bool		snapshot = false;
 		bool		isolation = false;
+		int			explicit_read_only = -1;
+		bool		read_only;
+		const char *level;
 
 		foreach_node(DefElem, opt, start->options)
-			if (strcmp(opt->defname, "transaction_isolation") == 0)
+		{
+			if (strcmp(opt->defname, "mysql_consistent_snapshot") == 0)
+				snapshot = true;
+			else if (strcmp(opt->defname, "transaction_isolation") == 0)
 				isolation = true;
+			else if (strcmp(opt->defname, "transaction_read_only") == 0 &&
+					 IsA(opt->arg, A_Const) && IsA(&((A_Const *) opt->arg)->val, Integer))
+				explicit_read_only = intVal(&((A_Const *) opt->arg)->val) != 0;
+		}
+		level = mys_transaction_start(explicit_read_only, &snapshot, &read_only);
 		if (!isolation)
 			start->options = lappend(start->options,
 									 makeDefElem("transaction_isolation",
-												 makeStringConst("repeatable read", -1), -1));
+												 makeStringConst(pstrdup(level), -1), -1));
+		if (explicit_read_only < 0 && (read_only || !RecoveryInProgress()))
+			start->options = lappend(start->options,
+									 makeDefElem("transaction_read_only",
+												 bool_const(read_only), -1));
 		pstmt = copyObject(pstmt);
 		pstmt->utilityStmt = (Node *) start;
 		if (prev_ProcessUtility)
@@ -851,7 +1029,8 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		else
 			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 									params, queryEnv, dest, qc);
-		(void) GetTransactionSnapshot();
+		if (snapshot)
+			(void) GetTransactionSnapshot();
 		return;
 	}
 
@@ -861,6 +1040,32 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	else
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 								params, queryEnv, dest, qc);
+}
+
+/* GLOBAL read_only applies to this utility statement alone */
+static void
+mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+				   bool readOnlyTree, ProcessUtilityContext context,
+				   ParamListInfo params, QueryEnvironment *queryEnv,
+				   DestReceiver *dest, QueryCompletion *qc)
+{
+	bool		saved = XactReadOnly;
+
+	if (!mys_is_mysql_session() || !server_read_only_utility(pstmt->utilityStmt, context))
+	{
+		process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+		return;
+	}
+	XactReadOnly = true;
+	PG_TRY();
+	{
+		process_utility(pstmt, queryString, readOnlyTree, context, params, queryEnv, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		XactReadOnly = saved;
+	}
+	PG_END_TRY();
 }
 
 void

@@ -46,6 +46,13 @@ extern void halo_mysql_ensure_extension(void);
 extern void halo_mysql_lock_setup(void);
 extern bool mys_foreign_key_checks(void);
 extern void mys_sync_foreign_key_checks(void);
+extern void mys_sync_session_state(void);
+extern void mys_start_implicit_transaction(bool ddl);
+extern const char *mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only);
+extern void mys_statement_done(bool end, bool next_ddl);
+extern void mys_statement_touched_tables(void);
+extern bool mys_server_read_only;
+extern bool mys_server_read_only_applies(void);
 
 /* how a MySQL statement interacts with transactions (mys_txn.c) */
 typedef enum MysTxnKind

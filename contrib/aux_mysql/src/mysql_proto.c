@@ -303,7 +303,11 @@ mys_status_flags(bool more_results)
 	uint16		status = autoCommit ? SERVER_STATUS_AUTOCOMMIT : 0;
 
 	if (IsTransactionBlock())
+	{
 		status |= SERVER_STATUS_IN_TRANS;
+		if (XactReadOnly)
+			status |= SERVER_STATUS_IN_TRANS_READONLY;
+	}
 	if (more_results)
 		status |= SERVER_MORE_RESULTS_EXISTS;
 	if (mys_sqlMode & MYS_MODE_NO_BACKSLASH_ESCAPES)
@@ -425,7 +429,12 @@ mys_errno(int sqlerrcode)
 		case ERRCODE_INVALID_PASSWORD:
 			return 1045;		/* ER_ACCESS_DENIED_ERROR */
 		case ERRCODE_T_R_DEADLOCK_DETECTED:
-			return 1213;		/* ER_LOCK_DEADLOCK */
+		case ERRCODE_T_R_SERIALIZATION_FAILURE:
+			return 1213;		/* ER_LOCK_DEADLOCK, SQLSTATE 40001: retry */
+		case ERRCODE_READ_ONLY_SQL_TRANSACTION:
+			return mys_server_read_only ?
+				1290 :			/* ER_OPTION_PREVENTS_STATEMENT (--read-only) */
+				1792;			/* ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION */
 		case ERRCODE_LOCK_NOT_AVAILABLE:
 			return 1205;		/* ER_LOCK_WAIT_TIMEOUT */
 		case ERRCODE_QUERY_CANCELED:
@@ -1014,6 +1023,10 @@ mys_send_ready_for_query(CommandDest dest)
 		PG_TRY();
 		{
 			halo_mysql_ensure_extension();
+			/* GLOBAL defaults (transaction_read_only ...) reach the first statement */
+			StartTransactionCommand();
+			mys_sync_session_state();
+			CommitTransactionCommand();
 		}
 		PG_CATCH();
 		{
@@ -1226,9 +1239,9 @@ mys_parse_query(const char *query_string)
 {
 	List	   *stmts;
 
-	/* a rollback may have restored session_replication_role */
+	/* session variables carried by GUCs; SET TRANSACTION; GLOBAL read_only */
 	if (!IsAbortedTransactionBlockState())
-		mys_sync_foreign_key_checks();
+		mys_sync_session_state();
 
 	if (halo_mysql_parser == MYS_PARSER_POSTGRES)
 	{
@@ -1286,6 +1299,15 @@ mys_parse_query(const char *query_string)
 			diagnostics_pending = false;
 		break;
 	}
+
+	/* a statement transaction starts now, a START TRANSACTION at execution */
+	if (!IsAbortedTransactionBlockState() &&
+		!(stmts != NIL && IsA(linitial_node(RawStmt, stmts)->stmt, TransactionStmt) &&
+		  (((TransactionStmt *) linitial_node(RawStmt, stmts)->stmt)->kind == TRANS_STMT_START ||
+		   ((TransactionStmt *) linitial_node(RawStmt, stmts)->stmt)->kind == TRANS_STMT_BEGIN)))
+		mys_start_implicit_transaction(stmt_infos != NIL &&
+									   ((MysStmtInfo *) linitial(stmt_infos))->txn_kind ==
+									   MYS_TXN_IMPLICIT_COMMIT);
 	return stmts;
 }
 
@@ -1293,10 +1315,16 @@ static void
 mys_end_command(const QueryCompletion *qc, CommandDest dest)
 {
 	MysStmtInfo *info = current_stmt_info();
+	MysStmtInfo *following;
 	bool		more = more_visible_results();
 
 	stmt_index++;
+	following = stmt_index < list_length(stmt_infos) ?
+		(MysStmtInfo *) list_nth(stmt_infos, stmt_index) : NULL;
 	mys_txn_stmt_done(info);
+	/* SET TRANSACTION's one-shot values; the next transaction's defaults */
+	mys_statement_done(info->txn_kind == MYS_TXN_END && !info->txn_control,
+					   following != NULL && following->txn_kind == MYS_TXN_IMPLICIT_COMMIT);
 	if (info->suppress_response)
 	{
 		resultset_active = false;

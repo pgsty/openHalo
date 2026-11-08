@@ -33,7 +33,17 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
 - **Prepared statements**: `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA` with binary result sets;
   `COM_RESET_CONNECTION` rolls back, clears variables/prepared statements/temp tables and resets session settings.
 - **Transactions**: `autocommit=0`, implicit commits before BEGIN / DDL / `SET autocommit=1`, statement-level
-  rollback, a COMMIT of an aborted transaction reports an error.
+  rollback, a COMMIT of an aborted transaction reports an error. `SET [GLOBAL | SESSION] TRANSACTION`,
+  `transaction_isolation` / `tx_isolation` and `transaction_read_only` / `tx_read_only` are accepted and
+  shown as set (aliases kept equal); `SET TRANSACTION` without a scope applies to the next transaction
+  (as in MySQL, a statement touching a table, COMMIT / ROLLBACK or DDL spends it).
+  Access modes take effect (read-only writes report 1792). Isolation follows what MySQL applications rely
+  on: READ UNCOMMITTED, READ COMMITTED and read-write REPEATABLE READ run as PostgreSQL READ COMMITTED
+  (latest committed rows, no serialization failures, as InnoDB's writes see), read-only REPEATABLE READ
+  and `START TRANSACTION WITH CONSISTENT SNAPSHOT` get a real snapshot, SERIALIZABLE is PostgreSQL's,
+  and serialization failures report 1213 (SQLSTATE 40001) so drivers retry them as deadlocks.
+  `SET GLOBAL read_only` / `super_read_only` stop writes per statement (1290) for ordinary users / for
+  everyone; temporary tables stay writable.
 - **Semantics**: `/` returns DECIMAL, `DIV`, division by zero gives NULL plus a warning (error 1365 in strict
   mode), case-insensitive string columns by default (`*_ci`; `*_bin` and a non-`_ci` table `COLLATE=` stay
   case-sensitive), lenient conversions when `sql_mode` is not strict, `ON UPDATE CURRENT_TIMESTAMP`,
@@ -88,6 +98,10 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
   fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION
   reports 1452 (MySQL: 1451), RESTRICT reports 1451.
+- A read-write REPEATABLE READ transaction does not keep one snapshot for its plain SELECTs (see above);
+  set `READ ONLY` or `WITH CONSISTENT SNAPSHOT` where a stable view matters.
+- With `autocommit = 0`, a `SET TRANSACTION` issued after the transaction began (even with a SELECT
+  without tables) does not reach that transaction.
 - PostgreSQL's MVCC differs from InnoDB locking reads for concurrent delete + insert of the same key
   (duplicate key errors where MySQL waits).
 

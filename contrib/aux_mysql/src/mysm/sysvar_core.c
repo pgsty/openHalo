@@ -49,6 +49,9 @@
 #include "postgres.h"
 #include "mysm_compat.h"
 #include "halo_mysql.h"
+#include "access/xact.h"
+#include "access/xlog.h"
+#include "miscadmin.h"
 #include "access/relscan.h"
 #include "access/sdir.h"
 #include "access/table.h"
@@ -159,6 +162,7 @@ static void rectifySystemVarValue(const char *varName, char **varValue,
 static void getDefaultValue(const char *varName, bool isSessionSystemVar, 
                             char **varValue);
 static void applySystemVarValue(const char *varName, const char *varValue);
+static void setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar);
 static int getSystemVariableValueImpl(char *varName, 
                                       bool isSessionSystemVar, 
                                       int selectShowType, 
@@ -281,6 +285,325 @@ getSystemVariableValueForShow(char *varName,
 }
 
 
+/*
+ * MySQL transaction characteristics.  The session values live in the system
+ * variable hash (transaction_isolation / tx_isolation, transaction_read_only /
+ * tx_read_only); SET TRANSACTION without a scope arrives as next_<name> and
+ * applies to the next transaction only.
+ */
+static char pending_isolation[32];		/* canonical level, "" for none */
+static int	pending_read_only = -1;		/* -1 none, else 0 / 1 */
+static bool pending_armed = false;	/* the running transaction got them */
+static bool txn_used = false;		/* a statement of it touched a table */
+static bool txn_explicit = false;	/* START TRANSACTION / BEGIN started it */
+static bool stmt_touched = false;	/* the running statement touched a table */
+bool		mys_server_read_only = false;	/* GLOBAL read_only applies now */
+
+static bool
+is_isolation_var(const char *name)
+{
+	return strcmp(name, "transaction_isolation") == 0 || strcmp(name, "tx_isolation") == 0;
+}
+
+static bool
+is_tx_read_only_var(const char *name)
+{
+	return strcmp(name, "transaction_read_only") == 0 || strcmp(name, "tx_read_only") == 0;
+}
+
+/* "repeatable read", "REPEATABLE-READ", 2, ... -> "REPEATABLE-READ"; NULL if none */
+static const char *
+canonical_isolation(const char *value)
+{
+	static const char *const levels[] = {
+		"READ-UNCOMMITTED", "READ-COMMITTED", "REPEATABLE-READ", "SERIALIZABLE"
+	};
+	char		buf[32];
+	int			i;
+
+	if (value == NULL || strlen(value) >= sizeof(buf))
+		return NULL;
+	if (value[0] >= '0' && value[0] <= '3' && value[1] == '\0')
+		return levels[value[0] - '0'];
+	for (i = 0; value[i]; i++)
+		buf[i] = (value[i] == ' ' || value[i] == '_') ? '-' : pg_toupper((unsigned char) value[i]);
+	buf[i] = '\0';
+	for (i = 0; i < lengthof(levels); i++)
+		if (strcmp(buf, levels[i]) == 0)
+			return levels[i];
+	return NULL;
+}
+
+/* ON / OFF style value -> "1" / "0"; NULL if none */
+static const char *
+canonical_flag(const char *value)
+{
+	if (value == NULL)
+		return NULL;
+	if (strcmp(value, "1") == 0 || pg_strcasecmp(value, "on") == 0 ||
+		pg_strcasecmp(value, "true") == 0 || pg_strcasecmp(value, "t") == 0)
+		return "1";
+	if (strcmp(value, "0") == 0 || pg_strcasecmp(value, "off") == 0 ||
+		pg_strcasecmp(value, "false") == 0 || pg_strcasecmp(value, "f") == 0)
+		return "0";
+	return NULL;
+}
+
+/* a session variable's value, copied into buf ("" when unknown) */
+static void
+session_value(const char *name, char *buf, size_t len)
+{
+	SystemVar  *var;
+	bool		found;
+
+	buf[0] = '\0';
+	if (sessionSystemVars == NULL)
+		return;
+	var = (SystemVar *) hash_search(sessionSystemVars, name, HASH_FIND, &found);
+	if (found)
+		strlcpy(buf, var->varConfValue, len);
+}
+
+/* a GLOBAL variable's value, copied under the spinlock: nothing allocated */
+static void
+global_value(const char *name, char *buf, size_t len)
+{
+	SystemVar  *var;
+	bool		found;
+
+	buf[0] = '\0';
+	if (globalSystemVars == NULL)
+		return;
+	lockGlobalSystemVars();
+	var = (SystemVar *) hash_search(globalSystemVars, name, HASH_FIND, &found);
+	if (found)
+		strlcpy(buf, var->varConfValue, len);
+	unlockGlobalSystemVars();
+}
+
+/* a GLOBAL ON/OFF variable */
+static bool
+global_flag(const char *name)
+{
+	char		value[16];
+
+	global_value(name, value, sizeof(value));
+	return canonical_flag(value) && strcmp(canonical_flag(value), "1") == 0;
+}
+
+static void
+set_guc(const char *name, const char *value)
+{
+	(void) set_config_option(name, value, PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SET, true, 0, false);
+}
+
+/*
+ * PostgreSQL level for a MySQL level.  MySQL's REPEATABLE READ reads a
+ * snapshot but updates the latest row versions without serialization
+ * failures; PostgreSQL's READ COMMITTED is closest for read-write work, so it
+ * runs RU, RC and RR.  A read-only REPEATABLE READ transaction, which cannot
+ * fail serialization in PostgreSQL, gets the real snapshot.
+ */
+static int
+pg_isolation(const char *level, bool read_only)
+{
+	if (strcmp(level, "SERIALIZABLE") == 0)
+		return RecoveryInProgress() ? XACT_REPEATABLE_READ : XACT_SERIALIZABLE;
+	if (strcmp(level, "REPEATABLE-READ") == 0 && read_only)
+		return XACT_REPEATABLE_READ;
+	return XACT_READ_COMMITTED;
+}
+
+static const char *
+pg_isolation_name(int level)
+{
+	return level == XACT_SERIALIZABLE ? "serializable" :
+		level == XACT_REPEATABLE_READ ? "repeatable read" : "read committed";
+}
+
+/*
+ * The MySQL isolation level and access mode the next transaction gets: SET
+ * TRANSACTION's one-shot values, or else the session's.
+ */
+static const char *
+next_transaction(bool *read_only)
+{
+	static char level[32];
+	char		session_level[32];
+	char		ro[16];
+
+	session_value("transaction_isolation", session_level, sizeof(session_level));
+	session_value("transaction_read_only", ro, sizeof(ro));
+	strlcpy(level, pending_isolation[0] ? pending_isolation :
+			canonical_isolation(session_level) ? canonical_isolation(session_level) :
+			"REPEATABLE-READ", sizeof(level));
+	*read_only = pending_read_only >= 0 ? pending_read_only == 1 :
+		(canonical_flag(ro) && strcmp(canonical_flag(ro), "1") == 0);
+	return level;
+}
+
+static bool
+have_pending(void)
+{
+	return pending_isolation[0] != '\0' || pending_read_only >= 0;
+}
+
+/*
+ * A transaction begins.  As in MySQL, SET TRANSACTION's one-shot values were
+ * spent by the previous one if it was explicit (COMMIT / ROLLBACK reset them)
+ * or one of its statements touched a table (InnoDB had a statement
+ * transaction to end); its last statement may have failed and so not reached
+ * mys_statement_done().  A SELECT without tables, SET or SHOW, or a statement
+ * that failed before opening its tables (a write in a read-only transaction),
+ * leaves them for the next transaction.
+ */
+static void
+spend_one_shot(void)
+{
+	pending_isolation[0] = '\0';
+	pending_read_only = -1;
+	pending_armed = false;
+}
+
+static void
+new_transaction(void)
+{
+	if (pending_armed && (txn_used || stmt_touched || txn_explicit))
+		spend_one_shot();
+	txn_used = stmt_touched = txn_explicit = false;
+	pending_armed = have_pending();
+}
+
+/* the executor opened one of the application's tables */
+void
+mys_statement_touched_tables(void)
+{
+	stmt_touched = true;
+}
+
+/* default_transaction_isolation / _read_only: what the next transaction gets */
+static void
+sync_transaction_defaults(void)
+{
+	bool		read_only;
+	const char *level;
+	int			pglevel;
+
+	if (sessionSystemVars == NULL)
+		return;
+	level = next_transaction(&read_only);
+	pglevel = pg_isolation(level, read_only);
+	if (DefaultXactIsoLevel != pglevel)
+		set_guc("default_transaction_isolation", pg_isolation_name(pglevel));
+	if (DefaultXactReadOnly != read_only)
+		set_guc("default_transaction_read_only", read_only ? "on" : "off");
+}
+
+/*
+ * Before each MySQL packet.  A new connection loads its variables (and so the
+ * GLOBAL transaction defaults) now rather than at its first variable access.
+ */
+void
+mys_sync_session_state(void)
+{
+	if (sessionSystemVars == NULL)
+		initSystemVariables();
+	mys_sync_foreign_key_checks();
+	sync_transaction_defaults();
+}
+
+/*
+ * After parsing a packet that does not open with START TRANSACTION / BEGIN:
+ * its first statement's transaction has begun, normally with the defaults
+ * that mys_statement_done() set.  Make sure of it (a new connection, an error
+ * that ended the previous packet) before the first snapshot.  ddl: the
+ * statement is one MySQL commits implicitly, which also resets SET
+ * TRANSACTION's one-shot values first: it runs with the session's.
+ */
+void
+mys_start_implicit_transaction(bool ddl)
+{
+	bool		read_only;
+	const char *level;
+	int			pglevel;
+
+	if (IsTransactionBlock() || FirstSnapshotSet || IsSubTransaction())
+		return;
+	new_transaction();
+	if (ddl)
+		spend_one_shot();
+	level = next_transaction(&read_only);
+	pglevel = pg_isolation(level, read_only);
+	if (XactIsoLevel != pglevel)
+		set_guc("transaction_isolation", pg_isolation_name(pglevel));
+	if (XactReadOnly != read_only && !RecoveryInProgress())
+		set_guc("transaction_read_only", read_only ? "on" : "off");
+}
+
+/*
+ * START TRANSACTION / BEGIN, as it executes (so a SET earlier in the same
+ * packet counts): the PostgreSQL isolation level and access mode of the
+ * transaction it starts; explicit_read_only is READ ONLY / READ WRITE or -1.
+ * WITH CONSISTENT SNAPSHOT (*snapshot) applies under REPEATABLE READ only; as
+ * in MySQL it is ignored with warning 138 otherwise.
+ */
+const char *
+mys_transaction_start(int explicit_read_only, bool *snapshot, bool *read_only)
+{
+	const char *level;
+
+	new_transaction();
+	txn_explicit = true;
+	level = next_transaction(read_only);
+	if (explicit_read_only >= 0)
+		*read_only = explicit_read_only == 1;
+	if (*snapshot && strcmp(level, "REPEATABLE-READ") != 0)
+	{
+		mys_add_warning(138, "InnoDB: WITH CONSISTENT SNAPSHOT was ignored because this phrase "
+						"can only be used with REPEATABLE READ isolation level.");
+		*snapshot = false;
+	}
+	return *snapshot ? "repeatable read" : pg_isolation_name(pg_isolation(level, *read_only));
+}
+
+/*
+ * After each statement (end_command), hidden ones included.  Once the
+ * transaction has ended, set what the next one starts with, outside any
+ * transaction so that no rollback undoes it: this also restores session
+ * values a rolled back SET took with it.  end: a COMMIT / ROLLBACK of the
+ * client's, which resets SET TRANSACTION's values in MySQL even with no
+ * transaction to end.  next_ddl: the next statement of the packet is one
+ * MySQL commits implicitly (see mys_start_implicit_transaction()).
+ */
+void
+mys_statement_done(bool end, bool next_ddl)
+{
+	if (stmt_touched)
+		txn_used = true;
+	stmt_touched = false;
+	if (IsTransactionState())
+		return;
+	new_transaction();
+	if (end || next_ddl)
+		spend_one_shot();
+	mys_sync_foreign_key_checks();
+	sync_transaction_defaults();
+}
+
+/*
+ * GLOBAL read_only (except for superusers, MySQL's SUPER) and
+ * super_read_only (for everyone) apply to the statement about to run.  Read
+ * per statement: SET GLOBAL in another session takes effect at once.
+ */
+bool
+mys_server_read_only_applies(void)
+{
+	mys_server_read_only = global_flag("super_read_only") ||
+		(global_flag("read_only") && !superuser());
+	return mys_server_read_only;
+}
+
 static bool
 foreign_key_checks_off(const char *value)
 {
@@ -323,8 +646,8 @@ mys_sync_foreign_key_checks(void)
 								 GUC_ACTION_SET, true, 0, false);
 }
 
-void
-setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
+static void
+setSystemVariableValueOne(char *varName, char *varValue, bool isSessionSystemVar)
 {
     SystemVar *systemVar;
     bool found;
@@ -346,7 +669,36 @@ setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
 
     lowerSystemVarName(varName);
 
+	/* SET TRANSACTION without a scope: the next transaction only */
+	if (strncmp(varName, "next_", 5) == 0 &&
+		(is_isolation_var(varName + 5) || is_tx_read_only_var(varName + 5)))
+	{
+		const char *value = is_isolation_var(varName + 5) ?
+			canonical_isolation(varValue) : canonical_flag(varValue);
+
+		if (value == NULL)
+			elog(ERROR, "Variable '%s' can't be set to the value of '%s'",
+				 varName + 5, varValue ? varValue : "NULL");
+		if (is_isolation_var(varName + 5))
+			strlcpy(pending_isolation, value, sizeof(pending_isolation));
+		else
+			pending_read_only = strcmp(value, "1") == 0;
+		return;
+	}
+
     rectifySystemVarValue(varName, &varValue, isSessionSystemVar);
+
+	/* MySQL spells these READ-COMMITTED and 0 / 1, whatever the input */
+	if (is_isolation_var(varName) || is_tx_read_only_var(varName))
+	{
+		const char *value = is_isolation_var(varName) ?
+			canonical_isolation(varValue) : canonical_flag(varValue);
+
+		if (value == NULL)
+			elog(ERROR, "Variable '%s' can't be set to the value of '%s'",
+				 varName, varValue ? varValue : "NULL");
+		varValue = (char *) value;
+	}
 
 	if (varValue == NULL && strcmp(varName, "foreign_key_checks") == 0)
 		elog(ERROR, "Variable '%s' can't be set to the value of 'NULL'", varName);
@@ -451,6 +803,43 @@ setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
             elog(ERROR, "Unknown system variable '%s'", varName);
         }
     }
+}
+
+void
+setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
+{
+	const char *also = NULL;
+	char		value[SYSTEM_VAR_VALUE_MAX_LEN];
+
+	setSystemVariableValueOne(varName, varValue, isSessionSystemVar);
+	if (strncmp(varName, "next_", 5) == 0)
+		return;
+	/* a SESSION value replaces SET TRANSACTION's for the same characteristic */
+	if (isSessionSystemVar && is_isolation_var(varName))
+		pending_isolation[0] = '\0';
+	else if (isSessionSystemVar && is_tx_read_only_var(varName))
+		pending_read_only = -1;
+	if (isSessionSystemVar)
+		session_value(varName, value, sizeof(value));
+	else
+		global_value(varName, value, sizeof(value));
+
+	/* MySQL keeps each pair of aliases equal (DEFAULT is resolved by now) */
+	if (strcmp(varName, "transaction_isolation") == 0)
+		also = "tx_isolation";
+	else if (strcmp(varName, "tx_isolation") == 0)
+		also = "transaction_isolation";
+	else if (strcmp(varName, "transaction_read_only") == 0)
+		also = "tx_read_only";
+	else if (strcmp(varName, "tx_read_only") == 0)
+		also = "transaction_read_only";
+	/* super_read_only = 1 sets read_only, read_only = 0 clears super_read_only */
+	else if (strcmp(varName, "super_read_only") == 0 && strcmp(value, "1") == 0)
+		also = "read_only";
+	else if (strcmp(varName, "read_only") == 0 && strcmp(value, "0") == 0)
+		also = "super_read_only";
+	if (also)
+		setSystemVariableValueOne(pstrdup(also), pstrdup(value), isSessionSystemVar);
 }
 
 
@@ -906,6 +1295,10 @@ resetSessionSystemVariables(void)
     HASH_SEQ_STATUS scan;
     SystemVar *entry;
 
+	/* COM_RESET_CONNECTION also drops SET TRANSACTION's one-shot values */
+	pending_isolation[0] = '\0';
+	pending_read_only = -1;
+	pending_armed = txn_used = txn_explicit = stmt_touched = false;
     if (sessionSystemVars == NULL)
         initSystemVariables();
     old = MemoryContextSwitchTo(TopMemoryContext);
@@ -1534,6 +1927,8 @@ applySystemVarValue(const char *varName, const char *varValue)
     }
 	else if (pg_strcasecmp(varName, "foreign_key_checks") == 0)
 		mys_sync_foreign_key_checks();
+	else if (is_isolation_var(varName) || is_tx_read_only_var(varName))
+		sync_transaction_defaults();
     else if (strncasecmp(varName, "time_zone", 9) == 0)
     {
         VariableSetStmt *variableSetStmt;

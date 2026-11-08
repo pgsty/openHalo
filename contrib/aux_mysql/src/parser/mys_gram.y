@@ -1637,7 +1637,7 @@ VariableSetStmt:
                             memcpy(arg, val, valLen);
                             arg[valLen] = '\0';
                         }
-                        argList = list_make2(makeStringConst(pstrdup(defElem->defname), -1),
+						argList = list_make2(makeStringConst(psprintf("next_%s", defElem->defname), -1),
                                              makeStringConst(pstrdup(arg), -1));
                         funcCall = (Node *) makeFuncCall(funcName,
                                                          argList,

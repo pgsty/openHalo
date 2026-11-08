@@ -270,6 +270,11 @@ def _():
   eq(val(c,'select v from cs_t'),before);eq(val(c,'select v from cs_t'),before);q(c,'commit')
  rejects(c,'start transaction with foo snapshot')
  o.close()
+ # MySQL ignores it, with warning 138, below REPEATABLE READ
+ q(c,'set session transaction isolation level read committed')
+ q(c,'start transaction with consistent snapshot')
+ assert any(w[1]==138 for w in q(c,'show warnings')), q(c,'show warnings')
+ q(c,'commit');q(c,'set session transaction isolation level repeatable read')
 @test('X02 DECIMAL(p,s) survives a SHOW CREATE TABLE replay; unbounded numeric does not break metadata')
 def _():
  from decimal import Decimal
@@ -368,6 +373,97 @@ def _():
  eq(val(c,'select ts from fkx_rep'),datetime.datetime(2000,1,1))
  q(c,'set foreign_key_checks=0');q(c,'update fkx_rep set v = 3');q(c,'set foreign_key_checks=1')
  assert val(c,'select ts from fkx_rep')>datetime.datetime(2000,1,1)
+
+@test('X05 transaction characteristics take effect; GLOBAL read_only is enforced per statement')
+def _():
+ from pymysql.constants import CLIENT
+ def conn(user,pw):
+  return pymysql.connect(host=HOST,port=MP,user=user,password=pw,autocommit=True,database=SCHEMA,client_flag=CLIENT.MULTI_STATEMENTS)
+ def multi(cn,sql):
+  with cn.cursor() as t:
+   t.execute(sql)
+   while t.nextset(): pass
+ def errno(f):
+  try: f()
+  except pymysql.err.MySQLError as e: return e.args[0]
+ V='select @@transaction_isolation, @@tx_isolation, @@transaction_read_only, @@tx_read_only'
+ q(c,'set session transaction isolation level read committed')
+ eq(tuple(map(str,q(c,V)[0])),('READ-COMMITTED','READ-COMMITTED','0','0'))
+ q(c,"set tx_isolation='repeatable-read'");q(c,'set tx_read_only=on')
+ eq(tuple(map(str,q(c,V)[0])),('REPEATABLE-READ','REPEATABLE-READ','1','1'))
+ q(c,'set session transaction read write')
+ q(c,'create table tx_t (id int primary key, v int)');q(c,'insert into tx_t values (1, 10)')
+ o=my();q(o,'use abfix')
+ def snapshot(start,*setup):
+  for s in setup: q(c,s)
+  q(c,start);x=val(c,'select v from tx_t');q(o,'update tx_t set v = v + 1');y=val(c,'select v from tx_t');q(c,'commit')
+  return x==y
+ assert snapshot('start transaction read only')
+ assert snapshot('start transaction','set transaction read only')
+ assert not snapshot('start transaction','set session transaction isolation level read committed')
+ q(c,'set session transaction isolation level repeatable read')
+ # read-write REPEATABLE READ runs as READ COMMITTED, also when READ WRITE overrides a read-only session
+ q(c,'set session transaction read only');q(c,'start transaction read write')
+ eq(val(c,"select current_setting('transaction_isolation')"),'read committed');q(c,'rollback')
+ q(c,'set session transaction read write')
+ # decided as START executes: a SET earlier in the same packet counts
+ m=conn(os.getenv('MYSQL_USER','postgres'),os.getenv('MYSQL_PASSWORD',''))
+ multi(m,'set session transaction isolation level read committed; start transaction with consistent snapshot')
+ assert any(w[1]==138 for w in q(m,'show warnings')), q(m,'show warnings')
+ eq(val(m,"select current_setting('transaction_isolation')"),'read committed');q(m,'rollback')
+ multi(m,'set transaction read only; start transaction')
+ eq(errno(lambda:q(m,'insert into tx_t values (7, 0)')),1792);q(m,'rollback');m.close()
+ # SET TRANSACTION applies to the next transaction only; SESSION survives a ROLLBACK
+ q(c,'set transaction read only');eq(errno(lambda:q(c,'insert into tx_t values (2, 0)')),1792)
+ # as in MySQL a failed statement, a SET or a SELECT without tables leaves it, one that reads a table spends it
+ q(c,'set transaction isolation level serializable');val(c,'select 1')
+ eq(errno(lambda:q(c,'insert into tx_t values (2, 0)')),1792);val(c,'select count(*) from tx_t')
+ q(c,'insert into tx_t values (3, 0)')
+ q(c,'set transaction read only');q(c,'start transaction');q(c,'commit');q(c,'insert into tx_t values (8, 0)')
+ # DDL commits implicitly first, which resets it: the DDL and what follows are read-write
+ q(c,'set transaction read only');q(c,'create table tx_ddl (id int)');q(c,'insert into tx_t values (9, 0)')
+ q(c,'drop table tx_ddl')
+ # a SESSION value replaces it, COMMIT / ROLLBACK reset it, a SET that reads a table spends it
+ q(c,'set transaction read only');q(c,'set session transaction read write');q(c,'insert into tx_t values (10, 0)')
+ q(c,'set transaction read only');q(c,'commit');q(c,'insert into tx_t values (11, 0)')
+ q(c,'set transaction read only');q(c,'set @n = (select count(*) from tx_t)');q(c,'insert into tx_t values (12, 0)')
+ # GLOBAL defaults reach a new connection's first packet
+ q(c,'set global transaction read only')
+ try:
+  r=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),database=SCHEMA,autocommit=None)
+  eq(errno(lambda:q(r,'insert into tx_t values (13, 0)')),1792);r.close()
+ finally:
+  q(c,'set global transaction read write')
+ q(c,'begin');q(c,'set session transaction read only');q(c,'rollback')
+ eq(errno(lambda:q(c,'insert into tx_t values (4, 0)')),1792)
+ q(c,'set session transaction read write')
+ # SERIALIZABLE serialization failures report 1213 (SQLSTATE 40001), which drivers retry
+ q(c,'set session transaction isolation level serializable');q(o,'set session transaction isolation level serializable')
+ q(c,'begin');q(o,'begin');val(c,'select sum(v) from tx_t');val(o,'select sum(v) from tx_t')
+ q(c,'update tx_t set v = 0 where id = 1');q(o,'update tx_t set v = 0 where id = 3')
+ codes={errno(lambda:q(c,'commit')),errno(lambda:q(o,'commit'))}
+ assert 1213 in codes,codes
+ q(c,'rollback');q(o,'rollback')
+ q(c,'set session transaction isolation level repeatable read');o.close()
+ # GLOBAL read_only: ordinary users, also across a COMMIT in one packet; temp tables stay writable
+ user=SCHEMA+'_ro'
+ q(p,"create role %s login password 'Ro.12345'"%user);q(p,'grant usage, create on schema abfix to %s'%user)
+ n=conn(user,'Ro.12345');q(n,'create table tx_n (id int primary key)')
+ try:
+  q(c,'set global read_only = 1')
+  eq(errno(lambda:q(n,'insert into tx_n values (1)')),1290)
+  eq(errno(lambda:multi(n,'commit; insert into tx_n values (2)')),1290)
+  eq(errno(lambda:multi(n,'commit; create table tx_n2 (id int)')),1290)
+  eq(errno(lambda:q(n,'select * from tx_n for update')),1290)
+  q(n,'create temporary table tx_tmp (id int)');q(n,'insert into tx_tmp values (1)')
+  q(n,'create temporary table tx_tmp2 (id int auto_increment primary key)');q(n,'insert into tx_tmp2 values ()')
+  q(n,'begin');q(n,'use abfix');q(n,'create temporary table tx_tmp3 (id int)');q(n,'rollback')
+  q(c,'insert into tx_t values (5, 0)')
+  q(c,'set global super_read_only = 1');eq(errno(lambda:q(c,'insert into tx_t values (6, 0)')),1290)
+ finally:
+  q(c,'set global super_read_only = 0');q(c,'set global read_only = 0')
+ q(n,'insert into tx_n values (3)');q(n,'drop table tx_n');n.close()
+ q(p,'drop owned by %s'%user);q(p,'drop role %s'%user)
 
 try:
     c.close()
