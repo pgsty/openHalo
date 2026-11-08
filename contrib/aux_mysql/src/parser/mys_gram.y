@@ -23243,26 +23243,23 @@ makeByteaStringConst(char *str, int location)
 	/*
 	 * openHalo had a special A_Const value type for binary strings; PG18 has
 	 * none, so emit '\\x<hex>'::bytea.  The scanner delivers two shapes:
-	 *	 _binary X'ABCD'  -> "xABCD"
+	 *	 _binary X'ABCD'  -> "xABCD" (odd digits: a leading 0, as in MySQL)
 	 *	 _binary '...'    -> 16 byte NUL padded decimal length + raw bytes
 	 *						 (escapes already processed, may contain NULs)
 	 */
-	StringInfoData buf;
+	int			len;
+	char	   *hex;
 
 	if (str[0] == 'x' || str[0] == 'X')
-		return makeStringConstCast(psprintf("\\x%s", str + 1), location,
-								   SystemTypeName("bytea"));
+		return makeStringConstCast(psprintf("\\x%s%s", strlen(str + 1) % 2 ? "0" : "", str + 1),
+								   location, SystemTypeName("bytea"));
 
-	initStringInfo(&buf);
-	appendStringInfoString(&buf, "\\x");
-	{
-		int			len = atoi(str);
-		const unsigned char *p = (const unsigned char *) str + 16;
-
-		for (int i = 0; i < len; i++)
-			appendStringInfo(&buf, "%02x", p[i]);
-	}
-	return makeStringConstCast(buf.data, location, SystemTypeName("bytea"));
+	len = atoi(str);
+	hex = palloc((Size) len * 2 + 3);
+	hex[0] = '\\';
+	hex[1] = 'x';
+	hex[hex_encode(str + 16, len, hex + 2) + 2] = '\0';
+	return makeStringConstCast(hex, location, SystemTypeName("bytea"));
 }
 
 static Node *

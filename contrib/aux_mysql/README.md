@@ -69,6 +69,13 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   under `mysql.parser = mysql`); `--` starts a comment only before a space, a control character or the
   end of the text (`1--1` is `1 - -1`), and both end only at `\n`; with multiple statements enabled,
   comments after the last `;` get an OK of their own, as MySQL sends for that empty statement.
+- **Binary strings**: BINARY / VARBINARY / BLOB columns store the bytes they are given, whatever they are,
+  and return them unchanged in text and binary result sets: `_binary '...'`, `X'..'` / `0x..` (an odd
+  number of digits gets a leading 0, as `0xabc` in MySQL), plain `'...'` / `"..."` literals with backslash
+  escapes (`\0`, `\\`, `\Z`, ...), raw NULs and bytes that are not valid UTF-8 (such a literal becomes a
+  binary string; a TEXT column rejects it with 1366, as strict MySQL does), and prepared-statement
+  parameters of any string or BLOB type. So mysqldump output replays byte for byte, with or without
+  `--hex-blob`. A NUL at the end of a query ends it, as in MySQL.
 - **Prefix key parts** `KEY (col(n))`: a column that may hold values beyond a btree entry (TEXT, BLOB,
   VARCHAR over 600 characters) is not indexed whole, so long values insert as in MySQL. A key starting
   with one becomes a hash index on that column, which serves `=` lookups (also for TEXT / BLOB keys
@@ -88,6 +95,14 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   `mysql.statement_rollback = off`.
 - `bigint unsigned` is an int8 domain (no values above 2^63-1); no zero dates; `'a' = 'A'` between two
   literals is case-sensitive (literals use the database collation); `1.5e0` is numeric, not DOUBLE.
+- PostgreSQL reads a string literal for a binary column with its bytea input, which takes backslashes as
+  escapes. aux_mysql passes the bytes of such literals in INSERT / REPLACE values, `UPDATE ... SET` and
+  `ON DUPLICATE KEY UPDATE`, but not elsewhere: `WHERE b = 'a\\b'` (also a string-typed parameter, such as
+  Go's `[]byte`) fails, and `'\\x41'` compares as `A`. Write `_binary '...'` or `X'..'` there. A literal
+  that is not valid UTF-8 or holds a NUL is a binary string everywhere: `SELECT '\xff'` returns a BLOB
+  column, and a TEXT column rejects it also in non-strict mode (MySQL truncates it with a warning).
+  BINARY(n) is not padded with 0x00 and BINARY / VARBINARY lengths are not checked. Hexadecimal literals
+  are not numbers (`0x41 + 0` fails), and a NUL inside a comment is rejected.
 - No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
 - Every MySQL collation name in a table or column definition is accepted and mapped to the closest
   aux_mysql collation, not reproduced (in expressions, `COLLATE utf8mb4_bin` is not mapped): `*_ci`

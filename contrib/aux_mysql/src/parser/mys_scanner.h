@@ -59,6 +59,10 @@ extern core_yyscan_t mys_scanner_init(const char *str,
 								  core_yy_extra_type *yyext,
 								  const ScanKeywordList *keywordlist,
 								  const uint16 *keyword_tokens);
+extern core_yyscan_t mys_scanner_init_len(const char *str, Size slen,
+										  core_yy_extra_type *yyext,
+										  const ScanKeywordList *keywordlist,
+										  const uint16 *keyword_tokens);
 extern void mys_scanner_finish(core_yyscan_t yyscanner);
 extern int	mys_core_yylex(core_YYSTYPE *lvalp, YYLTYPE *llocp,
 					   core_yyscan_t yyscanner);

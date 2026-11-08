@@ -196,12 +196,119 @@ def _():
  q(c,'alter table coll_rename rename to renamed');q(c,'alter table renamed add b varchar(10)')
  q(c,"insert into renamed values('a','a')");assert q(c,"select a='A',b='A' from renamed")==((0,0),)
  assert q(p,"select label from pg_seclabel where provider='aux_mysql' and objoid='extra.renamed'::regclass")==[('case_sensitive',)]
-@test('F11 nonbinary invalid UTF8 is still rejected')
+@test('F11 nonbinary invalid UTF8 keeps its bytes as in MySQL; TEXT columns still reject it')
 def _():
- try:q(c,b"select '\xff'")
- except pymysql.MySQLError as e:assert e.args[0] in (1105,1366),e
- else:raise AssertionError('nonbinary invalid UTF8 accepted')
- assert q(c,'select 1')==((1,),)
+ eq(val(c,b"select '\xff'"),b'\xff')
+ q(c,'create table badtext(t text)')
+ for lit in (b"'\xff'",b"_binary'\xff'",b"'a\\0b'"):
+  try:q(c,b'insert into badtext values ('+lit+b')')
+  except pymysql.MySQLError as e:assert e.args[0]==1366,e
+  else:raise AssertionError('not text, stored in TEXT: %r'%lit)
+ assert q(c,'select count(*) from badtext')==((0,),)
+@test('B01 binary strings keep every byte: literal forms, escapes, NULs, prepared statements, mysqldump')
+def _():
+ import random
+ rnd=random.Random(1)
+ def esc(b):
+  # mysql_real_escape_string (mysqldump, PyMySQL 1.x, Connector/J, PHP)
+  t={0:b'\\0',10:b'\\n',13:b'\\r',26:b'\\Z',39:b"\\'",34:b'\\"',92:b'\\\\'}
+  return b''.join(t.get(x,bytes([x])) for x in b)
+ values=[bytes(range(256)),bytes(range(255,-1,-1)),b'',b'\0',b'\0'*3,b'a\\b',b'\\x41',b'\\101\\\\',b'%_\\%\\_',
+  'h\xe9llo \u4e2d'.encode(),b'\xff',os.urandom(50)]+[rnd.randbytes(n) for n in (1,2,3,50,300,4000,70000)]
+ forms={'plain':lambda b:b"'"+esc(b)+b"'",'double quoted':lambda b:b'"'+esc(b)+b'"',
+  '_binary':lambda b:b"_binary'"+esc(b)+b"'",'_binary space':lambda b:b"_binary '"+esc(b)+b"'",
+  'X':lambda b:b"X'"+b.hex().encode()+b"'",'0x':lambda b:b'0x'+b.hex().encode() if b else b"''",
+  '_binary 0x':lambda b:b'_binary 0x'+b.hex().encode() if b else b"''",
+  'raw bytes':lambda b:b"'"+b.replace(b'\\',b'\\\\').replace(b"'",b"''")+b"'"}
+ q(c,'create table blobs2(id int primary key, b blob, l longblob, v varbinary(65000))')
+ rows={}
+ for f,lit in forms.items():
+  for v in values:
+   i=len(rows)+1;rows[i]=v;x=lit(v)
+   short=x if len(v)<65000 else b'NULL'
+   q(c,b'insert into blobs2 values (%d, %s, %s, %s)'%(i,short,x,short))
+   eq(val(c,b'select l = _binary X\''+v.hex().encode()+b"' from blobs2 where id = %d"%i),1)
+ for i,b,l,v in q(c,'select id, b, l, v from blobs2'):
+  eq((i,l),(i,rows[i]))
+  if len(rows[i])<65000:eq((i,b,v),(i,rows[i],rows[i]))
+ # the same literals in UPDATE SET and ON DUPLICATE KEY UPDATE, also in non-strict sql_mode
+ mode=val(c,'select @@sql_mode')
+ for m in ('',mode):
+  q(c,'set sql_mode = %s',(m,))
+  for f in ('plain','raw bytes','_binary'):
+   for v in values[:12]:
+    q(c,b'update blobs2 set b = '+forms[f](v)+b' where id = 1');eq(val(c,'select b from blobs2 where id = 1'),v)
+    q(c,b"insert into blobs2 (id, v) values (1, 'x') on duplicate key update v = "+forms[f](v))
+    eq(val(c,'select v from blobs2 where id = 1'),v)
+ # a mysqldump 5.7 data section: multi-row INSERTs in NO_AUTO_VALUE_ON_ZERO mode, default and --hex-blob
+ q(c,'create table dumped(id int primary key, b longblob)')
+ for lit in (forms['_binary space'],forms['0x'],forms['plain']):
+  q(c,'delete from dumped')
+  q(c,"/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */")
+  q(c,b'INSERT INTO `dumped` VALUES '+b','.join(b'(%d,%s)'%(i,lit(v)) for i,v in enumerate(values)))
+  q(c,'/*!40101 SET SQL_MODE=@OLD_SQL_MODE */')
+  eq(q(c,'select b from dumped order by id'),tuple((v,) for v in values))
+ # drivers: PyMySQL parameters (bytes go out as _binary'...' or as hex, depending on the version)
+ for prefix in (False,True):
+  d=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),database=SCHEMA,autocommit=True,binary_prefix=prefix)
+  q(d,'delete from dumped')
+  for i,v in enumerate(values):q(d,'insert into dumped values (%s, %s)',(i,v))
+  eq(q(d,'select b from dumped order by id'),tuple((v,) for v in values))
+  d.close()
+ # prepared statements: BLOB / VAR_STRING / STRING parameters, long data, binary result rows
+ x=my();q(x,'use abfix')
+ eof=not (x.server_capabilities & x.client_flag & (1 << 24))
+ def send(cmd,payload):
+  x._next_seq_id=0;x._write_bytes(struct.pack('<I',len(payload)+1)[:3]+b'\0'+bytes([cmd])+payload);x._next_seq_id=1
+ def read(): return x._read_packet().get_all_data()
+ def lenenc(b,i):
+  n=b[i]
+  if n<251:return n,i+1
+  w={0xfc:2,0xfd:3,0xfe:8}[n];return int.from_bytes(b[i+1:i+1+w],'little'),i+1+w
+ def prepare(sql):
+  send(0x16,sql);p=read();sid,ncols,nparams=struct.unpack('<IHH',p[1:9])
+  for _ in range(nparams+ncols+(eof and nparams>0)+(eof and ncols>0)):read()
+  return sid
+ def execute(sid,params):
+  nulls=bytearray((len(params)+7)//8);types=vals=b''
+  for t,v in params:
+   types+=struct.pack('<H',t)
+   if t==3:vals+=struct.pack('<i',v)
+   elif v is not ...:vals+=(bytes([len(v)]) if len(v)<251 else b'\xfc'+struct.pack('<H',len(v)) if len(v)<65536 else b'\xfd'+struct.pack('<I',len(v))[:3])+v
+  send(0x17,struct.pack('<IBI',sid,0,1)+(bytes(nulls)+b'\x01'+types+vals if params else b''))
+  p=read()
+  if p[0]==0:return None
+  ncols,_=lenenc(p,0)
+  for _ in range(ncols+eof):read()
+  rows=[]
+  while True:
+   p=read()
+   if p[0]==0xfe:return rows       # a binary row starts with 0x00
+   i=1+(ncols+9)//8;row=[]
+   for k in range(ncols):
+    n,i=lenenc(p,i);row.append(p[i:i+n]);i+=n
+   rows.append(tuple(row))
+ ins=prepare(b'insert into dumped values (?, ?)');sel=prepare(b'select b from dumped where id = ?')
+ for t in (0xfc,0xfd,0xfe):
+  q(x,'delete from dumped')
+  for i,v in enumerate(values):execute(ins,[(3,i),(t,v)])
+  eq(q(x,'select b from dumped order by id'),tuple((v,) for v in values))
+  for i,v in enumerate(values):eq(execute(sel,[(3,i)]),[(v,)])
+ q(x,'delete from dumped')
+ send(0x18,struct.pack('<IH',ins,1)+values[0]*100);send(0x18,struct.pack('<IH',ins,1)+b'\0\\\xff')
+ execute(ins,[(3,1),(0xfc,...)]);eq(execute(sel,[(3,1)]),[(values[0]*100+b'\0\\\xff',)])
+ # literals inside the prepared text
+ for i,lit in enumerate((b"'\xff\xfe\\0'",b"_binary'\\0\xff'",b"'a\\\\b'",b'0xabc',b"X'00ff'"),10):
+  execute(prepare(b'insert into dumped values (?, '+lit+b')'),[(3,i)])
+ eq(q(x,'select b from dumped where id >= 10 order by id'),((b'\xff\xfe\0',),(b'\0\xff',),(b'a\\b',),(b'\n\xbc',),(b'\0\xff',)))
+ x.close()
+ # as in MySQL, a NUL at the end ends the query, one inside the statement is a syntax error
+ eq(q(c,b'select 1\0'),((1,),));eq(q(c,b'select 1; \0 '),((1,),))
+ try:q(c,b'select 1\0+1')
+ except pymysql.MySQLError as e:assert e.args[0]==1064,e
+ else:raise AssertionError('NUL inside a statement accepted')
+ # outside binary columns nothing changed
+ eq(q(c,b"select 'a\\\\b', 'it''s', \"q\\\"\""),(('a\\b',"it's",'q"'),))
 @test('F16 packet limit reports effective GUC')
 def _():
  assert int(q(c,'select @@max_allowed_packet')[0][0])==int(val(p,'show mysql.max_allowed_packet'))

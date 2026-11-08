@@ -120,7 +120,6 @@ static char * text_position_next_internal(Oid collid, char *start_ptr, TextPosit
 static int text_position_get_match_pos(TextPositionState *state);
 static void text_position_cleanup(TextPositionState *state);
 static void check_collation_set(Oid collid);
-static void binary_to_hex(char ch0, char ch1, char ch2, char ch3, char* ch);
 static void convert_to_digit_text_for_mysql(char **str, int str_len);
 static void convert_to_text_for_mysql(char **str, int str_len);
 static bool lowerStrs(text *t1, text *t2, char **backupBuf1, char **backupBuf2);
@@ -1534,95 +1533,35 @@ mys_bit_to_text(PG_FUNCTION_ARGS)
 
 
 PG_FUNCTION_INFO_V1(cast_bittext_to_bytea);
+/*
+ * BIT -> bytea (X'..', 0x.., b'..' literals stored into binary columns): the
+ * bits right-aligned in whole bytes, as in MySQL (0xabc = 0x0abc, b'1' = 0x01)
+ */
 Datum
 cast_bittext_to_bytea(PG_FUNCTION_ARGS)
 {
-    if (!PG_ARGISNULL(0))
-    {
-        bytea* result;
-        int bc;
+	VarBit     *s = PG_GETARG_VARBIT_P(0);
+	int         nbytes = VARBITBYTES(s);
+	int         shift = nbytes * BITS_PER_BYTE - VARBITLEN(s);
+	const bits8 *src = VARBITS(s);
+	bytea      *result = palloc(VARHDRSZ + nbytes);
+	bits8      *dst = (bits8 *) VARDATA(result);
 
-        VarBit *s = PG_GETARG_VARBIT_P(0);
-        int len = VARBITLEN(s);
+	SET_VARSIZE(result, VARHDRSZ + nbytes);
+	if (shift == 0)
+		memcpy(dst, src, nbytes);
+	else
+	{
+		/* VarBit keeps the bits left-aligned: shift them right */
+		bits8       carry = 0;
 
-        //text *arg1 = PG_GETARG_TEXT_PP(0); 
-        //int len = VARSIZE_ANY_EXHDR(arg1);
-        if (0 < len)
-        {
-            // char* inputText = VARDATA_ANY(arg1);
-            char *inputText = DatumGetCString(DirectFunctionCall1(bit_out, VarBitPGetDatum(s)));
-            int i = 0;
-            int j = 0;
-            int len_mod_4 = len % 4;
-            if (len_mod_4 == 0)
-            {
-                char tmp1 = ' ';
-                binary_to_hex(inputText[0], inputText[1], inputText[2], inputText[3], &tmp1);
-                inputText[j++] = '\\';
-                inputText[j++] = 'x';
-                inputText[j++] = tmp1;
-                i += 4;
-            }
-            else if (len_mod_4 == 1)
-            {
-                char tmp1 = ' ';
-                char tmp2 = ' ';
-                binary_to_hex('0', '0', '0', inputText[0], &tmp1);
-                binary_to_hex(inputText[1], inputText[2], inputText[3], inputText[4], &tmp2);
-                inputText[j++] = '\\';
-                inputText[j++] = 'x';
-                inputText[j++] = tmp1;
-                inputText[j++] = tmp2;
-                i += 5;
-            }
-            else if (len_mod_4 == 2)
-            {
-                char tmp1 = ' ';
-                char tmp2 = ' ';
-                binary_to_hex('0', '0', inputText[0], inputText[1], &tmp1);
-                binary_to_hex(inputText[2], inputText[3], inputText[4], inputText[5], &tmp2);
-                inputText[j++] = '\\';
-                inputText[j++] = 'x';
-                inputText[j++] = tmp1;
-                inputText[j++] = tmp2;
-                i += 6;
-            }
-            else    // (len_mod_4 == 3)
-            {
-                char tmp1 = ' ';
-                binary_to_hex('0', inputText[0], inputText[1], inputText[2], &tmp1);
-                inputText[j++] = '\\';
-                inputText[j++] = 'x';
-                inputText[j++] = tmp1;
-                i += 3;
-            }
-
-            for (; i < len; i += 4)
-            {
-                binary_to_hex(inputText[i], inputText[i + 1], inputText[i + 2], inputText[i + 3], 
-                              &inputText[j++]);
-            }   
-
-            bc = (j - 2) / 2 + VARHDRSZ;	/* maximum possible length */
-            result = palloc(bc);
-            bc = hex_decode((inputText + 2), (j - 2), VARDATA(result));
-            SET_VARSIZE(result, (bc + VARHDRSZ)); /* actual length */
-
-            PG_RETURN_BYTEA_P(result);
-        }
-        else
-        {
-            bc = VARHDRSZ;	/* maximum possible length */
-            result = palloc(bc);
-            bc = hex_decode("", 0, VARDATA(result));
-            SET_VARSIZE(result, (bc + VARHDRSZ)); /* actual length */
-            PG_RETURN_BYTEA_P(result);
-        }
-    }
-    else
-    {
-        PG_RETURN_NULL();
-    }
+		for (int i = 0; i < nbytes; i++)
+		{
+			dst[i] = carry | (src[i] >> shift);
+			carry = (bits8) (src[i] << (BITS_PER_BYTE - shift));
+		}
+	}
+	PG_RETURN_BYTEA_P(result);
 }
 
 /*
@@ -2442,117 +2381,6 @@ check_collation_set(Oid collid)
 				 errmsg("could not determine which collation to use for string comparison"),
 				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 	}
-}
-
-static void 
-binary_to_hex(char ch0, char ch1, char ch2, char ch3, char* ch)
-{
-    if (ch0 == '0')     
-    {
-        if (ch1 == '0') 
-        {
-            if (ch2 == '0')
-            {
-                if (ch3 == '0')
-                {
-                    *ch = '0';
-                }
-                else 
-                {
-                    *ch = '1';
-                }
-            }
-            else 
-            {
-                if (ch3 == '0')
-                {
-                    *ch = '2';
-                }
-                else 
-                {
-                    *ch = '3';
-                }
-            }
-        }
-        else
-        {
-            if (ch2 == '0')
-            {
-                if (ch3 == '0')
-                {
-                    *ch = '4';
-                }
-                else 
-                {
-                    *ch = '5';
-                }
-            }
-            else 
-            {
-                if (ch3 == '0')
-                {
-                    *ch = '6';
-                }
-                else 
-                {
-                    *ch = '7';
-                }
-            }
-        }
-    }   
-    else   
-    {
-        if (ch1 == '0')
-        {
-            if (ch2 == '0')
-            {
-                if (ch3 == '0')
-                {
-                    *ch = '8';
-                }
-                else 
-                {
-                    *ch = '9';
-                }
-            }
-            else 
-            {
-                if (ch3 == '0')
-                {
-                    *ch = 'A';
-                }
-                else 
-                {
-                    *ch = 'B';
-                }
-            }
-        }
-        else
-        {
-            if (ch2 == '0')
-            {
-                if (ch3 == '0')
-                {
-                    *ch = 'C';
-                }
-                else 
-                {
-                    *ch = 'D';
-                }
-            }
-            else 
-            {
-                if (ch3 == '0')
-                {
-                    *ch = 'E';
-                }
-                else 
-                {
-                    *ch = 'F';
-                }
-            }
-        }
-    }
 }
 
 //static void

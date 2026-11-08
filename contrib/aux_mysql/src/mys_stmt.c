@@ -665,7 +665,7 @@ send_param_def(void)
 void
 mys_stmt_prepare(StringInfo pkt)
 {
-	char	   *query = pnstrdup(pkt->data + 1, pkt->len - 1);
+	char	   *volatile query = pnstrdup(pkt->data + 1, pkt->len - 1);
 	int		   *volatile locs = NULL;
 	volatile int nparams = 0;
 	TupleDesc	tupdesc = NULL;
@@ -704,6 +704,8 @@ mys_stmt_prepare(StringInfo pkt)
 	{
 		int		   *found_locs;
 
+		/* as for COM_QUERY, string literals that are not text become X'hex' */
+		query = mys_normalize_query(pkt->data + 1, pkt->len - 1);
 		nparams = find_markers(query, &found_locs);
 		locs = found_locs;
 	}

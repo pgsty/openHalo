@@ -101,26 +101,23 @@ rep('''	A_Const *n = makeNode(A_Const);
 	return (Node *)n;''', '''	/*
 	 * openHalo had a special A_Const value type for binary strings; PG18 has
 	 * none, so emit '\\\\x<hex>'::bytea.  The scanner delivers two shapes:
-	 *	 _binary X'ABCD'  -> "xABCD"
+\t *	 _binary X'ABCD'  -> "xABCD" (odd digits: a leading 0, as in MySQL)
 	 *	 _binary '...'    -> 16 byte NUL padded decimal length + raw bytes
 	 *						 (escapes already processed, may contain NULs)
 	 */
-	StringInfoData buf;
+\tint			len;
+\tchar	   *hex;
 
 	if (str[0] == 'x' || str[0] == 'X')
-		return makeStringConstCast(psprintf("\\\\x%s", str + 1), location,
-								   SystemTypeName("bytea"));
+\t\treturn makeStringConstCast(psprintf("\\\\x%s%s", strlen(str + 1) % 2 ? "0" : "", str + 1),
+\t\t\t\t\t\t\t\t   location, SystemTypeName("bytea"));
 
-	initStringInfo(&buf);
-	appendStringInfoString(&buf, "\\\\x");
-	{
-		int			len = atoi(str);
-		const unsigned char *p = (const unsigned char *) str + 16;
-
-		for (int i = 0; i < len; i++)
-			appendStringInfo(&buf, "%02x", p[i]);
-	}
-	return makeStringConstCast(buf.data, location, SystemTypeName("bytea"));''')
+\tlen = atoi(str);
+\thex = palloc((Size) len * 2 + 3);
+\thex[0] = '\\\\';
+\thex[1] = 'x';
+\thex[hex_encode(str + 16, len, hex + 2) + 2] = '\\0';
+\treturn makeStringConstCast(hex, location, SystemTypeName("bytea"));''')
 rep('''	n->val.type = T_Null;
 	n->location = location;''', '''	n->isnull = true;
 	n->location = location;''')

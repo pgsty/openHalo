@@ -141,6 +141,7 @@ const uint16 MysScanKeywordTokens[] = {
 static void addlit(char *ytext, int yleng, core_yyscan_t yyscanner);
 static void addlitchar(unsigned char ychar, core_yyscan_t yyscanner);
 static char *litbufdup(core_yyscan_t yyscanner);
+static bool literal_needs_binary(core_yyscan_t yyscanner);
 //static void decStrToHexStr(core_yyscan_t yyscanner, char *result);
 static unsigned char unescape_single_char(unsigned char c, core_yyscan_t yyscanner);
 static int	process_integer_literal(const char *token, YYSTYPE *lval);
@@ -700,7 +701,8 @@ other			.
 							 * Check that the data remains valid, if it might
 							 * have been made invalid by unescaping any chars.
 							 */
-                            if (MYS_YYEXTRA(yyextra)->saw_underscore_binary)
+							if (MYS_YYEXTRA(yyextra)->saw_underscore_binary ||
+								literal_needs_binary(yyscanner))
                             {
                                 MYS_YYEXTRA(yyextra)->binary_token_end = yytext - yyextra->scanbuf;
                                 MYS_YYEXTRA(yyextra)->saw_underscore_binary = false;
@@ -811,7 +813,8 @@ other			.
 							 * Check that the data remains valid, if it might
 							 * have been made invalid by unescaping any chars.
 							 */
-                            if (MYS_YYEXTRA(yyextra)->saw_underscore_binary)
+							if (MYS_YYEXTRA(yyextra)->saw_underscore_binary ||
+								literal_needs_binary(yyscanner))
                             {
                                 MYS_YYEXTRA(yyextra)->binary_token_end = yytext - yyextra->scanbuf;
                                 MYS_YYEXTRA(yyextra)->saw_underscore_binary = false;
@@ -1448,9 +1451,21 @@ mys_scanner_init(const char *str,
 			 const ScanKeywordList *keywordlist,
 			 const uint16 *keyword_tokens)
 {
-	//Size		slen = strlen(str);
+	return mys_scanner_init_len(str, strlen(str), yyext, keywordlist, keyword_tokens);
+}
+
+/*
+ * The same for a text of slen bytes, which may contain NULs (COM_QUERY is
+ * length-delimited, and MySQL accepts NULs inside string literals)
+ */
+core_yyscan_t
+mys_scanner_init_len(const char *str,
+			 Size slen,
+			 core_yy_extra_type *yyext,
+			 const ScanKeywordList *keywordlist,
+			 const uint16 *keyword_tokens)
+{
 	yyscan_t	scanner;
-	Size		slen = strlen(str);
 
 	if (yylex_init(&scanner) != 0)
 		elog(ERROR, "yylex_init() failed: %m");
@@ -1464,6 +1479,7 @@ mys_scanner_init(const char *str,
 	yyext->escape_string_warning = escape_string_warning;
 	yyext->standard_conforming_strings = standard_conforming_strings;
     MYS_YYEXTRA(yyext)->saw_underscore_binary = false;
+	MYS_YYEXTRA(yyext)->normalizing = false;
 	MYS_YYEXTRA(yyext)->in_exec_comment = false;
 	MYS_YYEXTRA(yyext)->xc_version_skip = false;
 
@@ -1563,6 +1579,23 @@ litbufdup(core_yyscan_t yyscanner)
 	memcpy(new, yyextra->literalbuf, llen);
 	new[llen] = '\0';
 	return new;
+}
+
+/*
+ * While mys_normalize_query scans, a string literal whose bytes cannot be
+ * PostgreSQL text (a NUL, or not valid in the database encoding) is
+ * returned like a _binary one, to be rewritten as a binary string: MySQL
+ * keeps such bytes unchanged.  The parser proper never sees one, because
+ * mys_normalize_query has rewritten it.
+ */
+static bool
+literal_needs_binary(core_yyscan_t yyscanner)
+{
+	if (!MYS_YYEXTRA(yyextra)->normalizing)
+		return false;
+	return memchr(yyextra->literalbuf, '\0', yyextra->literallen) != NULL ||
+		!pg_verify_mbstr(GetDatabaseEncoding(), yyextra->literalbuf,
+						 yyextra->literallen, true);
 }
 
 

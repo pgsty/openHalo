@@ -1122,7 +1122,8 @@ rewrite_alter_table(AlterTableStmt *stmt)
 }
 
 /* ----------------------------------------------------------------
- * Non-strict sql_mode: lenient conversion of literal values
+ * Literal values assigned to columns: the bytes of a string literal
+ * for a binary column; in non-strict sql_mode, lenient conversion
  * ----------------------------------------------------------------
  */
 extern bool isStrictTransTablesOn;
@@ -1253,6 +1254,57 @@ lenient_value(Node *val, Form_pg_attribute att)
 								 args, COERCE_EXPLICIT_CALL, -1);
 }
 
+/* a string literal holding a backslash */
+static bool
+is_backslash_literal(Node *val)
+{
+	return val != NULL && IsA(val, A_Const) && !((A_Const *) val)->isnull &&
+		IsA(&((A_Const *) val)->val, String) &&
+		strchr(strVal(&((A_Const *) val)->val), '\\') != NULL;
+}
+
+/*
+ * MySQL stores the bytes of a string literal assigned to a binary column
+ * (BINARY, VARBINARY, BLOB) as they are, but PostgreSQL reads an untyped
+ * literal for bytea with byteain, which takes backslashes as escapes:
+ * 'a\\b' would fail and '\\x41' would store "A".  So a literal holding a
+ * backslash becomes the bytea constant of its bytes.  A literal without one
+ * reads as it is; one that is not valid text arrives as _binary X'hex'
+ * (mys_normalize_query).
+ */
+static Node *
+binary_value(Node *val, Form_pg_attribute att)
+{
+	A_Const    *c = (A_Const *) val;
+	const char *s;
+	size_t		len;
+	char	   *hex;
+	TypeCast   *tc;
+
+	if (!is_backslash_literal(val) || getBaseType(att->atttypid) != BYTEAOID)
+		return val;
+	s = strVal(&c->val);
+	len = strlen(s);
+	hex = palloc(len * 2 + 3);
+	hex[0] = '\\';
+	hex[1] = 'x';
+	hex[hex_encode(s, len, hex + 2) + 2] = '\0';
+	c->val.sval.sval = hex;
+	tc = makeNode(TypeCast);
+	tc->arg = val;
+	tc->typeName = makeTypeNameFromOid(BYTEAOID, -1);
+	tc->location = c->location;
+	return (Node *) tc;
+}
+
+/* the literal to assign to column "att" */
+static Node *
+column_value(Node *val, Form_pg_attribute att)
+{
+	val = binary_value(val, att);
+	return isStrictTransTablesOn ? val : lenient_value(val, att);
+}
+
 static Form_pg_attribute
 find_attribute(TupleDesc desc, const char *name)
 {
@@ -1268,7 +1320,7 @@ find_attribute(TupleDesc desc, const char *name)
 
 /* SET col = literal, ... (UPDATE, ON DUPLICATE KEY UPDATE) */
 static void
-lenient_targets(List *targets, TupleDesc desc)
+literal_targets(List *targets, TupleDesc desc)
 {
 	foreach_node(ResTarget, rt, targets)
 	{
@@ -1278,13 +1330,13 @@ lenient_targets(List *targets, TupleDesc desc)
 			continue;
 		att = find_attribute(desc, rt->name);
 		if (att)
-			rt->val = lenient_value(rt->val, att);
+			rt->val = column_value(rt->val, att);
 	}
 }
 
 /* INSERT ... VALUES (literal, ...) */
 static void
-lenient_insert_values(InsertStmt *stmt, TupleDesc desc)
+literal_insert_values(InsertStmt *stmt, TupleDesc desc)
 {
 	SelectStmt *sel = (SelectStmt *) stmt->selectStmt;
 	List	   *targets = NIL;
@@ -1315,7 +1367,7 @@ lenient_insert_values(InsertStmt *stmt, TupleDesc desc)
 			Form_pg_attribute att = i < list_length(targets) ? list_nth(targets, i) : NULL;
 
 			if (att)
-				lfirst(vc) = lenient_value(lfirst(vc), att);
+				lfirst(vc) = column_value(lfirst(vc), att);
 			i++;
 		}
 	}
@@ -1328,12 +1380,20 @@ rewrite_update_stmt(UpdateStmt *stmt)
 	Relation	rel;
 
 	if (isStrictTransTablesOn)
-		return;
+	{
+		bool		any = false;
+
+		/* only binary columns need a look at the table then */
+		foreach_node(ResTarget, rt, stmt->targetList)
+			any |= is_backslash_literal(rt->val);
+		if (!any)
+			return;
+	}
 	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
 	if (!OidIsValid(relid))
 		return;
 	rel = relation_open(relid, AccessShareLock);
-	lenient_targets(stmt->targetList, RelationGetDescr(rel));
+	literal_targets(stmt->targetList, RelationGetDescr(rel));
 	relation_close(rel, NoLock);
 }
 
@@ -1475,13 +1535,13 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 	foreach(lc, stmt->cols)
 		insert_cols = lappend(insert_cols, lfirst_node(ResTarget, lc)->name);
 
-	/* non-strict sql_mode: closest valid value plus a warning */
-	if (!isStrictTransTablesOn)
-	{
-		lenient_insert_values(stmt, tupdesc);
-		if (oc && oc->action == ONCONFLICT_UPDATE)
-			lenient_targets(oc->targetList, tupdesc);
-	}
+	/*
+	 * bytes of string literals for binary columns; non-strict sql_mode:
+	 * closest valid value plus a warning
+	 */
+	literal_insert_values(stmt, tupdesc);
+	if (oc && oc->action == ONCONFLICT_UPDATE)
+		literal_targets(oc->targetList, tupdesc);
 
 	/* ON DUPLICATE KEY UPDATE / REPLACE need an explicit arbiter in PG */
 	if (oc && oc->infer == NULL &&
