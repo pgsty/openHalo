@@ -243,6 +243,22 @@ def _():
     q(c,"update showing_copy set v='new' where v='old'")
     assert val(c,"select t from showing_copy where v='new'").year>2000
 
+@test('X01 an unterminated executable comment is rejected; comments do not nest')
+def _():
+ q(c,'create table xe_del (id int primary key)');q(c,'insert into xe_del values (1),(2)')
+ rejects(c,'delete from xe_del /*!50000','unterminated')
+ eq(val(c,'select count(*) from xe_del'),2)
+ q(c,'delete from xe_del /*!50000 /* note: /* */ where id=1 */')
+ eq(q(c,'select id from xe_del'),((2,),))
+ eq(val(c,'select 1 /* a /* b */ + 1'),2)
+ q(c,'insert into xe_del values (1),(3)')
+ q(c,'delete from xe_del /*/*/ where id=1 /* */')
+ eq(q(c,'select id from xe_del order by id'),((2,),(3,)))
+ q(c,'delete from xe_del where id=2 /*!99999 /* inner */ or 1=1 -- */')
+ eq(q(c,'select id from xe_del'),((3,),))
+ eq(val(c,'select /*!50000 !*/0'),1)
+ eq(val(c,'select /*!+1*/'),1)
+
 try:
     c.close()
     q(p,'reset role')

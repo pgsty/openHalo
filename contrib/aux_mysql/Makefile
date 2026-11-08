@@ -98,5 +98,5 @@ src/mysql_parser.o src/mys_stmt.o src/parser/mys_gram.o src/parser/mys_scan.o sr
 	src/parser/mys_gram.h src/parser/mys_kwlist_d.h
 
 # PGXS tracks header dependencies only with --enable-depend: the shared
-# structs (MysStmtInfo, ...) must not get out of sync between objects.
-$(OBJS): src/halo_mysql.h src/mys_proto.h
+# structs (MysStmtInfo, mys_yy_extra_type, ...) must not get out of sync between objects.
+$(OBJS): src/halo_mysql.h src/mys_proto.h src/parser/mys_gramparse.h

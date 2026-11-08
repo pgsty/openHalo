@@ -44,6 +44,7 @@
 #include "parser/scansup.h"
 #include "mb/pg_wchar.h"
 #include "adapter/mysql/systemVar.h"
+#include "halo_mysql.h"
 }
 
 %{
@@ -53,6 +54,19 @@
 /* Avoid exit() on fatal scanner errors (a bit ugly -- see yy_fatal_error) */
 #undef fprintf
 #define fprintf(file, fmt, msg)  fprintf_to_ereport(fmt, msg)
+
+/* MySQL version id of the reported server version, e.g. 50732 for 5.7.32 */
+static int
+mys_server_version_id(void)
+{
+	int			major = 0,
+				minor = 0,
+				patch = 0;
+
+	if (halo_mysql_version)
+		sscanf(halo_mysql_version, "%d.%d.%d", &major, &minor, &patch);
+	return major * 10000 + minor * 100 + patch;
+}
 
 static void
 fprintf_to_ereport(const char *fmt, const char *msg)
@@ -406,6 +420,16 @@ self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=]
 op_chars		[\~\!\#\^\&\|\+\-\*\/\%\<\>\=]
 operator		{op_chars}+
 
+/*
+ * MySQL executable comments: the text of slash-star-bang ... star-slash is
+ * scanned as SQL.  Five digits after the bang name the oldest server version
+ * that runs it (MySQL 5.7 reads exactly five).  mysqldump relies on these
+ * for SET NAMES, FOREIGN_KEY_CHECKS, TIME_ZONE, SQL_MODE and view bodies.
+ * {xestop} must precede {operator} and {xestart} must precede {xcstart}.
+ */
+xestart			\/\*!{digit}*
+xestop			\*\/{op_chars}*
+
 /* we no longer allow unary minus in numbers.
  * instead we pass it separately to parser. there it gets
  * coerced via doNegate() -- Leon aug 20 1999
@@ -447,20 +471,65 @@ other			.
 					/* ignore */
 				}
 
+{xestart}		{
+					int			version = 0;
+					int			i;
+
+					/* fewer than five digits: no version, the digits are text */
+					if (yyleng >= 8)
+					{
+						for (i = 3; i < 8; i++)
+							version = version * 10 + (yytext[i] - '0');
+						yyless(8);
+					}
+					else
+						yyless(3);
+					if (version > mys_server_version_id())
+					{
+						/* only for a newer server: skipped, one nested comment allowed */
+						SET_YYLLOC();
+						yyextra->xcdepth = 0;
+						MYS_YYEXTRA(yyextra)->xc_version_skip = true;
+						BEGIN(xc);
+					}
+					else
+						MYS_YYEXTRA(yyextra)->in_exec_comment = true;
+				}
+
 {xcstart}		{
-					/* Set location in case of syntax error in comment */
-					SET_YYLLOC();
-					yyextra->xcdepth = 0;
-					BEGIN(xc);
-					/* Put back any characters past slash-star; see above */
-					yyless(2);
+					if (yytext[2] == '!')
+					{
+						/* executable comment followed by operator chars */
+						MYS_YYEXTRA(yyextra)->in_exec_comment = true;
+						yyless(3);
+					}
+					else
+					{
+						/* Set location in case of syntax error in comment */
+						SET_YYLLOC();
+						yyextra->xcdepth = 0;
+						MYS_YYEXTRA(yyextra)->xc_version_skip = false;
+						BEGIN(xc);
+						/* Put back any characters past slash-star; see above */
+						yyless(2);
+					}
 				}
 
 <xc>{
 {xcstart}		{
-					(yyextra->xcdepth)++;
-					/* Put back any characters past slash-star; see above */
-					yyless(2);
+					/*
+					 * MySQL comments do not nest: the slash is text, and the
+					 * star may begin the closing star-slash.  Only a skipped
+					 * newer-version comment may hold one nested comment.
+					 */
+					if (MYS_YYEXTRA(yyextra)->xc_version_skip &&
+						yyextra->xcdepth == 0)
+					{
+						yyextra->xcdepth = 1;
+						yyless(2);
+					}
+					else
+						yyless(1);
 				}
 
 {xcstop}		{
@@ -907,16 +976,36 @@ other			.
 					return yytext[0];
 				}
 
+{xestop}		{
+					if (MYS_YYEXTRA(yyextra)->in_exec_comment)
+					{
+						/* end of a MySQL executable comment */
+						MYS_YYEXTRA(yyextra)->in_exec_comment = false;
+						yyless(2);
+					}
+					else
+					{
+						/* as {operator} would: a lone '*', then rescan */
+						SET_YYLLOC();
+						yyless(1);
+						return yytext[0];
+					}
+				}
+
 {operator}		{
 					/*
 					 * Check for embedded slash-star or dash-dash; those
 					 * are comment starts, so operator must stop there.
 					 * Note that slash-star or dash-dash at the first
 					 * character will match a prior rule, not this one.
+					 * Inside a MySQL executable comment, star-slash ends
+					 * the comment and so the operator as well.
 					 */
 					int			nchars = yyleng;
 					char	   *slashstar = strstr(yytext, "/*");
 					char	   *dashdash = strstr(yytext, "--");
+					char	   *starslash = MYS_YYEXTRA(yyextra)->in_exec_comment ?
+						strstr(yytext, "*/") : NULL;
 
 					if (slashstar && dashdash)
 					{
@@ -928,6 +1017,8 @@ other			.
 						slashstar = dashdash;
 					if (slashstar)
 						nchars = slashstar - yytext;
+					if (starslash && starslash - yytext < nchars)
+						nchars = starslash - yytext;
 
 					/*
 					 * For SQL compatibility, '+' and '-' cannot be the
@@ -981,6 +1072,9 @@ other			.
 						if (nchars == 1 &&
 							strchr(",()[].;:+-*/%^<>=", yytext[0]))
 							return yytext[0];
+						/* as below: "!" cut off before a comment is NOT */
+						if (nchars == 1 && yytext[0] == '!')
+							return NOT_LA;
 						/*
 						 * Likewise, if what we have left is two chars, and
 						 * those match the tokens ">=", "<=", "=>", "<>" or
@@ -1162,7 +1256,10 @@ other			.
 				}
 
 <<EOF>>			{
+					/* as in MySQL, an executable comment must be closed */
 					SET_YYLLOC();
+					if (MYS_YYEXTRA(yyextra)->in_exec_comment)
+						yyerror("unterminated /* comment");
 					yyterminate();
 				}
 
@@ -1329,6 +1426,8 @@ mys_scanner_init(const char *str,
 	yyext->escape_string_warning = escape_string_warning;
 	yyext->standard_conforming_strings = standard_conforming_strings;
     MYS_YYEXTRA(yyext)->saw_underscore_binary = false;
+	MYS_YYEXTRA(yyext)->in_exec_comment = false;
+	MYS_YYEXTRA(yyext)->xc_version_skip = false;
 
 	/*
 	 * Make a scan buffer with special termination needed by flex.

@@ -85,6 +85,8 @@ typedef struct mys_yy_extra_type
 	 */
 	bool		saw_underscore_binary;	/* saw a _binary introducer */
 	int			binary_token_end;	/* end of a decoded binary string, or 0 */
+	bool		in_exec_comment;	/* inside a MySQL executable comment */
+	bool		xc_version_skip;	/* skipping a newer-version executable comment */
 } mys_yy_extra_type;
 
 #define MYS_YYEXTRA(core_extra) ((mys_yy_extra_type *) (core_extra))

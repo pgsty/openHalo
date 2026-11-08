@@ -160,6 +160,12 @@ check('quote in value stays data', b"union select" in e.get('rows', [b''])[0] an
 e = execute(r['id'], [(T_VAR_STRING, s('a\\') + b'')])
 check('trailing backslash stays data', e.get('rows', [b''])[0].endswith(b'a\\'), e)
 
+send(COM_STMT_PREPARE, b'select ? /*!50000')
+r = read()
+check('unterminated executable comment: prepare fails cleanly', r[:1] == b'\xff' and r[1:3] == struct.pack('<H', 1064), r)
+r = prepare('select ? /*!50000 + 1 */ as v')
+check('executable comment text is prepared', 'id' in r, r)
+
 with conn.cursor() as cur:
     cur.execute('select 1')
     check('connection usable afterwards', cur.fetchone() == (1,))

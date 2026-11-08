@@ -43,7 +43,9 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   `KEY`, `COMMENT`, `ALTER TABLE MODIFY/CHANGE/ADD INDEX/DROP PRIMARY KEY`, `ON DUPLICATE KEY UPDATE`,
   `REPLACE`, `INSERT IGNORE`, `CREATE USER ... IDENTIFIED BY`, `SHOW DATABASES/TABLES/COLUMNS/INDEX/CREATE TABLE/
   CHARACTER SET`, user and system variables, MySQL functions from aux_mysql), `ENGINE=` mapped to a table
-  access method of that name, `ENCRYPTION='Y'` to `tde_heap` when pg_tde is installed.
+  access method of that name, `ENCRYPTION='Y'` to `tde_heap` when pg_tde is installed. Executable comments
+  `/*! ... */` and `/*!NNNNN ... */` run as SQL when NNNNN is not newer than `mysql.halo_mysql_version`
+  (mysqldump's `SET NAMES`, `FOREIGN_KEY_CHECKS`, `TIME_ZONE`, `SQL_MODE` and view definitions).
 - **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
 
 ## Known gaps
