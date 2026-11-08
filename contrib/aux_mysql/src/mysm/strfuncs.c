@@ -517,6 +517,8 @@ text_instr(PG_FUNCTION_ARGS)
     text   *str = PG_GETARG_TEXT_PP(0); 
     text   *search_str = PG_GETARG_TEXT_PP(1); 
 
+	if (mys_is_mysql_session())
+		return mys_string_instr(fcinfo);
     PG_RETURN_INT32((int32) text_position(str, search_str, PG_GET_COLLATION()));
 }
 
@@ -580,6 +582,8 @@ text_locate2(PG_FUNCTION_ARGS)
     text   *str = PG_GETARG_TEXT_PP(0); 
     text   *search_str = PG_GETARG_TEXT_PP(1); 
 
+	if (mys_is_mysql_session())
+		return mys_string_locate(fcinfo);
     PG_RETURN_INT32((int32) text_position(search_str, str, PG_GET_COLLATION()));
 }
 
@@ -595,6 +599,8 @@ text_locate3(PG_FUNCTION_ARGS)
     text *slice;
     int32 ret;
 
+	if (mys_is_mysql_session())
+		return mys_string_locate(fcinfo);
     if (PG_ARGISNULL(0))
     {
         PG_RETURN_NULL();

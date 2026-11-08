@@ -176,6 +176,48 @@ class Checks:
         self.count += 1
 
 
+    def collation(self):
+        for coll in ('utf8mb4_general_ci','utf8mb4_bin','utf8_general_ci',
+                     'utf8_bin','utf8mb4_unicode_ci','utf8_unicode_ci'):
+            charset = 'utf8' if coll.startswith('utf8_') else 'utf8mb4'
+            for typ in ('VARCHAR(30)','CHAR(30)','TEXT'):
+                sql = 'CREATE TABLE search_t(id INT,s '+typ+' CHARACTER SET '+charset+' COLLATE '+coll+')'
+                actual, expected = self.oh.result(sql), self.my.result(sql)
+                assert actual[0] == expected[0] == (), (sql,actual,expected)
+                assert actual[1] == ((1105,) if 'unicode_ci' in coll else ()), (sql,actual)
+                assert expected[1] == (), (sql,expected)
+                self.count += 1
+                self.both("INSERT INTO search_t VALUES(1,'Hello'),(2,'éé'),(3,'xéA'),(4,''),(5,NULL),(6,'l ')")
+                for e in ("LOCATE('l',s)","INSTR(s,'l')","POSITION('l' IN s)",
+                          "LOCATE('L',s)","LOCATE('l',s,4)","LOCATE('',s,30)",
+                          "LOCATE('É',s)","LOCATE('e',s)","LOCATE('eÁ',s)",
+                          "LOCATE('l ',s)","LOCATE('x',s,NULL)",
+                          "REPLACE(s,'h','X')","REPLACE(s,'é','X')",
+                          "SUBSTRING_INDEX(s,'L',1)","SUBSTRING_INDEX(s,'l',-1)",
+                          "FIND_IN_SET(s,'abc,HELLO,ÉÉ')", "s LIKE '%L%'",
+                          "s LIKE '%e%'", "s LIKE '%É%'", "s NOT LIKE '%L%'"):
+                    self.both('SELECT '+e+',HEX('+e+') FROM search_t ORDER BY id')
+                self.both('DROP TABLE search_t')
+        # Historical aliases survive upgrades. They are not MySQL collation
+        # names, so assert their documented ICU behavior separately.
+        for alias, expected in [('case_insensitive',(3,3,1)),
+                                ('case_sensitive',(0,0,0)),
+                                ('ignore_accents',(0,0,0))]:
+            for typ in ('VARCHAR(30)','CHAR(30)','TEXT'):
+                self.oh.q('CREATE TABLE aliases(s '+typ+' COLLATE '+alias+')')
+                self.oh.q("INSERT INTO aliases VALUES('Hello')")
+                actual = self.oh.result("SELECT LOCATE('L',s),POSITION('L' IN s),s LIKE '%L%' FROM aliases")
+                assert actual == ((expected,),()), (alias,typ,actual)
+                self.count += 1
+                for e, value in [("INSTR(s,'l')",3),("LOCATE('l',s,4)",4),
+                                 ("REPLACE(s,'h','X')",'Hello'),
+                                 ("SUBSTRING_INDEX(s,'L',1)",'Hello'),
+                                 ("FIND_IN_SET(s,'abc,Hello')",2)]:
+                    actual = self.oh.result('SELECT '+e+' FROM aliases')
+                    assert actual == (((value,),),()), (alias,typ,e,actual)
+                    self.count += 1
+                self.oh.q('DROP TABLE aliases')
+
     def char(self):
         self.both('CREATE TABLE padding(c CHAR(5),v VARBINARY(20),b BINARY(5))')
         self.both("INSERT INTO padding(c) VALUES('x'),('é'),('xy ')")
@@ -201,7 +243,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text', 'binary', 'char'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

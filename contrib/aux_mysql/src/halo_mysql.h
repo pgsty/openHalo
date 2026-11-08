@@ -164,6 +164,8 @@ extern bool mys_hexlit_available;
 extern void mys_binary_session_init(void);
 extern Oid	mys_binary_base_type(Oid typid);
 extern bytea *mys_bpchar_bytes(Datum value);
+extern Datum mys_string_locate(PG_FUNCTION_ARGS);
+extern Datum mys_string_instr(PG_FUNCTION_ARGS);
 extern Node *mys_fold_hexlit_default(Node *expr, Oid typid);
 extern void mys_hexlit_columns_binary(Node *query);
 

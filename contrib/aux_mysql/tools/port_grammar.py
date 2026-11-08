@@ -641,6 +641,7 @@ rep('''            | BINARY
 rep('MySQLConvertType:\n            Character\n\t\t\t\t{\n\t\t\t\t\t$$ = SystemTypeName("varchar");\n\t\t\t\t\t$$->location = @1;\n\t\t\t\t}', 'MySQLConvertType:\n            Character\n                {\n                    $$ = SystemTypeName("varchar");\n                    if ($1->typmods && ((A_Const *) linitial($1->typmods))->location >= 0)\n                        $$->typmods = $1->typmods;\n                    $$->location = @1;\n                }')
 rep('$$ = makeTypeCast($3, $5, @1);', '$$ = mys_mysql_cast($3, $5, @1);', 2)
 rep('SystemFuncName("convert_to")', 'mys_binary_types_available ? list_make2(makeString("mysql"), makeString("convert_using")) : SystemFuncName("convert_to")', 2)
+rep('SystemFuncName("position")', 'mys_binary_types_available ? list_make2(makeString("mysql"), makeString("instr")) : SystemFuncName("position")')
 
 # Arithmetic must assign unknown strings their string type before the
 # operator resolver's exact-(hexlit,hexlit) shortcut.

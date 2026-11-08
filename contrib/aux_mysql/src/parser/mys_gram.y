@@ -20375,7 +20375,7 @@ func_expr_common_subexpr:
 					 * for position(), because the reversal of the arguments
 					 * creates too much risk of confusion.
 					 */
-					$$ = (Node *) makeFuncCall(SystemFuncName("position"),
+					$$ = (Node *) makeFuncCall(mys_binary_types_available ? list_make2(makeString("mysql"), makeString("instr")) : SystemFuncName("position"),
 											   $3,
 											   COERCE_SQL_SYNTAX,
 											   @1);

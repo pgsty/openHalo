@@ -69,7 +69,7 @@ Debug rebuilt/installed successfully. `tests/route_a.py --port 3804 --wp binary`
 private binary suite, libpq and pg_dump/restore: passed again. Test schemas now
 explicitly select utf8mb4, avoiding the reference server's latin1 database default.
 
-## WP3 — CHAR logical values
+## WP3 — CHAR logical values (`29a3d6d`)
 
 Centralized extraction of CHAR bytes. Default mode trims trailing spaces;
 PAD_CHAR_TO_FULL_LENGTH is already supported and retains all storage padding.
@@ -81,3 +81,24 @@ Debug rebuilt and installed. `tests/route_a.py --port 3804 --wp char`: 42
 assertions against 3771 passed in default and PAD modes. The reported examples
 produce `782C21` and `78`. WP2 binary (110) and WP1 text (371) assertions passed
 again after the character overload changes.
+
+## WP4 — searches under MySQL collations
+
+MySQL-session LOCATE/INSTR and grammar-lowered POSITION use length-aware search.
+The dedicated general_ci collation uses the existing MySQL 5.7 weight table and
+linear search; bin uses byte equality with character positions. Historical ICU
+aliases use explicit-length collation comparison without the PG14 substring
+restriction. REPLACE gets a case-sensitive character overload, matching MySQL
+even under general_ci. Native PG substring and cast paths remain unchanged.
+
+The error-string audit found the copied substring engine (now bypassed on these
+MySQL entry points) and ILIKE's ICU restriction (ILIKE is a PG extension, not a
+MySQL function). SUBSTRING_INDEX deliberately compares bytes, FIND_IN_SET uses
+collation-aware array lookup, and ordinary LIKE supports nondeterministic
+collations; the dedicated MySQL LIKE implementation uses simple weights.
+
+Debug built and installed. `tests/route_a.py --port 3804 --wp collation`: 468
+assertions, VARCHAR/CHAR/TEXT × utf8/utf8mb4 general_ci/bin/unicode_ci, plus all
+three historical aliases. Values, HEX and warning codes compared to 3771;
+unicode_ci's existing approximate mapping emits 1105 at DDL. Historical aliases
+have no namesake in MySQL and are asserted against their documented behavior.

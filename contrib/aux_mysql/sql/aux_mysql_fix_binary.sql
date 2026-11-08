@@ -177,6 +177,10 @@ BEGIN
     END LOOP;
 END $more$;
 
+-- MySQL REPLACE is case-sensitive even under a case-insensitive collation.
+CREATE FUNCTION mysql.replace(text,text,text) RETURNS text
+    AS '$libdir/aux_mysql', 'mys_string_replace' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
 DO $binary_hash$
 DECLARE t text;
 BEGIN
