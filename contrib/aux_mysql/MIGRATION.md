@@ -198,3 +198,13 @@ Native dumps must retain extension-managed triggers and aux_mysql security label
 Compare row counts, HEX values, defaults, generated expressions, FK actions and
 unique conflicts after restore. Legacy index names without the per-table suffix
 remain recognized and do not need a naming-only rebuild.
+
+Pending foreign keys now check the child table owner's current permissions
+before binding, including during a superuser restore: USAGE on the parent
+schema and REFERENCES on the parent table or every referenced column are
+required. Missing permission leaves the declaration pending with warning 1142;
+parent creation and restore continue, and existing rows are untouched. Review
+the warning, grant the intended permissions, then retry a table ALTER on the
+child or parent to bind. Recreating a parent does not inherit its old grants.
+New non-NULL child keys remain guarded until binding succeeds. This preserves
+PG's permissions model even though MySQL 5.7 does not check REFERENCES grants.

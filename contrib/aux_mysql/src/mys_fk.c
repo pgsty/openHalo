@@ -45,6 +45,7 @@
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -560,6 +561,64 @@ require_owner(Oid relid)
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE, get_rel_name(relid));
 }
 
+/* Internal ALTER runs as bootstrap superuser, but its authority belongs to
+ * the child owner, including during a privileged dump/restore. Match native
+ * FK REFERENCES checks (table grant or every referenced column), and check
+ * namespace USAGE before inspecting an otherwise inaccessible parent. */
+static bool
+owner_can_reference(Oid child, Oid parent, Constraint *c)
+{
+	Relation childrel = table_open(child, NoLock);
+	Oid owner = childrel->rd_rel->relowner;
+	Relation parentrel;
+	bool allowed = true;
+
+	table_close(childrel, NoLock);
+	parentrel = table_open(parent, ShareRowExclusiveLock);
+	if (object_aclcheck(NamespaceRelationId, RelationGetNamespace(parentrel), owner,
+							  ACL_USAGE) != ACLCHECK_OK)
+		allowed = false;
+	else if (pg_class_aclcheck(parent, owner, ACL_REFERENCES) != ACLCHECK_OK)
+	{
+		if (c->pk_attrs != NIL)
+		{
+			foreach_node(String, name, c->pk_attrs)
+			{
+				AttrNumber attnum = get_attnum(parent, strVal(name));
+
+				if (attnum <= 0 ||
+					pg_attribute_aclcheck(parent, attnum, owner, ACL_REFERENCES) != ACLCHECK_OK)
+				{
+					allowed = false;
+					break;
+				}
+			}
+		}
+		else
+		{
+			Oid pkindex = RelationGetPrimaryKeyIndex(parentrel, true);
+
+			allowed = OidIsValid(pkindex);
+			if (allowed)
+			{
+				Relation index = index_open(pkindex, AccessShareLock);
+
+				for (int i = 0; i < index->rd_index->indnkeyatts; i++)
+					if (pg_attribute_aclcheck(parent, index->rd_index->indkey.values[i],
+											  owner, ACL_REFERENCES) != ACLCHECK_OK)
+					{
+						allowed = false;
+						break;
+					}
+				index_close(index, AccessShareLock);
+			}
+		}
+	}
+	/* Retain an authorized parent's lock until ALTER has installed the FK. */
+	table_close(parentrel, allowed ? NoLock : ShareRowExclusiveLock);
+	return allowed;
+}
+
 /* Remove only declarations whose parent is absent. All other constraints go
  * through normal PG analysis and permissions, including self-referencing FKs. */
 static List *
@@ -887,19 +946,12 @@ mys_fk_before_utility(PlannedStmt **pstmt)
 		if (OidIsValid(guard_function(true)) &&
 			LookupFuncName(s->funcname, 0, NULL, true) == guard_function(true))
 		{
-			List *keys;
-
 			if (list_length(s->args) != 1 || !s->row || s->timing != TRIGGER_TYPE_AFTER ||
 				s->events != (TRIGGER_TYPE_INSERT | TRIGGER_TYPE_UPDATE) || s->whenClause || s->columns)
 				fk_error("guard must check every inserted/updated row");
-			keys = parse_label(strVal(linitial(s->args)));
-			foreach_node(Constraint, c, keys)
-			{
-				Oid parent = parent_oid(c);
-
-				if (OidIsValid(parent) && pg_class_aclcheck(parent, GetUserId(), ACL_REFERENCES) != ACLCHECK_OK)
-					aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_TABLE, get_rel_name(parent));
-			}
+			/* Validate the declaration now; binding below checks its owner's
+			 * current ACLs, not the identity of the restoring connection. */
+			(void) parse_label(strVal(linitial(s->args)));
 			state->target = RangeVarGetRelid(s->relation, AccessExclusiveLock, false);
 		}
 		else state->rebind = false;
@@ -1008,6 +1060,14 @@ mys_fk_after_utility(MysFKUtility *state)
 				continue;
 			}
 			LockRelationOid(child, AccessExclusiveLock);
+			if (!owner_can_reference(child, parent, c))
+			{
+				ereport(WARNING, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					errmsg("foreign key \"%s\" remains pending: child owner lacks USAGE or REFERENCES on \"%s.%s\"",
+						   c->conname, c->pktable->schemaname, c->pktable->relname)));
+				remaining = lappend(remaining, c);
+				continue;
+			}
 			/* NOT VALID installs all new-write checks and referential actions,
 			 * without rejecting rows written while checks were disabled. */
 			PG_TRY();

@@ -37,6 +37,7 @@ python3 tests/review_fix_sql_generated.py --ports "$MYSQL_PORT" --password "$MYS
 python3 tests/review_fix_generated_export.py --ports "$MYSQL_PORT" --password "$MYSQL_PASSWORD"
 python3 tests/review_fix_generated_policy.py --ports "$MYSQL_PORT" --password "$MYSQL_PASSWORD"
 python3 tests/review_fix_pending_fk.py --ports "$MYSQL_PORT" --password "$MYSQL_PASSWORD"
+python3 tests/route_a_fk_privileges.py
 python3 tests/review_fix_collation_mapping.py --mysql-port "$MYSQL_PORT" --pg-port "$PGPORT"
 python3 tests/indexes_mysql.py
 python3 tests/indexes_btree.py
@@ -55,6 +56,12 @@ index-plan and DML tests also need
 a PostgreSQL connection; their PG role must be able to create fixture roles and
 triggers. The transaction suite changes global flags only with its explicit flag
 and restores them in cleanup.
+
+The Route A FK privilege suite creates two non-superuser roles and verifies
+schema USAGE, table/column REFERENCES, implicit composite primary keys,
+revocation, parent recreation and privileged pg_dump/restore. Denied binding
+must retain the declaration and old rows, warn 1142, and let parent DDL finish.
+This enforces PG ownership; MySQL 5.7 does not check equivalent REFERENCES ACLs.
 
 The generated-expression policy suite checks rejection of nondeterministic
 expressions and preserves legitimate compatibility functions and sql_mode

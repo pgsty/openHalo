@@ -169,6 +169,8 @@ def main():
                 subprocess.run([sys.executable,str(tests/'route_a.py'),'--port',str(a.mysql_port),
                                 '--reference-port',str(a.reference_port),'--wp',wp],env=env,
                                stdout=stream,stderr=subprocess.STDOUT,check=True)
+            subprocess.run([sys.executable,str(tests/'route_a_fk_privileges.py')],
+                           env=env,stdout=stream,stderr=subprocess.STDOUT,check=True)
         print('PASS post-upgrade AB smoke and Route A reference assertions',flush=True)
     finally:
         for c in connections: c.close()

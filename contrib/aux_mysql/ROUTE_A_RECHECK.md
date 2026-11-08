@@ -201,7 +201,7 @@ Debug validation:
 
 Release build repetition and final full acceptance are still pending.
 
-## WP9 — ignored index hints
+## WP9 — ignored index hints (`311ef83`)
 
 The generator accepts USE/IGNORE/FORCE, INDEX/KEY, optional FOR JOIN/ORDER BY/
 GROUP BY, multiple/quoted/PRIMARY names, repeated hints, aliases and empty USE
@@ -219,3 +219,22 @@ operands and alias collision), plus INSERT IGNORE and USE database regression.
 All 315 assertions passed against 3771. `release_dml.py` passed its SQL,
 concurrency, trigger and privilege cases, including reference-port repetition.
 Generator byte identity passed.
+
+## WP10 — pending FK owner permissions
+
+Before privileged binding, check the child owner's schema USAGE and table-level
+or every-column REFERENCES, including implicit composite primary keys. Missing
+authority leaves the declaration pending and emits WARNING/1142; parent CREATE
+and ALTER succeed. Authorized bindings retain the parent lock through ALTER.
+Restore validates metadata first and applies the same owner checks, rather than
+using the restoring account's privileges or requiring a table-level grant.
+
+Debug rebuilt. `tests/route_a_fk_privileges.py` passed 46 assertions with two
+non-superuser roles: revoked USAGE, absent/partial REFERENCES, successful column
+grants, implicit keys, parent deletion/recreation, same-owner behavior and
+privileged pg_dump/restore with/without permission. Orphan rows and binary HEX
+remain unchanged; an unbound key cannot probe existing parent keys or prevent
+parent deletion. `review_fix_pending_fk.py --ports 3804 3771` passed all five
+groups on both servers. The real-upgrade runner now includes the ACL suite.
+This PG security boundary intentionally differs from MySQL 5.7's REFERENCES
+permission policy. Release repetition and final full validation follow below.
