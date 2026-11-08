@@ -8,6 +8,8 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 
+#include "halo_mysql.h"
+
 #define VAR_VALUE_EXTEND_BYTES 1
 
 typedef struct MysqlUserVariableItem
@@ -116,7 +118,7 @@ mysSetUserVarInternal(char *userVarName, char *userVarValue, Oid varValueType, b
 
     if (!isNull)
     {
-        Oid baseVarValueType = getBaseType(varValueType);
+		Oid baseVarValueType = mys_binary_base_type(varValueType);
         bytea *result = NULL;
 
         if (baseVarValueType == BYTEAOID)
@@ -182,7 +184,7 @@ mysSetUserVarForPl(char *userVarName, Datum userVarValue, Oid varValueType, bool
 
     if (!isNull)
     {
-        Oid baseVarValueType = getBaseType(varValueType);
+		Oid baseVarValueType = mys_binary_base_type(varValueType);
         Oid typOutput = InvalidOid;
         bool typIsVarlena;
         bool isDigit;

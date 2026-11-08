@@ -100,5 +100,8 @@ extern int	mys_yylex(YYSTYPE *lvalp, YYLTYPE *llocp,
 extern void mys_parser_init(mys_yy_extra_type *yyext);
 extern int	mys_yyparse(core_yyscan_t yyscanner);
 
+/* mys_binary.c: hexadecimal literals are mysql.hexlit constants */
+extern bool mys_hexlit_available;
+
 #endif							/* MYS_GRAMPARSE_H */
 

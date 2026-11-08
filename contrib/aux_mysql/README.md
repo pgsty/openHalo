@@ -72,6 +72,8 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   under `mysql.parser = mysql`); `--` starts a comment only before a space, a control character or the
   end of the text (`1--1` is `1 - -1`), and both end only at `\n`; with multiple statements enabled,
   comments after the last `;` get an OK of their own, as MySQL sends for that empty statement.
+  As in MySQL, a string literal keeps the backslash of `\%` and `\_`, so `LIKE 'a\_b'` matches only `a_b`
+  and `'50\%'` is four characters.
 - **Binary strings**: BINARY / VARBINARY / BLOB columns store the bytes they are given, whatever they are,
   and return them unchanged in text and binary result sets: `_binary '...'`, `X'..'` / `0x..` (an odd
   number of digits gets a leading 0, as `0xabc` in MySQL), plain `'...'` / `"..."` literals with backslash
@@ -79,6 +81,18 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   binary string; a TEXT column rejects it with 1366, as strict MySQL does), and prepared-statement
   parameters of any string or BLOB type. So mysqldump output replays byte for byte, with or without
   `--hex-blob`. A NUL at the end of a query ends it, as in MySQL.
+- **Hexadecimal and bit-value literals** (`X'41'`, `0x41`, `b'101'`, `0b101`; aux_mysql 1.8, type
+  `mysql.hexlit`) are binary strings that are numbers in numeric context, as in MySQL: `SELECT 0x41`
+  returns `A` (VARBINARY), `0x41 + 0` is 65, `0x10 = 16`, `flags & 0x10`, `CONCAT(X'41', 'b')` is `Ab`,
+  `X'41' = 'A'`, `b'101'` is 5 and `0x05`. Arithmetic and bit operations with numbers, BIT columns, strings
+  and BLOBs (read as numbers, as MySQL does) yield BIGINT (`/` DECIMAL, with a DECIMAL or DOUBLE operand
+  that type); comparisons with numbers and BIT columns compare the value, with strings, BLOBs and other
+  literals the bytes (case-sensitively). INSERT / UPDATE store the number into numeric columns, the bytes
+  into string and binary columns (a string column rejects bytes that are not valid text with 1366) and the
+  bits into BIT(n) (1406 when they do not fit); a column DEFAULT stores the value; a literal column of
+  `CREATE TABLE ... AS` / `CREATE VIEW` is VARBINARY. `WHERE binary_col = X'..'` and `IN (X'..', ...)` use
+  an index. `HEX()` / `UNHEX()`: strings, BLOBs and literals byte by byte, numbers rounded to 64 bits in
+  two's complement (`HEX(-1)` is 16 `F`s), BIT columns as numbers; UNHEX of a non-digit is NULL with 1411.
 - **Prefix key parts** `KEY (col(n))`: a column that may hold values beyond a btree entry (TEXT, BLOB,
   VARCHAR over 600 characters) is not indexed whole, so long values insert as in MySQL. A key starting
   with one becomes a hash index on that column, which serves `=` lookups (also for TEXT / BLOB keys
@@ -123,8 +137,27 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   Go's `[]byte`) fails, and `'\\x41'` compares as `A`. Write `_binary '...'` or `X'..'` there. A literal
   that is not valid UTF-8 or holds a NUL is a binary string everywhere: `SELECT '\xff'` returns a BLOB
   column, and a TEXT column rejects it also in non-strict mode (MySQL truncates it with a warning).
-  BINARY(n) is not padded with 0x00 and BINARY / VARBINARY lengths are not checked. Hexadecimal literals
-  are not numbers (`0x41 + 0` fails), and a NUL inside a comment is rejected.
+  A NUL inside a comment is rejected.
+- BINARY(n) and VARBINARY(n) are BLOB domains without the length (the grammar drops it): BINARY(n) does not
+  pad with 0x00 (MySQL stores `'ab'` in BINARY(4) as `ab\0\0`), so a shorter value reads back, compares
+  and is indexed unpadded; values of exactly n bytes (UUIDs, hashes) behave as in MySQL. A longer value is
+  stored whole (strict MySQL: 1406; non-strict: truncated with a warning). Both would need a binary type
+  that carries a length, in place of the bytea domains every binary code path knows. SHOW CREATE TABLE and
+  SHOW COLUMNS print `binary` / `varbinary` without the length; aux_mysql reads both back, MySQL takes
+  `binary` as BINARY(1) and refuses `varbinary`. They also print a BLOB / BINARY default as `'\x..'::bytea`,
+  which the MySQL dialect reads back as the characters `x..`: a replayed default (mysqldump) is wrong.
+- Hexadecimal literals: aux_mysql has no unsigned 64-bit integer, so a literal of 2^63 or more in numeric
+  context, or such a result (`0x8000000000000000 + 0`, a literal into BIGINT UNSIGNED), is error 1264
+  rather than MySQL's unsigned value (`~0x0f` is exact, as DECIMAL). `0x41 + '1'` reads the string literal
+  as bytes (MySQL: as the number 1). A literal is taken by functions of BLOBs (SUBSTRING, LENGTH, MD5,
+  REVERSE, ...), CONCAT, HEX, LOWER / UPPER and IFNULL, not by other functions: `REPLACE(0x41, ..)`,
+  `LEFT`, `TRIM`, `LOCATE`, `CHAR_LENGTH`, `ASCII`, `IF(c, 0x41, 0x42)`, `SUM(0x10)`, `REPEAT('a', 0x3)`,
+  `INTERVAL 0x10 DAY`, `LEAST(1, 0x42)` and MySQL's `||` (OR) fail; write `CAST(0x10 AS UNSIGNED)` or
+  `CAST(0x41 AS CHAR)` there. An integer column compared with a literal is not looked up by index. BIT columns still return their bits as
+  text (`01000001`, MySQL: the bytes) and have no arithmetic of their own (`b + 0` fails; `b | b'1'` works).
+  User variables hold strings: `HEX(@n)` of a number shows its digits (`323535` for 255), and a string
+  variable in numeric context (`@s + 0`) fails. A MySQL session opened before `ALTER EXTENSION aux_mysql
+  UPDATE` to 1.8 (or with new binaries and an older aux_mysql) keeps openHalo's bit-string literals.
 - No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
 - Every MySQL collation name in a table or column definition is accepted and mapped to the closest
   aux_mysql collation, not reproduced (in expressions, `COLLATE utf8mb4_bin` is not mapped): `*_ci`
@@ -156,9 +189,9 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
   AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0` (1.6)
   and SHOW / information_schema report DECIMAL precision and scale, SHOW prefix key parts (1.7), and
-  `GET_LOCK()` locks and SHOW / information_schema show key names (1.8: in 1.7, `GET_LOCK()`,
-  `RELEASE_LOCK()`, `IS_FREE_LOCK()` and `IS_USED_LOCK()` were stubs that let every session "hold"
-  every lock).
+  `GET_LOCK()` locks, SHOW / information_schema show key names, hexadecimal literals are binary strings
+  and numbers, `HEX()` / `UNHEX()` exist (1.8: in 1.7, `GET_LOCK()`, `RELEASE_LOCK()`, `IS_FREE_LOCK()`
+  and `IS_USED_LOCK()` were stubs that let every session "hold" every lock).
   With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
   table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
   fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION

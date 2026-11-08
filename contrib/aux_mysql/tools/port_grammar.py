@@ -556,6 +556,127 @@ rep('''static Node *makeByteaStringConst(char *str, int location);''',
     '''static Node *makeByteaStringConst(char *str, int location);
 static Node *makeRegexSubject(Node *arg);''')
 
+# Hexadecimal (X'41', 0x41) and bit-value (b'101', 0b101) literals are MySQL
+# binary strings that are unsigned integers in numeric context: constants of
+# type mysql.hexlit (aux_mysql 1.8, src/mys_binary.c); _binary b'..' is a
+# plain bytea.  A session whose aux_mysql has no mysql.hexlit yet (binaries
+# newer than the installed extension) keeps openHalo's bit strings.
+rep('''			| BCONST
+\t\t\t\t{
+\t\t\t\t\t$$ = makeBitStringConst($1, @1);
+\t\t\t\t}
+\t\t\t| XCONST
+\t\t\t\t{
+\t\t\t\t\t/* This is a bit constant per SQL99:
+\t\t\t\t\t * Without Feature F511, "BIT data type",
+\t\t\t\t\t * a <general literal> shall not be a
+\t\t\t\t\t * <bit string literal> or a <hex string literal>.
+\t\t\t\t\t */
+\t\t\t\t\t$$ = makeBitStringConst($1, @1);
+\t\t\t\t}
+            | UNDERSCORE_BINARY BCONST
+                {
+                    $$ = makeBitStringConst($2, @2);
+                }''', '''			| BCONST
+\t\t\t\t{
+\t\t\t\t\t$$ = makeHexLitConst($1, false, @1);
+\t\t\t\t}
+\t\t\t| XCONST
+\t\t\t\t{
+\t\t\t\t\t/* MySQL: a binary string, a number in numeric context */
+\t\t\t\t\t$$ = makeHexLitConst($1, false, @1);
+\t\t\t\t}
+\t\t\t| UNDERSCORE_BINARY BCONST
+\t\t\t\t{
+\t\t\t\t\t$$ = makeHexLitConst($2, true, @2);
+\t\t\t\t}''')
+rep('''static Node *makeRegexSubject(Node *arg);''', '''static Node *makeRegexSubject(Node *arg);
+static Node *makeHexLitConst(char *str, bool binary, int location);''')
+# SHOW CREATE TABLE prints a VARBINARY column without its length (which the
+# grammar drops, see README): accept that spelling back.
+rep('''            | VARBINARY '(' Iconst ')'              {
+                //$$ = SystemTypeName("bytea");
+                $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
+                                                         makeString("varbinary")));
+                //$$->typmods = list_make1(makeIntConst($3, -1));
+                }''', '''            | VARBINARY '(' Iconst ')'              {
+                //$$ = SystemTypeName("bytea");
+                $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
+                                                         makeString("varbinary")));
+                //$$->typmods = list_make1(makeIntConst($3, -1));
+                }
+\t\t\t| VARBINARY
+\t\t\t\t{
+\t\t\t\t\t$$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
+\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t makeString("varbinary")));
+\t\t\t\t}''')
+rep('''static Node *
+makeRegexSubject(Node *arg)
+{''', '''/*
+ * A hexadecimal (str "x41": X'41', 0x41) or bit-value ("b101": b'101',
+ * 0b101) literal.  In MySQL it is a binary string that is an unsigned
+ * integer in numeric context: '\\x<bytes>'::mysql.hexlit, whose operators
+ * and casts give it both meanings, or with _binary a plain bytea.  The bits
+ * are right-aligned in whole bytes, as in MySQL (b'101' = 0x05, 0xabc =
+ * 0x0abc).  Without mysql.hexlit (binaries newer than the installed
+ * aux_mysql) a literal remains a bit string.
+ */
+static Node *
+makeHexLitConst(char *str, bool binary, int location)
+{
+\tstatic const char hexdigits[] = "0123456789abcdef";
+\tconst char *digits = str + 1;
+\tint			len = strlen(digits);
+\tStringInfoData buf;
+
+\tif (!binary && !mys_hexlit_available)
+\t\treturn makeBitStringConst(str, location);
+
+\tinitStringInfo(&buf);
+\tappendStringInfoString(&buf, "\\\\x");
+\tif (str[0] == 'x' || str[0] == 'X')
+\t{
+\t\tif (len % 2)
+\t\t\tappendStringInfoChar(&buf, '0');
+\t\tappendStringInfoString(&buf, digits);
+\t}
+\telse
+\t{
+\t\tint			nbytes = (len + 7) / 8;
+\t\tint			lead = nbytes * 8 - len;
+
+\t\tfor (int i = 0; i < nbytes; i++)
+\t\t{
+\t\t\tint			byte = 0;
+
+\t\t\tfor (int j = 0; j < 8; j++)
+\t\t\t{
+\t\t\t\tint			k = i * 8 + j - lead;
+
+\t\t\t\tbyte <<= 1;
+\t\t\t\tif (k < 0)
+\t\t\t\t\tcontinue;
+\t\t\t\tif (digits[k] == '1')
+\t\t\t\t\tbyte |= 1;
+\t\t\t\telse if (digits[k] != '0')
+\t\t\t\t\tereport(ERROR,
+\t\t\t\t\t\t\t(errcode(ERRCODE_SYNTAX_ERROR),
+\t\t\t\t\t\t\t errmsg("\\"%c\\" is not a valid binary digit", digits[k])));
+\t\t\t}
+\t\t\tappendStringInfoChar(&buf, hexdigits[byte >> 4]);
+\t\t\tappendStringInfoChar(&buf, hexdigits[byte & 0xf]);
+\t\t}
+\t}
+\treturn makeStringConstCast(buf.data, location,
+\t\t\t\t\t\t\t   binary ? SystemTypeName("bytea") :
+\t\t\t\t\t\t\t   makeTypeNameFromNameList(list_make2(makeString("mysql"),
+\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t   makeString("hexlit"))));
+}
+
+static Node *
+makeRegexSubject(Node *arg)
+{''')
+
 # openHalo 14.18 moved the column COLLATE mapping out of the grammar (into its
 # forked parse_utilcmd; aux_mysql does it in mys_rewrite.c) and commented the
 # old code out, leaving typeName computed but unused.

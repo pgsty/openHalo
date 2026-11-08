@@ -4,8 +4,9 @@
 /src/parser/mys_gram.output
 /src/parser/mys_scan.c
 /src/parser/mys_kwlist_d.h
-# built from sql/aux_mysql.sql + sql/aux_mysql_additions.sql
+# built from sql/aux_mysql.sql + sql/aux_mysql_additions.sql (+ sql/aux_mysql_binary.sql)
 /sql/aux_mysql--1.5.sql
 /sql/aux_mysql--1.6.sql
 /sql/aux_mysql--1.7.sql
 /sql/aux_mysql--1.8.sql
+/sql/aux_mysql--1.7--1.8.sql

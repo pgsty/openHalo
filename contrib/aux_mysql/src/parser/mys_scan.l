@@ -750,8 +750,19 @@ other			.
                     if(yytext[1] == '0')
                         yytext[1] = '\0';
 					check_string_escape_warning(yytext[1], yyscanner);
-					addlitchar(unescape_single_char(yytext[1], yyscanner),
-							   yyscanner);
+					if (yytext[1] == '%' || yytext[1] == '_')
+					{
+						/*
+						 * MySQL keeps the backslash of \% and \_: they stand
+						 * for a literal % and _ in a LIKE pattern, and are
+						 * the two characters \% and \_ anywhere else.
+						 */
+						addlitchar('\\', yyscanner);
+						addlitchar(yytext[1], yyscanner);
+					}
+					else
+						addlitchar(unescape_single_char(yytext[1], yyscanner),
+								   yyscanner);
 				}
 <xe>.			{
 					/* This is only needed for \ just before EOF */
@@ -862,8 +873,19 @@ other			.
                     if(yytext[1] == '0')
                         yytext[1] = '\0';
 					check_string_escape_warning(yytext[1], yyscanner);
-					addlitchar(unescape_single_char(yytext[1], yyscanner),
-							   yyscanner);
+					if (yytext[1] == '%' || yytext[1] == '_')
+					{
+						/*
+						 * MySQL keeps the backslash of \% and \_: they stand
+						 * for a literal % and _ in a LIKE pattern, and are
+						 * the two characters \% and \_ anywhere else.
+						 */
+						addlitchar('\\', yyscanner);
+						addlitchar(yytext[1], yyscanner);
+					}
+					else
+						addlitchar(unescape_single_char(yytext[1], yyscanner),
+								   yyscanner);
 				}
 <xde>.			{
 					/* This is only needed for \ just before EOF */

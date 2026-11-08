@@ -205,6 +205,7 @@ static Node *makeFloatConst(char *str, int location);
 static Node *makeBitStringConst(char *str, int location);
 static Node *makeByteaStringConst(char *str, int location);
 static Node *makeRegexSubject(Node *arg);
+static Node *makeHexLitConst(char *str, bool binary, int location);
 static Node *makeNullAConst(int location);
 static Node *makeAConst(Node *v, int location);
 static Node *makeBoolAConst(bool state, int location);
@@ -17838,6 +17839,11 @@ SimpleTypename:
                                                          makeString("varbinary")));
                 //$$->typmods = list_make1(makeIntConst($3, -1));
                 }
+			| VARBINARY
+				{
+					$$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
+															 makeString("varbinary")));
+				}
             | YEAR_P opt_field_length opt_field_option
                 {
                     if ( $2 != NULL)
@@ -21526,21 +21532,17 @@ AexprConst: Iconst
 				}
 			| BCONST
 				{
-					$$ = makeBitStringConst($1, @1);
+					$$ = makeHexLitConst($1, false, @1);
 				}
 			| XCONST
 				{
-					/* This is a bit constant per SQL99:
-					 * Without Feature F511, "BIT data type",
-					 * a <general literal> shall not be a
-					 * <bit string literal> or a <hex string literal>.
-					 */
-					$$ = makeBitStringConst($1, @1);
+					/* MySQL: a binary string, a number in numeric context */
+					$$ = makeHexLitConst($1, false, @1);
 				}
-            | UNDERSCORE_BINARY BCONST
-                {
-                    $$ = makeBitStringConst($2, @2);
-                }
+			| UNDERSCORE_BINARY BCONST
+				{
+					$$ = makeHexLitConst($2, true, @2);
+				}
             | UNDERSCORE_BINARY XCONST
                 {
                     $$ = makeByteaStringConst($2, @2);
@@ -23193,6 +23195,67 @@ makeBitStringConst(char *str, int location)
 	n->location = location;
 
 	return (Node *)n;
+}
+
+/*
+ * A hexadecimal (str "x41": X'41', 0x41) or bit-value ("b101": b'101',
+ * 0b101) literal.  In MySQL it is a binary string that is an unsigned
+ * integer in numeric context: '\x<bytes>'::mysql.hexlit, whose operators
+ * and casts give it both meanings, or with _binary a plain bytea.  The bits
+ * are right-aligned in whole bytes, as in MySQL (b'101' = 0x05, 0xabc =
+ * 0x0abc).  Without mysql.hexlit (binaries newer than the installed
+ * aux_mysql) a literal remains a bit string.
+ */
+static Node *
+makeHexLitConst(char *str, bool binary, int location)
+{
+	static const char hexdigits[] = "0123456789abcdef";
+	const char *digits = str + 1;
+	int			len = strlen(digits);
+	StringInfoData buf;
+
+	if (!binary && !mys_hexlit_available)
+		return makeBitStringConst(str, location);
+
+	initStringInfo(&buf);
+	appendStringInfoString(&buf, "\\x");
+	if (str[0] == 'x' || str[0] == 'X')
+	{
+		if (len % 2)
+			appendStringInfoChar(&buf, '0');
+		appendStringInfoString(&buf, digits);
+	}
+	else
+	{
+		int			nbytes = (len + 7) / 8;
+		int			lead = nbytes * 8 - len;
+
+		for (int i = 0; i < nbytes; i++)
+		{
+			int			byte = 0;
+
+			for (int j = 0; j < 8; j++)
+			{
+				int			k = i * 8 + j - lead;
+
+				byte <<= 1;
+				if (k < 0)
+					continue;
+				if (digits[k] == '1')
+					byte |= 1;
+				else if (digits[k] != '0')
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("\"%c\" is not a valid binary digit", digits[k])));
+			}
+			appendStringInfoChar(&buf, hexdigits[byte >> 4]);
+			appendStringInfoChar(&buf, hexdigits[byte & 0xf]);
+		}
+	}
+	return makeStringConstCast(buf.data, location,
+							   binary ? SystemTypeName("bytea") :
+							   makeTypeNameFromNameList(list_make2(makeString("mysql"),
+																   makeString("hexlit"))));
 }
 
 static Node *

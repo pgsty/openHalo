@@ -80,6 +80,7 @@
 #include "utils/varbit.h"
 #include "utils/varlena.h"
 #include "adapter/mysql/adapter.h"
+#include "halo_mysql.h"
 
 
 typedef struct
@@ -163,7 +164,7 @@ elt(PG_FUNCTION_ARGS)
 
     datum = PG_GETARG_DATUM(index);
     valtype = get_fn_expr_argtype(fcinfo->flinfo, index);
-    valBaseType = getBaseType(valtype);
+	valBaseType = mys_binary_base_type(valtype);
     if (valBaseType != BYTEAOID)
     {
         value = OutputFunctionCall(&foutcache[index], datum);
@@ -1861,7 +1862,7 @@ concat_internal(const char *sepstr, int argidx,
 		{
 			Datum value = PG_GETARG_DATUM(i);
             Oid valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
-            Oid valBaseType = getBaseType(valtype);
+			Oid valBaseType = mys_binary_base_type(valtype);
 
 			/* add separator if appropriate */
 			if (first_arg)
@@ -1921,7 +1922,7 @@ concat_ws_internal(const char *sepstr, int argidx, FunctionCallInfo fcinfo)
 		{
 			Datum value = PG_GETARG_DATUM(i);
             Oid valtype = get_fn_expr_argtype(fcinfo->flinfo, i);
-            Oid valBaseType = getBaseType(valtype);
+			Oid valBaseType = mys_binary_base_type(valtype);
 
 			/* add separator if appropriate */
 			if (first_arg)

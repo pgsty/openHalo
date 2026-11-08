@@ -1265,6 +1265,26 @@ alter_added_columns(AlterTableStmt *stmt)
 	return cols;
 }
 
+/* DEFAULT 0x..: the literal of its value for the column's type (mys_binary.c) */
+static void
+fold_column_default(ColumnDef *col)
+{
+	foreach_ptr(Node, n, col->constraints)
+	{
+		Constraint *c = (Constraint *) n;
+		Type		t;
+
+		if (!IsA(n, Constraint) || c->contype != CONSTR_DEFAULT || c->raw_expr == NULL ||
+			col->typeName == NULL)
+			continue;
+		t = LookupTypeName(NULL, col->typeName, NULL, true);
+		if (t == NULL)
+			continue;
+		c->raw_expr = mys_fold_hexlit_default(c->raw_expr, typeTypeId(t));
+		ReleaseSysCache(t);
+	}
+}
+
 static List *
 rewrite_create_stmt(CreateStmt *stmt)
 {
@@ -1304,6 +1324,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 			ListCell   *lc2;
 
 			mys_rectify_column_collation(col, table_collation);
+			fold_column_default(col);
 			foreach(lc2, col->constraints)
 			{
 				Node	   *n = lfirst(lc2);
@@ -1452,6 +1473,7 @@ rewrite_alter_table(AlterTableStmt *stmt)
 			bool		found = false;
 			Constraint *check = NULL;
 
+			fold_column_default(col);
 			foreach_ptr(Node, n, col->constraints)
 			{
 				if (is_on_update_clause(n))
@@ -1471,12 +1493,22 @@ rewrite_alter_table(AlterTableStmt *stmt)
 			setup = true;
 		}
 
+		if (cmd->subtype == AT_ColumnDefault && cmd->def)
+		{
+			Oid			relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+			AttrNumber	attnum = OidIsValid(relid) ? get_attnum(relid, cmd->name) : InvalidAttrNumber;
+
+			if (attnum > 0)
+				cmd->def = mys_fold_hexlit_default(cmd->def, get_atttype(relid, attnum));
+		}
+
 		if (cmd->subtype == AT_AddColumn && cmd->def && IsA(cmd->def, ColumnDef))
 		{
 			ColumnDef  *col = (ColumnDef *) cmd->def;
 			List	   *cons = NIL;
 			ListCell   *lc2;
 
+			fold_column_default(col);
 			foreach(lc2, col->constraints)
 			{
 				Node	   *n = lfirst(lc2);
@@ -2482,6 +2514,12 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 			}
 		}
 		mys_txn_classify(rs->stmt, info);
+
+		/* CREATE TABLE ... AS / CREATE VIEW: a literal 0x.. column is VARBINARY */
+		if (IsA(rs->stmt, CreateTableAsStmt))
+			mys_hexlit_columns_binary(((CreateTableAsStmt *) rs->stmt)->query);
+		else if (IsA(rs->stmt, ViewStmt))
+			mys_hexlit_columns_binary(((ViewStmt *) rs->stmt)->query);
 
 		switch ((int) nodeTag(rs->stmt))
 		{

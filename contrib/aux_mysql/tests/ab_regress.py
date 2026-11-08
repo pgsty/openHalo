@@ -6,7 +6,7 @@ PGDATABASE must name mysql.database. MYSQL_* and PG* connection variables
 are honored. Each run creates and removes a uniquely named schema and roles.
 Exit 0 = all passed, 1 = failures, 2 = missing Python dependencies.
 """
-import os, sys, json, threading, concurrent.futures, time, traceback, uuid, struct
+import os, sys, json, threading, concurrent.futures, time, traceback, uuid, struct, decimal
 try:
     import pymysql, psycopg2
 except ImportError as exc:
@@ -309,6 +309,108 @@ def _():
  else:raise AssertionError('NUL inside a statement accepted')
  # outside binary columns nothing changed
  eq(q(c,b"select 'a\\\\b', 'it''s', \"q\\\"\""),(('a\\b',"it's",'q"'),))
+# B02-B05: expected values are MySQL 5.7.32's for the same statements
+def errno(f):
+ try: f()
+ except pymysql.err.MySQLError as e: return e.args[0]
+def same(rows,expected):
+ # aux_mysql returns some binary strings (CONCAT, HEX) as text, MySQL as bytes
+ norm=lambda r:tuple(x.encode() if isinstance(x,str) and isinstance(e,bytes) else x for x,e in zip(r,expected))
+ eq(norm(rows[0]),tuple(expected))
+@test('B02 hexadecimal and bit-value literals: binary strings, numbers in numeric context')
+def _():
+ same(q(c,"select 0x41, X'41', b'01000001', 0b101, X'', 0xabc, 0x00"),(b'A',b'A',b'A',b'\x05',b'',b'\n\xbc',b'\0'))
+ same(q(c,"select 0x41 + 0, X'41' + 0, b'101' + 0, 0b101 + 0, 0x10 * 2, 0x10 / 3, 0x10 div 3, 0x10 % 3, -0x10,"
+          " 0x41 + 0.5, 1 + X'10', 0x41 - 0x01, 0x41 * 0x02, 0x41 / 0x02, 0x7fffffffffffffff + 0"),
+      (65,65,5,5,32,decimal.Decimal('5.3333'),5,1,-16,decimal.Decimal('65.5'),17,64,130,decimal.Decimal('32.5000'),
+       9223372036854775807))
+ same(q(c,"select 0x0f << 2, 0x41 & 0x0f, 0x41 | 0x02, 0x41 ^ 0x01, 0x10 >> 2, 1 << 0x02, 5 & 0x04,"
+          " 0xffffffffffffffff & 0xff, 0x0000000000000000ff & 0xff, ~0x0f"),
+      (60,1,67,64,4,4,4,255,255,18446744073709551600))
+ same(q(c,"select 0x10 = 16, 0x41 = 'A', 0x41 = 'a', 'A' = 0x41, 0x4142 = 'AB', 0x41 = 65.0, 0x41 = '65',"
+          " 0x31 = 1, 0x31 = '1', 0x41 > 0x40, 0x4100 > 0x41, X'41' < 'B', 0x41 >= 'A', 0x41 <= 65, 'B' > 0x41,"
+          " X'41' <> 'A', 0x41 in (65, 66), 0x41 in ('A', 'B'), 0x41 between 60 and 70, 0x41 between 'A' and 'B',"
+          " x'41' <=> 'A', null <=> 0x41, b'101' = 5, b'0101' = 0x05, 0x10 = 0x10"),
+      (1,1,0,1,1,1,0,0,1,1,1,1,1,1,1,0,1,1,1,1,1,0,1,1,1))
+ same(q(c,"select concat(0x41, 'b'), concat(X'41', 1), length(0x414243), 0x61 like 'a%', 0x61 like 'A',"
+          " 'A' like 0x41, lower(0x41), upper(0x61), cast(0x41 as char), cast(0x41 as unsigned),"
+          " cast(0x41 as decimal(5,1)), coalesce(0x41, 'x'), ifnull(null, 0x41), case when 1 then 0x41 end,"
+          " greatest(0x41, 0x42), 0x41 is true, not 0x41, not 0x00, 0x41 and 1"),
+      (b'Ab',b'A1',3,1,0,1,b'A',b'a','A',65,decimal.Decimal('65.0'),b'A',b'A',b'A',b'B',1,0,1,1))
+ eq(q(c,'select 0x41 union select 0x42 order by 1'),((b'A',),(b'B',)))
+ eq(q(c,'select distinct v from (select 0x41 as v union all select 0x41) s'),((b'A',),))
+ q(c,'set @hexlit = 0x41');same(q(c,"select @hexlit, hex(@hexlit), @hexlit = 'A'"),(b'A','41',1))
+ # MySQL: 9223372036854775808. aux_mysql has no unsigned BIGINT (README): an error, never a wrong value
+ rejects(c,'select 0x8000000000000000 + 0','out of range')
+@test('B03 hexadecimal literals in INSERT, UPDATE and WHERE of typed, BIT and binary columns; DEFAULT; CREATE ... AS')
+def _():
+ q(c,'create table hexcols (id int, i int, ti tinyint, bi bigint, d decimal(10,2), f double, v varchar(10), c char(3),'
+     ' t text, b blob, vb varbinary(10), bt bit(8), bt3 bit(3))')
+ q(c,"insert into hexcols values (1, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, b'1000001', b'101')")
+ q(c,"insert into hexcols (id, i, bt3) values (2, b'1111', 0x0005)")
+ eq(q(c,'select i, ti, bi, d, f, v, c, t, b, vb, hex(bt), hex(bt3) from hexcols where id = 1'),
+    ((65,65,65,decimal.Decimal('65.00'),65.0,'A','A','A',b'A',b'A','41','5'),))
+ eq(q(c,'select i, hex(bt3) from hexcols where id = 2'),((15,'5'),))
+ for w in ("v = 0x41","c = 0x41","t = X'41'","vb = 0x41","b = 0x41","i = 0x41 and i & 0x40 and ti | 0x00 = 65",
+           "bt = 0x41","bt = 65","bt > 0x40","v like 0x41","v in (0x41, 0x42)","d = 0x41","f = 0x41"):
+  eq(q(c,'select id from hexcols where '+w),((1,),))
+ eq(q(c,"select id from hexcols where bt3 = b'101' order by id"),((1,),(2,)))
+ q(c,"update hexcols set i = i | 0x100, v = concat(v, 0x42), bt3 = bt3 | b'010' where id = 1")
+ eq(q(c,'select i, hex(i), v, hex(bt3) from hexcols where id = 1'),((321,'141','AB','7'),))
+ eq(errno(lambda:q(c,"insert into hexcols (id, bt3) values (3, 0x08)")),1406)
+ eq(errno(lambda:q(c,"insert into hexcols (id, i) values (3, 0xffffffff)")),1264)
+ # BINARY(16) keys looked up by hexadecimal literals
+ q(c,'create table hexkeys (id binary(16) primary key, n int)')
+ keys=[uuid.uuid4().bytes for _ in range(20)]
+ for n,k in enumerate(keys):q(c,"insert into hexkeys values (X'%s', %d)"%(k.hex(),n))
+ eq(q(c,'select n from hexkeys where id = 0x%s'%keys[7].hex()),((7,),))
+ eq(q(c,"select n from hexkeys where id in (X'%s', 0x%s) order by n"%(keys[3].hex(),keys[5].hex())),((3,),(5,)))
+ # DEFAULT 0x..: stored as the value, so SHOW CREATE TABLE shows what it shows for the
+ # plain literal, and replays
+ q(c,"create table hexdef (b binary(4) default 0x00, i int default 0x10, bt bit(1) default b'1', v varchar(4) default 0x41,"
+     " bl varbinary(8) default X'4142')")
+ q(c,"create table hexplain (b binary(4) default _binary X'00', i int default 16, bt bit(1) default 1,"
+     " v varchar(4) default 'A', bl varbinary(8) default _binary 'AB')")
+ ddl=q(c,'show create table hexdef')[0][1]
+ eq(ddl,q(c,'show create table hexplain')[0][1].replace('`hexplain`','`hexdef`',1))
+ q(c,'insert into hexdef values ()');eq(q(c,'select b, i, hex(bt), v, bl from hexdef'),((b'\0',16,'1','A',b'AB'),))
+ # (a replayed BLOB / BINARY default is wrong for plain literals too: README Known gaps)
+ q(c,ddl.replace('`hexdef`','`hexdef2`',1))
+ q(c,'insert into hexdef2 values ()');eq(q(c,'select i, hex(bt), v from hexdef2'),((16,'1','A'),))
+ q(c,'alter table hexdef alter column i set default 0x20');q(c,'insert into hexdef (b) values (0x01)')
+ eq(val(c,"select i from hexdef where b = 0x01"),32)
+ # CREATE TABLE ... AS: a literal column is a binary string
+ q(c,"create table hexctas as select 0x41 as a, b'101' as b, X'' as c")
+ eq(q(c,'select a, b, c from hexctas'),((b'A',b'\x05',b''),))
+ q(c,"insert into hexctas values ('xy', 'z', '')");eq(val(c,"select count(*) from hexctas where a = 'xy'"),1)
+@test('B04 HEX() and UNHEX()')
+def _():
+ same(q(c,"select hex('abc'), hex(255), hex(-1), hex(_binary X'00ff'), hex(X'00ff'), hex(0x41), hex(b'101'),"
+          " hex(1.5), hex(3.6), hex(2.5e0), hex(-2.5e0), hex(0.5), hex(-0.4), hex(18446744073709551615), hex(1e20),"
+          " hex(null), hex(''), hex(true), hex(0), hex('255'), hex(_binary 'a\\0b'), hex('\u00e9')"),
+      ('616263','FF','FFFFFFFFFFFFFFFF','00FF','00FF','41','05','2','4','3','FFFFFFFFFFFFFFFD','1','0',
+       'FFFFFFFFFFFFFFFF','FFFFFFFFFFFFFFFF',None,'','1','0','323535','610062','C3A9'))
+ q(c,'create table hexed (b blob, vb varbinary(8), t text, v varchar(8), i int, d decimal(5,2), bt bit(8))')
+ q(c,"insert into hexed values (_binary X'00ff10', _binary X'0a', 'xyz', 'abc', 300, 2.5, b'101')")
+ eq(q(c,'select hex(b), hex(vb), hex(t), hex(v), hex(i), hex(d), hex(bt) from hexed'),
+    (('00FF10','0A','78797A','616263','12C','3','5'),))
+ eq(q(c,"select hex(b) from hexed where hex(b) like '00%'"),(('00FF10',),))
+ eq(q(c,"select unhex('616263'), unhex('6'), unhex(41), unhex(''), unhex(0x3431), hex(unhex('00ff'))"),
+    ((b'abc',b'\x06',b'A',b'',b'A','00FF'),))
+ eq(val(c,"select unhex('4g')"),None);assert 1411 in [w[1] for w in q(c,'show warnings')]
+ eq(val(c,"select unhex(hex(b)) = b from hexed"),1)
+@test('B05 \\% and \\_ keep their backslash, so LIKE matches a literal % and _')
+def _():
+ eq(q(c,r"select '\%', '\_', length('\%'), '\\%', concat('\%', 'x'), replace('100%', '%', '\%'), "+'"\\%"'),
+    ((r'\%',r'\_',2,r'\%',r'\%x',r'100\%',r'\%'),))
+ eq(q(c,r"select 'a%' like 'a\%', 'a%' like '\%', '%' like '\%', '_' like '\_', 'x' like '\_',"
+        r" 'abc_def' like 'abc\_def', 'abcXdef' like 'abc\_def', 'a\%b' = 'a%b', '\%' = '%'"),((1,0,1,1,0,1,0,0,0),))
+ q(c,'create table likes (id int, name varchar(20))')
+ q(c,r"insert into likes values (1, 'a_b'), (2, 'axb'), (3, '50\%')")
+ with c.cursor() as t:eq(t.execute(r"update likes set id = id + 10 where name like 'a\_b'"),1)
+ eq(q(c,'select id, name, length(name) from likes order by id'),((2,'axb',3),(3,r'50\%',4),(11,'a_b',3)))
+ q(c,"set sql_mode='NO_BACKSLASH_ESCAPES'");eq(q(c,r"select '\%', '\_'"),((r'\%',r'\_'),))
+ q(c,"set sql_mode='STRICT_TRANS_TABLES'")
 @test('F16 packet limit reports effective GUC')
 def _():
  assert int(q(c,'select @@max_allowed_packet')[0][0])==int(val(p,'show mysql.max_allowed_packet'))

@@ -1163,6 +1163,7 @@ mys_send_ready_for_query(CommandDest dest)
 			/* GLOBAL defaults (transaction_read_only ...) reach the first statement */
 			StartTransactionCommand();
 			mys_sync_session_state();
+			mys_binary_session_init();
 			CommitTransactionCommand();
 		}
 		PG_CATCH();
@@ -1763,6 +1764,14 @@ mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 
 	/* aux_mysql models tinyint, datetime, ... as domains */
 	typid = getBaseTypeAndTypmod(typid, &typmod);
+	if (mys_binary_base_type(typid) != typid)
+	{
+		/* a hexadecimal literal: VARBINARY, as in MySQL */
+		*mtype = MYSQL_TYPE_VAR_STRING;
+		*len = 255;
+		*flags = BINARY_FLAG;
+		return;
+	}
 
 	switch (typid)
 	{
@@ -1986,7 +1995,7 @@ mys_dr_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 			tlc = lnext(tlist, tlc);
 		}
 
-		col->typid = getBaseType(attr->atttypid);
+		col->typid = mys_binary_base_type(attr->atttypid);
 		mys_type_info(attr->atttypid, attr->atttypmod, &col->mtype, &len,
 					  &flags, &decimals, &charset);
 		getTypeOutputInfo(attr->atttypid, &typoutput, &col->typisvarlena);

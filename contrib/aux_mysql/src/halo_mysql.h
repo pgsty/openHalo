@@ -149,6 +149,13 @@ extern void mys_add_warning(uint16 code, const char *message);
 /* mys_lock.c: GET_LOCK() and friends */
 extern int64 mys_release_user_locks(void);
 
+/* mys_binary.c: hexadecimal literals (mysql.hexlit), HEX(), UNHEX() */
+extern bool mys_hexlit_available;
+extern void mys_binary_session_init(void);
+extern Oid	mys_binary_base_type(Oid typid);
+extern Node *mys_fold_hexlit_default(Node *expr, Oid typid);
+extern void mys_hexlit_columns_binary(Node *query);
+
 /* mys_semantics.c */
 extern void mys_set_auto_increment(Oid relid, int64 next);
 extern void mys_sync_auto_increment(Oid relid);
