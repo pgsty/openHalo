@@ -45,7 +45,7 @@ new build; the extra CHAR scan excludes those two pre-existing combinations.
 Remaining packages and final debug/release acceptance are in progress. A package
 being committed or built does not imply the final full suite has passed.
 
-## WP2 — binary-to-character conversions
+## WP2 — binary-to-character conversions (`894b949`)
 
 Added assignment casts from both length-aware binary types to text/varchar/bpchar.
 They validate the entire payload as UTF-8; NUL (including BINARY padding) and
@@ -68,3 +68,16 @@ Debug rebuilt/installed successfully. `tests/route_a.py --port 3804 --wp binary`
 110 assertions against 3771 passed. WP1 text scan: 371 passed again. Stock-PG18
 private binary suite, libpq and pg_dump/restore: passed again. Test schemas now
 explicitly select utf8mb4, avoiding the reference server's latin1 database default.
+
+## WP3 — CHAR logical values
+
+Centralized extraction of CHAR bytes. Default mode trims trailing spaces;
+PAD_CHAR_TO_FULL_LENGTH is already supported and retains all storage padding.
+CONCAT/CONCAT_WS/ELT, binary and character CAST, HEX, GROUP_CONCAT, lock names,
+user variables and SQL EXECUTE now follow this rule. Exact character overloads
+prevent an implicit text cast from discarding PAD mode before function entry.
+
+Debug rebuilt and installed. `tests/route_a.py --port 3804 --wp char`: 42
+assertions against 3771 passed in default and PAD modes. The reported examples
+produce `782C21` and `78`. WP2 binary (110) and WP1 text (371) assertions passed
+again after the character overload changes.

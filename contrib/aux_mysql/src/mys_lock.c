@@ -104,6 +104,13 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 		*len = VARSIZE_ANY_EXHDR(b);
 		return VARDATA_ANY(b);
 	}
+	if (base == BPCHAROID)
+	{
+		bytea *b = mys_bpchar_bytes(PG_GETARG_DATUM(argno));
+
+		*len = VARSIZE_ANY_EXHDR(b);
+		return VARDATA_ANY(b);
+	}
 	if (*binary)
 	{
 		VarBit	   *b = PG_GETARG_VARBIT_P(argno);

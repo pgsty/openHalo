@@ -192,7 +192,9 @@ mysSetUserVarForPl(char *userVarName, Datum userVarValue, Oid varValueType, bool
         bytea *result = NULL;
 
         getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
-        varValue = OidOutputFunctionCall(typOutput, userVarValue);
+		varValue = baseVarValueType == BPCHAROID ?
+			text_to_cstring((text *) mys_bpchar_bytes(userVarValue)) :
+			OidOutputFunctionCall(typOutput, userVarValue);
         isDigit = varValueIsDigit(userVarValue, varValueType);
 
         if (baseVarValueType == BYTEAOID)

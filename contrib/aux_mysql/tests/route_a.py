@@ -176,11 +176,32 @@ class Checks:
         self.count += 1
 
 
+    def char(self):
+        self.both('CREATE TABLE padding(c CHAR(5),v VARBINARY(20),b BINARY(5))')
+        self.both("INSERT INTO padding(c) VALUES('x'),('é'),('xy ')")
+        for mode in ('', 'PAD_CHAR_TO_FULL_LENGTH'):
+            for s in (self.oh, self.my):
+                s.q("SET sql_mode='"+mode+"'")
+            for expr in ["CONCAT_WS(',',c,'!')", 'CAST(c AS BINARY)',
+                         "CONCAT(c,'!')", 'CAST(c AS CHAR)', 'HEX(c)',
+                         'CONVERT(c USING utf8mb4)', "ELT(1,c,'!')"]:
+                self.both('SELECT '+expr+' FROM padding ORDER BY c')
+                self.both('SELECT HEX('+expr+') FROM padding ORDER BY c')
+            self.both('UPDATE padding SET v=c,b=c')
+            self.both('SELECT HEX(v),HEX(b) FROM padding ORDER BY c')
+            self.both('SELECT HEX(GROUP_CONCAT(c ORDER BY c)) FROM padding')
+            self.both("SET @c=(SELECT c FROM padding WHERE c='x')")
+            self.both('SELECT HEX(@c)')
+        self.both("SET sql_mode=''")
+        assert self.oh.q("SELECT HEX(CONCAT_WS(',',c,'!')),HEX(CAST(c AS BINARY)) FROM padding WHERE c='x'") == (('782C21','78'),)
+        self.count += 1
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text', 'binary'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary', 'char'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

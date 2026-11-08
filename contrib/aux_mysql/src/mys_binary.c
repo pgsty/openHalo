@@ -91,6 +91,19 @@ mys_is_hexlit(Oid typid)
 	return is_mysql_type(typid, "hexlit");
 }
 
+/* CHAR values are logical strings unless the supported MySQL PAD mode is
+ * active. Never expose bpcharout's storage padding accidentally. */
+bytea *
+mys_bpchar_bytes(Datum value)
+{
+	BpChar *b = DatumGetBpCharPP(value);
+	int len = VARSIZE_ANY_EXHDR(b);
+
+	if (!(mys_sqlMode & MYS_MODE_PAD_CHAR_TO_FULL_LENGTH))
+		len = bpchartruelen(VARDATA_ANY(b), len);
+	return (bytea *) cstring_to_text_with_len(VARDATA_ANY(b), len);
+}
+
 /* A callback only marks state. Catalog lookups must wait for a transaction. */
 static void
 binary_types_invalidate(Datum arg, int cacheid, uint32 hashvalue)
@@ -559,7 +572,8 @@ PG_FUNCTION_INFO_V1(mys_hex_bytes);
 Datum
 mys_hex_bytes(PG_FUNCTION_ARGS)
 {
-	bytea	   *b = PG_GETARG_BYTEA_PP(0);
+	bytea	   *b = getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID ?
+		mys_bpchar_bytes(PG_GETARG_DATUM(0)) : PG_GETARG_BYTEA_PP(0);
 	const unsigned char *p = (const unsigned char *) VARDATA_ANY(b);
 	int			len = VARSIZE_ANY_EXHDR(b);
 	text	   *result = (text *) palloc(VARHDRSZ + (Size) len * 2);
@@ -798,9 +812,8 @@ mys_binary_coerce(PG_FUNCTION_ARGS)
 {
 	bytea *b = PG_GETARG_BYTEA_PP(0);
 
-	if (getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID &&
-		!(mys_sqlMode & MYS_MODE_PAD_CHAR_TO_FULL_LENGTH))
-		b = (bytea *) DatumGetTextPP(DirectFunctionCall1(rtrim1, PointerGetDatum(b)));
+	if (getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID)
+		b = mys_bpchar_bytes(PG_GETARG_DATUM(0));
 	PG_RETURN_BYTEA_P(binary_sized(b, PG_GETARG_INT32(1),
 								  is_mysql_type(get_fn_expr_rettype(fcinfo->flinfo), "binary_n"),
 								  PG_GETARG_BOOL(2)));
@@ -1058,6 +1071,8 @@ mys_concat_one(PG_FUNCTION_ARGS)
 
 	if (base == BYTEAOID || base == TEXTOID || base == VARCHAROID)
 		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+	if (base == BPCHAROID)
+		PG_RETURN_BYTEA_P(mys_bpchar_bytes(PG_GETARG_DATUM(0)));
 	getTypeOutputInfo(typid, &out, &varlena);
 	PG_RETURN_TEXT_P(cstring_to_text(OidOutputFunctionCall(out, PG_GETARG_DATUM(0))));
 }
@@ -1139,6 +1154,8 @@ binary_arg(FunctionCallInfo fcinfo, int i)
 
 	if (base == BYTEAOID || base == TEXTOID || base == VARCHAROID)
 		return PG_GETARG_BYTEA_PP(i);
+	if (base == BPCHAROID)
+		return mys_bpchar_bytes(PG_GETARG_DATUM(i));
 	getTypeOutputInfo(t, &out, &varlena);
 	return (bytea *) cstring_to_text(OidOutputFunctionCall(out, PG_GETARG_DATUM(i)));
 }
@@ -1150,8 +1167,7 @@ Datum
 mys_cast_char(PG_FUNCTION_ARGS)
 {
 	bytea *b = getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID ?
-		(bytea *) DatumGetTextPP(DirectFunctionCall1(rtrim1, PG_GETARG_DATUM(0))) :
-		binary_arg(fcinfo, 0);
+		mys_bpchar_bytes(PG_GETARG_DATUM(0)) : binary_arg(fcinfo, 0);
 	int len = VARSIZE_ANY_EXHDR(b);
 	int limit = PG_GETARG_INT32(1);
 	int clipped;
@@ -1168,8 +1184,7 @@ Datum
 mys_convert_using(PG_FUNCTION_ARGS)
 {
 	bytea *b = getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID ?
-		(bytea *) DatumGetTextPP(DirectFunctionCall1(rtrim1, PG_GETARG_DATUM(0))) :
-		binary_arg(fcinfo, 0);
+		mys_bpchar_bytes(PG_GETARG_DATUM(0)) : binary_arg(fcinfo, 0);
 	char *name = text_to_cstring(PG_GETARG_TEXT_PP(1));
 
 	/* UTF-8 MySQL charset aliases share the database's Unicode text value.
@@ -1730,7 +1745,8 @@ mys_group_concat_binary(PG_FUNCTION_ARGS)
 		bytea *b;
 
 		if (isnull) continue;
-		b = DatumGetByteaPP(value);
+		b = getBaseType(ARR_ELEMTYPE(array)) == BPCHAROID ?
+			mys_bpchar_bytes(value) : DatumGetByteaPP(value);
 		if (!first)
 			appendBinaryStringInfo(&out, VARDATA_ANY(sep), VARSIZE_ANY_EXHDR(sep));
 		appendBinaryStringInfo(&out, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));

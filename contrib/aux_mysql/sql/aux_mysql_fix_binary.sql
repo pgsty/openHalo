@@ -236,3 +236,15 @@ BEGIN
             AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE$f$,t);
     END LOOP;
 END $group_concat$;
+
+-- CHAR arguments observe the writer/session PAD_CHAR_TO_FULL_LENGTH setting.
+CREATE FUNCTION mysql.hex(bpchar) RETURNS text
+    AS '$libdir/aux_mysql','mys_hex_bytes' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.array_to_string_for_mysql(bpchar[],text) RETURNS text
+    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.concat_one(bpchar) RETURNS text
+    AS '$libdir/aux_mysql','mys_concat_one' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.array_to_string_for_mysql(text[],text) RETURNS text
+    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.array_to_string_for_mysql(varchar[],text) RETURNS text
+    AS '$libdir/aux_mysql','mys_group_concat_binary' LANGUAGE C STABLE STRICT PARALLEL SAFE;

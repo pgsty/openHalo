@@ -48,6 +48,7 @@
 
 #include "postgres.h"
 #include "mysm_compat.h"
+#include "halo_mysql.h"
 #include "nodes/nodes.h"
 #include "catalog/pg_type.h"
 
@@ -237,7 +238,9 @@ mysSetUserVar(PG_FUNCTION_ARGS)
         bool isDigit;
 
         getTypeOutputInfo(varValueType, &typOutput, &typIsVarlena);
-        varValue = OidOutputFunctionCall(typOutput, datumValue);
+		varValue = getBaseType(varValueType) == BPCHAROID ?
+			text_to_cstring((text *) mys_bpchar_bytes(datumValue)) :
+			OidOutputFunctionCall(typOutput, datumValue);
         varValueType = get_fn_expr_argtype(fcinfo->flinfo, 1);
         isDigit = varValueIsDigit(datumValue, varValueType);
 
@@ -296,7 +299,9 @@ mysSetUserVarInExpr(PG_FUNCTION_ARGS)
     if (!PG_ARGISNULL(1))
     {
         Datum datumValue = PG_GETARG_DATUM(1);
-        char *varValue = OutputFunctionCall(foutcache, datumValue);
+		char *varValue = getBaseType(varValueType) == BPCHAROID ?
+			text_to_cstring((text *) mys_bpchar_bytes(datumValue)) :
+			OutputFunctionCall(foutcache, datumValue);
         bool isDigit = varValueIsDigit(datumValue, varValueType);
 
         mysSetUserVarInternal(varName, varValue, varValueType, isDigit, false);

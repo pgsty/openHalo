@@ -1313,6 +1313,12 @@ append_using_value(StringInfo buf, Node *arg, ParseState *pstate)
 
 		append_string_literal(buf, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), true);
 	}
+	else if (type == BPCHAROID)
+	{
+		bytea *b = mys_bpchar_bytes(value);
+
+		append_string_literal(buf, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), false);
+	}
 	else if (type == BOOLOID)
 		appendStringInfoString(buf, DatumGetBool(value) ? "(1)" : "(0)");
 	else
