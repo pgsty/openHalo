@@ -1071,6 +1071,8 @@ IsoLocaleName(const char *winlocname)
 /*
  * Create a new pg_locale_t struct for the given collation oid.
  */
+pg_locale_create_hook_type pg_locale_create_hook = NULL;
+
 static pg_locale_t
 create_pg_locale(Oid collid, MemoryContext context)
 {
@@ -1096,6 +1098,14 @@ create_pg_locale(Oid collid, MemoryContext context)
 		PGLOCALE_SUPPORT_ERROR(collform->collprovider);
 
 	result->is_default = false;
+
+	if (pg_locale_create_hook)
+	{
+		MemoryContext oldcontext = MemoryContextSwitchTo(context);
+
+		pg_locale_create_hook(collid, result);
+		MemoryContextSwitchTo(oldcontext);
+	}
 
 	Assert((result->collate_is_c && result->collate == NULL) ||
 		   (!result->collate_is_c && result->collate != NULL));

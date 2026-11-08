@@ -22,6 +22,8 @@
  */
 
 #include "postgres.h"
+#include "postmaster/protocol_extension.h"
+#include "utils/resowner.h"
 
 #include "access/htup_details.h"
 #include "access/sysattr.h"
@@ -247,7 +249,7 @@ pg_noreturn static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
  * Check foreign key existence (combined for INSERT and UPDATE).
  */
 static Datum
-RI_FKey_check(TriggerData *trigdata)
+RI_FKey_check(TriggerData *trigdata, bool before_insert)
 {
 	const RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
@@ -272,7 +274,8 @@ RI_FKey_check(TriggerData *trigdata)
 	 * and lock on the buffer to call HeapTupleSatisfiesVisibility.  Caller
 	 * should be holding pin, but not lock.
 	 */
-	if (!table_tuple_satisfies_snapshot(trigdata->tg_relation, newslot, SnapshotSelf))
+	if (!before_insert &&
+		!table_tuple_satisfies_snapshot(trigdata->tg_relation, newslot, SnapshotSelf))
 		return PointerGetDatum(NULL);
 
 	/*
@@ -349,6 +352,34 @@ RI_FKey_check(TriggerData *trigdata)
 			 * of MATCH.
 			 */
 			break;
+	}
+
+	/* A self-reference may be satisfied by the row about to be inserted. */
+	if (before_insert && riinfo->pk_relid == riinfo->fk_relid && !riinfo->hasperiod)
+	{
+		bool self_match = true;
+
+		for (int i = 0; i < riinfo->nkeys; i++)
+		{
+			bool pnull, fnull;
+			Datum pval = slot_getattr(newslot, riinfo->pk_attnums[i], &pnull);
+			Datum fval = slot_getattr(newslot, riinfo->fk_attnums[i], &fnull);
+			Oid ptype = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+			Oid ftype = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+
+			if (pnull || fnull || ptype != ftype ||
+				!ri_CompareWithCast(riinfo->pf_eq_oprs[i], ptype,
+								 RIAttCollation(pk_rel, riinfo->pk_attnums[i]), pval, fval))
+			{
+				self_match = false;
+				break;
+			}
+		}
+		if (self_match)
+		{
+			table_close(pk_rel, RowShareLock);
+			return PointerGetDatum(NULL);
+		}
 	}
 
 	SPI_connect();
@@ -465,6 +496,71 @@ RI_FKey_check(TriggerData *trigdata)
 }
 
 
+/* INSERT IGNORE preflight.  The successful checks retain key-share locks;
+ * a failed check unwinds only its own SPI work, before a heap tuple is written.
+ * Normal AFTER triggers remain enabled as a final integrity check. */
+bool
+RI_FKey_check_insert(Relation rel, TupleTableSlot *slot)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
+	volatile bool valid = true;
+
+	if (!rel->trigdesc || !rel->trigdesc->trig_insert_after_row ||
+		(MyProtocolExtension && MyProtocolExtension->foreign_key_checks &&
+		 !MyProtocolExtension->foreign_key_checks()))
+		return true;
+
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcontext);
+	PG_TRY();
+	{
+		if (MyProtocolExtension && MyProtocolExtension->foreign_key_insert)
+			MyProtocolExtension->foreign_key_insert(rel, slot);
+		for (int i = 0; i < rel->trigdesc->numtriggers; i++)
+		{
+			Trigger *trigger = &rel->trigdesc->triggers[i];
+			TriggerData td = {0};
+
+			if (trigger->tgfoid != F_RI_FKEY_CHECK_INS ||
+				trigger->tgenabled == TRIGGER_DISABLED ||
+				(SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA ?
+				 trigger->tgenabled == TRIGGER_FIRES_ON_ORIGIN :
+				 trigger->tgenabled == TRIGGER_FIRES_ON_REPLICA))
+				continue;
+			td.type = T_TriggerData;
+			td.tg_event = TRIGGER_EVENT_INSERT | TRIGGER_EVENT_ROW;
+			td.tg_relation = rel;
+			td.tg_trigger = trigger;
+			td.tg_trigslot = slot;
+			RI_FKey_check(&td, true);
+		}
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
+		if (edata->sqlerrcode != ERRCODE_FOREIGN_KEY_VIOLATION)
+			ReThrowError(edata);
+		ereport(WARNING, (errcode(edata->sqlerrcode),
+						  errmsg_internal("%s", edata->message),
+						  errdetail_internal("%s", edata->detail ? edata->detail : "")));
+		FreeErrorData(edata);
+		valid = false;
+	}
+	PG_END_TRY();
+	return valid;
+}
+
 /*
  * RI_FKey_check_ins -
  *
@@ -477,7 +573,7 @@ RI_FKey_check_ins(PG_FUNCTION_ARGS)
 	ri_CheckTrigger(fcinfo, "RI_FKey_check_ins", RI_TRIGTYPE_INSERT);
 
 	/* Share code with UPDATE case. */
-	return RI_FKey_check((TriggerData *) fcinfo->context);
+	return RI_FKey_check((TriggerData *) fcinfo->context, false);
 }
 
 
@@ -493,7 +589,7 @@ RI_FKey_check_upd(PG_FUNCTION_ARGS)
 	ri_CheckTrigger(fcinfo, "RI_FKey_check_upd", RI_TRIGTYPE_UPDATE);
 
 	/* Share code with INSERT case. */
-	return RI_FKey_check((TriggerData *) fcinfo->context);
+	return RI_FKey_check((TriggerData *) fcinfo->context, false);
 }
 
 

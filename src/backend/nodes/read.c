@@ -150,6 +150,16 @@ stringToNodeWithLocations(const char *str)
  * as a single token.
  */
 const char *
+pg_strtok_peek(int *length)
+{
+	const char *saved = pg_strtok_ptr;
+	const char *token = pg_strtok(length);
+
+	pg_strtok_ptr = saved;
+	return token;
+}
+
+const char *
 pg_strtok(int *length)
 {
 	const char *local_str;		/* working pointer to string */

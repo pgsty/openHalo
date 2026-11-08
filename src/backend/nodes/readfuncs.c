@@ -255,6 +255,40 @@ readBitmapset(void)
 
 #include "readfuncs.funcs.c"
 
+/* Stored rules and SQL function bodies from before aux_mysql 1.9 omit the
+ * dialect flags. Keep their positional format intact and default to native
+ * semantics. Also accept the leading fields used by development snapshots. */
+static OnConflictExpr *
+_readOnConflictExpr(void)
+{
+	READ_LOCALS(OnConflictExpr);
+
+	READ_ENUM_FIELD(action, OnConflictAction);
+	token = pg_strtok_peek(&length);
+	if (token && length == 11 && strncmp(token, ":allIndexes", 11) == 0)
+	{
+		READ_BOOL_FIELD(allIndexes);
+		READ_BOOL_FIELD(replace);
+		READ_BOOL_FIELD(ignoreFailure);
+	}
+	READ_NODE_FIELD(arbiterElems);
+	READ_NODE_FIELD(arbiterWhere);
+	READ_OID_FIELD(constraint);
+	READ_NODE_FIELD(onConflictSet);
+	READ_NODE_FIELD(onConflictWhere);
+	READ_INT_FIELD(exclRelIndex);
+	READ_NODE_FIELD(exclRelTlist);
+	token = pg_strtok_peek(&length);
+	if (token && length == 11 && strncmp(token, ":allIndexes", 11) == 0)
+	{
+		READ_BOOL_FIELD(allIndexes);
+		READ_BOOL_FIELD(replace);
+		READ_BOOL_FIELD(ignoreFailure);
+	}
+
+	READ_DONE();
+}
+
 
 /*
  * Support functions for nodes with custom_read_write attribute or

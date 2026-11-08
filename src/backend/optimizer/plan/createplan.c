@@ -7221,6 +7221,9 @@ make_modifytable(PlannerInfo *root, Plan *subplan,
 	else
 	{
 		node->onConflictAction = onconflict->action;
+		node->onConflictAll = onconflict->allIndexes;
+		node->onConflictReplace = onconflict->replace;
+		node->onConflictIgnore = onconflict->ignoreFailure;
 
 		/*
 		 * Here we convert the ON CONFLICT UPDATE tlist, if any, to the

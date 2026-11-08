@@ -718,6 +718,8 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	targetPerms = ACL_INSERT;
 	if (isOnConflictUpdate)
 		targetPerms |= ACL_UPDATE;
+	if (stmt->onConflictClause && stmt->onConflictClause->replace)
+		targetPerms |= ACL_DELETE;
 	qry->resultRelation = setTargetTable(pstate, stmt->relation,
 										 false, false, targetPerms);
 
@@ -1028,10 +1030,40 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		qry->onConflict = transformOnConflictClause(pstate,
 													stmt->onConflictClause);
 
+	/* MySQL requires SELECT only for read columns that are not updated.
+	 * EXCLUDED contains proposed values and does not read the target table.
+	 * Do this before RETURNING, whose explicit column reads still need ACLs. */
+	if (qry->onConflict && qry->onConflict->allIndexes)
+	{
+		perminfo->selectedCols = bms_difference(perminfo->selectedCols,
+												perminfo->updatedCols);
+		if (bms_is_empty(perminfo->selectedCols))
+			perminfo->requiredPerms &= ~ACL_SELECT;
+	}
+
 	/* Process RETURNING, if any. */
 	if (stmt->returningClause)
+	{
+		AclMode		requiredPerms = perminfo->requiredPerms;
+		Bitmapset  *selectedCols = stmt->returningInternal ?
+			bms_copy(perminfo->selectedCols) : NULL;
+
 		transformReturningClause(pstate, qry, stmt->returningClause,
 								 EXPR_KIND_RETURNING);
+
+		/*
+		 * A dialect may need hidden RETURNING columns for protocol metadata
+		 * such as the generated insert ID.  Preserve all privileges collected
+		 * from the actual statement, but do not require additional SELECT for
+		 * those internal columns.  Copy the bitmap above because RETURNING
+		 * analysis can modify it in place.  Explicit RETURNING keeps its ACLs.
+		 */
+		if (stmt->returningInternal)
+		{
+			perminfo->requiredPerms = requiredPerms;
+			perminfo->selectedCols = selectedCols;
+		}
+	}
 
 	/* done building the range table and jointree */
 	qry->rtable = pstate->p_rtable;
@@ -1248,12 +1280,35 @@ transformOnConflictClause(ParseState *pstate,
 		 */
 		Assert((ParseNamespaceItem *) llast(pstate->p_namespace) == exclNSItem);
 		pstate->p_namespace = list_delete_last(pstate->p_namespace);
+
+		/* MySQL VALUES(col) reads the proposed row, requiring no additional
+		 * SELECT privilege. Remove its permission entry after expression
+		 * analysis: a zero requiredPerms entry violates executor invariants.
+		 * Other RTEs may have been added by subexpressions, so renumber them. */
+		if (onConflictClause->allIndexes)
+		{
+			Index oldindex = exclNSItem->p_rte->perminfoindex;
+
+			pstate->p_rteperminfos = list_delete_ptr(pstate->p_rteperminfos,
+													 exclNSItem->p_perminfo);
+			foreach_node(RangeTblEntry, rte, pstate->p_rtable)
+			{
+				if (rte->perminfoindex == oldindex)
+					rte->perminfoindex = 0;
+				else if (rte->perminfoindex > oldindex)
+					rte->perminfoindex--;
+			}
+			exclNSItem->p_perminfo = NULL;
+		}
 	}
 
 	/* Finally, build ON CONFLICT DO [NOTHING | UPDATE] expression */
 	result = makeNode(OnConflictExpr);
 
 	result->action = onConflictClause->action;
+	result->allIndexes = onConflictClause->allIndexes;
+	result->replace = onConflictClause->replace;
+	result->ignoreFailure = onConflictClause->ignoreFailure;
 	result->arbiterElems = arbiterElems;
 	result->arbiterWhere = arbiterWhere;
 	result->constraint = arbiterConstraint;

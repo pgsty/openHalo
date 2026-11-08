@@ -51,6 +51,7 @@
  */
 
 #include "postgres.h"
+#include "postmaster/protocol_extension.h"
 
 #include "access/htup_details.h"
 #include "access/tableam.h"
@@ -131,6 +132,35 @@ typedef struct UpdateContext
 	LockTupleMode lockmode;
 } UpdateContext;
 
+
+static bool ExecOnConflictDelete(ModifyTableContext *context,
+								 ResultRelInfo *resultRelInfo,
+								 ItemPointer conflictTid, TupleTableSlot *newslot,
+								 uint64 *deleted, bool *unchanged);
+
+/* Physical equality, independent of a text column's comparison collation. */
+static bool
+conflict_rows_equal(TupleTableSlot *a, TupleTableSlot *b)
+{
+	TupleDesc desc = a->tts_tupleDescriptor;
+
+	slot_getallattrs(a);
+	slot_getallattrs(b);
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped)
+			continue;
+		if (a->tts_isnull[i] != b->tts_isnull[i])
+			return false;
+		if (!a->tts_isnull[i] &&
+			!datum_image_eq(a->tts_values[i], b->tts_values[i],
+							att->attbyval, att->attlen))
+			return false;
+	}
+	return true;
+}
 
 static void ExecBatchInsert(ModifyTableState *mtstate,
 							ResultRelInfo *resultRelInfo,
@@ -863,6 +893,7 @@ ExecInsert(ModifyTableContext *context,
 	TransitionCaptureState *ar_insert_trig_tcs;
 	ModifyTable *node = (ModifyTable *) mtstate->ps.plan;
 	OnConflictAction onconflict = node->onConflictAction;
+	uint64		conflict_deleted = 0;
 	PartitionTupleRouting *proute = mtstate->mt_partition_tuple_routing;
 	MemoryContext oldContext;
 
@@ -881,6 +912,14 @@ ExecInsert(ModifyTableContext *context,
 	}
 
 	ExecMaterializeSlot(slot);
+
+	/* Input scans retain their original snapshot.  Only the write command
+	 * advances, allowing successive input rows to change the same target. */
+	if (node->onConflictAll)
+	{
+		CommandCounterIncrement();
+		estate->es_output_cid = GetCurrentCommandId(true);
+	}
 
 	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 
@@ -1139,7 +1178,26 @@ ExecInsert(ModifyTableContext *context,
 										   arbiterIndexes))
 			{
 				/* committed conflict tuple found */
-				if (onconflict == ONCONFLICT_UPDATE)
+				if (node->onConflictReplace)
+				{
+					bool unchanged = false;
+
+					if (!ExecOnConflictDelete(context, resultRelInfo, &conflictTid,
+											  slot, &conflict_deleted, &unchanged))
+						return NULL; /* a BEFORE DELETE trigger suppressed it */
+					if (unchanged)
+					{
+						if (canSetTag)
+							estate->es_processed++;
+						if (MyProtocolExtension && MyProtocolExtension->on_conflict_row)
+							MyProtocolExtension->on_conflict_row(slot, slot, 0);
+						return resultRelInfo->ri_projectReturning ?
+							ExecProcessReturning(context, resultRelInfo, CMD_INSERT,
+											 slot, slot, planSlot) : NULL;
+					}
+					goto vlock; /* more than one unique key can delete more rows */
+				}
+				else if (onconflict == ONCONFLICT_UPDATE)
 				{
 					/*
 					 * In case of ON CONFLICT DO UPDATE, execute the UPDATE
@@ -1175,10 +1233,20 @@ ExecInsert(ModifyTableContext *context,
 					Assert(onconflict == ONCONFLICT_NOTHING);
 					ExecCheckTIDVisible(estate, resultRelInfo, &conflictTid,
 										ExecGetReturningSlot(estate, resultRelInfo));
+					if (node->onConflictIgnore)
+						ereport(WARNING,
+								(errcode(ERRCODE_UNIQUE_VIOLATION),
+								 errmsg("Duplicate entry for unique key")));
 					InstrCountTuples2(&mtstate->ps, 1);
 					return NULL;
 				}
 			}
+
+			/* An already-known duplicate is skipped before touching its FK
+			 * parents. Only candidates that will be inserted need key locks. */
+			if (node->onConflictIgnore &&
+				!RI_FKey_check_insert(resultRelationDesc, slot))
+				return NULL;
 
 			/*
 			 * Before we start insertion proper, acquire our "speculative
@@ -1231,6 +1299,9 @@ ExecInsert(ModifyTableContext *context,
 		else
 		{
 			/* insert the tuple normally */
+			if (node->onConflictIgnore &&
+				!RI_FKey_check_insert(resultRelationDesc, slot))
+				return NULL;
 			table_tuple_insert(resultRelationDesc, slot,
 							   estate->es_output_cid,
 							   0, NULL);
@@ -1293,6 +1364,10 @@ ExecInsert(ModifyTableContext *context,
 	 */
 	if (resultRelInfo->ri_WithCheckOptions != NIL)
 		ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo, slot, estate);
+
+	if (node->onConflictAll && MyProtocolExtension &&
+		MyProtocolExtension->on_conflict_row)
+		MyProtocolExtension->on_conflict_row(NULL, slot, conflict_deleted);
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
@@ -2709,12 +2784,84 @@ redo_act:
 	ExecUpdateEpilogue(context, &updateCxt, resultRelInfo, tupleid, oldtuple,
 					   slot);
 
+	if (((ModifyTable *) context->mtstate->ps.plan)->onConflictAll &&
+		MyProtocolExtension && MyProtocolExtension->on_conflict_row)
+		MyProtocolExtension->on_conflict_row(oldSlot, slot, 0);
+
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
 		return ExecProcessReturning(context, resultRelInfo, CMD_UPDATE,
 									oldSlot, slot, context->planSlot);
 
 	return NULL;
+}
+
+/* Delete exactly the version found by the unique-index probe.  Concurrent
+ * changes restart the probe instead of deleting a no-longer-conflicting row. */
+static bool
+ExecOnConflictDelete(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
+					 ItemPointer conflictTid, TupleTableSlot *newslot,
+					 uint64 *deleted, bool *unchanged)
+{
+	EState *estate = context->estate;
+	Relation rel = resultRelInfo->ri_RelationDesc;
+	TupleTableSlot *existing = ExecGetReturningSlot(estate, resultRelInfo);
+	TM_FailureData tmfd;
+	TM_Result result;
+	bool tupleDeleted = false;
+	int unique_indexes = 0;
+
+	result = table_tuple_lock(rel, conflictTid, estate->es_snapshot, existing,
+							  estate->es_output_cid, LockTupleExclusive,
+							  LockWaitBlock, 0, &tmfd);
+	if (result == TM_Updated || result == TM_Deleted)
+	{
+		if (IsolationUsesXactSnapshot())
+			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent update")));
+		ExecClearTuple(existing);
+		return true;
+	}
+	if (result != TM_Ok)
+		elog(ERROR, "unexpected tuple lock status during conflict deletion: %u", result);
+	ExecCheckTupleVisible(estate, rel, existing);
+	if (resultRelInfo->ri_WithCheckOptions != NIL)
+		ExecWithCheckOptions(WCO_RLS_CONFLICT_CHECK, resultRelInfo, existing, estate);
+	CheckCmdReplicaIdentity(rel, CMD_DELETE);
+
+	for (int i = 0; i < resultRelInfo->ri_NumIndices; i++)
+		if (resultRelInfo->ri_IndexRelationDescs[i]->rd_index->indisunique)
+			unique_indexes++;
+	if (*deleted == 0 && unique_indexes == 1 &&
+		(!rel->trigdesc || (!rel->trigdesc->trig_delete_before_row &&
+						   !rel->trigdesc->trig_delete_after_row)) &&
+		conflict_rows_equal(existing, newslot))
+	{
+		/* A physical no-op is still a MySQL INSERT event. The locked heap
+		 * slot supplies the real TID needed by queued row triggers. */
+		ExecARInsertTriggers(estate, resultRelInfo, existing, NIL,
+							 context->mtstate->mt_transition_capture);
+		if (resultRelInfo->ri_WithCheckOptions != NIL)
+			ExecWithCheckOptions(WCO_VIEW_CHECK, resultRelInfo, existing, estate);
+		*unchanged = true;
+		ExecClearTuple(existing);
+		return true;
+	}
+	ExecClearTuple(existing);
+
+	/* Run DELETE actions before insertion: NO ACTION, CASCADE, and user
+	 * AFTER DELETE triggers must observe the row's actual absence. */
+	AfterTriggerBeginQuery();
+	ExecDelete(context, resultRelInfo, conflictTid, NULL, false, false, false,
+			   &result, &tupleDeleted, NULL);
+	AfterTriggerEndQuery(estate);
+	if (tupleDeleted)
+	{
+		(*deleted)++;
+		CommandCounterIncrement();
+		estate->es_output_cid = GetCurrentCommandId(true);
+	}
+	return tupleDeleted;
 }
 
 /*

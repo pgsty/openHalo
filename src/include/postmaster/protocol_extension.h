@@ -30,6 +30,8 @@
 
 struct Port;
 struct ErrorData;
+struct TupleTableSlot;
+struct RelationData;
 
 /* Maximum number of protocol extensions that can be registered */
 #define MAX_PROTOCOL_EXTENSIONS 8
@@ -98,6 +100,14 @@ typedef struct ProtocolExtensionConfig
 
 	/* Reset protocol state during error recovery (optional) */
 	void		(*comm_reset) (void);
+
+	/* Optional SQL dialect semantics; native sessions never use these. */
+	bool		(*foreign_key_checks) (void);
+	void		(*foreign_key_insert) (struct RelationData *relation,
+								  struct TupleTableSlot *slot);
+	void		(*sequence_write) (struct RelationData *sequence);
+	void		(*on_conflict_row) (struct TupleTableSlot *oldslot,
+								struct TupleTableSlot *newslot, uint64 deleted);
 } ProtocolExtensionConfig;
 
 /*

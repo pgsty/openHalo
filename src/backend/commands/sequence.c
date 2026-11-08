@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "postmaster/protocol_extension.h"
 
 #include "access/bufmask.h"
 #include "access/htup_details.h"
@@ -657,6 +658,8 @@ nextval_internal(Oid relid, bool check_permissions)
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
 		PreventCommandIfReadOnly("nextval()");
+	if (MyProtocolExtension && MyProtocolExtension->sequence_write)
+		MyProtocolExtension->sequence_write(seqrel);
 
 	/*
 	 * Forbid this during parallel operation because, to make it work, the
@@ -980,6 +983,8 @@ do_setval(Oid relid, int64 next, bool iscalled, bool advance_only)
 	/* read-only transactions may only modify temp sequences */
 	if (!seqrel->rd_islocaltemp)
 		PreventCommandIfReadOnly("setval()");
+	if (MyProtocolExtension && MyProtocolExtension->sequence_write)
+		MyProtocolExtension->sequence_write(seqrel);
 
 	/*
 	 * Forbid this during parallel operation because, to make it work, the

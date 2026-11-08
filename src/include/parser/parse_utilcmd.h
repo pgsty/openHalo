@@ -19,6 +19,12 @@
 struct AttrMap;					/* avoid including attmap.h here */
 
 
+/* Extensions may restore an index AM from constraint metadata before
+ * normal validation. Also used by internal ALTER TYPE constraint rebuilds. */
+#define INDEX_CONSTRAINT_TRANSFORM_HOOK 1
+typedef void (*index_constraint_transform_hook_type) (Constraint *constraint);
+extern PGDLLIMPORT index_constraint_transform_hook_type index_constraint_transform_hook;
+
 extern List *transformCreateStmt(CreateStmt *stmt, const char *queryString);
 extern AlterTableStmt *transformAlterTableStmt(Oid relid, AlterTableStmt *stmt,
 											   const char *queryString,

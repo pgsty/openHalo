@@ -2348,11 +2348,16 @@ transformIndexConstraints(CreateStmtContext *cxt)
  * For a PRIMARY KEY constraint, we additionally create not-null constraints
  * for columns that don't already have them.
  */
+index_constraint_transform_hook_type index_constraint_transform_hook = NULL;
+
 static IndexStmt *
 transformIndexConstraint(Constraint *constraint, CreateStmtContext *cxt)
 {
 	IndexStmt  *index;
 	ListCell   *lc;
+
+	if (index_constraint_transform_hook)
+		index_constraint_transform_hook(constraint);
 
 	index = makeNode(IndexStmt);
 

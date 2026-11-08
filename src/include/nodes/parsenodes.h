@@ -1651,6 +1651,10 @@ typedef struct OnConflictClause
 {
 	NodeTag		type;
 	OnConflictAction action;	/* DO NOTHING or UPDATE? */
+	/* Alternative SQL dialects: arbitrate all keys, in input row order. */
+	bool		allIndexes;
+	bool		replace;		/* delete conflicts before inserting */
+	bool		ignoreFailure;	/* skip rows violating foreign keys */
 	InferClause *infer;			/* Optional index inference clause */
 	List	   *targetList;		/* the target list (of ResTarget) */
 	Node	   *whereClause;	/* qualifications */
@@ -2110,6 +2114,7 @@ typedef struct InsertStmt
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
 	OverridingKind override;	/* OVERRIDING clause */
+	bool		returningInternal; /* dialect-generated protocol metadata */
 } InsertStmt;
 
 /* ----------------------

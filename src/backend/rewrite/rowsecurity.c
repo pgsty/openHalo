@@ -300,6 +300,22 @@ get_row_security_policies(Query *root, RangeTblEntry *rte, int rt_index,
 								   true);
 		}
 
+		/* Conflict deletion must satisfy DELETE USING policies as well as
+		 * the INSERT WITH CHECK policies already collected above. */
+		if (commandType == CMD_INSERT && root->onConflict && root->onConflict->replace)
+		{
+			List *delete_permissive_policies;
+			List *delete_restrictive_policies;
+
+			get_policies_for_relation(rel, CMD_DELETE, user_id,
+									  &delete_permissive_policies,
+									  &delete_restrictive_policies);
+			add_with_check_options(rel, rt_index, WCO_RLS_CONFLICT_CHECK,
+								   delete_permissive_policies,
+								   delete_restrictive_policies,
+								   withCheckOptions, hasSubLinks, true);
+		}
+
 		/*
 		 * For INSERT ... ON CONFLICT DO UPDATE we need additional policy
 		 * checks for the UPDATE which may be applied to the same RTE.

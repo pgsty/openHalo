@@ -378,6 +378,27 @@ outDatum(StringInfo str, Datum value, int typlen, bool typbyval)
 
 #include "outfuncs.funcs.c"
 
+/* Keep native stored ON CONFLICT queries byte-compatible with PG18. */
+static void
+_outOnConflictExpr(StringInfo str, const OnConflictExpr *node)
+{
+	WRITE_NODE_TYPE("ONCONFLICTEXPR");
+	WRITE_ENUM_FIELD(action, OnConflictAction);
+	WRITE_NODE_FIELD(arbiterElems);
+	WRITE_NODE_FIELD(arbiterWhere);
+	WRITE_OID_FIELD(constraint);
+	WRITE_NODE_FIELD(onConflictSet);
+	WRITE_NODE_FIELD(onConflictWhere);
+	WRITE_INT_FIELD(exclRelIndex);
+	WRITE_NODE_FIELD(exclRelTlist);
+	if (node->allIndexes || node->replace || node->ignoreFailure)
+	{
+		WRITE_BOOL_FIELD(allIndexes);
+		WRITE_BOOL_FIELD(replace);
+		WRITE_BOOL_FIELD(ignoreFailure);
+	}
+}
+
 
 /*
  * Support functions for nodes with custom_read_write attribute or
