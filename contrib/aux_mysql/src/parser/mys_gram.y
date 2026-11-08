@@ -18171,6 +18171,8 @@ MySQLConvertType:
             Character
 				{
 					$$ = SystemTypeName("varchar");
+					if ($1->typmods && ((A_Const *) linitial($1->typmods))->location >= 0)
+						$$->typmods = $1->typmods;
 					$$->location = @1;
 				}
 			| SIGNED
@@ -18384,7 +18386,7 @@ Text:
                     //    $$ = SystemTypeName("text");
                     //}
 
-					$$ = mys_binary_type_name("text_string", 255, @1);
+                    $$ = SystemTypeName("text");
                     $$->location = @1;
                 }
             | TEXT_P opt_field_length opt_charset_with_opt_binary
@@ -18418,7 +18420,7 @@ Text:
                     //    //                                         makeString("text")));
                     //}
 
-					$$ = mys_binary_type_name("text_string", 65535, @1);
+                    $$ = SystemTypeName("text");
                     $$->location = @1;
                 }
             | MEDIUMTEXT opt_charset_with_opt_binary
@@ -18444,7 +18446,7 @@ Text:
                     //    $$ = SystemTypeName("text");
                     //}
 
-					$$ = mys_binary_type_name("text_string", 16777215, @1);
+                    $$ = SystemTypeName("text");
                     $$->location = @1;
                 }
             | LONGTEXT opt_charset_with_opt_binary
@@ -18470,7 +18472,7 @@ Text:
                     //    $$ = SystemTypeName("text");
                     //}
 
-					$$ = mys_binary_type_name("text_string", -1, @1);
+                    $$ = SystemTypeName("text");
                     $$->location = @1;
                 }
             | LONG opt_charset_with_opt_binary
@@ -20199,25 +20201,25 @@ func_expr_common_subexpr:
 				}
 			| CAST '(' a_expr AS MySQLConvertType ')'
 				{
-                    $$ = makeTypeCast($3, $5, @1);
+					$$ = mys_mysql_cast($3, $5, @1);
                 }
 			| CONVERT '(' a_expr USING IDENT ')'
                 {
-					$$ = (Node *) makeFuncCall(SystemFuncName("convert_to"),
+					$$ = (Node *) makeFuncCall(mys_binary_types_available ? list_make2(makeString("mysql"), makeString("convert_using")) : SystemFuncName("convert_to"),
 											   list_make2($3, makeStringConst($5, @5)),
 											   COERCE_EXPLICIT_CALL,
 											   @1);
                 }
 			| CONVERT '(' a_expr USING Sconst ')'
                 {
-					$$ = (Node *) makeFuncCall(SystemFuncName("convert_to"),
+					$$ = (Node *) makeFuncCall(mys_binary_types_available ? list_make2(makeString("mysql"), makeString("convert_using")) : SystemFuncName("convert_to"),
 											   list_make2($3, makeStringConst($5, @5)),
 											   COERCE_EXPLICIT_CALL,
 											   @1);
                 }
 			| CONVERT '(' a_expr ',' MySQLConvertType ')'
 				{
-                    $$ = makeTypeCast($3, $5, @1);
+					$$ = mys_mysql_cast($3, $5, @1);
                 }
 			| EXTRACT '(' extract_list ')'
 				{

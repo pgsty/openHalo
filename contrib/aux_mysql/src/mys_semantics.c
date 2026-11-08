@@ -1291,14 +1291,13 @@ generated_display_constants(Node *node, void *context)
 {
 	if (node == NULL)
 		return NULL;
-	if (IsA(node, Const) && !mys_is_text_string(((Const *) node)->consttype) &&
+	if (IsA(node, Const) &&
 		mys_binary_base_type(((Const *) node)->consttype) == BYTEAOID)
 	{
 		Const *constant = copyObject((Const *) node);
 
 		/* binary_n / varbinary_n share bytea's layout.  Emit their actual
-		 * bytes as MySQL X'hex'.  text_string must retain its type and hex
-		 * external input/output, or replay would change overload selection. */
+		 * bytes as MySQL X'hex'. */
 		constant->consttype = BYTEAOID;
 		constant->consttypmod = -1;
 		constant->constcollid = InvalidOid;

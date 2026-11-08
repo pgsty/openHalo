@@ -125,3 +125,14 @@ PG_CONFIG=/path/to/pg18/bin/pg_config BUILD_DIR=/tmp/aux-prefix-check \
 BINARY_FIX_READONLY_REPO=/path/to/openhalo PG_CONFIG=/path/to/pg18/bin/pg_config \
   BUILD_DIR=/tmp/aux-binary-check tests/binary_fix/run.sh
 ```
+
+## Route A release recheck
+
+`python3 tests/check_generated.py` regenerates all tracked grammar/SQL outputs
+from `pg14` in a temporary directory and compares their bytes.
+`python3 tests/route_a.py --port "$MYSQL_PORT" --reference-port 3771 --wp text`
+asserts character functions, mixed expressions, value/HEX assignments, and the
+intentional 1366 boundary for NUL in every character family and write mode.
+The standalone expression harness omits executor-only conflict node assignments
+when compiled against stock PG18 headers; production parser byte identity is
+checked independently and DML is verified by the full wire suites.

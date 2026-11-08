@@ -15,8 +15,8 @@ pq.PQclear.argtypes=[c.c_void_p];pq.PQfinish.argtypes=[c.c_void_p]
 conn=pq.PQconnectdb(b'')
 assert pq.PQstatus(conn)==0
 try:
-    for fmt, expected in [(0,b'\\x410042c3a9'),(1,b'A\x00B\xc3\xa9')]:
-        result=pq.PQexecParams(conn,b'SELECT s FROM review_fix_binary.b WHERE id=1',0,None,None,None,None,fmt)
+    for fmt, expected in [(0,b'\\x61620000'),(1,b'ab\0\0')]:
+        result=pq.PQexecParams(conn,b'SELECT b FROM review_fix_binary.b WHERE id=1',0,None,None,None,None,fmt)
         try:
             assert pq.PQresultStatus(result)==2
             value=c.string_at(pq.PQgetvalue(result,0,0),pq.PQgetlength(result,0,0))
@@ -26,7 +26,7 @@ try:
     payload=b'A\x00B\xc3\xa9'
     buffers=(c.c_char_p*1)(payload)
     lengths=(c.c_int*1)(len(payload));formats=(c.c_int*1)(1)
-    result=pq.PQexecParams(conn,b'SELECT $1::mysql.text_string',1,None,buffers,lengths,formats,1)
+    result=pq.PQexecParams(conn,b'SELECT $1::mysql.varbinary_n',1,None,buffers,lengths,formats,1)
     try:
         assert pq.PQresultStatus(result)==2
         value=c.string_at(pq.PQgetvalue(result,0,0),pq.PQgetlength(result,0,0))

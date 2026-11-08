@@ -1,0 +1,46 @@
+# aux_mysql 1.9 Route A release recheck
+
+Base: clean main `6821954a3f8387287e655d7e91036a3ea0d80c28`.
+Branch: `fix/aux-mysql-1.9-route-a`. Nothing pushed.
+Builds, clusters and raw logs: ohdev `/tmp/aux-route-a/`.
+Debug: MySQL 3804 / PG 5804 (ports checked before initialization).
+Reference: MySQL 5.7.32 on 3771. Baselines 3792/3793 remain intact.
+
+## WP1 — native TEXT
+
+Removed the unpublished custom character type, its SQL objects, C paths and
+fixtures. All TEXT declarations again use PG text; binary types retain arbitrary
+bytes. Updated NUL boundaries and binary/character round-trip fixtures.
+The MySQL CAST lowering now retains explicit CHAR(n) lengths (1292 on truncation),
+and CONVERT USING accepts UTF-8 names. Other encoding names use the closest
+Unicode representation with 1105; this is an approximation, not transcoding.
+Native PG casts are unchanged. Character arithmetic emits 1292 on bad prefixes.
+
+Validation:
+
+- Debug configured with `--enable-debug --enable-cassert --enable-depend
+  --with-openssl`, full kernel/extension built and installed successfully.
+- `python3 tests/route_a.py --port 3804 --reference-port 3771 --wp text`:
+  371 assertions passed (values, HEX, warnings, 1366 boundaries).
+- `python3 tests/check_generated.py`: all five generated files byte-identical.
+- `PG_CONFIG=/usr/pgsql-18/bin/pg_config BUILD_DIR=/tmp/aux-route-a/standalone-binary
+  tests/binary_fix/run.sh` (OS user pg, original pg14 grammar supplied): passed,
+  including private libpq binary I/O and pg_dump/restore.
+- Baseline AB `p04.sql` / `p04b.sql`: restored native string results and mixed
+  expressions. LOCATE/INSTR remains for WP4. Existing excluded function gaps
+  remain; unordered GROUP BY output is compared as a set, not by incidental order.
+- Removed-type source search: zero references. Generated output keeps original
+  upstream whitespace on the four restored TEXT rules.
+
+Actual metadata: TINYTEXT, TEXT, MEDIUMTEXT and LONGTEXT all display `text` in
+SHOW CREATE TABLE and both DATA_TYPE and COLUMN_TYPE. Subtype fidelity is outside
+this release repair, as requested.
+
+Observed warning difference: on live 3771, `'Hello'+0` gives 1292 but table-column
+`s+0` gives 0 without a warning. OpenHalo returns 0 with the requested 1292;
+regression assertions explicitly distinguish this diagnostic difference.
+CHAR/VARCHAR mixed IFNULL/IF overloads are ambiguous on both baseline 3793 and the
+new build; the extra CHAR scan excludes those two pre-existing combinations.
+
+Remaining packages and final debug/release acceptance are in progress. A package
+being committed or built does not imply the final full suite has passed.

@@ -96,8 +96,7 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 	if (!OidIsValid(type))
 		elog(ERROR, "could not determine the type of argument %d", argno + 1);
 	base = mys_binary_base_type(type);	/* a 0x41 literal: its bytes */
-	*binary = !mys_is_text_string(type) &&
-		(base == BYTEAOID || base == BITOID || base == VARBITOID);
+	*binary = base == BYTEAOID || base == BITOID || base == VARBITOID;
 	if (base == BYTEAOID)
 	{
 		bytea	   *b = PG_GETARG_BYTEA_PP(argno);

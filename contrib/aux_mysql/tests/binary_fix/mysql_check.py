@@ -71,20 +71,20 @@ try:
     equal("SELECT CONCAT_WS(0x00,'a',NULL,'',0xff),ELT(1,0x00ff,'x'),ELT(2,0x00ff,'x')",((b'a\0\0\xff',b'\0\xff',b'x'),))
     equal("SELECT HEX(TRIM(0x20004120)),HEX(REPLACE(0x410042,'A','Z')),CHAR_LENGTH(0x00ff)",(('0041','5A0042',2),))
     execute('CREATE TABLE b (id INT PRIMARY KEY, fixed BINARY(4) UNIQUE, varying VARBINARY(3), chars TEXT)')
-    execute("INSERT INTO b VALUES (1,'ab','xy',0x410042c3a9)")
-    equal('SELECT HEX(fixed),HEX(varying),HEX(chars),CHAR_LENGTH(chars) FROM b',(('61620000','7879','410042C3A9',4),))
-    equal('SELECT fixed,varying,chars FROM b',((b'ab\0\0',b'xy','A\0Bé'),))
-    assert prepared_strings('SELECT fixed,varying,chars,CONCAT(0x00ff,\'a\') FROM b') == [b'ab\0\0',b'xy',b'A\0B\xc3\xa9',b'\0\xffa']
-    equal("SELECT CONCAT_WS(',',chars,'z'),ELT(1,chars,'z') FROM b",(('A\0Bé,z','A\0Bé'),))
-    assert prepared_strings("SELECT CONCAT_WS(0x00,'a',0xff),ELT(2,0x00ff,'x'),ELT(1,chars,'z') FROM b") == [b'a\0\xff',b'x',b'A\0B\xc3\xa9']
+    execute("INSERT INTO b VALUES (1,'ab','xy',0x410142c3a9)")
+    equal('SELECT HEX(fixed),HEX(varying),HEX(chars),CHAR_LENGTH(chars) FROM b',(('61620000','7879','410142C3A9',4),))
+    equal('SELECT fixed,varying,chars FROM b',((b'ab\0\0',b'xy','A\1Bé'),))
+    assert prepared_strings('SELECT fixed,varying,chars,CONCAT(0x00ff,\'a\') FROM b') == [b'ab\0\0',b'xy',b'A\1B\xc3\xa9',b'\0\xffa']
+    equal("SELECT CONCAT_WS(',',chars,'z'),ELT(1,chars,'z') FROM b",(('A\1Bé,z','A\1Bé'),))
+    assert prepared_strings("SELECT CONCAT_WS(0x00,'a',0xff),ELT(2,0x00ff,'x'),ELT(1,chars,'z') FROM b") == [b'a\0\xff',b'x',b'A\1B\xc3\xa9']
     execute('CREATE TABLE searches(t TEXT)')
-    execute("INSERT INTO searches VALUES('Hello World'),(0xc3a900e7958c576f726c64)")
+    execute("INSERT INTO searches VALUES('Hello World'),(0xc3a901e7958c576f726c64)")
     equal("SELECT t RLIKE 'world$',LOCATE('WORLD',t),INSTR(t,'world'),t LIKE '%WORLD' FROM searches WHERE t='Hello World'",((1,7,7,1),))
     equal("SELECT LOCATE('WORLD',t),INSTR(t,'world') FROM searches WHERE CHAR_LENGTH(t)=8",((4,4),))
     execute('CREATE TABLE locate_weight(needle TEXT,ci TEXT COLLATE utf8mb4_general_ci,bin TEXT COLLATE utf8mb4_bin)')
     execute("INSERT INTO locate_weight(ci,bin) VALUES('a','a')")
     equal("SELECT LOCATE('a ',ci),LOCATE('a ',bin),INSTR(ci,'a ') FROM locate_weight",((0,0,0),))
-    for needle,haystack,ci,bin_result in [('É','e',0,0),('s','ß',0,0),('éA','xeÁ',2,0),('ée','eeé',2,0),('é','x\0É',3,0),('\0a','é\0a\0a',2,2)]:
+    for needle,haystack,ci,bin_result in [('É','e',0,0),('s','ß',0,0),('éA','xeÁ',2,0),('ée','eeé',2,0),('é','x\1É',3,0),('\1a','é\1a\1a',2,2)]:
         nhex=needle.encode('utf8').hex();hhex=haystack.encode('utf8').hex()
         execute(f'UPDATE locate_weight SET needle=0x{nhex},ci=0x{hhex},bin=0x{hhex}')
         actual=execute('SELECT LOCATE(needle,ci),LOCATE(needle COLLATE utf8mb4_bin,bin) FROM locate_weight')
@@ -114,7 +114,7 @@ try:
     finally:
         execute("SELECT pg_catalog.set_config('enable_seqscan',%s,false)",(seqscan,))
     execute('CREATE TABLE locknames(n TEXT)')
-    lockname=(schema+'_A\0Ä').encode()
+    lockname=(schema+'_A\1Ä').encode()
     execute('INSERT INTO locknames VALUES(0x'+lockname.hex()+')')
     try:
         equal('SELECT GET_LOCK(n,0) FROM locknames',((1,),))
@@ -136,7 +136,7 @@ try:
     # openHalo's EXPLAIN prints a PostgreSQL plan in one column.
     plan=execute('EXPLAIN SELECT * FROM i WHERE v=0x41')
     assert any('Index' in str(row) for row in plan),plan
-    print('PASS: MySQL DDL, text/binary packets, length rules, NUL string contexts/locks and integer/binary indexes; schema '+schema)
+    print('PASS: MySQL DDL, text/binary packets, length rules, character contexts/locks and integer/binary indexes; schema '+schema)
 finally:
     try:
         execute('SET SESSION sql_mode=%s',(mode,))

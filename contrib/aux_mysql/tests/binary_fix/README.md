@@ -1,7 +1,7 @@
 # Binary and character compatibility checks
 
 These tests cover fixed and varying binary lengths, hexadecimal numeric/string
-contexts, NUL-preserving TEXT, typed string functions, indexed comparisons,
+contexts, native TEXT, typed string functions, indexed comparisons,
 user locks, protocol bytes and logical backups.
 
 ## Integrated MySQL protocol
@@ -15,11 +15,11 @@ MYSQL_USER=dbuser_mysql MYSQL_PASSWORD=fixture-password \
 
 The script creates a unique schema and removes it on exit. It tests text and raw
 prepared packets, binary padding/truncation and defaults, CONCAT/CONCAT_WS/ELT,
-lazy IF/IFNULL, binary btree equality/range scans, NUL-aware regex/LIKE/search and
+lazy IF/IFNULL, binary btree equality/range scans, character regex/LIKE/search and
 lock arguments. It changes session settings only and releases its locks.
 
 LOCATE/INSTR checks include significant trailing spaces, Unicode weights,
-character positions, NUL, overlapping matches and 65,535-character searches.
+character positions, control bytes, overlapping matches and 65,535-character searches.
 The dedicated MySQL general_ci/bin path uses linear KMP matching with memory
 proportional to the needle. Its generous five-second timeout detects the former
 quadratic/cubic behavior without requiring a microbenchmark threshold.
@@ -56,10 +56,10 @@ acceptance is documented in [../../TESTING.md](../../TESTING.md).
 
 ## Representation boundaries
 
-New BINARY/VARBINARY types store exact byte counts; new TEXT-family columns use
-NUL-safe character storage. Existing binary domains have no recoverable length,
-and old PG TEXT columns retain their representation until explicitly migrated.
-CHAR/VARCHAR remain native PG character types. Use original schema definitions
+New BINARY/VARBINARY types store exact byte counts and preserve NUL. All
+CHAR/VARCHAR/TEXT families use native PG character storage and reject NUL
+with 1366 in every sql_mode, including IGNORE. Existing binary domains have
+no recoverable length; TEXT retains its original PG representation. Use original schema definitions
 for such migrations and verify bytes after conversion.
 
 The dedicated general_ci/bin collations implement MySQL 5.7 simple weights and

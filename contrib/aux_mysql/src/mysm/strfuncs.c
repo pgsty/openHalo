@@ -48,6 +48,7 @@
 
 #include "postgres.h"
 #include "mysm_compat.h"
+#include "halo_mysql.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1194,6 +1195,20 @@ convert_text_to_digit_text_for_mysql(PG_FUNCTION_ARGS)
         Datum txt = PG_GETARG_DATUM(0);
         char* str = TextDatumGetCString(txt);
         int len = strlen(str);
+
+		if (mys_is_mysql_session())
+		{
+			char *end;
+
+			(void) strtod(str, &end);
+			if (end == str)
+				mys_add_warning(1292, "Truncated incorrect DOUBLE value");
+			else
+			{
+				while (isspace((unsigned char) *end)) end++;
+				if (*end) mys_add_warning(1292, "Truncated incorrect DOUBLE value");
+			}
+		}
         if (1 <= len)
         {
             convert_to_digit_text_for_mysql(&str, len);

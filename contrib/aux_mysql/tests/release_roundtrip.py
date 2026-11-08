@@ -59,7 +59,7 @@ def verify():
         assert e.args[0] == 1062, e.args
     else:
         raise AssertionError('restored prefix PRIMARY KEY accepted a duplicate')
-    query('INSERT INTO data(id,t) VALUES(3,0x610062)')
+    query('INSERT INTO data(id,t) VALUES(3,0x610162)')
     assert query('SELECT HEX(b),HEX(t),HEX(g) FROM data WHERE id=3') == (
         ('4142', '610062', '414200'),)
     query('DELETE FROM data WHERE id=3')
@@ -94,7 +94,7 @@ try:
     query('USE ' + schema)
     query("CREATE TABLE data(id INT PRIMARY KEY,b VARBINARY(8) DEFAULT 0x4142,"
           "t TEXT,g BLOB AS(CONCAT(b,0x00)) STORED,v DECIMAL(10,3) DEFAULT 1.234)")
-    query("INSERT INTO data(id,b,t) VALUES(1,0x00ff27,0x610062),(2,0x4142,'é')")
+    query("INSERT INTO data(id,b,t) VALUES(1,0x00ff27,0x610162),(2,0x4142,'é')")
     query('CREATE VIEW view_data AS SELECT id,HEX(g) AS bytes FROM data')
     with pg.cursor() as q:
         q.execute(sql.SQL('ALTER VIEW {}.view_data RENAME COLUMN bytes TO renamed_bytes').format(

@@ -163,7 +163,6 @@ extern int64 mys_release_user_locks(void);
 extern bool mys_hexlit_available;
 extern void mys_binary_session_init(void);
 extern Oid	mys_binary_base_type(Oid typid);
-extern bool mys_is_text_string(Oid typid);
 extern Node *mys_fold_hexlit_default(Node *expr, Oid typid);
 extern void mys_hexlit_columns_binary(Node *query);
 
@@ -255,7 +254,6 @@ extern void mys_queue_query(const char *query, const MysTextMap *map, const char
 /* SHOW CREATE metadata, called by mys_rewrite_raw_stmts inside a transaction. */
 extern Node *mys_rewrite_show_create(Node *stmt);
 /* Implemented by the binary worker; includes the new bytea-layout base types. */
-extern bool mys_is_text_string(Oid type);
 extern Oid mys_binary_base_type(Oid type);
 
 /* mys_rewrite.c */

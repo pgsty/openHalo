@@ -15,6 +15,18 @@ else:
     raw = output(['git', '-C', repo, 'show', 'pg14:src/backend/parser/mysql/mys_gram.y'])
 (build/'upstream.y').write_bytes(raw)
 run([sys.executable, str(src/'tools/port_grammar.py'), str(build/'upstream.y'), str(build/'mys_gram.y')])
+# Stock PG18 lacks OpenHalo's executor-only ON CONFLICT fields. This private
+# expression harness never executes INSERT/REPLACE; remove just those field
+# assignments from its scratch parser. check_generated.py verifies the actual
+# production grammar byte for byte separately.
+headers = pathlib.Path(output([pgconfig, '--includedir-server'], text=True).strip())
+if 'allIndexes' not in (headers/'nodes/parsenodes.h').read_text():
+    grammar = (build/'mys_gram.y').read_text()
+    for field in ('allIndexes', 'ignoreFailure'):
+        assignment = 'onconflict->' + field + ' = true;'
+        assert grammar.count(assignment) == 4, assignment
+        grammar = grammar.replace(assignment, '/* OpenHalo executor field omitted in expression harness */')
+    (build/'mys_gram.y').write_text(grammar)
 run([os.environ.get('BISON', 'bison'), '-d', '-o', str(build/'mys_gram.c'), str(build/'mys_gram.y')])
 run([os.environ.get('FLEX', 'flex'), '-CF', '-o', str(build/'mys_scan.c'), str(src/'src/parser/mys_scan.l')])
 run(['perl', '-I', str(src/'tools'), str(src/'tools/gen_keywordlist.pl'), '--extern', '--varname=MysScanKeywords', '--output', str(build), str(src/'src/parser/mys_kwlist.h')])

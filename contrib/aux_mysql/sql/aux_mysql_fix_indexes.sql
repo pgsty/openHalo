@@ -41,7 +41,7 @@ CREATE OPERATOR mysql.!~#~ (LEFTARG=bpchar, RIGHTARG=text, FUNCTION=mysql.prefix
 CREATE FUNCTION mysql.register_prefix_type(t regtype, string_storage boolean)
 RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog AS $body$
 DECLARE
-    c record; p record; rhs regtype;
+    c record; p record;
     statements text[] := '{}'; family_name text;
 BEGIN
     SELECT opc.* INTO STRICT c FROM pg_opclass opc JOIN pg_am am ON am.oid=opc.opcmethod
@@ -84,20 +84,6 @@ BEGIN
         EXECUTE format('ALTER OPERATOR FAMILY mysql.%I USING mysql_prefix ADD '
                        'OPERATOR 6 mysql.~#~ (%s,text), OPERATOR 7 pg_catalog.~~ (%s,text)',
                        family_name, t, t);
-    ELSIF string_storage AND (SELECT typcollation<>0 FROM pg_type WHERE oid=t) THEN
-        -- The binary worker's text_string is collatable bytea-layout data,
-        -- including embedded NUL. Both parameters stay length-delimited.
-        FOREACH rhs IN ARRAY ARRAY[t, 'text'::regtype] LOOP
-            EXECUTE format('CREATE FUNCTION mysql.prefix_like(%s,%s) RETURNS boolean '
-                'AS %L,%L LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE', t, rhs,
-                '$libdir/aux_mysql', 'mys_prefix_like');
-            EXECUTE format('CREATE FUNCTION mysql.prefix_not_like(%s,%s) RETURNS boolean '
-                'AS %L,%L LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE', t, rhs,
-                '$libdir/aux_mysql', 'mys_prefix_not_like');
-            EXECUTE format('CREATE OPERATOR mysql.~#~ (LEFTARG=%s,RIGHTARG=%s,FUNCTION=mysql.prefix_like)',t,rhs);
-            EXECUTE format('CREATE OPERATOR mysql.!~#~ (LEFTARG=%s,RIGHTARG=%s,FUNCTION=mysql.prefix_not_like)',t,rhs);
-            EXECUTE format('ALTER OPERATOR FAMILY mysql.%I USING mysql_prefix ADD OPERATOR 6 mysql.~#~ (%s,%s)',family_name,t,rhs);
-        END LOOP;
     END IF;
 END $body$;
 
@@ -106,7 +92,7 @@ END $body$;
 DO $body$
 DECLARE name text; t regtype;
 BEGIN
-    FOREACH name IN ARRAY ARRAY['mysql.binary_n','mysql.varbinary_n','mysql.text_string'] LOOP
+    FOREACH name IN ARRAY ARRAY['mysql.binary_n','mysql.varbinary_n'] LOOP
         t := to_regtype(name);
         IF t IS NOT NULL THEN PERFORM mysql.register_prefix_type(t, true); END IF;
     END LOOP;

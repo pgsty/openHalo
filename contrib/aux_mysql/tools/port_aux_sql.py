@@ -535,17 +535,11 @@ for prefix, terminator in (
             f = f[:pos] + sized + f[pos + len(old):]
         else:
             f = f.replace(old, sized)
-    f = f.replace("when ty.typname='text' then 'text'",
-                  "when ty.typname='text_string' then case att.atttypmod "
-                  "when 255 then 'tinytext' when 16777215 then 'mediumtext' "
-                  "when -1 then 'longtext' else 'text' end\n            "
-                  "when ty.typname='text' then 'text'")
     if 'VIEW' in prefix:
         for field, multiplier in (('CHARACTER_MAXIMUM_LENGTH', ''), ('CHARACTER_OCTET_LENGTH', ' * 4')):
             f = f.replace('65535::bigint as ' + field,
                           "(select case when ty.typname in ('binary_n','varbinary_n') then att.atttypmod "
-                          "when ty.typname='text_string' then case when att.atttypmod=-1 then 4294967295 "
-                          "else att.atttypmod end when ty.typname in ('varchar','bpchar') and att.atttypmod>=4 "
+                          "when ty.typname in ('varchar','bpchar') and att.atttypmod>=4 "
                           "then (att.atttypmod-4)" + multiplier + " when ty.typname in ('text','blob') then 65535 "
                           "end from pg_catalog.pg_type ty where ty.oid=att.atttypid)::bigint as " + field)
         f = f.replace("when ty.typname='binary' then NULL",

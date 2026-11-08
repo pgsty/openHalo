@@ -8,8 +8,8 @@ extern TypeName *mys_binary_type_name(const char *name, int32 typmod, int locati
 extern bool (*mys_binary_ignore_hook)(void);
 extern bool mys_is_fixed_binary(Oid typid);
 extern bool mys_is_hexlit(Oid typid);
-extern bool mys_is_text_string(Oid typid);
 extern A_Expr *mys_hexlit_operator(A_Expr_Kind kind, char *name,
 								  Node *left, Node *right, int location);
 extern Node *mys_binary_func_call(FuncCall *call);
+extern Node *mys_mysql_cast(Node *arg, TypeName *type, int location);
 #endif

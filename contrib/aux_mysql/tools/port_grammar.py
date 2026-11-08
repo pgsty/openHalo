@@ -636,17 +636,11 @@ rep('''            | BINARY
                     $$->location = @1;
                 }''')
 
-for token, following, limit in (
-        ('TINYTEXT', 'TEXT_P', 255), ('TEXT_P', 'MEDIUMTEXT', 65535),
-        ('MEDIUMTEXT', 'LONGTEXT', 16777215), ('LONGTEXT', 'LONG', -1)):
-    start = s.index('            | ' + token + ' opt_')
-    end = s.index('            | ' + following + ' ', start)
-    block = s[start:end]
-    old = '                    $$ = SystemTypeName("text");'
-    assert block.count(old) == 1
-    block = block.replace(old,
-        '                    $$ = mys_binary_type_name("text_string", %d, @1);' % limit)
-    s = s[:start] + block + s[end:]
+# Preserve explicit CAST AS CHAR(n) lengths; the default CHAR(1) column
+# typmod has location -1 and does not constrain a CAST AS CHAR.
+rep('MySQLConvertType:\n            Character\n\t\t\t\t{\n\t\t\t\t\t$$ = SystemTypeName("varchar");\n\t\t\t\t\t$$->location = @1;\n\t\t\t\t}', 'MySQLConvertType:\n            Character\n                {\n                    $$ = SystemTypeName("varchar");\n                    if ($1->typmods && ((A_Const *) linitial($1->typmods))->location >= 0)\n                        $$->typmods = $1->typmods;\n                    $$->location = @1;\n                }')
+rep('$$ = makeTypeCast($3, $5, @1);', '$$ = mys_mysql_cast($3, $5, @1);', 2)
+rep('SystemFuncName("convert_to")', 'mys_binary_types_available ? list_make2(makeString("mysql"), makeString("convert_using")) : SystemFuncName("convert_to")', 2)
 
 # Arithmetic must assign unknown strings their string type before the
 # operator resolver's exact-(hexlit,hexlit) shortcut.
@@ -657,7 +651,7 @@ assert 'makeSimpleA_Expr(AEXPR_OP, "+", $1, $3, @2)' in block
 block = block.replace('makeSimpleA_Expr(AEXPR_OP,', 'mys_hexlit_operator(AEXPR_OP,')
 s = s[:start] + block + s[end:]
 
-# TRIM dispatch must reach the overloads for binary and NUL-safe strings.
+# TRIM dispatch must reach the overloads for binary strings.
 # Existing native text overloads remain available through search_path.
 for trim_name in ('btrim', 'ltrim', 'rtrim'):
     rep('SystemFuncName("' + trim_name + '")',

@@ -169,47 +169,26 @@ try:
     assert db.q("SELECT 'e '::text COLLATE mysql.utf8mb4_bin LIKE 'e'") == [('f',)]
     passed('utf8mb4_bin retains accents/case while enforcing PAD SPACE')
 
-    if db.q("SELECT to_regtype('mysql.text_string') IS NOT NULL") == [('t',)]:
-        db.q('CREATE TABLE nul_text(a mysql.text_string COLLATE mysql.utf8mb4_general_ci)')
-        db.q("CREATE UNIQUE INDEX nul_text_u ON nul_text USING mysql_prefix(a) WITH(prefix_lengths='3')")
-        original = blob('a\0éx'.encode()) + '::mysql.text_string'
-        duplicate = blob('A\0ey'.encode()) + '::mysql.text_string'
-        db.q(f'INSERT INTO nul_text VALUES ({original})')
-        fails(db, f'INSERT INTO nul_text VALUES ({duplicate})')
-        db.q('SET enable_seqscan=off')
-        assert db.q(f'SELECT count(*) FROM nul_text WHERE a OPERATOR(mysql.=) {original}') == [('1',)]
-        pattern = blob('a\0e%'.encode()) + '::mysql.text_string'
-        assert db.q(f'SELECT count(*) FROM nul_text WHERE a OPERATOR(mysql.~~) {pattern}') == [('1',)]
-        db.q('RESET enable_seqscan')
+    if db.q("SELECT to_regtype('mysql.varbinary_n') IS NOT NULL") == [('t',)]:
         for typ in ('binary_n','varbinary_n'):
             db.q(f'CREATE TABLE {typ}(a mysql.{typ})')
             db.q(f"CREATE UNIQUE INDEX {typ}_u ON {typ} USING mysql_prefix(a) WITH(prefix_lengths='3')")
             db.q(f'INSERT INTO {typ} VALUES ({blob(bytes([0,255,1,2]))}::mysql.{typ})')
             fails(db,f'INSERT INTO {typ} VALUES ({blob(bytes([0,255,1,3]))}::mysql.{typ})')
-        passed('bytea-layout text_string: NUL, character prefixes, GENERAL_CI and LIKE; binary types use bytes')
-        db.q('CREATE TABLE pad_order(a mysql.text_string COLLATE mysql.utf8mb4_general_ci)')
-        db.q("CREATE INDEX pad_order_i ON pad_order USING mysql_prefix(a) WITH(prefix_lengths='4')")
-        for value in (b'a', b'a\0', b'a \0', b'a!'):
-            db.q(f'INSERT INTO pad_order VALUES ({blob(value)}::mysql.text_string)')
-        db.q('SET enable_seqscan=off')
-        assert db.q(f"SELECT encode(a::bytea,'hex') FROM pad_order WHERE a OPERATOR(mysql.<) {blob(b'a')}::mysql.text_string ORDER BY a") == [('6100',), ('612000',)]
-        assert db.q("SELECT encode(a::bytea,'hex') FROM pad_order ORDER BY a") == [('6100',), ('612000',), ('61',), ('6121',)]
-        assert db.q(f"SELECT count(*) FROM pad_order WHERE a OPERATOR(mysql.~~) {blob(b'a%')}::mysql.text_string") == [('4',)]
-        db.q('RESET enable_seqscan')
-        passed('PAD SPACE orders NUL below padding; LIKE range includes all control-character continuations')
         # An explicit custom-type opclass with options must also survive a
         # restore into another database, where the type OID is different.
         opclass = db.q("SELECT opc.opcname FROM pg_opclass opc JOIN pg_am am ON am.oid=opc.opcmethod "
-                       "WHERE am.amname='mysql_prefix' AND opc.opcintype='mysql.text_string'::regtype")[0][0]
-        db.q('CREATE TABLE custom_options(a mysql.text_string COLLATE mysql.utf8mb4_general_ci)')
+                       "WHERE am.amname='mysql_prefix' AND opc.opcintype='mysql.varbinary_n'::regtype")[0][0]
+        db.q('CREATE TABLE custom_options(a mysql.varbinary_n)')
         db.q('CREATE UNIQUE INDEX custom_options_u ON custom_options USING mysql_prefix '
              '(a mysql."' + opclass.replace('"', '""') + '"(mysql_prefix=2))')
-        db.q(f"INSERT INTO custom_options VALUES ({blob(b'abc')}::mysql.text_string)")
+        db.q(f"INSERT INTO custom_options VALUES ({blob(b'abc')}::mysql.varbinary_n)")
         db.q('SELECT mysql.prefix_test_ddl(' + lit('CREATE TABLE pk_custom('
-             'a mysql.text_string COLLATE mysql.utf8mb4_general_ci, PRIMARY KEY(a) '
+             'a mysql.varbinary_n, PRIMARY KEY(a) '
              "WITH(prefix_lengths='2'))") + ')')
-        db.q(f"INSERT INTO pk_custom VALUES ({blob(b'a\0b')}::mysql.text_string)")
-        fails(db, f"INSERT INTO pk_custom VALUES ({blob(b'A\0z')}::mysql.text_string)")
+        db.q(f"INSERT INTO pk_custom VALUES ({blob(b'a\0b')}::mysql.varbinary_n)")
+        fails(db, f"INSERT INTO pk_custom VALUES ({blob(b'a\0z')}::mysql.varbinary_n)")
+
 
     db.q('CREATE TABLE multibyte(a text COLLATE mysql.utf8mb4_general_ci)')
     db.q("CREATE UNIQUE INDEX multibyte_u ON multibyte USING mysql_prefix(a) WITH(prefix_lengths='1')")
@@ -303,7 +282,7 @@ try:
             restore_dsn = os.environ['PREFIX_TEST_RESTORE_DSN']
             restored = DB(restore_dsn)
             try:
-                assert restored.q("SELECT 'mysql.text_string'::regtype::oid") != db.q("SELECT 'mysql.text_string'::regtype::oid")
+                assert restored.q("SELECT 'mysql.varbinary_n'::regtype::oid") != db.q("SELECT 'mysql.varbinary_n'::regtype::oid")
                 subprocess.run([os.environ.get('PSQL', 'psql'), '--dbname=' + restore_dsn, '-X', '-v',
                                 'ON_ERROR_STOP=1', '-f', str(dump)], check=True, stdout=subprocess.DEVNULL)
                 restored.q(f'SET search_path={schema},pg_catalog')
@@ -311,8 +290,8 @@ try:
                 fails(restored, "INSERT INTO pk VALUES ('ABC9',1)")
                 fails(restored, "INSERT INTO pk_copy VALUES ('ABC9',1)")
                 fails(restored, "INSERT INTO pk VALUES (NULL,1)", '23502')
-                fails(restored, f"INSERT INTO custom_options VALUES ({blob(b'abz')}::mysql.text_string)")
-                fails(restored, f"INSERT INTO pk_custom VALUES ({blob(b'A\0z')}::mysql.text_string)")
+                fails(restored, f"INSERT INTO custom_options VALUES ({blob(b'abz')}::mysql.varbinary_n)")
+                fails(restored, f"INSERT INTO pk_custom VALUES ({blob(b'a\0z')}::mysql.varbinary_n)")
                 fails(restored, "INSERT INTO pk_custom VALUES (NULL)", '23502')
                 assert restored.q('SELECT count(*) FROM collision') == [('4',)]
                 passed('native dump to a different database retains PRIMARY and custom-type opclass options despite changed type OIDs')

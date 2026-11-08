@@ -361,8 +361,7 @@ is_string_column(ColumnDef *col)
 		return false;
 	base = getBaseType(typeTypeId(t));
 	ReleaseSysCache(t);
-	return base == TEXTOID || base == VARCHAROID || base == BPCHAROID ||
-		mys_is_text_string(base);
+	return base == TEXTOID || base == VARCHAROID || base == BPCHAROID;
 }
 
 /* MySQL collation names ending in _ci compare case-insensitively */
@@ -764,10 +763,7 @@ legacy_prefix_key_parts(List **params, bool unique, bool primary, char **access_
 		if (ie->name && key_column_type(ie->name, coldefs, relid, &typid, &typmod))
 		{
 			base[i] = getBaseTypeAndTypmod(typid, &typmod);
-			if (mys_is_text_string(base[i]))
-				base[i] = TEXTOID;
-			else
-				base[i] = mys_binary_base_type(base[i]);
+			base[i] = mys_binary_base_type(base[i]);
 			is_long[i] = base[i] == TEXTOID || base[i] == BYTEAOID ||
 				((base[i] == VARCHAROID || base[i] == BPCHAROID) &&
 				 (typmod < (int32) VARHDRSZ || typmod - VARHDRSZ > 600));
@@ -830,7 +826,7 @@ legacy_prefix_key_parts(List **params, bool unique, bool primary, char **access_
 }
 
 /* Upper bound of the stored datum, including its varlena header. Domains
- * inherit their base typmod. MySQL binary_n/varbinary_n/text_string typmods
+ * inherit their base typmod. MySQL binary_n/varbinary_n typmods
  * are byte counts; PostgreSQL varchar/bpchar typmods are characters + 4. */
 static int64
 key_column_max_bytes(Oid typid, int32 typmod)

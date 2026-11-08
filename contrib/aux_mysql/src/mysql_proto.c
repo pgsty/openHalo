@@ -1809,14 +1809,6 @@ mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 
 	/* aux_mysql models tinyint, datetime, ... as domains */
 	typid = getBaseTypeAndTypmod(typid, &typmod);
-	if (mys_is_text_string(typid))
-	{
-		*mtype = MYSQL_TYPE_BLOB;
-		*len = typmod >= 0 ? (uint32) typmod : 0xffffffff;
-		*flags = BLOB_FLAG;
-		*charset = MYS_CHARSET_UTF8MB4;
-		return;
-	}
 	if (mys_binary_base_type(typid) != typid)
 	{
 		*mtype = mys_is_fixed_binary(typid) && typmod >= 0 ?

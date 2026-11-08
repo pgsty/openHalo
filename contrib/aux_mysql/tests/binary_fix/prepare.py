@@ -24,6 +24,13 @@ CREATE FUNCTION mysql.release_lock("any") RETURNS int8 AS '$libdir/aux_mysql','m
 CREATE FUNCTION mysql.is_free_lock("any") RETURNS int8 AS '$libdir/aux_mysql','mys_is_free_lock' LANGUAGE C VOLATILE;
 CREATE FUNCTION mysql.release_all_locks() RETURNS int8 AS '$libdir/aux_mysql','mys_release_all_locks' LANGUAGE C VOLATILE;
 """
+s+="""CREATE FUNCTION mysql.locate(text,text) RETURNS int4 AS '$libdir/aux_mysql','mys_string_locate' LANGUAGE C IMMUTABLE STRICT;
+CREATE FUNCTION mysql.locate(text,text,int4) RETURNS int4 AS '$libdir/aux_mysql','mys_string_locate' LANGUAGE C IMMUTABLE;
+CREATE FUNCTION mysql.instr(text,text) RETURNS int4 AS '$libdir/aux_mysql','mys_string_instr' LANGUAGE C IMMUTABLE STRICT;
+CREATE FUNCTION mysql.replace(text,text,text) RETURNS text AS 'replace_text' LANGUAGE internal IMMUTABLE STRICT;
+CREATE FUNCTION mysql.if(int4,text,text) RETURNS text LANGUAGE sql AS 'SELECT CASE WHEN $1<>0 THEN $2 ELSE $3 END';
+CREATE FUNCTION mysql.ifnull(text,text) RETURNS text LANGUAGE sql AS 'SELECT coalesce($1,$2)';
+"""
 s+="CREATE FUNCTION mysql.review_fix_value(text, bool DEFAULT false) RETURNS text AS '$libdir/aux_mysql', 'review_fix_value' LANGUAGE C VOLATILE;\nCOMMIT;\n"
 s=s.replace('$libdir/aux_mysql',lib)
 (pathlib.Path(os.environ['BINARY_FIX_BUILD_DIR'])/'setup.sql').write_text(s)

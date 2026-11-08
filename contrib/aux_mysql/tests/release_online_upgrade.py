@@ -92,9 +92,9 @@ try:
     # Reuse exactly the same wire connection; invalidations must refresh caches.
     assert query('SELECT id,HEX(b),s FROM old_data') == ((1, '41', 'abc'),)
     query('CREATE TABLE new_data(id INT PRIMARY KEY,b BINARY(3),s TEXT,g BLOB AS(CONCAT(b,0x00)) STORED)')
-    query('INSERT INTO new_data(id,b,s) VALUES(1,0x41,0x610062)')
+    query('INSERT INTO new_data(id,b,s) VALUES(1,0x41,0x610162)')
     assert query('SELECT HEX(b),HEX(s),HEX(g) FROM new_data') == (
-        ('410000', '610062', '41000000'),)
+        ('410000', '610162', '41000000'),)
     query('CREATE TABLE new_key(v VARCHAR(16),PRIMARY KEY(v(2)))')
     query("INSERT INTO new_key VALUES('Ab1')")
     try:
@@ -108,7 +108,7 @@ try:
     query('INSERT INTO new_generated(v) VALUES(999)')
     assert any(r[1] == 1264 for r in query('SHOW WARNINGS'))
     assert query('SELECT g FROM new_generated') == ((99,),)
-    print('PASS same-session 1.8→1.9: invalidation refresh, padded binary, NUL TEXT, prefix and generated coercion')
+    print('PASS same-session 1.8→1.9: invalidation refresh, padded binary, native TEXT, prefix and generated coercion')
 finally:
     if wire:
         wire.close()

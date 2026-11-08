@@ -285,8 +285,8 @@ mys_simple_weight_next(MysSimpleCollation kind, const char *data, int byte_len,
 	if (*offset < 0 || (kind != MYS_SIMPLE_GENERAL_CI && kind != MYS_SIMPLE_BIN))
 		elog(ERROR, "invalid simple collation iterator state");
 	p = (const unsigned char *) data + *offset;
-	/* PostgreSQL's UTF-8 verifier rejects NUL; text_string permits it. The
-	 * remaining input length bounds verification before utf8_to_unicode. */
+	/* Iterate explicit lengths, including embedded NUL in binary input.
+	 * Bound verification before utf8_to_unicode by the remaining bytes. */
 	width = *p == 0 ? 1 : pg_encoding_verifymbchar(PG_UTF8, (const char *) p,
 												byte_len - *offset);
 	if (width < 0)

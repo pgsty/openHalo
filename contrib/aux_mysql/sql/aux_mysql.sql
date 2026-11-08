@@ -34034,7 +34034,6 @@ SELECT
             when ty.typname='bigint unsigned' then 'bigint unsigned'
             when ty.typname='varchar' then 'varchar'
             when ty.typname='bpchar' then 'char'
-            when ty.typname='text_string' then case att.atttypmod when 255 then 'tinytext' when 16777215 then 'mediumtext' when -1 then 'longtext' else 'text' end
             when ty.typname='text' then 'text'
             when ty.typname='blob' then 'blob'
             when ty.typname='time' then 'time'
@@ -34062,8 +34061,8 @@ SELECT
         end
         from pg_catalog.pg_type ty
         where att.atttypid = ty.oid)::varchar(64) as DATA_TYPE,
-    (select case when ty.typname in ('binary_n','varbinary_n') then att.atttypmod when ty.typname='text_string' then case when att.atttypmod=-1 then 4294967295 else att.atttypmod end when ty.typname in ('varchar','bpchar') and att.atttypmod>=4 then (att.atttypmod-4) when ty.typname in ('text','blob') then 65535 end from pg_catalog.pg_type ty where ty.oid=att.atttypid)::bigint as CHARACTER_MAXIMUM_LENGTH,
-    (select case when ty.typname in ('binary_n','varbinary_n') then att.atttypmod when ty.typname='text_string' then case when att.atttypmod=-1 then 4294967295 else att.atttypmod end when ty.typname in ('varchar','bpchar') and att.atttypmod>=4 then (att.atttypmod-4) * 4 when ty.typname in ('text','blob') then 65535 end from pg_catalog.pg_type ty where ty.oid=att.atttypid)::bigint as CHARACTER_OCTET_LENGTH,
+    (select case when ty.typname in ('binary_n','varbinary_n') then att.atttypmod when ty.typname in ('varchar','bpchar') and att.atttypmod>=4 then (att.atttypmod-4) when ty.typname in ('text','blob') then 65535 end from pg_catalog.pg_type ty where ty.oid=att.atttypid)::bigint as CHARACTER_MAXIMUM_LENGTH,
+    (select case when ty.typname in ('binary_n','varbinary_n') then att.atttypmod when ty.typname in ('varchar','bpchar') and att.atttypmod>=4 then (att.atttypmod-4) * 4 when ty.typname in ('text','blob') then 65535 end from pg_catalog.pg_type ty where ty.oid=att.atttypid)::bigint as CHARACTER_OCTET_LENGTH,
     (case when att.atttypid='pg_catalog.numeric'::pg_catalog.regtype then (mysql.decimal_ps(att.atttypmod))[1] end)::bigint as NUMERIC_PRECISION,
     (case when att.atttypid='pg_catalog.numeric'::pg_catalog.regtype then (mysql.decimal_ps(att.atttypmod))[2] end)::bigint as NUMERIC_SCALE,
     NULL::bigint as DATETIME_PRECISION,
@@ -34126,7 +34125,6 @@ SELECT
             when ty.typname='bigint unsigned' then 'bigint unsigned'
             when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
             when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
-            when ty.typname='text_string' then case att.atttypmod when 255 then 'tinytext' when 16777215 then 'mediumtext' when -1 then 'longtext' else 'text' end
             when ty.typname='text' then 'text'
             when ty.typname='date' then 'date'
             when ty.typname='time' then 'time'
@@ -34235,8 +34233,7 @@ BEGIN
                     when ty.typname='bigint unsigned' then 'bigint unsigned'
                     when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
                     when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
-                    when ty.typname='text_string' then case att.atttypmod when 255 then 'tinytext' when 16777215 then 'mediumtext' when -1 then 'longtext' else 'text' end
-            when ty.typname='text' then 'text'
+                    when ty.typname='text' then 'text'
                     when ty.typname='date' then 'date'
                     when ty.typname='time' then 'time'
                     when ty.typname='datetime' then 'datetime(6)'
@@ -34349,8 +34346,7 @@ BEGIN
                     when ty.typname='bigint unsigned' then 'bigint unsigned'
                     when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
                     when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
-                    when ty.typname='text_string' then case att.atttypmod when 255 then 'tinytext' when 16777215 then 'mediumtext' when -1 then 'longtext' else 'text' end
-            when ty.typname='text' then 'text'
+                    when ty.typname='text' then 'text'
                     when ty.typname='date' then 'date'
                     when ty.typname='time' then 'time'
                     when ty.typname='datetime' then 'datetime(6)'
@@ -34749,8 +34745,7 @@ BEGIN
                         when ty.typname='bigint unsigned' then 'bigint unsigned'
                         when ty.typname='varchar' then pg_catalog.concat('varchar', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character varying', ''))
                         when ty.typname='bpchar' then pg_catalog.concat('char', pg_catalog.replace(format_type(att.atttypid, att.atttypmod), 'character', ''))
-                        when ty.typname='text_string' then case att.atttypmod when 255 then 'tinytext' when 16777215 then 'mediumtext' when -1 then 'longtext' else 'text' end
-            when ty.typname='text' then 'text'
+                        when ty.typname='text' then 'text'
                         when ty.typname='date' then 'date'
                         when ty.typname='time' then 'time'
                         when ty.typname='datetime' then 'datetime(6)'

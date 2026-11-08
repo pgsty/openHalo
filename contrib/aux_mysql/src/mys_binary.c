@@ -91,12 +91,6 @@ mys_is_hexlit(Oid typid)
 	return is_mysql_type(typid, "hexlit");
 }
 
-bool
-mys_is_text_string(Oid typid)
-{
-	return is_mysql_type(getBaseType(typid), "text_string");
-}
-
 /* A callback only marks state. Catalog lookups must wait for a transaction. */
 static void
 binary_types_invalidate(Datum arg, int cacheid, uint32 hashvalue)
@@ -140,7 +134,7 @@ mys_binary_base_type(Oid typid)
 	Oid			base = getBaseType(typid);
 
 	return (mys_is_hexlit(base) || is_mysql_type(base, "binary_n") ||
-			is_mysql_type(base, "varbinary_n") || mys_is_text_string(base))
+			is_mysql_type(base, "varbinary_n"))
 		? BYTEAOID : base;
 }
 
@@ -912,9 +906,27 @@ binary_call(const char *name, List *args, int location)
 						args, COERCE_EXPLICIT_CALL, location);
 }
 
+/* MySQL CAST lowering, leaving PostgreSQL casts untouched. */
+Node *
+mys_mysql_cast(Node *arg, TypeName *type, int location)
+{
+	TypeCast *cast;
+
+	if (mys_binary_types_available && type->names &&
+		strcmp(strVal(llast(type->names)), "varchar") == 0)
+		return (Node *) binary_call("cast_char", list_make2(arg,
+			type->typmods ? linitial(type->typmods) :
+			binary_make_const(T_Integer, NULL, -1)), location);
+	cast = makeNode(TypeCast);
+	cast->arg = arg;
+	cast->typeName = type;
+	cast->location = location;
+	return (Node *) cast;
+}
+
 /* Infer the result's string type from every argument without evaluating
  * them. A dead CASE branch carries the existing CONCAT type resolution:
- * bytea dominates text_string, which dominates native text. Its NULL value
+ * bytea dominates native text. Its NULL value
  * is only a polymorphic type witness; no PG text ever contains binary bytes. */
 static Node *
 string_result_type(List *args, int location)
@@ -1029,7 +1041,7 @@ mys_binary_func_call(FuncCall *call)
 }
 
 /* Convert one SQL argument to its string bytes. Unknown literals are text;
- * binary, hexlit, and the NUL-safe character type use their payloads. */
+ * binary and hexlit use their payloads. */
 PG_FUNCTION_INFO_V1(mys_concat_one);
 Datum
 mys_concat_one(PG_FUNCTION_ARGS)
@@ -1075,86 +1087,6 @@ mys_binary_ascii(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(VARSIZE_ANY_EXHDR(b) ? (unsigned char) *VARDATA_ANY(b) : 0);
 }
 
-/* ----------------------------------------------------------------
- * NUL-safe MySQL TEXT. Storage is a varlena payload, NOT a PostgreSQL text.
- * External PG text representation is bytea's escaped format; send is raw
- * bytes. Validation counts a NUL as one character, never as end-of-string.
- * Only explicit conversion to native PG text can produce a PG text Datum.
- * ---------------------------------------------------------------- */
-static bytea *
-string_checked(bytea *b, int32 maxbytes)
-{
-	const char *s = VARDATA_ANY(b);
-	int len = VARSIZE_ANY_EXHDR(b);
-	int pos = 0;
-	int end = len;
-
-	while (pos < len)
-	{
-		int n = s[pos] == '\0' ? 1 :
-			pg_encoding_verifymbchar(GetDatabaseEncoding(), s + pos, len - pos);
-
-		if (n < 0)
-		{
-			if (binary_strict())
-				ereport(ERROR, (errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
-							   errmsg("Incorrect string value for MySQL TEXT")));
-			mys_add_warning(1366, "Incorrect string value for MySQL TEXT; truncated at invalid character");
-			end = pos;
-			break;
-		}
-		if (maxbytes >= 0 && pos + n > maxbytes)
-		{
-			if (binary_strict())
-				ereport(ERROR, (errcode(ERRCODE_STRING_DATA_RIGHT_TRUNCATION),
-							   errmsg("Data too long for MySQL TEXT")));
-			mys_add_warning(1265, "Data truncated for MySQL TEXT");
-			end = pos;
-			break;
-		}
-		pos += n;
-	}
-	return end == len ? b : (bytea *) cstring_to_text_with_len(s, end);
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_in);
-Datum
-mys_text_string_in(PG_FUNCTION_ARGS)
-{
-	bytea *b = mys_is_mysql_session() ?
-		(bytea *) cstring_to_text(PG_GETARG_CSTRING(0)) :
-		DatumGetByteaP(DirectFunctionCall1(byteain, PG_GETARG_DATUM(0)));
-	PG_RETURN_BYTEA_P(string_checked(b, PG_GETARG_INT32(2)));
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_recv);
-Datum
-mys_text_string_recv(PG_FUNCTION_ARGS)
-{
-	bytea *b = DatumGetByteaP(DirectFunctionCall1(bytearecv, PG_GETARG_DATUM(0)));
-	PG_RETURN_BYTEA_P(string_checked(b, PG_GETARG_INT32(2)));
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_coerce);
-Datum
-mys_text_string_coerce(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_BYTEA_P(string_checked(PG_GETARG_BYTEA_PP(0), PG_GETARG_INT32(1)));
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_typmodin);
-Datum
-mys_text_string_typmodin(PG_FUNCTION_ARGS)
-{
-	int n;
-	int32 *mods = ArrayGetIntegerTypmods(PG_GETARG_ARRAYTYPE_P(0), &n);
-
-	if (n != 1 || mods[0] < 0 || mods[0] > 1073741823 - VARHDRSZ)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					   errmsg("invalid MySQL TEXT byte limit")));
-	PG_RETURN_INT32(mods[0]);
-}
-
 /* These functions iterate explicitly: pg_mbstrlen_with_len stops at NUL. */
 static int
 string_chars(const char *s, int len)
@@ -1165,44 +1097,6 @@ string_chars(const char *s, int len)
 	return chars;
 }
 
-static int
-string_offset(const char *s, int len, int chars)
-{
-	int i = 0;
-	while (i < len && chars-- > 0)
-		i += s[i] == '\0' ? 1 : pg_mblen(s + i);
-	return i;
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_length);
-Datum
-mys_text_string_length(PG_FUNCTION_ARGS)
-{
-	bytea *b = PG_GETARG_BYTEA_PP(0);
-	PG_RETURN_INT32(string_chars(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b)));
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_left);
-Datum
-mys_text_string_left(PG_FUNCTION_ARGS)
-{
-	bytea *b = PG_GETARG_BYTEA_PP(0);
-	int len = string_offset(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), Max(PG_GETARG_INT32(1), 0));
-	PG_RETURN_BYTEA_P((bytea *) cstring_to_text_with_len(VARDATA_ANY(b), len));
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_right);
-Datum
-mys_text_string_right(PG_FUNCTION_ARGS)
-{
-	bytea *b = PG_GETARG_BYTEA_PP(0);
-	int len = VARSIZE_ANY_EXHDR(b);
-	const char *s = VARDATA_ANY(b);
-	int count = string_chars(s, len);
-	int start = string_offset(s, len, count - Min(count, Max(PG_GETARG_INT32(1), 0)));
-	PG_RETURN_BYTEA_P((bytea *) cstring_to_text_with_len(s + start, len - start));
-}
-
 PG_FUNCTION_INFO_V1(mys_string_substr);
 Datum
 mys_string_substr(PG_FUNCTION_ARGS)
@@ -1210,8 +1104,7 @@ mys_string_substr(PG_FUNCTION_ARGS)
 	bytea *b = PG_GETARG_BYTEA_PP(0);
 	const char *s = VARDATA_ANY(b);
 	int len = VARSIZE_ANY_EXHDR(b);
-	bool chars = mys_is_text_string(get_fn_expr_argtype(fcinfo->flinfo, 0));
-	int count = chars ? string_chars(s, len) : len;
+	int count = len;
 	int64 start = PG_GETARG_INT32(1);
 	int64 n = PG_NARGS() > 2 ? PG_GETARG_INT32(2) : count;
 	int from, to;
@@ -1220,61 +1113,10 @@ mys_string_substr(PG_FUNCTION_ARGS)
 	if (start < 0 || start >= count || n <= 0)
 		PG_RETURN_BYTEA_P((bytea *) cstring_to_text(""));
 	n = Min(n, count - start);
-	from = chars ? string_offset(s, len, start) : start;
-	to = chars ? string_offset(s, len, start + n) : start + n;
+	from = start;
+	to = start + n;
 	PG_RETURN_BYTEA_P((bytea *) cstring_to_text_with_len(s + from, to - from));
 }
-
-/* Trim spaces as MySQL 5.7 PAD SPACE collations do. Binary comparisons use
- * bytea operators instead. ICU compares explicit lengths. libc does not:
- * compare successive NUL-delimited spans so suffixes are never discarded.
- * No native text sort support is registered (it uses C strings). */
-static int
-text_string_cmp(bytea *a, bytea *b, Oid collid)
-{
-	const char *p = VARDATA_ANY(a), *q = VARDATA_ANY(b);
-	int m = VARSIZE_ANY_EXHDR(a), n = VARSIZE_ANY_EXHDR(b);
-	pg_locale_t locale = pg_newlocale_from_collation(collid);
-
-	while (m > 0 && p[m - 1] == ' ') m--;
-	while (n > 0 && q[n - 1] == ' ') n--;
-	if (locale->provider == COLLPROVIDER_LIBC && !locale->collate_is_c)
-	{
-		while (m && n)
-		{
-			const char *pz = memchr(p, 0, m), *qz = memchr(q, 0, n);
-			int x = pz ? pz - p : m, y = qz ? qz - q : n;
-			int cmp = varstr_cmp(p, x, q, y, collid);
-			if (cmp) return cmp;
-			if (!pz || !qz) return (pz != NULL) - (qz != NULL);
-			p += x + 1; m -= x + 1;
-			q += y + 1; n -= y + 1;
-		}
-		return (m > 0) - (n > 0);
-	}
-	return varstr_cmp(p, m, q, n, collid);
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_cmp);
-Datum
-mys_text_string_cmp(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT32(text_string_cmp(PG_GETARG_BYTEA_PP(0), PG_GETARG_BYTEA_PP(1), PG_GET_COLLATION()));
-}
-
-#define STRING_COMPARE(name, test) \
-PG_FUNCTION_INFO_V1(name); \
-Datum name(PG_FUNCTION_ARGS) \
-{ \
-	int c = text_string_cmp(PG_GETARG_BYTEA_PP(0), PG_GETARG_BYTEA_PP(1), PG_GET_COLLATION()); \
-	PG_RETURN_BOOL(test); \
-}
-STRING_COMPARE(mys_text_string_eq, c == 0)
-STRING_COMPARE(mys_text_string_ne, c != 0)
-STRING_COMPARE(mys_text_string_lt, c < 0)
-STRING_COMPARE(mys_text_string_le, c <= 0)
-STRING_COMPARE(mys_text_string_gt, c > 0)
-STRING_COMPARE(mys_text_string_ge, c >= 0)
 
 bool
 mys_is_fixed_binary(Oid typid)
@@ -1294,6 +1136,44 @@ binary_arg(FunctionCallInfo fcinfo, int i)
 		return PG_GETARG_BYTEA_PP(i);
 	getTypeOutputInfo(t, &out, &varlena);
 	return (bytea *) cstring_to_text(OidOutputFunctionCall(out, PG_GETARG_DATUM(i)));
+}
+
+/* CAST AS CHAR uses characters, validates even truncated-away bytes and
+ * reports MySQL's SELECT truncation diagnostic independently of sql_mode. */
+PG_FUNCTION_INFO_V1(mys_cast_char);
+Datum
+mys_cast_char(PG_FUNCTION_ARGS)
+{
+	bytea *b = getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID ?
+		(bytea *) DatumGetTextPP(DirectFunctionCall1(rtrim1, PG_GETARG_DATUM(0))) :
+		binary_arg(fcinfo, 0);
+	int len = VARSIZE_ANY_EXHDR(b);
+	int limit = PG_GETARG_INT32(1);
+	int clipped;
+
+	pg_verifymbstr(VARDATA_ANY(b), len, false);
+	clipped = limit < 0 ? len : pg_mbcharcliplen(VARDATA_ANY(b), len, limit);
+	if (clipped < len)
+		mys_add_warning(1292, "Truncated incorrect CHAR value");
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(VARDATA_ANY(b), clipped));
+}
+
+PG_FUNCTION_INFO_V1(mys_convert_using);
+Datum
+mys_convert_using(PG_FUNCTION_ARGS)
+{
+	bytea *b = getBaseType(get_fn_expr_argtype(fcinfo->flinfo, 0)) == BPCHAROID ?
+		(bytea *) DatumGetTextPP(DirectFunctionCall1(rtrim1, PG_GETARG_DATUM(0))) :
+		binary_arg(fcinfo, 0);
+	char *name = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	/* UTF-8 MySQL charset aliases share the database's Unicode text value.
+	 * Other names retain the nearest Unicode representation with a warning. */
+	if (pg_strcasecmp(name, "utf8mb4") && pg_strcasecmp(name, "utf8mb3") &&
+		pg_strcasecmp(name, "utf8") && pg_strcasecmp(name, "utf-8"))
+		mys_add_warning(1105, "CONVERT character set mapped to UTF-8");
+	pg_verifymbstr(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b), false);
+	PG_RETURN_TEXT_P((text *) b);
 }
 
 PG_FUNCTION_INFO_V1(mys_raw_bytes);
@@ -1398,63 +1278,9 @@ mys_string_trim(PG_FUNCTION_ARGS)
 	PG_RETURN_BYTEA_P((bytea *) cstring_to_text_with_len(s + lo, hi - lo));
 }
 
-PG_FUNCTION_INFO_V1(mys_text_string_case);
-Datum
-mys_text_string_case(PG_FUNCTION_ARGS)
-{
-	bytea *b = PG_GETARG_BYTEA_PP(0);
-	const char *s = VARDATA_ANY(b);
-	int len = VARSIZE_ANY_EXHDR(b), i = 0;
-	char *name = get_func_name(fcinfo->flinfo->fn_oid);
-	bool upper = strcmp(name, "upper") == 0 || strcmp(name, "ucase") == 0;
-	StringInfoData buf;
-
-	initStringInfo(&buf);
-	while (i < len)
-	{
-		const char *z = memchr(s + i, 0, len - i);
-		int n = z ? z - (s + i) : len - i;
-		char *mapped = upper ? str_toupper(s + i, n, PG_GET_COLLATION()) :
-							   str_tolower(s + i, n, PG_GET_COLLATION());
-		appendStringInfoString(&buf, mapped);
-		pfree(mapped);
-		i += n;
-		if (z) { appendStringInfoChar(&buf, '\0'); i++; }
-	}
-	PG_RETURN_BYTEA_P((bytea *) cstring_to_text_with_len(buf.data, buf.len));
-}
-
-PG_FUNCTION_INFO_V1(mys_text_string_hash);
-Datum
-mys_text_string_hash(PG_FUNCTION_ARGS)
-{
-	bytea *b = PG_GETARG_BYTEA_PP(0);
-	const char *s = VARDATA_ANY(b);
-	int len = VARSIZE_ANY_EXHDR(b);
-	pg_locale_t locale = pg_newlocale_from_collation(PG_GET_COLLATION());
-	Datum result;
-
-	while (len && s[len - 1] == ' ') len--;
-	if (locale->deterministic)
-		result = PG_NARGS() == 2 ? hash_any_extended((unsigned char *) s, len, PG_GETARG_INT64(1)) :
-								  hash_any((unsigned char *) s, len);
-	else
-	{
-		Size n = pg_strnxfrm(NULL, 0, s, len, locale), actual;
-		char *key = palloc(n + 1);
-		actual = pg_strnxfrm(key, n + 1, s, len, locale);
-		if (actual > n) elog(ERROR, "collation key grew unexpectedly");
-		result = PG_NARGS() == 2 ? hash_any_extended((unsigned char *) key, actual, PG_GETARG_INT64(1)) :
-								  hash_any((unsigned char *) key, actual);
-		pfree(key);
-	}
-	PG_FREE_IF_COPY(b, 0);
-	return result;
-}
-
 /* Binary types have their original 1.8 domain behavior before the 1.9 SQL
  * update. Once pg_type invalidation arrives, the next parse adopts typmods
- * and NUL-safe TEXT even on a connection opened before ALTER EXTENSION. */
+ * even on a connection opened before ALTER EXTENSION. */
 TypeName *
 mys_binary_type_name(const char *name, int32 typmod, int location)
 {
@@ -1463,10 +1289,7 @@ mys_binary_type_name(const char *name, int32 typmod, int location)
 	mys_binary_session_init();
 	if (!mys_binary_types_available)
 	{
-		if (strcmp(name, "text_string") == 0)
-			type = SystemTypeName("text");
-		else
-			type = makeTypeNameFromNameList(list_make2(makeString("mysql"),
+		type = makeTypeNameFromNameList(list_make2(makeString("mysql"),
 				makeString(pstrdup(strcmp(name, "binary_n") == 0 ? "binary" : "varbinary"))));
 	}
 	else
@@ -1492,8 +1315,6 @@ mys_string_result(PG_FUNCTION_ARGS)
 	value = binary_arg(fcinfo, 1);
 	if (result_type == TEXTOID)
 		pg_verifymbstr(VARDATA_ANY(value), VARSIZE_ANY_EXHDR(value), false);
-	else if (mys_is_text_string(result_type))
-		value = string_checked(value, -1);
 	else if (result_type != BYTEAOID)
 		ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH),
 					   errmsg("string_result requires a string type witness")));
@@ -1605,7 +1426,7 @@ binary_string_arg(FunctionCallInfo fcinfo, int argno)
 {
 	Oid type = get_fn_expr_argtype(fcinfo->flinfo, argno);
 
-	return mys_binary_base_type(type) == BYTEAOID && !mys_is_text_string(type);
+	return mys_binary_base_type(type) == BYTEAOID;
 }
 
 /* Unlike pg_mb2wchar_with_len(), retain U+0000 and everything after it.

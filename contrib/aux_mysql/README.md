@@ -79,8 +79,8 @@ and separate validation. Load it through `shared_preload_libraries` (the OpenHal
   and `'50\%'` is four characters.
 - **Binary and character strings**: new BINARY(n) columns pad with zero bytes; VARBINARY(n) enforces
   its byte limit. Strict writes reject overflow, while non-strict and INSERT IGNORE writes truncate
-  with warnings. BLOB values preserve every byte. TEXT-family columns use a length-aware character
-  type that preserves NUL and validates UTF-8. Text and prepared result packets retain complete values.
+  with warnings. BLOB values preserve every byte. TEXT-family columns use native PostgreSQL text. CHAR/VARCHAR/TEXT reject NUL
+  with error 1366 in every sql_mode, including IGNORE. Text and prepared result packets retain complete values.
   Literal backslash escapes, `_binary`, hex/bit literals and BLOB parameters preserve binary payloads.
   Native PostgreSQL I/O for these new types uses bytea escaping, so pg_dump can round-trip NUL and
   non-UTF8 binary bytes. Existing columns keep their old types until explicitly migrated.
@@ -137,10 +137,10 @@ and separate validation. Load it through `shared_preload_libraries` (the OpenHal
   `GENERATION_EXPRESSION`, `GENERATED ALWAYS AS (expr) VIRTUAL | STORED`.
 - **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
 
-Compatibility targets common MySQL 5.7 applications with defined, reproducible
-behavior. An explicit unsupported-feature error is an accepted boundary when
-support would weaken PostgreSQL integrity guarantees or require disproportionate
-changes. Successful execution must not hide lost bytes, ineffective safety
+Compatibility targets legacy MySQL 5.7 applications, including permissive SQL.
+Accept MySQL syntax and use the nearest semantics with warnings where exact
+behavior is unavailable. Errors are reserved for MySQL errors under the same
+sql_mode, crash prevention, and preventing silent data corruption or loss. Successful execution must not hide lost bytes, ineffective safety
 settings, or silently weakened constraints. Non-strict sql_mode and INSERT IGNORE
 retain their documented conversions and warnings; they do not authorize arbitrary
 lossy substitutions. The read-write REPEATABLE READ mapping described above is an
@@ -162,16 +162,14 @@ explicit product choice.
 - `bigint unsigned` is an int8 domain (no values above 2^63-1); no zero dates; `'a' = 'A'` between two
   literals is case-sensitive (literals use the database collation); `1.5e0` is numeric, not DOUBLE.
 - Old BINARY/VARBINARY columns are bytea domains with discarded lengths. Installing 1.9 does not
-  infer their original lengths or pad historical values. Old PG TEXT columns also retain their NUL
-  restriction. Use the original schema and the [migration procedure](MIGRATION.md) to convert them.
+  infer their original lengths or pad historical values. TEXT-family columns retain native PG text storage. Use the original schema and the [migration procedure](MIGRATION.md) to convert them.
 - Hexadecimal numeric contexts above signed int8 remain limited; BIGINT UNSIGNED is not a full
   unsigned 64-bit type. Common string operations, binary CONCAT and indexed integer comparisons are
   covered, but arbitrary combinations of MySQL functions and custom types are not fully implemented.
   BIT result metadata and user-variable numeric typing still differ from MySQL.
-- CHAR/VARCHAR intentionally retain native PostgreSQL character storage: values containing NUL
-  fail with 1366. Bytes are never stripped or replaced to make an insert succeed. The NUL-preserving
-  representation applies to TINYTEXT/TEXT/MEDIUMTEXT/LONGTEXT and binary types. Changing a column to
-  one of these types is an explicit migration decision, including its length and comparison rules.
+- CHAR/VARCHAR and all TEXT families retain native PostgreSQL character storage: values containing NUL
+  fail with 1366. Bytes are never stripped or replaced to make an insert succeed. Only BLOB/BINARY/VARBINARY preserve NUL and arbitrary bytes. Changing a column to
+  a binary type is an explicit migration decision, including its length and comparison rules.
 - No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
 - Four names have exact dedicated implementations: `utf8_general_ci`, `utf8mb4_general_ci`, `utf8_bin`,
   and `utf8mb4_bin`. Other MySQL collation names are accepted and mapped by their suffix to the closest
