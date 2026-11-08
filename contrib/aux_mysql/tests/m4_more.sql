@@ -24,3 +24,6 @@ SELECT COUNT(*) FROM users;
 DROP TABLE IF EXISTS `t3`;
 CREATE TABLE t3 (a int, b text);
 SHOW FULL TABLES;
+CREATE TABLE uj_x (id int primary key, v int);
+UPDATE t3 JOIN uj_x ON t3.a = uj_x.id SET uj_x.v = 1;
+DROP TABLE uj_x;

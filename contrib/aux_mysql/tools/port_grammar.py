@@ -633,5 +633,54 @@ rep('VariableShowStmt:\n', '''VariableShowStmt:
             |
 ''')
 
+# ---------------------------------------------------------------------------
+# Multi-table UPDATE
+# ---------------------------------------------------------------------------
+# set_clause_list_for_mysql yields [qualifier, ResTarget] pairs (qualifier is
+# NULL or a String A_Const).  The JOIN form passed that list to PG as the
+# targetList, so the rewriter read an A_Const or NULL as a ResTarget and the
+# backend crashed.  Keep only the ResTargets; PG updates just the left table,
+# so a qualifier naming another table is refused rather than misapplied.
+# Unqualified columns resolve to the left table, as PG does for UPDATE.
+rep('                    n->targetList = $9;\n', (
+    '\t\t\t\t\t{\n'
+    '\t\t\t\t\t\tconst char *target = $3->alias ? $3->alias->aliasname : $3->relname;\n'
+    '\t\t\t\t\t\tint\t\t\ti;\n'
+    '\n'
+    '\t\t\t\t\t\tn->targetList = NIL;\n'
+    '\t\t\t\t\t\tfor (i = 0; i + 1 < list_length($9); i += 2)\n'
+    '\t\t\t\t\t\t{\n'
+    '\t\t\t\t\t\t\tNode\t   *qualifier = (Node *) list_nth($9, i);\n'
+    '\t\t\t\t\t\t\tResTarget  *rt = list_nth_node(ResTarget, $9, i + 1);\n'
+    '\n'
+    '\t\t\t\t\t\t\tif (qualifier != NULL &&\n'
+    '\t\t\t\t\t\t\t\t(!IsA(qualifier, A_Const) ||\n'
+    '\t\t\t\t\t\t\t\t !IsA(&((A_Const *) qualifier)->val, String) ||\n'
+    '\t\t\t\t\t\t\t\t pg_strcasecmp(strVal(&((A_Const *) qualifier)->val), target) != 0))\n'
+    '\t\t\t\t\t\t\t\tereport(ERROR,\n'
+    '\t\t\t\t\t\t\t\t\t\t(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),\n'
+    '\t\t\t\t\t\t\t\t\t\t errmsg("UPDATE ... JOIN can only change columns of \\"%s\\"", target),\n'
+    '\t\t\t\t\t\t\t\t\t\t parser_errposition(rt->location)));\n'
+    '\t\t\t\t\t\t\tn->targetList = lappend(n->targetList, rt);\n'
+    '\t\t\t\t\t\t}\n'
+    '\t\t\t\t\t}\n'))
+# The comma form compared only a prefix of the target name, so aliases "o"
+# and "oi" both matched "o".  Compare whole names (case-insensitively, as
+# with lower_case_table_names=1).
+rep('''                        int len;
+                        ListCell* lc;
+                        char* targetRelationName;
+''', '''                        ListCell* lc;
+                        char* targetRelationName;
+''')
+rep('\n                        len = 0;\n', '\n')
+rep('\n' + ' ' * 40 + 'len = strlen(targetRelationName);\n', '\n')
+rep('\n' + ' ' * 40 + 'if (strncasecmp(targetRelationName, rel->val.sval.sval, len) != 0)',
+    '\n' + '\t' * 10 + 'if (pg_strcasecmp(targetRelationName, rel->val.sval.sval) != 0)')
+rep(' ' * 32 + 'if (strncasecmp(targetRelationName, rangeVar->alias->aliasname, len) == 0)',
+    '\t' * 8 + 'if (pg_strcasecmp(targetRelationName, rangeVar->alias->aliasname) == 0)')
+rep(' ' * 32 + 'if ((strncasecmp(targetRelationName, rangeVar->relname, len)) == 0)',
+    '\t' * 8 + 'if (pg_strcasecmp(targetRelationName, rangeVar->relname) == 0)')
+
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 print("ported grammar written to", dst)

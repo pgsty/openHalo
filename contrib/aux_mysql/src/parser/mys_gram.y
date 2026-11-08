@@ -15738,7 +15738,6 @@ MysUpdateStmt:
                     else
                     {
                         int i;
-                        int len;
                         ListCell* lc;
                         char* targetRelationName;
 
@@ -15747,7 +15746,6 @@ MysUpdateStmt:
                         n->fromClause = NULL;
 
                         i = 0;
-                        len = 0;
                         targetRelationName = NULL;
 
                         foreach (lc, $5)
@@ -15769,11 +15767,10 @@ MysUpdateStmt:
                                     if (i == 0)
                                     {
                                         targetRelationName = rel->val.sval.sval;
-                                        len = strlen(targetRelationName);
                                     }
                                     else
                                     {
-                                        if (strncasecmp(targetRelationName, rel->val.sval.sval, len) != 0)
+										if (pg_strcasecmp(targetRelationName, rel->val.sval.sval) != 0)
                                         {
                                             ereport(ERROR,
                                                     (errcode(ERRCODE_SYNTAX_ERROR),
@@ -15813,7 +15810,7 @@ MysUpdateStmt:
                             RangeVar* rangeVar = (RangeVar*) lfirst(lc);
                             if (rangeVar->alias != NULL)
                             {
-                                if (strncasecmp(targetRelationName, rangeVar->alias->aliasname, len) == 0)
+								if (pg_strcasecmp(targetRelationName, rangeVar->alias->aliasname) == 0)
                                 {
                                     n->relation = rangeVar;
                                 }
@@ -15824,7 +15821,7 @@ MysUpdateStmt:
                             }
                             else
                             {
-                                if ((strncasecmp(targetRelationName, rangeVar->relname, len)) == 0)
+								if (pg_strcasecmp(targetRelationName, rangeVar->relname) == 0)
                                 {
                                     n->relation = rangeVar;
                                 }
@@ -15869,7 +15866,27 @@ MysUpdateStmt:
                     //char* targetRelationName;
 
                     n->relation = $3;
-                    n->targetList = $9;
+					{
+						const char *target = $3->alias ? $3->alias->aliasname : $3->relname;
+						int			i;
+
+						n->targetList = NIL;
+						for (i = 0; i + 1 < list_length($9); i += 2)
+						{
+							Node	   *qualifier = (Node *) list_nth($9, i);
+							ResTarget  *rt = list_nth_node(ResTarget, $9, i + 1);
+
+							if (qualifier != NULL &&
+								(!IsA(qualifier, A_Const) ||
+								 !IsA(&((A_Const *) qualifier)->val, String) ||
+								 pg_strcasecmp(strVal(&((A_Const *) qualifier)->val), target) != 0))
+								ereport(ERROR,
+										(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+										 errmsg("UPDATE ... JOIN can only change columns of \"%s\"", target),
+										 parser_errposition(rt->location)));
+							n->targetList = lappend(n->targetList, rt);
+						}
+					}
                     //i = 0;
                     //len = 0;
                     //targetRelationName = NULL;
