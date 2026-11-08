@@ -107,6 +107,47 @@ binary, generated-column and prefix-index availability must refresh without a
 reconnect. It needs an otherwise idle disposable instance and the original 1.6
 installation SQL used to construct the 1.8 fixture.
 
+The released 1.5 path needs an actual old server, not a new server installing old
+SQL. In ohdev, build the tag outside the repository, then run the restart test
+with an empty work directory and unused ports:
+
+```sh
+export UPGRADE_WORK=/tmp/aux-real-upgrade
+mkdir -p "$UPGRADE_WORK/source-v18.6" "$UPGRADE_WORK/build-v18.6"
+git archive v18.6 | tar -x -C "$UPGRADE_WORK/source-v18.6"
+cd "$UPGRADE_WORK/build-v18.6"
+../source-v18.6/configure --prefix="$UPGRADE_WORK/v18.6" --with-openssl --enable-depend
+make -j12 && make install
+cd /w/openhalo/contrib/aux_mysql
+ss -ltn
+python3 tests/release_real_upgrade.py --old-prefix "$UPGRADE_WORK/v18.6" \
+  --new-prefix /path/to/new/install --work-dir "$UPGRADE_WORK/run-debug" \
+  --mysql-port 3807 --pg-port 5807 --reference-port 3771
+```
+
+Repeat with the release prefix and another empty work directory. The script runs
+the server as OS user `pg`, disables 1.5's racing background auto-installer,
+keeps a MySQL connection open over SQL upgrade, verifies another new connection,
+and stops the server on exit. Logs, original DDL/data, full catalog definitions
+and differences remain outside the repository. Every application object is
+created over MySQL protocol. Old procedures use the accepted BEGIN ATOMIC body;
+a native DO block supplies the trigger function because 1.5 has no MySQL trigger
+body parser. CREATE TRIGGER itself is sent through MySQL protocol.
+
+For the separate unreleased 1.6→1.7→1.8→1.9 chain, construct its original
+installation SQL from the historical commit, never today's generator:
+
+```sh
+git show da426c5:contrib/aux_mysql/sql/aux_mysql.sql > /path/to/new/install/share/postgresql/extension/aux_mysql--1.6.sql
+git show da426c5:contrib/aux_mysql/sql/aux_mysql_additions.sql >> /path/to/new/install/share/postgresql/extension/aux_mysql--1.6.sql
+python3 tests/release_upgrade.py
+```
+
+The shared catalog comparator covers membership, complete function and view
+definitions, view descriptors, casts, operators and opclass support members.
+Only the explicitly reported historical EXTRA collation is allowed to differ on
+the unreleased chain; released 1.5→1.9 must match the fresh catalog exactly.
+
 Run PostgreSQL's own regression suite against the debug kernel with the cluster's
 bootstrap superuser and a writable build tree:
 
@@ -133,6 +174,9 @@ from `pg14` in a temporary directory and compares their bytes.
 `python3 tests/route_a.py --port "$MYSQL_PORT" --reference-port 3771 --wp text`
 asserts character functions, mixed expressions, value/HEX assignments, and the
 intentional 1366 boundary for NUL in every character family and write mode.
+The other work packages are selected with `--wp binary`, `char`, `collation`,
+`numeric_cast`, `uint64`, and `prefix_nul`. The numeric CAST check also uses
+`PSQL` (or psql on PATH) over PG at the MySQL port plus 2000.
 The standalone expression harness omits executor-only conflict node assignments
 when compiled against stock PG18 headers; production parser byte identity is
 checked independently and DML is verified by the full wire suites.

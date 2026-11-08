@@ -196,17 +196,15 @@ def _():
  q(c,'alter table coll_rename rename to renamed');q(c,'alter table renamed add b varchar(10)')
  q(c,"insert into renamed values('a','a')");assert q(c,"select a='A',b='A' from renamed")==((0,0),)
  assert q(p,"select label from pg_seclabel where provider='aux_mysql' and objoid='extra.renamed'::regclass")==[('case_sensitive',)]
-@test('F11 invalid UTF8 remains binary; strict TEXT rejects it but preserves valid NUL characters')
+@test('F11 invalid UTF8 remains binary; TEXT rejects invalid UTF8 and NUL with 1366')
 def _():
  eq(val(c,b"select '\xff'"),b'\xff')
  q(c,'create table badtext(t text)')
- for lit in (b"'\xff'",b"_binary'\xff'"):
+ for lit in (b"'\xff'",b"_binary'\xff'",b"'a\\0b'"):
   try:q(c,b'insert into badtext values ('+lit+b')')
   except pymysql.MySQLError as e:assert e.args[0]==1366,e
   else:raise AssertionError('not text, stored in TEXT: %r'%lit)
  assert q(c,'select count(*) from badtext')==((0,),)
- q(c,b"insert into badtext values ('a\\0b')")
- eq(q(c,'select hex(t),length(t) from badtext'),(('610062',3),))
 @test('B01 binary strings keep every byte: literal forms, escapes, NULs, prepared statements, mysqldump')
 def _():
  import random

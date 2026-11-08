@@ -144,7 +144,7 @@ Out-of-MySQL-range literals retain the requested existing lenient clipping with
 INT64_MAX, whereas MySQL stores UINT64_MAX. This remaining boundary difference
 requires full uint64 storage to eliminate. Legal high-half values never clip.
 
-## WP7 — NUL-safe character prefix clipping
+## WP7 — NUL-safe character prefix clipping (`9ef2a83`)
 
 Both bin and historical collation paths now clip by explicit character count;
 NUL consumes one character and cannot terminate the key. A private standalone
@@ -160,3 +160,43 @@ including concurrent keys and pg_dump/restore; `tests/indexes_btree.py` passed
 on 3804/5804. `tests/route_a.py --port 3804 --wp prefix_nul`: 19 assertions
 against 3771 passed, covering the character 1366 boundary and byte-preserving
 binary ODKU/REPLACE with distinct NUL-containing prefix keys.
+
+## WP8 — real released 1.5 upgrade
+
+Built unmodified tag v18.6 (`5086d18f03af2794b69c87c784768a7aeb5d43e9`)
+outside the repository. The repeatable test initializes with its binaries and
+1.5 SQL, creates all representative type families, keys, checked/unchecked FKs,
+an orphan, a discarded generator, views, a procedure and a trigger through
+MySQL protocol, stops it, and starts that same data directory with the new debug
+build. BEGIN ATOMIC procedures and a native DO block for the trigger function
+use syntax accepted by 1.5; MySQL-style routine/trigger bodies remain a historical
+capability gap. The old auto-install worker is disabled to avoid its startup race.
+
+Fixed the missing column metadata helpers, preserved the dependent EXTRA view
+descriptor, added the missing diagnostics function and refreshed routines view
+metadata. All changes are in generators/upgrade sources, with generated files
+regenerated. No user data or old index definitions are changed. Updated migration
+checks/repair instructions for lost binary/prefix lengths, generated expressions
+and unchecked FK orphans. A leftover AB expectation for TEXT NUL now asserts the
+requested 1366; binary byte/NUL tests are unchanged.
+
+Debug validation:
+
+- `tests/release_real_upgrade.py --old-prefix /tmp/aux-route-a/v18.6
+  --new-prefix /tmp/aux-route-a/debug --work-dir /tmp/aux-route-a/real-upgrade-debug6
+  --mysql-port 3807 --pg-port 5807`: passed. Existing/new connections, unchanged
+  legacy snapshots, procedure/trigger and dependent view all verified; AB 46/46
+  and all seven Route A suites (1497 assertions) passed after upgrade.
+- Real 1.5→1.9 versus fresh 1.9: zero differences across 3372 extension members,
+  1761 functions, 20 views/272 descriptors, 82 casts, 665 operators, 27 opclasses.
+  Catalog JSON/digests are retained in the test work directory.
+- `PGHOST=/tmp PGPORT=5804 PGUSER=postgres tests/release_upgrade.py`: historical
+  1.6→1.7→1.8→1.9 passed, including legacy stored ON CONFLICT, old binary/index
+  objects and orphan-safe enforcement. Sole retained catalog difference:
+  `mys_informa_schema.columns.extra` keeps pg_catalog.default rather than fresh
+  pg_catalog.C; the view definition and descriptor record that same difference.
+  It is a fixed-label metadata column; preserving it retains dependent views.
+- `tests/release_online_upgrade.py --allow-listener-reload` on 3804/5804 passed
+  the separate same-session 1.8→1.9 refresh test.
+
+Release build repetition and final full acceptance are still pending.

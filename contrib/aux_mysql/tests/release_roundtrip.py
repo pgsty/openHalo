@@ -61,7 +61,7 @@ def verify():
         raise AssertionError('restored prefix PRIMARY KEY accepted a duplicate')
     query('INSERT INTO data(id,t) VALUES(3,0x610162)')
     assert query('SELECT HEX(b),HEX(t),HEX(g) FROM data WHERE id=3') == (
-        ('4142', '610062', '414200'),)
+        ('4142', '610162', '414200'),)
     query('DELETE FROM data WHERE id=3')
     for table in ('child', 'pending_child'):
         try:

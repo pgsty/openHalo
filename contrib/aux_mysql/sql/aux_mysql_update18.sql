@@ -282,7 +282,7 @@ BEGIN
     ret := pg_catalog.concat('CREATE TABLE `', tabName, '` (');
 
     FOR records IN
-        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) as extra, att.attname as column_name,
+        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C" as extra, att.attname as column_name,
                 (pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adrelid = tabOid and ad.adnum = att.attnum), tabOid)) as column_default,
                 (case when att.attnotnull then 'NO' else 'YES' end) as is_nullable,
                 (select
@@ -603,7 +603,8 @@ RETURNS anyelement
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
 AS 'SELECT $2';
 
-CREATE OR REPLACE VIEW mys_informa_schema.columns AS
+DO $view_upgrade$
+DECLARE coll text; definition text := $view_definition$CREATE OR REPLACE VIEW mys_informa_schema.columns AS
 SELECT
     'def'::varchar(256) as TABLE_CATALOG,
     (select ns.nspname from pg_catalog.pg_namespace ns where ns.oid = (select cl.relnamespace from pg_catalog.pg_class cl where cl.oid = att.attrelid))::varchar(256) as TABLE_SCHEMA,
@@ -746,7 +747,7 @@ SELECT
         from pg_catalog.pg_type ty
         where att.atttypid = ty.oid)::text as COLUMN_TYPE,
     (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as COLUMN_KEY,
-    mysql.column_extra(att.attrelid, att.attnum)::text as EXTRA,
+    mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"::text as EXTRA,
     'select,insert,update,references'::varchar(256) as PRIVILEGES,
     col_description(att.attrelid, att.attnum)::varchar(512) as COLUMN_COMMENT,
     (case when att.attgenerated <> '' then mysql.column_generation(att.attrelid, att.attnum)
@@ -756,7 +757,19 @@ FROM pg_catalog.pg_attribute att
 WHERE 16384 <= att.attrelid and att.attname != 'tableoid' and att.attname != 'cmax' and
       att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
       att.attname != 'ctid' and att.attname not like '%pg.dropped.%'
-order by att.attnum;
+order by att.attnum;$view_definition$;
+BEGIN
+    SELECT pg_catalog.format('%I.%I',n.nspname,c.collname) INTO coll
+      FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_collation c ON c.oid=a.attcollation
+      JOIN pg_catalog.pg_namespace n ON n.oid=c.collnamespace
+      WHERE a.attrelid=pg_catalog.to_regclass('mys_informa_schema.columns') AND a.attname='extra';
+    IF coll IS NOT NULL THEN
+        definition := pg_catalog.replace(definition,
+          'mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"',
+          pg_catalog.concat('mysql.column_extra(att.attrelid, att.attnum) COLLATE ',coll));
+    END IF;
+    EXECUTE definition;
+END $view_upgrade$;
 
 CREATE OR REPLACE FUNCTION mysql.show_table_columns(pg_catalog.text, pg_catalog.text)
 RETURNS setof RECORD
@@ -853,7 +866,7 @@ BEGIN
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
             (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
-            mysql.column_extra(att.attrelid, att.attnum)::text as Extra
+            mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"::text as Extra
         FROM pg_catalog.pg_attribute att
         WHERE att.attrelid = tabOid and att.attname != 'tableoid' and att.attname != 'cmax' and
                 att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
@@ -963,7 +976,7 @@ BEGIN
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
             (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
-            mysql.column_extra(att.attrelid, att.attnum)::text as Extra,
+            mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"::text as Extra,
             'select,insert,update,references'::varchar(256) as Privileges,
             (case when col_description(att.attrelid, att.attnum) is not null then col_description(att.attrelid, att.attnum) else '' end)::varchar(512) as Comment
         FROM pg_catalog.pg_attribute att
@@ -1008,7 +1021,7 @@ BEGIN
     ret := pg_catalog.concat('CREATE TABLE `', tabName, '` (');
 
     FOR records IN
-        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) as extra, att.attname as column_name,
+        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C" as extra, att.attname as column_name,
                 (pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adrelid = tabOid and ad.adnum = att.attnum and att.attgenerated = ''), tabOid)) as column_default,
                 mysql.column_generation(att.attrelid, att.attnum) as generation,
                 (case when att.attnotnull then 'NO' else 'YES' end) as is_nullable,

@@ -122,7 +122,8 @@ END;
 $$
 STABLE LANGUAGE plpgsql;
 
-CREATE OR REPLACE VIEW mys_informa_schema.columns AS
+DO $view_upgrade$
+DECLARE coll text; definition text := $view_definition$CREATE OR REPLACE VIEW mys_informa_schema.columns AS
 SELECT
     'def'::varchar(256) as TABLE_CATALOG,
     (select ns.nspname from pg_catalog.pg_namespace ns where ns.oid = (select cl.relnamespace from pg_catalog.pg_class cl where cl.oid = att.attrelid))::varchar(256) as TABLE_SCHEMA,
@@ -269,7 +270,7 @@ SELECT
         from pg_catalog.pg_type ty
         where att.atttypid = ty.oid)::text as COLUMN_TYPE,
     (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as COLUMN_KEY,
-    mysql.column_extra(att.attrelid, att.attnum)::text as EXTRA,
+    mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"::text as EXTRA,
     'select,insert,update,references'::varchar(256) as PRIVILEGES,
     col_description(att.attrelid, att.attnum)::varchar(512) as COLUMN_COMMENT,
     (case when att.attgenerated <> '' then mysql.column_generation(att.attrelid, att.attnum)
@@ -279,7 +280,19 @@ FROM pg_catalog.pg_attribute att
 WHERE 16384 <= att.attrelid and att.attname != 'tableoid' and att.attname != 'cmax' and
       att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
       att.attname != 'ctid' and att.attname not like '%pg.dropped.%'
-order by att.attnum;
+order by att.attnum;$view_definition$;
+BEGIN
+    SELECT pg_catalog.format('%I.%I',n.nspname,c.collname) INTO coll
+      FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_collation c ON c.oid=a.attcollation
+      JOIN pg_catalog.pg_namespace n ON n.oid=c.collnamespace
+      WHERE a.attrelid=pg_catalog.to_regclass('mys_informa_schema.columns') AND a.attname='extra';
+    IF coll IS NOT NULL THEN
+        definition := pg_catalog.replace(definition,
+          'mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"',
+          pg_catalog.concat('mysql.column_extra(att.attrelid, att.attnum) COLLATE ',coll));
+    END IF;
+    EXECUTE definition;
+END $view_upgrade$;
 
 CREATE OR REPLACE FUNCTION mysql.show_table_columns(pg_catalog.text, pg_catalog.text)
 RETURNS setof RECORD
@@ -378,7 +391,7 @@ BEGIN
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
             (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
-            mysql.column_extra(att.attrelid, att.attnum)::text as Extra
+            mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"::text as Extra
         FROM pg_catalog.pg_attribute att
         WHERE att.attrelid = tabOid and att.attname != 'tableoid' and att.attname != 'cmax' and
                 att.attname != 'xmax' and att.attname != 'cmin' and att.attname != 'xmin' and
@@ -490,7 +503,7 @@ BEGIN
             (case when att.attnotnull then 'NO' else 'YES' end)::varchar(8) as Null,
             (mysql.get_column_key(att.attrelid, att.attname))::varchar(256) as Key,
             (mysql.amend_def_val(pg_get_expr((select ad.adbin from pg_catalog.pg_attrdef ad where ad.adnum = att.attnum and ad.adrelid = att.attrelid and att.attgenerated = ''), tabOid)))::text as Default,
-            mysql.column_extra(att.attrelid, att.attnum)::text as Extra,
+            mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C"::text as Extra,
             'select,insert,update,references'::varchar(256) as Privileges,
             (case when col_description(att.attrelid, att.attnum) is not null then col_description(att.attrelid, att.attnum) else '' end)::varchar(512) as Comment
         FROM pg_catalog.pg_attribute att
@@ -904,7 +917,7 @@ BEGIN
     ret := pg_catalog.concat('CREATE TABLE `', tabName, '` (');
 
     FOR records IN
-        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) as extra, att.attname as column_name,
+        select att.attidentity as identity, mysql.column_extra(att.attrelid, att.attnum) COLLATE pg_catalog."C" as extra, att.attname as column_name,
                 mysql.column_default(att.attrelid, att.attnum) as column_default,
                 mysql.column_generation(att.attrelid, att.attnum) as generation,
                 (case when att.attnotnull then 'NO' else 'YES' end) as is_nullable,
@@ -1132,3 +1145,136 @@ BEGIN
 END;
 $$
 STABLE LANGUAGE plpgsql;
+
+CREATE OR REPLACE VIEW mys_informa_schema.routines as
+    select
+        proname::varchar(64) as specific_name,
+        'def'::varchar(512) as routine_catalog,
+        pronamespace::regnamespace::varchar(64) as routine_schema,
+        proname::varchar(64) as routine_name,
+        (case when pg_proc.prokind = 'f'::text THEN 'FUNCTION'  else 'PROCEDURE' end)::varchar(9) as routine_type,
+        (case
+            when pg_proc.prokind = 'f'::text THEN
+                (select
+                    case
+                        when ty.typname='tinyint' then 'tinyint'
+                        when ty.typname='tinyint signed' then 'tinyint signed'
+                        when ty.typname='tinyint unsigned' then 'tinyint unsigned'
+                        when ty.typname='smallint' then 'smallint'
+                        when ty.typname='smallint signed' then 'smallint signed'
+                        when ty.typname='smallint unsigned' then 'smallint unsigned'
+                        when ty.typname='mediumint' then 'mediumint'
+                        when ty.typname='mediumint signed' then 'mediumint signed'
+                        when ty.typname='mediumint unsigned' then 'mediumint unsigned'
+                        when ty.typname='int4' then 'int'
+                        when ty.typname='int signed' then 'int signed'
+                        when ty.typname='int unsigned' then 'int unsigned'
+                        when ty.typname='int8' then 'bigint'
+                        when ty.typname='bigint signed' then 'bigint signed'
+                        when ty.typname='bigint unsigned' then 'bigint unsigned'
+                        when ty.typname='varchar' then 'varchar'
+                        when ty.typname='bpchar' then 'char'
+                        when ty.typname='text' then 'text'
+                        when ty.typname='date' then 'date'
+                        when ty.typname='time' then 'time'
+                        when ty.typname='datetime' then 'datetime'
+                        when ty.typname='timestamp' then 'timestamp'
+                        when ty.typname='bit' then 'bit'
+                        when ty.typname='varbit' then 'bit'
+                        when ty.typname='binary' then 'binary'
+                        when ty.typname='varbinary' then 'varbinary'
+                        when ty.typname='tinyblob' then 'tinyblob'
+                        when ty.typname='blob' then 'blob'
+                        when ty.typname='mediumblob' then 'mediumblob'
+                        when ty.typname='longblob' then 'longblob'
+                        when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
+                        when ty.typname='double' then 'double'
+                        when ty.typname='decimal' then 'decimal'
+                        when ty.typname='numeric' then 'decimal'
+                        when ty.typname='real' then 'double'
+                        when ty.typname='year_' then 'year'
+                        else ty.typname
+                    end
+                    from pg_catalog.pg_type ty
+                    where ty.oid = prorettype)
+            else ''
+        end)::varchar(64) as data_type,
+        null::int as CHARACTER_MAXIMUM_LENGTH,
+        null::int as CHARACTER_OCTET_LENGTH,
+        null::bigint as NUMERIC_PRECISION,
+        null::int as NUMERIC_SCALE,
+        null::bigint as DATETIME_PRECISION,
+        null::varchar(64) as CHARACTER_SET_NAME,
+        null::varchar(64) as COLLATION_NAME,
+        (case
+            when pg_proc.prokind = 'f'::text THEN
+                (select
+                    case
+                        when ty.typname='tinyint' then 'tinyint'
+                        when ty.typname='tinyint signed' then 'tinyint signed'
+                        when ty.typname='tinyint unsigned' then 'tinyint unsigned'
+                        when ty.typname='smallint' then 'smallint'
+                        when ty.typname='smallint signed' then 'smallint signed'
+                        when ty.typname='smallint unsigned' then 'smallint unsigned'
+                        when ty.typname='mediumint' then 'mediumint'
+                        when ty.typname='mediumint signed' then 'mediumint signed'
+                        when ty.typname='mediumint unsigned' then 'mediumint unsigned'
+                        when ty.typname='int4' then 'int'
+                        when ty.typname='int signed' then 'int signed'
+                        when ty.typname='int unsigned' then 'int unsigned'
+                        when ty.typname='int8' then 'bigint'
+                        when ty.typname='bigint signed' then 'bigint signed'
+                        when ty.typname='bigint unsigned' then 'bigint unsigned'
+                        when ty.typname='varchar' then 'varchar'
+                        when ty.typname='bpchar' then 'char'
+                        when ty.typname='text' then 'text'
+                        when ty.typname='date' then 'date'
+                        when ty.typname='time' then 'time'
+                        when ty.typname='datetime' then 'datetime'
+                        when ty.typname='timestamp' then 'timestamp'
+                        when ty.typname='bit' then 'bit'
+                        when ty.typname='varbit' then 'bit'
+                        when ty.typname='binary' then 'binary'
+                        when ty.typname='varbinary' then 'varbinary'
+                        when ty.typname='tinyblob' then 'tinyblob'
+                        when ty.typname='blob' then 'blob'
+                        when ty.typname='mediumblob' then 'mediumblob'
+                        when ty.typname='longblob' then 'longblob'
+                        when ty.typname='float8' then 'double'
+            when mysql.left(ty.typname, 5)='float' then 'float'
+                        when ty.typname='double' then 'double'
+                        when ty.typname='decimal' then 'decimal'
+                        when ty.typname='numeric' then 'decimal'
+                        when ty.typname='real' then 'double'
+                        when ty.typname='year_' then 'year'
+                        else ty.typname
+                    end
+                    from pg_catalog.pg_type ty
+                    where ty.oid = prorettype)
+            else ''
+        end)::text as DTD_IDENTIFIER,
+        'SQL'::varchar(8) as ROUTINE_BODY,
+        prosrc::text as ROUTINE_DEFINITION,
+        null::varchar(64) as EXTERNAL_NAME,
+        null::varchar(64) as EXTERNAL_LANGUAGE,
+        'SQL'::varchar(8) as PARAMETER_STYLE,
+        (case
+            when provolatile='i' then 'YES'
+            else 'NO'
+        end)::varchar(3) as IS_DETERMINISTIC,
+        'MODIFIES SQL DATA'::varchar(64) as SQL_DATA_ACCESS,
+        null::varchar(64) as SQL_PATH,
+        'DEFINER'::varchar(7) as SECURITY_TYPE,
+        '2024-1-1'::mysql.datetime as CREATED,
+        '2024-1-1'::mysql.datetime as LAST_ALTERED,
+        'STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION'::varchar(8192) as SQL_MODE,
+        ''::text as ROUTINE_COMMENT,
+        pg_catalog.concat(pg_get_userbyid(proowner), '@%')::varchar(93) as DEFINER,
+        'utf8mb4'::varchar(32) as CHARACTER_SET_CLIENT,
+        'utf8mb4_general_ci'::varchar(32) as COLLATION_CONNECTION,
+        'utf8_general_ci'::varchar(32) as DATABASE_COLLATION
+    from pg_proc
+    where pronamespace not in('pg_catalog'::regnamespace, 'mysql'::regnamespace) and
+          substring(proname from 1 for 21) != 'func_reset_serial_for' and
+          prorettype != 2279;

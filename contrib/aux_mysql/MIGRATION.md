@@ -85,13 +85,28 @@ extension; do not replay the old extension's internal SQL/catalog modifications.
 
 ## Updating an existing OpenHalo 18 installation
 
-Version 1.9 supplies an extension update path from 1.6 through 1.7 and 1.8.
+The released v18.6 tag installs extension 1.5. Version 1.9 supports that real
+upgrade path: 1.5 → 1.6 → 1.7 → 1.8 → 1.9. Versions 1.6–1.8 were not released.
 Install matching OpenHalo kernel and extension binaries, restart, and run this
 through a PostgreSQL connection in the MySQL database:
 
 ```sql
 ALTER EXTENSION aux_mysql UPDATE TO '1.9';
 ```
+
+The update creates missing metadata helpers before replacing their dependent
+views. It preserves the `information_schema.columns.EXTRA` descriptor and user
+views depending on it. Released 1.5 and fresh 1.9 use the C collation there;
+an unreleased 1.6 installation can retain its default collation. That metadata
+column contains fixed ASCII labels; its retained collation is the sole expected
+catalog difference for that historical chain. No user table is rewritten.
+
+`tests/release_real_upgrade.py` initializes with actual v18.6 binaries and 1.5
+SQL, creates application objects over the MySQL protocol, stops the old server,
+starts the same data directory with new binaries, upgrades, and tests existing
+and new sessions. It compares extension functions, casts, operators, operator
+classes, views and view descriptors with a fresh 1.9, then runs AB and Route A
+assertions. See TESTING.md for reproducible build and invocation commands.
 
 The protocol callback and node layouts changed: rebuild the kernel and extension
 together, using `--enable-depend` or a clean build. Do not mix old kernel objects
@@ -153,6 +168,30 @@ rewrite them. Old ICU collations and whole-column/MD5 prefix indexes likewise
 retain their original definitions; create replacement tables/indexes from the
 original MySQL DDL to obtain correct prefix and general_ci/PAD SPACE semantics.
 Resolve newly discovered duplicate keys before replacing the old objects.
+
+For the released 1.5 data directory, explicitly review these four losses:
+
+- **BINARY length:** 1.5 discarded the declaration length; a declared BINARY(4)
+  containing `A` can physically contain only hex `41`. Inventory binary-domain
+  columns and their `atttypmod`, then compare `octet_length`/HEX with the original
+  DDL. After checking every value fits, a reviewed MySQL `ALTER TABLE ... MODIFY
+  b BINARY(4)` installs current padding semantics. The upgrade never guesses the
+  length or pads/truncates old values automatically.
+- **Prefix length:** inspect `pg_get_indexdef` and the authoritative MySQL DDL.
+  Old whole-column/expression indexes cannot reveal a discarded prefix length.
+  Check duplicates under the intended prefix and collation, for example
+  `SELECT LEFT(v,3) COLLATE utf8mb4_general_ci,COUNT(*) FROM t GROUP BY
+  LEFT(v,3) COLLATE utf8mb4_general_ci HAVING COUNT(*)>1`. Resolve collisions,
+  then recreate the reviewed key through MySQL syntax. Preserve the original
+  index until the replacement is validated.
+- **Generated expression:** an ordinary column with NULL or a default is not
+  evidence of its former expression. Use the manifest/audit above and a reviewed
+  MODIFY to rebuild it. The real-upgrade test confirms a discarded `v+1`
+  expression remains an ordinary NULL-valued column until explicitly repaired.
+- **Unchecked foreign keys:** `NOT ENFORCED` declarations and orphan rows from
+  `FOREIGN_KEY_CHECKS=0` survive the update. Run the orphan audit, repair rows
+  according to application rules, then ENFORCE and VALIDATE. Existing orphans
+  must not make extension upgrade fail, and the script must not delete them.
 
 Keep both native and MySQL logical backups and exercise restore before cutover.
 Native dumps must retain extension-managed triggers and aux_mysql security labels.
