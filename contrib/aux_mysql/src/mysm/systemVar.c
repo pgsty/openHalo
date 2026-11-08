@@ -110,6 +110,21 @@ getSystemVariable(PG_FUNCTION_ARGS)
     }
 }
 
+/* SHOW VARIABLES must expose the same live settings as @@variables, with
+ * SHOW's enum spellings (for example ON/OFF), rather than placeholder values. */
+PG_FUNCTION_INFO_V1(mys_show_system_variable);
+Datum
+mys_show_system_variable(PG_FUNCTION_ARGS)
+{
+	char *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *value = NULL;
+
+	if (!getSystemVariableValueForShow(name, PG_GETARG_BOOL(1), &value) ||
+		value == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(value));
+}
+
 
 /*
  * mysql.getenv(name): environment variable of the server process (openHalo

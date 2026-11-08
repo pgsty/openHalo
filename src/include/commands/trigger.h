@@ -260,6 +260,7 @@ extern void ExecASTruncateTriggers(EState *estate,
 								   ResultRelInfo *relinfo);
 
 extern void AfterTriggerBeginXact(void);
+extern bool RI_FKey_check_insert(Relation rel, TupleTableSlot *slot);
 extern void AfterTriggerBeginQuery(void);
 extern void AfterTriggerEndQuery(EState *estate);
 extern void AfterTriggerFireDeferred(void);

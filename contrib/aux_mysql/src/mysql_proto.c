@@ -60,6 +60,7 @@
 #include "utils/varlena.h"
 
 #include "halo_mysql.h"
+#include "mys_fk.h"
 #include "mys_proto.h"
 #include "adapter/mysql/adapter.h"
 #include "adapter/mysql/systemVar.h"
@@ -156,6 +157,7 @@ static bool com_query = false;		/* the command is COM_QUERY */
 static bool trailing_comment_ok = false;	/* an OK follows the last statement */
 static bool trailing_ok_deferred = false;	/* ... of the last queued part */
 static bool last_queued_part = false;	/* running the last queued query */
+static uint64 upsert_deleted;
 static uint64 upsert_rows[MYS_ROW_UNCHANGED + 1];	/* per MysUpsertRow */
 
 static MysStmtInfo *
@@ -406,7 +408,7 @@ mys_status_flags(bool more_results)
 {
 	uint16		status = autoCommit ? SERVER_STATUS_AUTOCOMMIT : 0;
 
-	if (IsTransactionBlock())
+	if (mys_transaction_active())
 	{
 		status |= SERVER_STATUS_IN_TRANS;
 		if (XactReadOnly)
@@ -590,6 +592,8 @@ mys_sqlstate(int sqlerrcode)
 			return "42000";
 		case ERRCODE_MYS_USER_LOCK_DEADLOCK:
 			return "40001";
+		case MYS_ERRCODE_TXN_CHARACTERISTICS:
+			return "25001";
 		default:
 			return PGUNSIXBIT(sqlerrcode) == 'M' ? "42000" : unpack_sql_state(sqlerrcode);
 	}
@@ -1465,6 +1469,8 @@ mys_parse_query(const char *query_string)
 	}
 	stmt_index = 0;
 	cur_insert_id = 0;
+	memset(upsert_rows, 0, sizeof(upsert_rows));
+	upsert_deleted = 0;
 	foreach_ptr(MysStmtInfo, info, stmt_infos)
 	{
 		if (info->suppress_response)
@@ -1475,7 +1481,6 @@ mys_parse_query(const char *query_string)
 			diagnostics_pending = false;
 		break;
 	}
-	mys_flush_rewrite_warnings();
 
 	/* a statement transaction starts now, a START TRANSACTION at execution */
 	if (!IsAbortedTransactionBlockState() &&
@@ -1488,12 +1493,31 @@ mys_parse_query(const char *query_string)
 	return stmts;
 }
 
+/* Count at execution time: RETURNING can be buffered before its receiver
+ * is started.  Only scalar counts live across that boundary. */
+static void
+mys_record_upsert_row(TupleTableSlot *oldslot, TupleTableSlot *newslot, uint64 deleted)
+{
+	uint64 row;
+
+	if (current_stmt_info()->upsert == MYS_UPSERT_NONE)
+		return;
+	row = mys_upsert_row(oldslot, newslot, deleted);
+	if (row <= MYS_ROW_UNCHANGED)
+		upsert_rows[row]++;
+	else
+	{
+		upsert_rows[MYS_ROW_INSERTED]++;
+		upsert_deleted += row - MYS_ROW_UNCHANGED;
+	}
+}
+
 /*
  * MySQL's affected rows of INSERT ... ON DUPLICATE KEY UPDATE / REPLACE: 1
  * per inserted row, 2 per updated or replaced row; a row ON DUPLICATE KEY
  * UPDATE leaves unchanged counts 0, 1 for CLIENT_FOUND_ROWS clients; an
  * identical row REPLACE leaves alone counts 1, 2 when it deletes and
- * inserts.  nprocessed when the rows did not all reach mys_dr_receive().
+ * inserts.  nprocessed is the fallback for statements outside this execution path.
  */
 static uint64
 upsert_affected(MysUpsertKind kind, uint64 nprocessed)
@@ -1501,8 +1525,10 @@ upsert_affected(MysUpsertKind kind, uint64 nprocessed)
 	uint64		inserted = upsert_rows[MYS_ROW_INSERTED];
 	uint64		changed = upsert_rows[MYS_ROW_CHANGED];
 	uint64		unchanged = upsert_rows[MYS_ROW_UNCHANGED];
+	uint64		deleted = upsert_deleted;
 
 	memset(upsert_rows, 0, sizeof(upsert_rows));
+	upsert_deleted = 0;
 	if (inserted + changed + unchanged != nprocessed)
 		return nprocessed;
 	switch (kind)
@@ -1517,7 +1543,7 @@ upsert_affected(MysUpsertKind kind, uint64 nprocessed)
 		default:
 			break;
 	}
-	return inserted + 2 * changed + unchanged;
+	return inserted + 2 * changed + unchanged + deleted;
 }
 
 static void
@@ -1527,6 +1553,8 @@ end_statement(const QueryCompletion *qc)
 	MysStmtInfo *following;
 	bool		more = more_visible_results();
 
+	mys_flush_rewrite_warnings(info->rewrite_warnings);
+	info->rewrite_warnings = NIL;
 	stmt_index++;
 	following = stmt_index < list_length(stmt_infos) ?
 		(MysStmtInfo *) list_nth(stmt_infos, stmt_index) : NULL;
@@ -1630,6 +1658,19 @@ mys_null_command(CommandDest dest)
 }
 #endif
 
+/* NO ACTION uses the same PostgreSQL SQLSTATE on either side of an FK.
+ * message_id is the untranslated primary template, so lc_messages does not
+ * affect the distinction between a missing parent and a referenced parent. */
+static uint16
+mys_error_number(ErrorData *edata)
+{
+	if (edata->sqlerrcode == ERRCODE_FOREIGN_KEY_VIOLATION &&
+		edata->message_id &&
+		strncmp(edata->message_id, "update or delete on table", 24) == 0)
+		return 1451;
+	return mys_errno(edata->sqlerrcode);
+}
+
 static void
 mys_send_message(ErrorData *edata)
 {
@@ -1639,7 +1680,7 @@ mys_send_message(ErrorData *edata)
 	{
 		/* not the warnings of hidden BEGIN / COMMIT statements */
 		if (edata->elevel >= WARNING && !current_stmt_info()->txn_control)
-			mys_record_diagnostic(false, mys_errno(edata->sqlerrcode), edata->message);
+			mys_record_diagnostic(false, mys_error_number(edata), edata->message);
 		return;
 	}
 
@@ -1654,7 +1695,7 @@ mys_send_message(ErrorData *edata)
 		if (at && strcmp(key, edata->constraint_name) != 0)
 			msg = psprintf("%.*s\"%s\"%s", (int) (at - msg), msg, key, at + strlen(pgname));
 	}
-	mys_send_err(mys_errno(edata->sqlerrcode),
+	mys_send_err(mys_error_number(edata),
 				 mys_sqlstate(edata->sqlerrcode), msg);
 	mys_flush();
 	resultset_active = false;
@@ -1666,6 +1707,8 @@ mys_send_message(ErrorData *edata)
 static void
 mys_comm_reset(void)
 {
+	memset(upsert_rows, 0, sizeof(upsert_rows));
+	upsert_deleted = 0;
 	resultset_active = false;
 	discard_queued_queries();
 #ifdef HALO_BABELFISH_API
@@ -1766,11 +1809,19 @@ mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 
 	/* aux_mysql models tinyint, datetime, ... as domains */
 	typid = getBaseTypeAndTypmod(typid, &typmod);
+	if (mys_is_text_string(typid))
+	{
+		*mtype = MYSQL_TYPE_BLOB;
+		*len = typmod >= 0 ? (uint32) typmod : 0xffffffff;
+		*flags = BLOB_FLAG;
+		*charset = MYS_CHARSET_UTF8MB4;
+		return;
+	}
 	if (mys_binary_base_type(typid) != typid)
 	{
-		/* a hexadecimal literal: VARBINARY, as in MySQL */
-		*mtype = MYSQL_TYPE_VAR_STRING;
-		*len = 255;
+		*mtype = mys_is_fixed_binary(typid) && typmod >= 0 ?
+			MYSQL_TYPE_STRING : MYSQL_TYPE_VAR_STRING;
+		*len = typmod >= 0 ? (uint32) typmod : 65535;
 		*flags = BINARY_FLAG;
 		return;
 	}
@@ -1961,7 +2012,7 @@ mys_dr_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 		dr->capture = info->capture_insert_id;
 		dr->captured = false;
 		dr->upsert = info->upsert != MYS_UPSERT_NONE;
-		memset(upsert_rows, 0, sizeof(upsert_rows));
+
 	}
 
 	if (dr->portal && !dr->discard)
@@ -2231,13 +2282,7 @@ mys_dr_receive(TupleTableSlot *slot, DestReceiver *self)
 			lastInsertID = (unsigned long) cur_insert_id;
 			dr->captured = true;
 		}
-		if (dr->upsert && dr->natts > 0 && !slot->tts_isnull[dr->natts - 1])
-		{
-			int32		row = DatumGetInt32(slot->tts_values[dr->natts - 1]);
 
-			if (row >= MYS_ROW_INSERTED && row <= MYS_ROW_UNCHANGED)
-				upsert_rows[row]++;
-		}
 		return true;
 	}
 
@@ -2337,6 +2382,10 @@ const ProtocolExtensionConfig mysql_protocol_config = {
 	.null_command = mys_null_command,
 	.report_param_status = NULL,
 	.comm_reset = mys_comm_reset,
+	.foreign_key_checks = mys_foreign_key_checks,
+	.foreign_key_insert = mys_pending_fk_check_insert,
+	.sequence_write = mys_sequence_write,
+	.on_conflict_row = mys_record_upsert_row,
 };
 
 bool

@@ -96,7 +96,8 @@ any_arg_bytes(FunctionCallInfo fcinfo, int argno, int *len, bool *binary)
 	if (!OidIsValid(type))
 		elog(ERROR, "could not determine the type of argument %d", argno + 1);
 	base = mys_binary_base_type(type);	/* a 0x41 literal: its bytes */
-	*binary = base == BYTEAOID || base == BITOID || base == VARBITOID;
+	*binary = !mys_is_text_string(type) &&
+		(base == BYTEAOID || base == BITOID || base == VARBITOID);
 	if (base == BYTEAOID)
 	{
 		bytea	   *b = PG_GETARG_BYTEA_PP(argno);
@@ -143,7 +144,10 @@ user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag, uint64 *key)
 	if (PG_ARGISNULL(argno))
 		wrong_lock_name("NULL");
 	name = any_arg_bytes(fcinfo, argno, &len, &binary);
-	nchars = binary ? len : pg_mbstrlen_with_len(name, len);
+	/* pg_mbstrlen_with_len() stops at NUL. A MySQL TEXT name does not. */
+	nchars = 0;
+	for (int i = 0; i < len; nchars++)
+		i += binary || name[i] == '\0' ? 1 : pg_mblen(name + i);
 	if (len == 0 || nchars > MYS_LOCK_NAME_CHARS)
 		/* MySQL shows up to 192 bytes of the name */
 		wrong_lock_name(pnstrdup(name, binary ? Min(len, 192) : pg_mbcliplen(name, len, 192)));
@@ -151,15 +155,19 @@ user_lock_tag(FunctionCallInfo fcinfo, int argno, LOCKTAG *tag, uint64 *key)
 	/* lower case: 'Lock' and 'lock' are one lock, 'Straße' is not 'STRASSE' */
 	if (!binary && GetDatabaseEncoding() == PG_UTF8)
 	{
-		size_t		size = (size_t) len * 2 + 1;
-		size_t		n;
+		int n = 0;
 
-		lower = palloc(size);
-		n = unicode_strlower(lower, size, name, len, false);
-		if (n >= size)
+		/* unicode_strlower() also stops at NUL. Simple case conversion is
+		 * one codepoint at a time, including U+0000 and every suffix byte.
+		 * The already checked name has at most 64 characters, four bytes
+		 * each after case conversion. */
+		lower = palloc(nchars * 4);
+		for (int i = 0; i < len; i += pg_utf_mblen((const unsigned char *) name + i))
 		{
-			lower = repalloc(lower, n + 1);
-			n = unicode_strlower(lower, n + 1, name, len, false);
+			pg_wchar code = utf8_to_unicode((const unsigned char *) name + i);
+
+			unicode_to_utf8(unicode_lowercase_simple(code), (unsigned char *) lower + n);
+			n += pg_utf_mblen((const unsigned char *) lower + n);
 		}
 		len = n;
 	}
@@ -188,7 +196,7 @@ timeout_arg(FunctionCallInfo fcinfo, int argno)
 	if (PG_ARGISNULL(argno))
 		return 0;
 	type = getBaseType(get_fn_expr_argtype(fcinfo->flinfo, argno));
-	if (type != BYTEAOID && mys_binary_base_type(type) == BYTEAOID)
+	if (mys_is_hexlit(type))
 		type = BITOID;			/* a 0x0a literal is a number, as a bit string */
 	switch (type)
 	{
@@ -251,28 +259,31 @@ timeout_arg(FunctionCallInfo fcinfo, int argno)
 			{
 				int			len;
 				bool		binary;
-				char	   *s = pnstrdup(any_arg_bytes(fcinfo, argno, &len, &binary), len);
-				const char *p = s;
+				/* Read the length before using it; argument evaluation order
+				 * cannot sequence any_arg_bytes(...,&len) and pnstrdup(...,len).
+				 * Keep an end pointer so NUL suffixes are diagnosed as well. */
+				const char *s = any_arg_bytes(fcinfo, argno, &len, &binary);
+				const char *p = s, *end = s + len;
 				bool		neg = false;
 				bool		digits = false;
 				uint64		v = 0;
 
-				while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
+				while (p < end && (*p == ' ' || (*p >= '\t' && *p <= '\r')))
 					p++;
-				if (*p == '-' || *p == '+')
+				if (p < end && (*p == '-' || *p == '+'))
 					neg = *p++ == '-';
-				for (; *p >= '0' && *p <= '9'; p++)
+				for (; p < end && *p >= '0' && *p <= '9'; p++)
 				{
 					digits = true;
 					if (v <= (uint64) PG_INT64_MAX / 10)
 						v = v * 10 + (*p - '0');
 					else
-						v = (uint64) PG_INT64_MAX + 1;	/* out of range */
+						v = (uint64) PG_INT64_MAX + 1;
 				}
-				while (*p == ' ' || (*p >= '\t' && *p <= '\r'))
+				while (p < end && (*p == ' ' || (*p >= '\t' && *p <= '\r')))
 					p++;
-				if (!digits || *p != '\0')
-					mys_add_warning(1292, psprintf("Truncated incorrect INTEGER value: '%s'", s));
+				if (!digits || p != end)
+					mys_add_warning(1292, "Truncated incorrect INTEGER value for lock timeout");
 				if (v > (uint64) PG_INT64_MAX)
 					return neg ? PG_INT64_MIN : PG_INT64_MAX;
 				return neg ? -(int64) v : (int64) v;

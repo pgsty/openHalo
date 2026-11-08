@@ -2355,6 +2355,8 @@ typedef struct FromExpr
  */
 typedef struct OnConflictExpr
 {
+	pg_node_attr(custom_read_write)
+
 	NodeTag		type;
 	OnConflictAction action;	/* DO NOTHING or UPDATE? */
 
@@ -2369,6 +2371,11 @@ typedef struct OnConflictExpr
 	Node	   *onConflictWhere;	/* qualifiers to restrict UPDATE to */
 	int			exclRelIndex;	/* RT index of 'excluded' relation */
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
+
+	/* Optional trailing serialized fields preserve pre-1.9 stored queries. */
+	bool		allIndexes;
+	bool		replace;		/* delete conflicts before inserting */
+	bool		ignoreFailure;	/* skip rows violating foreign keys */
 } OnConflictExpr;
 
 #endif							/* PRIMNODES_H */

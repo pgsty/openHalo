@@ -43,10 +43,12 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
 #include "halo_mysql.h"
+#include "mys_prefix.h"
 #include "mys_parsenodes.h"
 
 static ResTarget *
@@ -298,6 +300,42 @@ rewrite_select_into_vars(SelectStmt *sel)
 /* GUC mysql.default_collation: collation of string columns without COLLATE */
 char	   *halo_mysql_default_collation = NULL;
 
+/* Scratch list for the raw statement currently being rewritten. Ownership
+ * moves to its MysStmtInfo before rewriting the next statement. */
+static List *rewrite_warnings = NIL;
+
+static void
+queue_rewrite_warning(List **warnings, const char *message)
+{
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	foreach_ptr(char, previous, *warnings)
+		if (strcmp(previous, message) == 0)
+		{
+			MemoryContextSwitchTo(oldcontext);
+			return;
+		}
+	*warnings = lappend(*warnings, pstrdup(message));
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static void
+collation_warning(const char *requested, const char *actual, bool rewriting)
+{
+	MysStmtInfo *info = rewriting ? NULL : mys_current_stmt_info();
+	List	  **warnings;
+	char	   *message;
+
+	if (!rewriting && info == NULL)
+		return;
+	warnings = rewriting ? &rewrite_warnings : &info->rewrite_warnings;
+	message = psprintf("Collation '%s' is approximated by '%s'; comparison, ordering and UNIQUE/ON DUPLICATE KEY behavior may differ",
+					   requested, actual);
+	queue_rewrite_warning(warnings, message);
+	pfree(message);
+}
+
 static CollateClause *
 make_collate_clause(const char *schema, const char *name)
 {
@@ -323,7 +361,8 @@ is_string_column(ColumnDef *col)
 		return false;
 	base = getBaseType(typeTypeId(t));
 	ReleaseSysCache(t);
-	return base == TEXTOID || base == VARCHAROID || base == BPCHAROID;
+	return base == TEXTOID || base == VARCHAROID || base == BPCHAROID ||
+		mys_is_text_string(base);
 }
 
 /* MySQL collation names ending in _ci compare case-insensitively */
@@ -335,29 +374,96 @@ mysql_collation_is_ci(const char *name)
 	return len > 3 && pg_strcasecmp(name + len - 3, "_ci") == 0;
 }
 
+/* Keep the existing, bounded comparison/index implementations. Every
+ * approximation is explicit in the statement diagnostics. In particular,
+ * unicode_ci/520 and language-specific rules are not general_ci aliases. */
+static const char *
+mapped_collation(const char *requested, bool rewriting)
+{
+	bool		ci;
+	const char *actual;
+	bool		exact;
+
+	if (pg_strcasecmp(requested, "case_insensitive") == 0)
+		return mys_prefix_collation_name(false);
+	if (pg_strcasecmp(requested, "case_sensitive") == 0)
+		return mys_prefix_collation_name(true);
+	if (pg_strcasecmp(requested, "ignore_accents") == 0 ||
+		pg_strcasecmp(requested, "default") == 0)
+		return asc_tolower(requested, strlen(requested));
+
+	ci = mysql_collation_is_ci(requested);
+	actual = mys_prefix_collation_name(!ci);
+	exact = ci ?
+		(pg_strcasecmp(requested, "utf8_general_ci") == 0 ||
+		 pg_strcasecmp(requested, "utf8mb4_general_ci") == 0) :
+		(pg_strcasecmp(requested, "utf8_bin") == 0 ||
+		 pg_strcasecmp(requested, "utf8mb4_bin") == 0);
+
+	/* New binaries can precede the 1.9 SQL installation. The old ICU
+	 * collations are fallbacks too, even for a normally exact MySQL name. */
+	if (!exact || strcmp(actual, ci ? "utf8mb4_general_ci" : "utf8mb4_bin") != 0)
+		collation_warning(requested, actual, rewriting);
+	return actual;
+}
+
+/* COLLATE can occur in a SELECT/INSERT/UPDATE expression as well as in a
+ * column definition. The former bypasses mys_rectify_column_collation, so
+ * rewrite it before PostgreSQL tries to resolve the name. */
+static bool
+rewrite_expression_collation(Node *node, void *context)
+{
+	CollateClause *clause;
+	char	   *requested;
+	const char *actual;
+
+	(void) context;
+
+	if (node == NULL)
+		return false;
+	if (!IsA(node, CollateClause))
+		return raw_expression_tree_walker(node, rewrite_expression_collation, context);
+	clause = (CollateClause *) node;
+	if (clause->collname == NIL || !IsA(llast(clause->collname), String))
+		return raw_expression_tree_walker(node, rewrite_expression_collation, context);
+	requested = strVal(llast(clause->collname));
+	if (pg_strcasecmp(requested, "default") == 0)
+	{
+		clause->collname = list_make2(makeString("pg_catalog"), makeString("default"));
+		return raw_expression_tree_walker(node, rewrite_expression_collation, context);
+	}
+	actual = mapped_collation(requested, true);
+	clause->collname = list_make2(makeString("mysql"), makeString(pstrdup(actual)));
+	return raw_expression_tree_walker(node, rewrite_expression_collation, context);
+}
+
+static void
+rewrite_expression_collations(Node *stmt)
+{
+	if (stmt == NULL)
+		return;
+	if (IsA(stmt, CreateTableAsStmt))
+		raw_expression_tree_walker(((CreateTableAsStmt *) stmt)->query,
+								rewrite_expression_collation, NULL);
+	else if (IsA(stmt, ViewStmt))
+		raw_expression_tree_walker(((ViewStmt *) stmt)->query,
+								rewrite_expression_collation, NULL);
+	else if (IsA(stmt, SelectStmt) || IsA(stmt, InsertStmt) ||
+				 IsA(stmt, UpdateStmt) || IsA(stmt, DeleteStmt) || IsA(stmt, MergeStmt))
+		raw_expression_tree_walker(stmt, rewrite_expression_collation, NULL);
+}
+
 /*
- * MySQL compares strings with the column's collation, by default a
- * case-insensitive one (utf8mb4_0900_ai_ci).  Give string columns declared
- * without COLLATE the configured nondeterministic collation (PG18 supports
- * them for =, LIKE, GROUP BY, unique indexes ...).
- */
-/*
- * Map the collation of a MySQL column definition to a PostgreSQL one
- * (openHalo 14.18, rectifyColumnCollate):
- *
- *	COLLATE xxx_ci                 -> mysql.case_insensitive
- *	COLLATE <other> (utf8mb4_bin)  -> mysql.case_sensitive (code point order)
- *	no COLLATE                     -> mysql.default_collation, or
- *	                                  case_sensitive when the table's
- *	                                  COLLATE= is not a _ci collation
- *
- * Collation names shown by SHOW CREATE TABLE (case_insensitive,
- * case_sensitive, ignore_accents, default) are accepted as such, so its
- * output can be replayed.  COLLATE on a non-string column is ignored, as
- * openHalo did.
+ * New MySQL string columns use the dedicated utf8mb4_general_ci collation:
+ * simple MySQL 5.7 weights (case/accent insensitive) with PAD SPACE. The
+ * "case_insensitive" table-label/GUC alias remains replay-compatible. Existing
+ * columns and indexes on the old ICU collation are never changed in place.
+ * Other legacy aliases retain their existing meanings; non-string columns
+ * have no collation. See mys_prefix.c for comparison and LIKE methods.
  */
 void
-mys_rectify_column_collation(ColumnDef *col, const char *table_collation)
+mys_rectify_column_collation(ColumnDef *col, const char *table_collation,
+							 bool rewriting)
 {
 	char	   *name;
 
@@ -379,35 +485,38 @@ mys_rectify_column_collation(ColumnDef *col, const char *table_collation)
 	if (pg_strcasecmp(name, "case_insensitive") == 0 ||
 		pg_strcasecmp(name, "case_sensitive") == 0 ||
 		pg_strcasecmp(name, "ignore_accents") == 0)
-		col->collClause = make_collate_clause("mysql", asc_tolower(name, strlen(name)));
+		col->collClause = make_collate_clause("mysql",
+			pg_strcasecmp(name, "case_insensitive") == 0 ? mys_prefix_collation_name(false) :
+			pg_strcasecmp(name, "case_sensitive") == 0 ? mys_prefix_collation_name(true) :
+			asc_tolower(name, strlen(name)));
 	else if (pg_strcasecmp(name, "default") == 0)
 		col->collClause = make_collate_clause("pg_catalog", "default");
-	else if (mysql_collation_is_ci(name))
-		col->collClause = make_collate_clause("mysql", "case_insensitive");
 	else
-		col->collClause = make_collate_clause("mysql", "case_sensitive");
+		col->collClause = make_collate_clause("mysql", mapped_collation(name, rewriting));
 }
 
 /* table-level COLLATE=: case-insensitive unless a non-_ci collation is given */
 static const char *
 table_collation_name(List *options)
 {
+	const char *name = halo_mysql_default_collation && halo_mysql_default_collation[0] ?
+		halo_mysql_default_collation : "default";
+
 	foreach_node(DefElem, d, options)
 	{
 		if (strcmp(d->defname, "collate") == 0 && d->arg && IsA(d->arg, List))
 		{
-			char *name = strVal(llast((List *) d->arg));
-
-			if (pg_strcasecmp(name, "case_insensitive") == 0 ||
-				pg_strcasecmp(name, "case_sensitive") == 0 ||
-				pg_strcasecmp(name, "ignore_accents") == 0 ||
-				pg_strcasecmp(name, "default") == 0)
-				return asc_tolower(name, strlen(name));
-			return mysql_collation_is_ci(name) ? "case_insensitive" : "case_sensitive";
+			name = strVal(llast((List *) d->arg));
+			break;
 		}
 	}
-	return halo_mysql_default_collation && halo_mysql_default_collation[0] ?
-		halo_mysql_default_collation : "default";
+	if (pg_strcasecmp(name, "case_insensitive") == 0 ||
+		pg_strcasecmp(name, "case_sensitive") == 0 ||
+		pg_strcasecmp(name, "ignore_accents") == 0 ||
+		pg_strcasecmp(name, "default") == 0)
+		return asc_tolower(name, strlen(name));
+	(void) mapped_collation(name, true);
+	return mysql_collation_is_ci(name) ? "case_insensitive" : "case_sensitive";
 }
 
 /*
@@ -546,30 +655,22 @@ make_identity_column(ColumnDef *col, Constraint *c)
 static Node *int_const(int32 v);
 
 /*
- * Warnings found while rewriting: the diagnostics area is reset after the
- * packet is rewritten (it depends on whether it is SHOW WARNINGS), so they
- * are kept here until mys_flush_rewrite_warnings().
+ * Warnings are emitted with their statement's result, after execution. Raw
+ * rewriting can visit later statements before earlier ones have even run.
  */
-static List *rewrite_warnings = NIL;
-
-static void
-add_rewrite_warning(const char *message)
-{
-	rewrite_warnings = lappend(rewrite_warnings, pstrdup(message));
-}
-
 void
-mys_flush_rewrite_warnings(void)
+mys_flush_rewrite_warnings(List *warnings)
 {
-	foreach_ptr(char, message, rewrite_warnings)
+	foreach_ptr(char, message, warnings)
 		mys_add_warning(1105, message);
-	rewrite_warnings = NIL;
+	list_free_deep(warnings);
 }
 
 /* a statement rewritten only to describe it (COM_STMT_PREPARE) */
 void
 mys_discard_rewrite_warnings(void)
 {
+	list_free_deep(rewrite_warnings);
 	rewrite_warnings = NIL;
 }
 
@@ -607,9 +708,8 @@ key_column_type(const char *name, List *coldefs, Oid relid, Oid *typid, int32 *t
 }
 
 /*
- * pg_catalog.left(col, n) / pg_catalog.substr(col, 1, n): the prefix of a
- * column; digest: its pg_catalog.md5(), for UNIQUE BLOB prefixes that may not
- * fit a btree entry together (MySQL allows 3072 bytes).
+ * Legacy expression-index description, retained for reading pre-1.9 indexes.
+ * With the 1.9 SQL installed, new DDL uses mysql_prefix on original columns.
  */
 static Node *
 prefix_expr(const char *column, bool bytes, int length, bool digest)
@@ -619,7 +719,7 @@ prefix_expr(const char *column, bool bytes, int length, bool digest)
 
 	ref->fields = list_make1(makeString(pstrdup(column)));
 	ref->location = -1;
-	prefix = (Node *) makeFuncCall(list_make2(makeString("pg_catalog"),
+	prefix = (Node *) makeFuncCall(list_make2(makeString(bytes ? "pg_catalog" : "mysql"),
 											  makeString(bytes ? "substr" : "left")),
 								   bytes ? list_make3(ref, int_const(1), int_const(length)) :
 								   list_make2(ref, int_const(length)),
@@ -630,30 +730,11 @@ prefix_expr(const char *column, bool bytes, int length, bool digest)
 								 list_make1(prefix), COERCE_EXPLICIT_CALL, -1);
 }
 
-/*
- * MySQL prefix key parts, col(n), marked by the grammar.  A btree entry holds
- * ~2.7kB, so a key must not index whole values of a "long" column (TEXT,
- * BLOB, VARCHAR / CHAR over 600 characters), or a long value would fail an
- * INSERT that MySQL accepts:
- *
- * - A non-unique key starting with a long column, prefixed or (TEXT / BLOB,
- *   where MySQL wants a prefix) not, becomes a hash index on that column: it
- *   serves = lookups on it, as the key did.  Other long parts become
- *   left(col, n), the n of all of them together at most 600 characters.
- * - A UNIQUE key enforces the prefix of a long column as MySQL does, on
- *   left(col, n) (ON DUPLICATE KEY infers it as its arbiter); when the
- *   prefixes of a key may exceed 2000 bytes together, its BLOB prefixes are
- *   compared by MD5 (text keeps its collation's comparison).  When the key starts with one, the
- *   column is returned: the caller adds a hash index on it for = lookups,
- *   which left(col, n) cannot serve.
- * - Values of other columns fit an entry, and they are indexed whole: lookups
- *   and foreign keys keep using the key, but a UNIQUE or PRIMARY KEY prefix
- *   shorter than the column then accepts rows that differ only after it; a
- *   warning says so.  A PRIMARY KEY, which cannot have expressions, is
- *   always indexed whole.
- */
+/* Until the SQL upgrade installs the AM and every required opclass, preserve
+ * the previous release's storage strategy and warnings. This compatibility
+ * path is not a repair or migration of pre-1.9 indexes. */
 static char *
-prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
+legacy_prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
 				 Oid relid, List *coldefs)
 {
 	int			nparts = list_length(*params);
@@ -683,11 +764,16 @@ prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
 		if (ie->name && key_column_type(ie->name, coldefs, relid, &typid, &typmod))
 		{
 			base[i] = getBaseTypeAndTypmod(typid, &typmod);
+			if (mys_is_text_string(base[i]))
+				base[i] = TEXTOID;
+			else
+				base[i] = mys_binary_base_type(base[i]);
 			is_long[i] = base[i] == TEXTOID || base[i] == BYTEAOID ||
 				((base[i] == VARCHAROID || base[i] == BPCHAROID) &&
 				 (typmod < (int32) VARHDRSZ || typmod - VARHDRSZ > 600));
 			/* a prefix as long as the column is the whole column */
-			if (typmod >= (int32) VARHDRSZ && length[i] >= typmod - VARHDRSZ)
+			if ((base[i] == VARCHAROID || base[i] == BPCHAROID) &&
+				typmod >= (int32) VARHDRSZ && length[i] >= typmod - VARHDRSZ)
 				length[i] = -1;
 		}
 		if (is_long[i] && (length[i] > 0 ||
@@ -698,7 +784,7 @@ prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
 			unique_bytes += base[i] == BYTEAOID ? length[i] : length[i] * 4;
 		i++;
 	}
-	if (access_method && strcmp(*access_method, DEFAULT_INDEX_TYPE) != 0)
+	if (access_method && *access_method && strcmp(*access_method, DEFAULT_INDEX_TYPE) != 0)
 		return NULL;
 
 	i = 0;
@@ -712,8 +798,13 @@ prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
 		if (!cut || (unique && primary))
 		{
 			if (unique && n > 0)
-				add_rewrite_warning(psprintf("prefix of unique key part \"%s\" is enforced on the whole column",
-											 ie->name));
+				{
+					char *message = psprintf("prefix of unique key part \"%s\" is enforced on the whole column",
+													 ie->name);
+
+					queue_rewrite_warning(&rewrite_warnings, message);
+					pfree(message);
+				}
 			continue;
 		}
 		if (!unique && i == 1 && access_method)
@@ -738,8 +829,120 @@ prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
 	return lookup;
 }
 
+/* Upper bound of the stored datum, including its varlena header. Domains
+ * inherit their base typmod. MySQL binary_n/varbinary_n/text_string typmods
+ * are byte counts; PostgreSQL varchar/bpchar typmods are characters + 4. */
+static int64
+key_column_max_bytes(Oid typid, int32 typmod)
+{
+	Oid base = getBaseTypeAndTypmod(typid, &typmod);
+	int16 len = get_typlen(base);
+
+	if (len > 0)
+		return len;
+	if (base == VARCHAROID || base == BPCHAROID)
+		return typmod >= VARHDRSZ ? (int64) (typmod - VARHDRSZ) * 4 + VARHDRSZ : -1;
+	if (base != BYTEAOID && mys_binary_base_type(base) == BYTEAOID)
+		return typmod >= 0 ? (int64) typmod + VARHDRSZ : -1;
+	return type_maximum_size(base, typmod);
+}
+
 /*
- * A key part prefix_key_parts() made: pg_catalog.left(col, n) or
+ * Keep every key part and its declared length. mysql_prefix stores ordered
+ * candidate keys and compares the complete original prefixes on the heap.
+ * Lengths are index options so PostgreSQL can retain real PRIMARY/UNIQUE
+ * constraints (including NOT NULL) while transforming IndexElems to names.
+ * Zero denotes an unprefixed column. Short full-column keys stay native
+ * btree so ORDER BY/LIMIT and index-only scans retain their normal plans.
+ * A quarter-page budget, including per-datum alignment and tuple overhead,
+ * leaves headroom below btree's one-third-page limit for all compound parts.
+ */
+static char *
+prefix_key_parts(List **params, bool unique, bool primary, char **access_method,
+				 List **options, Oid relid, List *coldefs)
+{
+	bool needed = false;
+	int64 key_bytes = 32;        /* index tuple header and maximum null bitmap */
+	StringInfoData lengths;
+
+	if (access_method && *access_method &&
+		strcmp(*access_method, DEFAULT_INDEX_TYPE) != 0 &&
+		strcmp(*access_method, MYS_PREFIX_AM) != 0)
+		return NULL;
+	/* Check before consuming prefix markers: a mixed-version server must
+	 * still run the old rewrite if SQL objects/types are not installed yet. */
+	if (!mys_prefix_available())
+		return legacy_prefix_key_parts(params, unique, primary, access_method, relid, coldefs);
+	foreach_node(IndexElem, ie, *params)
+	{
+		Oid typid;
+		int32 typmod = -1;
+		if (ie->name && key_column_type(ie->name, coldefs, relid, &typid, &typmod) &&
+			!mys_prefix_type_available(typid))
+			return legacy_prefix_key_parts(params, unique, primary, access_method, relid, coldefs);
+	}
+	initStringInfo(&lengths);
+	foreach_node(IndexElem, ie, *params)
+	{
+		DefElem *prefix = NULL;
+		Oid typid;
+		int32 typmod = -1;
+		int n = 0;
+
+		foreach_node(DefElem, opt, ie->opclassopts)
+			if (strcmp(opt->defname, "mysql_prefix") == 0)
+				prefix = opt;
+		if (prefix)
+		{
+			n = intVal(prefix->arg);
+			ie->opclassopts = list_delete_ptr(ie->opclassopts, prefix);
+			needed = true;
+		}
+		if (ie->name && key_column_type(ie->name, coldefs, relid, &typid, &typmod))
+		{
+			int64 width = key_column_max_bytes(typid, typmod);
+			if (width < 0)
+				needed = true;
+			else
+				key_bytes += MAXALIGN(width);
+		}
+		else
+			needed = true;
+		if (lengths.len) appendStringInfoChar(&lengths, ',');
+		appendStringInfo(&lengths, "%d", n);
+		/* MySQL 5.7 accepts ASC/DESC syntax but stores ascending keys. */
+		ie->ordering = SORTBY_DEFAULT;
+		ie->nulls_ordering = SORTBY_NULLS_DEFAULT;
+	}
+	if (needed || key_bytes > BLCKSZ / 4)
+	{
+		if (access_method) *access_method = MYS_PREFIX_AM;
+		*options = lappend(*options, makeDefElem("prefix_lengths",
+							(Node *) makeString(lengths.data), -1));
+	}
+	return NULL;
+}
+
+/* Column-level UNIQUE/PRIMARY must use the same total-width decision as
+ * table-level constraints, including when ALTER TABLE adds the column. */
+static void
+prefix_column_constraint(ColumnDef *col, Constraint *constraint)
+{
+	IndexElem *key;
+	List *keys;
+
+	if (constraint->contype != CONSTR_PRIMARY && constraint->contype != CONSTR_UNIQUE)
+		return;
+	key = makeNode(IndexElem);
+	key->name = col->colname;
+	keys = list_make1(key);
+	(void) prefix_key_parts(&keys, true, constraint->contype == CONSTR_PRIMARY,
+						   &constraint->access_method, &constraint->options,
+						   InvalidOid, list_make1(col));
+}
+
+/*
+ * A legacy key part (before 1.9): pg_catalog.left(col, n) or
  * pg_catalog.substr(col, 1, n) of an index expression, or its md5()
  * (*digest).
  */
@@ -1327,7 +1530,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 	List	   *generated = NIL;
 	Constraint *identity = NULL;
 	ListCell   *lc;
-	const char *table_collation = table_collation_name(stmt->options);
+	const char *table_collation = NULL;
 	KeyNamer	kn;
 	RangeVar   *like = NULL;
 
@@ -1347,6 +1550,8 @@ rewrite_create_stmt(CreateStmt *stmt)
 								makeDefElem("generated_like",
 											(Node *) copyObject(((TableLikeClause *) elt)->relation), -1));
 		}
+	if (table_collation == NULL)
+		table_collation = table_collation_name(stmt->options);
 
 	foreach(lc, stmt->tableElts)
 	{
@@ -1361,7 +1566,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 
 			if (kind)
 				generated = lappend(generated, kind);
-			mys_rectify_column_collation(col, table_collation);
+			mys_rectify_column_collation(col, table_collation, true);
 			fold_column_default(col);
 			foreach(lc2, col->constraints)
 			{
@@ -1399,7 +1604,12 @@ rewrite_create_stmt(CreateStmt *stmt)
 				{
 					/* UNIQUE / PRIMARY KEY of the column */
 					if (IsA(n, Constraint))
-						name_key_constraint(&kn, (Constraint *) n, col->colname);
+					{
+						Constraint *c = (Constraint *) n;
+
+						name_key_constraint(&kn, c, col->colname);
+						prefix_column_constraint(col, c);
+					}
 					cons = lappend(cons, n);
 				}
 			}
@@ -1418,7 +1628,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 
 			name_key_constraint(&kn, c, NULL);
 			if (c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE)
-				lookup = prefix_key_parts(&c->keys, true, c->contype == CONSTR_PRIMARY, NULL,
+				lookup = prefix_key_parts(&c->keys, true, c->contype == CONSTR_PRIMARY, &c->access_method, &c->options,
 										  InvalidOid, stmt->tableElts);
 			if (normalize_index_constraint(c, stmt->relation, &indexes))
 				elts = lappend(elts, elt);
@@ -1431,7 +1641,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 	foreach_ptr(Node, n, indexes)
 		if (IsA(n, IndexStmt) && !((IndexStmt *) n)->unique)
 			prefix_key_parts(&((IndexStmt *) n)->indexParams, false, false,
-							 &((IndexStmt *) n)->accessMethod, InvalidOid, stmt->tableElts);
+							 &((IndexStmt *) n)->accessMethod, &((IndexStmt *) n)->options, InvalidOid, stmt->tableElts);
 	indexes = add_lookup_indexes(indexes, lookups, &kn);
 	stmt->tableElts = elts;
 
@@ -1592,7 +1802,12 @@ rewrite_alter_table(AlterTableStmt *stmt)
 				{
 					/* UNIQUE / PRIMARY KEY of the column */
 					if (IsA(n, Constraint))
-						name_key_constraint(&kn, (Constraint *) n, col->colname);
+					{
+						Constraint *c = (Constraint *) n;
+
+						name_key_constraint(&kn, c, col->colname);
+						prefix_column_constraint(col, c);
+					}
 					cons = lappend(cons, n);
 				}
 			}
@@ -1608,14 +1823,14 @@ rewrite_alter_table(AlterTableStmt *stmt)
 			{
 				IndexStmt  *idx = (IndexStmt *) make_index_stmt(stmt->relation, c);
 
-				prefix_key_parts(&idx->indexParams, false, false, &idx->accessMethod,
+				prefix_key_parts(&idx->indexParams, false, false, &idx->accessMethod, &idx->options,
 								 RangeVarGetRelid(stmt->relation, NoLock, true),
 								 alter_added_columns(stmt));
 				indexes = lappend(indexes, idx);
 				continue;
 			}
 			if (c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE)
-				lookup = prefix_key_parts(&c->keys, true, c->contype == CONSTR_PRIMARY, NULL,
+				lookup = prefix_key_parts(&c->keys, true, c->contype == CONSTR_PRIMARY, &c->access_method, &c->options,
 										  RangeVarGetRelid(stmt->relation, NoLock, true),
 										  alter_added_columns(stmt));
 			if (lookup)
@@ -1797,7 +2012,7 @@ binary_value(Node *val, Form_pg_attribute att)
 	char	   *hex;
 	TypeCast   *tc;
 
-	if (!is_backslash_literal(val) || getBaseType(att->atttypid) != BYTEAOID)
+	if (!is_backslash_literal(val) || mys_binary_base_type(att->atttypid) != BYTEAOID)
 		return val;
 	s = strVal(&c->val);
 	len = strlen(s);
@@ -1928,115 +2143,6 @@ name_in_list(List *names, const char *name)
 			return true;
 	}
 	return false;
-}
-
-/*
- * Pick the unique index MySQL would most likely hit: the primary key if all
- * its columns are supplied, else the first unique index whose columns are
- * all supplied, else the primary key, else the first unique index (a
- * column's default value can be a duplicate too).  A prefix key part counts
- * as its column; other expressions make an index unusable.  *nkeys is
- * incremented by the number of usable indexes.
- */
-static Oid
-choose_arbiter_index(Relation rel, List *insert_cols, int *nkeys)
-{
-	List	   *indexes = RelationGetIndexList(rel);
-	Oid			pk = InvalidOid;
-	Oid			covered = InvalidOid;
-	Oid			first = InvalidOid;
-	ListCell   *lc;
-
-	foreach(lc, indexes)
-	{
-		Oid			indexoid = lfirst_oid(lc);
-		Relation	idx = index_open(indexoid, AccessShareLock);
-		Form_pg_index form = idx->rd_index;
-		bool		usable = form->indisunique && form->indimmediate &&
-			heap_attisnull(idx->rd_indextuple, Anum_pg_index_indpred, NULL);
-		bool		all = usable;
-		List	   *exprs = usable ? RelationGetIndexExpressions(idx) : NIL;
-		ListCell   *expr = list_head(exprs);
-
-		for (int i = 0; usable && i < form->indnkeyatts; i++)
-		{
-			AttrNumber	attnum = form->indkey.values[i];
-			int			length;
-			bool		bytes;
-			bool		digest;
-
-			if (attnum == 0 && expr != NULL)
-			{
-				if (!mys_index_prefix(lfirst(expr), &attnum, &length, &bytes, &digest))
-					attnum = 0;
-				expr = lnext(exprs, expr);
-			}
-			if (attnum <= 0)
-			{
-				usable = all = false;
-				break;
-			}
-			if (insert_cols != NIL &&
-				!name_in_list(insert_cols, get_attname(RelationGetRelid(rel), attnum, false)))
-				all = false;
-		}
-		if (usable)
-			(*nkeys)++;
-		if (usable && form->indisprimary)
-			pk = indexoid;
-		if (usable && !OidIsValid(first))
-			first = indexoid;
-		if (all && (!OidIsValid(covered) || form->indisprimary))
-			covered = indexoid;
-		index_close(idx, AccessShareLock);
-	}
-	return OidIsValid(covered) ? covered : OidIsValid(pk) ? pk : first;
-}
-
-/*
- * The arbiter clause for a unique index of rel: its constraint, or (always
- * when by_columns: an index copied from rel) its columns and prefix key
- * parts.
- */
-static InferClause *
-make_infer_clause(Relation rel, Oid indexoid, bool by_columns)
-{
-	InferClause *infer = makeNode(InferClause);
-	Oid			conoid = by_columns ? InvalidOid : get_index_constraint(indexoid);
-
-	infer->location = -1;
-	if (OidIsValid(conoid))
-		infer->conname = get_constraint_name(conoid);
-	else
-	{
-		Relation	idx = index_open(indexoid, AccessShareLock);
-		List	   *exprs = RelationGetIndexExpressions(idx);
-		ListCell   *expr = list_head(exprs);
-
-		for (int i = 0; i < idx->rd_index->indnkeyatts; i++)
-		{
-			IndexElem  *ie = makeNode(IndexElem);
-			AttrNumber	attnum = idx->rd_index->indkey.values[i];
-			int			length;
-			bool		bytes;
-			bool		digest;
-
-			/* a prefix key part (choose_arbiter_index() took no other expression) */
-			if (attnum == 0 && mys_index_prefix(lfirst(expr), &attnum, &length, &bytes, &digest))
-			{
-				ie->expr = prefix_expr(get_attname(RelationGetRelid(rel), attnum, false),
-									   bytes, length, digest);
-				expr = lnext(exprs, expr);
-			}
-			else
-				ie->name = get_attname(RelationGetRelid(rel), attnum, false);
-			ie->ordering = SORTBY_DEFAULT;
-			ie->nulls_ordering = SORTBY_NULLS_DEFAULT;
-			infer->indexElems = lappend(infer->indexElems, ie);
-		}
-		index_close(idx, AccessShareLock);
-	}
-	return infer;
 }
 
 /*
@@ -2216,42 +2322,6 @@ remember_alter_table(AlterTableStmt *stmt, List *extra)
 	add_batch_indexes(bt, extra);
 }
 
-/* choose_arbiter_index() for a batch table */
-static InferClause *
-batch_infer_clause(BatchTable *bt, List *insert_cols)
-{
-	List	   *key = NIL;
-	List	   *keys = bt->uniques;
-	InferClause *infer;
-
-	if (bt->primary)
-		keys = lcons(bt->primary, list_copy(keys));
-	foreach_ptr(List, elems, keys)
-	{
-		bool		all = true;
-
-		foreach_node(IndexElem, ie, elems)
-		{
-			if (insert_cols != NIL &&
-				!name_in_list(insert_cols, ie->name ? ie->name : ie->indexcolname))
-				all = false;
-		}
-		if (all)
-		{
-			key = elems;
-			break;
-		}
-	}
-	if (key == NIL && keys != NIL)
-		key = linitial(keys);
-	if (key == NIL)
-		return NULL;
-	infer = makeNode(InferClause);
-	infer->indexElems = copyObject(key);
-	infer->location = -1;
-	return infer;
-}
-
 /*
  * ON DUPLICATE KEY UPDATE: a column name alone is the existing row's column
  * (VALUES(col), the new row's, is already EXCLUDED.col), which PostgreSQL
@@ -2277,192 +2347,49 @@ qualify_upsert_columns(Node *node, void *refname)
 	return raw_expression_tree_walker(node, qualify_upsert_columns, refname);
 }
 
-#define UPSERT_OLD	"aux_mysql_old_row"
-#define UPSERT_NEW	"aux_mysql_new_row"
-
-/*
- * The hidden RETURNING column that tells a MysUpsertRow: no old row means
- * an inserted row; otherwise the assigned columns changed or not, compared
- * byte for byte as MySQL compares records ('a' -> 'A' changes a row under a
- * case-insensitive collation).  Only the assigned columns are compared, and
- * read: an ON UPDATE CURRENT_TIMESTAMP column moves only when another one
- * changes (mys_on_update_trigger()).
- */
+/* The executor reports the final physical row, including BEFORE triggers.
+ * Keeping this hidden RETURNING free of column references avoids granting
+ * SELECT on otherwise unreadable columns just to obtain an affected count. */
 static ReturningClause *
-upsert_returning(List *targets)
+upsert_returning(void)
 {
 	ReturningClause *rc = makeNode(ReturningClause);
-	ReturningOption *o = makeNode(ReturningOption);
-	ReturningOption *n = makeNode(ReturningOption);
-	CaseExpr   *kind = makeNode(CaseExpr);
-	CaseWhen   *inserted = makeNode(CaseWhen);
-	NullTest   *noold = makeNode(NullTest);
-	RowExpr    *oldrow = makeNode(RowExpr);
-	RowExpr    *newrow = makeNode(RowExpr);
 
-	o->option = RETURNING_OPTION_OLD;
-	o->value = UPSERT_OLD;
-	o->location = -1;
-	n->option = RETURNING_OPTION_NEW;
-	n->value = UPSERT_NEW;
-	n->location = -1;
-
-	noold->arg = (Expr *) make_colref(UPSERT_OLD, "ctid");
-	noold->nulltesttype = IS_NULL;
-	noold->location = -1;
-	inserted->expr = (Expr *) noold;
-	inserted->result = (Expr *) int_const(MYS_ROW_INSERTED);
-	inserted->location = -1;
-	kind->args = list_make1(inserted);
-	kind->defresult = (Expr *) int_const(MYS_ROW_UNCHANGED);
-	kind->location = -1;
-
-	foreach_node(ResTarget, rt, targets)
-	{
-		oldrow->args = lappend(oldrow->args, make_colref(UPSERT_OLD, pstrdup(rt->name)));
-		newrow->args = lappend(newrow->args, make_colref(UPSERT_NEW, pstrdup(rt->name)));
-	}
-	if (oldrow->args != NIL)
-	{
-		CaseWhen   *changed = makeNode(CaseWhen);
-
-		oldrow->row_format = newrow->row_format = COERCE_EXPLICIT_CALL;
-		oldrow->location = newrow->location = -1;
-		changed->expr = (Expr *) makeFuncCall(list_make2(makeString("pg_catalog"),
-														 makeString("record_image_ne")),
-											  list_make2(oldrow, newrow),
-											  COERCE_EXPLICIT_CALL, -1);
-		changed->result = (Expr *) int_const(MYS_ROW_CHANGED);
-		changed->location = -1;
-		kind->args = lappend(kind->args, changed);
-	}
-
-	rc->options = list_make2(o, n);
-	rc->exprs = list_make1(make_target(NULL, (Node *) kind));
+	rc->exprs = list_make1(make_target(NULL, int_const(0)));
 	return rc;
 }
 
-/* a row DELETE trigger, such as a foreign key's: MySQL's REPLACE deletes */
-static bool
-has_delete_triggers(Relation rel)
-{
-	return rel->trigdesc &&
-		(rel->trigdesc->trig_delete_before_row || rel->trigdesc->trig_delete_after_row);
-}
-
-/*
- * ON DUPLICATE KEY UPDATE / REPLACE: PostgreSQL's ON CONFLICT DO UPDATE
- * needs the unique index that finds the duplicate.  A table without a
- * PRIMARY KEY or UNIQUE key cannot have one, and MySQL simply inserts: so
- * does the statement, without its ON CONFLICT clause.  rel is NULL when the
- * catalog does not show the table; bt describes it when the batch creates
- * it.  With info, a hidden RETURNING tells inserted, updated and unchanged
- * rows apart for the affected rows (info->upsert).
- */
 static void
 rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt,
 			   MysStmtInfo *info)
 {
 	OnConflictClause *oc = stmt->onConflictClause;
-	List	   *columns = NIL;
-	bool		replace;
-	bool		mysql_form;
-	int			nkeys = 0;
-	bool		deletes = false;
+	bool replace;
 
-	if (oc == NULL ||
-		(oc->action != ONCONFLICT_UPDATE && (int) oc->action != (int) ONCONFLICT_REPLACE))
+	if (oc == NULL || oc->infer != NULL || oc->whereClause != NULL ||
+		(oc->action != ONCONFLICT_UPDATE &&
+		 (int) oc->action != (int) ONCONFLICT_REPLACE))
 		return;
 	replace = (int) oc->action == (int) ONCONFLICT_REPLACE;
-	oc->action = ONCONFLICT_UPDATE;
-	/* not PostgreSQL's ON CONFLICT (...) DO UPDATE ... [WHERE] */
-	mysql_form = oc->infer == NULL && oc->whereClause == NULL;
+	oc->allIndexes = true;
+	oc->replace = replace;
+	oc->action = replace ? ONCONFLICT_NOTHING : ONCONFLICT_UPDATE;
 
-	if (mysql_form && !replace)
+	if (replace)
+		oc->targetList = NIL;
+	else
 	{
-		char	   *refname = stmt->relation->alias ? stmt->relation->alias->aliasname
+		char *refname = stmt->relation->alias ? stmt->relation->alias->aliasname
 			: stmt->relation->relname;
 
 		foreach_node(ResTarget, rt, oc->targetList)
 			qualify_upsert_columns(rt->val, refname);
 	}
-
-	if (bt && bt->known && !OidIsValid(bt->like))
+	if (info)
 	{
-		if (oc->infer == NULL)
-			oc->infer = batch_infer_clause(bt, insert_cols);
-		columns = bt->columns;
-		nkeys = (bt->primary != NIL) + list_length(bt->uniques);
-	}
-	else
-	{
-		/* the catalog's table, or the one a batch table copies */
-		Relation	keys = bt && bt->known ? relation_open(bt->like, AccessShareLock) : rel;
-
-		if (keys)
-		{
-			TupleDesc	tupdesc = RelationGetDescr(keys);
-			Oid			arbiter = choose_arbiter_index(keys, insert_cols, &nkeys);
-
-			if (oc->infer == NULL && OidIsValid(arbiter))
-				oc->infer = make_infer_clause(keys, arbiter, keys != rel);
-			for (int i = 0; i < tupdesc->natts; i++)
-			{
-				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-
-				if (!att->attisdropped && !att->attgenerated)
-					columns = lappend(columns, pstrdup(NameStr(att->attname)));
-			}
-			if (keys != rel)
-				relation_close(keys, NoLock);
-			else
-				deletes = has_delete_triggers(rel);
-		}
-	}
-
-	if (oc->infer == NULL)
-	{
-		/* no unique key: no row is a duplicate */
-		stmt->onConflictClause = NULL;
-		return;
-	}
-	if (replace)
-	{
-		/*
-		 * REPLACE deletes the duplicate and inserts the new row: every column
-		 * takes the new row's value, also one the statement does not list.
-		 * excluded is that row as the INSERT built it, with column defaults
-		 * (the new AUTO_INCREMENT value when the duplicate is in another key)
-		 * and BEFORE INSERT triggers applied; DEFAULT would draw a second
-		 * AUTO_INCREMENT value.  Generated columns are computed again.  As
-		 * every column is assigned (update_cols), ON UPDATE CURRENT_TIMESTAMP
-		 * leaves the new row's values alone.
-		 */
-		oc->targetList = NIL;
-		foreach_ptr(char, name, columns)
-		{
-			oc->targetList = lappend(oc->targetList,
-									 make_target(pstrdup(name),
-												 make_colref("excluded", pstrdup(name))));
-		}
-	}
-
-	if (info && mysql_form)
-	{
-		stmt->returningClause = upsert_returning(oc->targetList);
-		/*
-		 * MySQL's REPLACE leaves an identical row alone (1 affected row)
-		 * only when it found the row by the table's last unique key and no
-		 * foreign key or DELETE trigger needs a DELETE.  An identical row is
-		 * a duplicate in every unique key, the first one found: so that is
-		 * a table with a single unique key.
-		 */
-		if (!replace)
-			info->upsert = MYS_UPSERT_UPDATE;
-		else if (nkeys > 1 || deletes)
-			info->upsert = MYS_UPSERT_REPLACE_DELETE;
-		else
-			info->upsert = MYS_UPSERT_REPLACE;
+		stmt->returningClause = upsert_returning();
+		stmt->returningInternal = true;
+		info->upsert = replace ? MYS_UPSERT_REPLACE : MYS_UPSERT_UPDATE;
 	}
 }
 
@@ -2521,6 +2448,7 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 											  make_colref(NULL, pstrdup(NameStr(att->attname)))),
 								  rc->exprs);
 				stmt->returningClause = rc;
+				stmt->returningInternal = true;
 				info->capture_insert_id = true;
 				break;
 			}
@@ -2572,12 +2500,14 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 			}
 		}
 		mys_txn_classify(rs->stmt, info);
+		rs->stmt = mys_rewrite_show_create(rs->stmt);
 
 		/* CREATE TABLE ... AS / CREATE VIEW: a literal 0x.. column is VARBINARY */
 		if (IsA(rs->stmt, CreateTableAsStmt))
 			mys_hexlit_columns_binary(((CreateTableAsStmt *) rs->stmt)->query);
 		else if (IsA(rs->stmt, ViewStmt))
 			mys_hexlit_columns_binary(((ViewStmt *) rs->stmt)->query);
+		rewrite_expression_collations(rs->stmt);
 
 		switch ((int) nodeTag(rs->stmt))
 		{
@@ -2662,6 +2592,7 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 				{
 					InsertStmt *ins = (InsertStmt *) rs->stmt;
 
+					info->ignore = ins->onConflictClause && ins->onConflictClause->ignoreFailure;
 					rewrite_insert_stmt(ins, info);
 					info->is_write = true;
 					if (ins->onConflictClause)
@@ -2688,7 +2619,7 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 					name_key(&kn, idx->idxname, first_key_column(idx->indexParams),
 							 &idx->idxname, &idx->options);
 					lookup = prefix_key_parts(&idx->indexParams, idx->unique, false,
-											  &idx->accessMethod,
+											  &idx->accessMethod, &idx->options,
 											  RangeVarGetRelid(idx->relation, NoLock, true), NIL);
 					if (lookup)
 						extra = add_lookup_indexes(NIL, list_make1(make_lookup_index(idx->relation, lookup)),
@@ -2737,6 +2668,8 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 				break;
 		}
 
+		info->rewrite_warnings = rewrite_warnings;
+		rewrite_warnings = NIL;
 		result = lappend(result, rs);
 		*infos = lappend(*infos, info);
 

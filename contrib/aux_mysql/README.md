@@ -1,10 +1,11 @@
 # aux_mysql
 
-openHalo's MySQL Supplementary Extension (version 1.8, same name and settings as in openHalo 1.0) on
+openHalo's MySQL Supplementary Extension (version 1.9, same name and settings as in openHalo 1.0) on
 PostgreSQL 18. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
-aux_mysql held the SQL layer; here aux_mysql carries all of it, on top of the kernel's generic protocol
-extension hooks and its atomic sequence-advancement API. Other kernels need both APIs and separate validation. It must be
-loaded through `shared_preload_libraries` (the OpenHalo 18 default).
+aux_mysql held the SQL layer; here the extension implements MySQL behavior with the matching
+OpenHalo kernel's protocol, executor, foreign-key and collation hooks. The node and callback
+layouts must match: build the kernel and extension together. Other kernels require adaptation
+and separate validation. Load it through `shared_preload_libraries` (the OpenHalo 18 default).
 
 ## Parameters
 
@@ -45,7 +46,7 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   and `START TRANSACTION WITH CONSISTENT SNAPSHOT` get a real snapshot, SERIALIZABLE is PostgreSQL's,
   and serialization failures report 1213 (SQLSTATE 40001) so drivers retry them as deadlocks.
   `SET GLOBAL read_only` / `super_read_only` stop writes per statement (1290) for ordinary users / for
-  everyone; temporary tables stay writable.
+  everyone, including persistent sequence writes; temporary tables stay writable.
 - **Semantics**: `/` returns DECIMAL, `DIV`, division by zero gives NULL plus a warning (error 1365 in strict
   mode), case-insensitive string columns by default (`*_ci`; `*_bin` and a non-`_ci` table `COLLATE=` stay
   case-sensitive), lenient conversions when `sql_mode` is not strict, `ON UPDATE CURRENT_TIMESTAMP`,
@@ -55,11 +56,13 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   MySQL cannot type (no typmod, from expressions, views or PostgreSQL DDL) is reported as `decimal(65,30)`
   with a warning: replayed, it keeps values of up to 35 integer and 30 fractional digits.
 - **Foreign keys**: enforced with their ON DELETE / ON UPDATE actions, as in InnoDB.
-  `FOREIGN_KEY_CHECKS=0` turns off both checking and actions for the session, as in MySQL: it sets
-  `session_replication_role = replica` (aux_mysql's own AUTO_INCREMENT and ON UPDATE triggers keep
-  firing; other PostgreSQL triggers are skipped), `ALTER TABLE ... ADD FOREIGN KEY` does not check
-  existing rows (`NOT VALID`), and `TRUNCATE` of a referenced table deletes just its rows. Turning it
-  back on does not recheck existing rows. Any MySQL user may set it, as in MySQL.
+  `FOREIGN_KEY_CHECKS=0` disables only foreign-key checks/actions; user triggers, AUTO_INCREMENT and
+  ON UPDATE triggers still run. Referenced-table TRUNCATE remains TRUNCATE and does not cascade.
+  Missing or dropped parents retain durable FK declarations, visible in SHOW and information_schema.
+  Recreating the parent restores enforcement and actions without checking historical rows.
+  With checks enabled, new invalid child keys fail with 1452; blocked parent writes fail with 1451.
+  `INSERT IGNORE` skips each invalid FK row with a warning. Turning checks back on does not validate
+  old rows. Any MySQL user may set this session variable, as in MySQL.
 - **Dialect**: openHalo's MySQL grammar (backquotes, `LIMIT m,n`, `"strings"`, `UPDATE ... JOIN`, inline
   `KEY`, `COMMENT`, `ALTER TABLE MODIFY/CHANGE/ADD INDEX/DROP PRIMARY KEY`, `ON DUPLICATE KEY UPDATE`,
   `REPLACE`, `INSERT IGNORE`, `CREATE USER ... IDENTIFIED BY`, `SHOW DATABASES/TABLES/COLUMNS/INDEX/CREATE TABLE/
@@ -74,13 +77,13 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   comments after the last `;` get an OK of their own, as MySQL sends for that empty statement.
   As in MySQL, a string literal keeps the backslash of `\%` and `\_`, so `LIKE 'a\_b'` matches only `a_b`
   and `'50\%'` is four characters.
-- **Binary strings**: BINARY / VARBINARY / BLOB columns store the bytes they are given, whatever they are,
-  and return them unchanged in text and binary result sets: `_binary '...'`, `X'..'` / `0x..` (an odd
-  number of digits gets a leading 0, as `0xabc` in MySQL), plain `'...'` / `"..."` literals with backslash
-  escapes (`\0`, `\\`, `\Z`, ...), raw NULs and bytes that are not valid UTF-8 (such a literal becomes a
-  binary string; a TEXT column rejects it with 1366, as strict MySQL does), and prepared-statement
-  parameters of any string or BLOB type. So mysqldump output replays byte for byte, with or without
-  `--hex-blob`. A NUL at the end of a query ends it, as in MySQL.
+- **Binary and character strings**: new BINARY(n) columns pad with zero bytes; VARBINARY(n) enforces
+  its byte limit. Strict writes reject overflow, while non-strict and INSERT IGNORE writes truncate
+  with warnings. BLOB values preserve every byte. TEXT-family columns use a length-aware character
+  type that preserves NUL and validates UTF-8. Text and prepared result packets retain complete values.
+  Literal backslash escapes, `_binary`, hex/bit literals and BLOB parameters preserve binary payloads.
+  Native PostgreSQL I/O for these new types uses bytea escaping, so pg_dump can round-trip NUL and
+  non-UTF8 binary bytes. Existing columns keep their old types until explicitly migrated.
 - **Hexadecimal and bit-value literals** (`X'41'`, `0x41`, `b'101'`, `0b101`; aux_mysql 1.8, type
   `mysql.hexlit`) are binary strings that are numbers in numeric context, as in MySQL: `SELECT 0x41`
   returns `A` (VARBINARY), `0x41 + 0` is 65, `0x10 = 16`, `flags & 0x10`, `CONCAT(X'41', 'b')` is `Ab`,
@@ -93,13 +96,13 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   `CREATE TABLE ... AS` / `CREATE VIEW` is VARBINARY. `WHERE binary_col = X'..'` and `IN (X'..', ...)` use
   an index. `HEX()` / `UNHEX()`: strings, BLOBs and literals byte by byte, numbers rounded to 64 bits in
   two's complement (`HEX(-1)` is 16 `F`s), BIT columns as numbers; UNHEX of a non-digit is NULL with 1411.
-- **Prefix key parts** `KEY (col(n))`: a column that may hold values beyond a btree entry (TEXT, BLOB,
-  VARCHAR over 600 characters) is not indexed whole, so long values insert as in MySQL. A key starting
-  with one becomes a hash index on that column, which serves `=` lookups (also for TEXT / BLOB keys
-  without a prefix, which MySQL refuses); a later part becomes `left(col, n)`, at most 600 characters
-  in all. A UNIQUE key enforces such a prefix as MySQL does (also for ON DUPLICATE KEY and REPLACE),
-  with a hash index for lookups when it is the first part. Other columns are indexed whole.
-  `SHOW CREATE TABLE` / `SHOW INDEX` show `col(n)` and `Sub_part` for `left(col, n)` parts.
+- **Prefix key parts** `KEY (col(n))`: UNIQUE and PRIMARY prefixes enforce the declared character
+  prefix (binary prefixes count bytes), including short columns and all composite components.
+  Oversized keys use the `mysql_prefix` access method: bounded index keys select candidates, then
+  original heap values decide equality. Hash collisions never decide uniqueness. The same indexes
+  arbitrate ODKU/REPLACE. SHOW preserves names, component order and prefix lengths; native dumps and
+  CREATE TABLE LIKE preserve the access method and its options. No auxiliary hash index is created.
+  Unprefixed, bounded short keys keep native btree scans, including ordered and index-only scans.
 - **User-level locks**: `GET_LOCK`, `RELEASE_LOCK`, `IS_FREE_LOCK`, `IS_USED_LOCK` and `RELEASE_ALL_LOCKS`
   as in MySQL 5.7: a session can hold several locks, and one lock several times; names are compared
   case-insensitively (at most 64 characters, else error 3057); the timeout is in seconds, a negative one
@@ -121,18 +124,34 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   functions). Only `DEFAULT` can be written to them (3105 otherwise), also through REPLACE and
   `ON DUPLICATE KEY UPDATE`. A generated column may read the generated columns defined before it, and
   `ALTER TABLE ... MODIFY / CHANGE` recomputes the columns that read a redefined column, also when a
-  column they read changes type. An expression PostgreSQL deems mutable (CONCAT, IFNULL, `/`, DIV,
-  DATE_FORMAT: they read `sql_mode` or are PL/pgSQL) is computed by an IMMUTABLE SQL function
+  column they read changes type. CREATE, ALTER and LIKE check resolved expressions before planning:
+  random numbers, current time, user/session variables, external reads and unapproved functions
+  are rejected with 3102. Reviewed compatibility implementations (CONCAT, IFNULL, `/`, DIV,
+  DATE_FORMAT) remain usable even when PostgreSQL marks them mutable. These use an IMMUTABLE SQL function
   `aux_mysql_gen_<hash>` in the table's schema, removed by DROP TABLE / ALTER TABLE once unused.
+  New bounded VARCHAR/CHAR and DECIMAL generators apply the writer's current sql_mode and IGNORE
+  rules, including constant expressions and prepared executions; non-strict overflow/truncation
+  reports a warning. Arbitrary user-defined functions are not admitted by this compatibility path.
   `SHOW COLUMNS`, `SHOW CREATE TABLE` and `information_schema.COLUMNS` show them as MySQL does: no default,
   Extra `VIRTUAL GENERATED` / `STORED GENERATED` (so mysqldump leaves them out of its INSERTs),
   `GENERATION_EXPRESSION`, `GENERATED ALWAYS AS (expr) VIRTUAL | STORED`.
 - **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
 
+Compatibility targets common MySQL 5.7 applications with defined, reproducible
+behavior. An explicit unsupported-feature error is an accepted boundary when
+support would weaken PostgreSQL integrity guarantees or require disproportionate
+changes. Successful execution must not hide lost bytes, ineffective safety
+settings, or silently weakened constraints. Non-strict sql_mode and INSERT IGNORE
+retain their documented conversions and warnings; they do not authorize arbitrary
+lossy substitutions. The read-write REPEATABLE READ mapping described above is an
+explicit product choice.
+
 ## Known gaps
 
-- `SHOW STATUS`, some `SHOW VARIABLES LIKE` forms; `information_schema` mapping is partial (`TABLE_CONSTRAINTS` is
-  empty, no `KEY_COLUMN_USAGE`; GUI tools and ORMs need more).
+- `SHOW STATUS` and the system-variable catalog remain incomplete; SHOW VARIABLES reports current
+  values for the declared variables. Constraint metadata now
+  includes PRIMARY/UNIQUE/FK declarations and ordered key columns; broader information_schema
+  compatibility is still partial.
 - A key name longer than 54 bytes (18 CJK characters) is shortened to that length (PostgreSQL index
   names hold 63 bytes, and the suffix takes 9); key names compare case-insensitively in ASCII only.
 - Native ENUM/SET, negative and long-duration TIME, and direct PG14 physical upgrades remain unsupported;
@@ -142,93 +161,62 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   `mysql.statement_rollback = off`.
 - `bigint unsigned` is an int8 domain (no values above 2^63-1); no zero dates; `'a' = 'A'` between two
   literals is case-sensitive (literals use the database collation); `1.5e0` is numeric, not DOUBLE.
-- PostgreSQL reads a string literal for a binary column with its bytea input, which takes backslashes as
-  escapes. aux_mysql passes the bytes of such literals in INSERT / REPLACE values, `UPDATE ... SET` and
-  `ON DUPLICATE KEY UPDATE`, but not elsewhere: `WHERE b = 'a\\b'` (also a string-typed parameter, such as
-  Go's `[]byte`) fails, and `'\\x41'` compares as `A`. Write `_binary '...'` or `X'..'` there. A literal
-  that is not valid UTF-8 or holds a NUL is a binary string everywhere: `SELECT '\xff'` returns a BLOB
-  column, and a TEXT column rejects it also in non-strict mode (MySQL truncates it with a warning).
-  A NUL inside a comment is rejected.
-- BINARY(n) and VARBINARY(n) are BLOB domains without the length (the grammar drops it): BINARY(n) does not
-  pad with 0x00 (MySQL stores `'ab'` in BINARY(4) as `ab\0\0`), so a shorter value reads back, compares
-  and is indexed unpadded; values of exactly n bytes (UUIDs, hashes) behave as in MySQL. A longer value is
-  stored whole (strict MySQL: 1406; non-strict: truncated with a warning). Both would need a binary type
-  that carries a length, in place of the bytea domains every binary code path knows. SHOW CREATE TABLE and
-  SHOW COLUMNS print `binary` / `varbinary` without the length; aux_mysql reads both back, MySQL takes
-  `binary` as BINARY(1) and refuses `varbinary`. They also print a BLOB / BINARY default as `'\x..'::bytea`,
-  which the MySQL dialect reads back as the characters `x..`: a replayed default (mysqldump) is wrong.
-- Hexadecimal literals: aux_mysql has no unsigned 64-bit integer, so a literal of 2^63 or more in numeric
-  context, or such a result (`0x8000000000000000 + 0`, a literal into BIGINT UNSIGNED), is error 1264
-  rather than MySQL's unsigned value (`~0x0f` is exact, as DECIMAL). `0x41 + '1'` reads the string literal
-  as bytes (MySQL: as the number 1). A literal is taken by functions of BLOBs (SUBSTRING, LENGTH, MD5,
-  REVERSE, ...), CONCAT, HEX, LOWER / UPPER and IFNULL, not by other functions: `REPLACE(0x41, ..)`,
-  `LEFT`, `TRIM`, `LOCATE`, `CHAR_LENGTH`, `ASCII`, `IF(c, 0x41, 0x42)`, `SUM(0x10)`, `REPEAT('a', 0x3)`,
-  `INTERVAL 0x10 DAY`, `LEAST(1, 0x42)` and MySQL's `||` (OR) fail; write `CAST(0x10 AS UNSIGNED)` or
-  `CAST(0x41 AS CHAR)` there. An integer column compared with a literal is not looked up by index. BIT columns still return their bits as
-  text (`01000001`, MySQL: the bytes) and have no arithmetic of their own (`b + 0` fails; `b | b'1'` works).
-  User variables hold strings: `HEX(@n)` of a number shows its digits (`323535` for 255), and a string
-  variable in numeric context (`@s + 0`) fails. A MySQL session opened before `ALTER EXTENSION aux_mysql
-  UPDATE` to 1.8 (or with new binaries and an older aux_mysql) keeps openHalo's bit-string literals.
+- Old BINARY/VARBINARY columns are bytea domains with discarded lengths. Installing 1.9 does not
+  infer their original lengths or pad historical values. Old PG TEXT columns also retain their NUL
+  restriction. Use the original schema and the [migration procedure](MIGRATION.md) to convert them.
+- Hexadecimal numeric contexts above signed int8 remain limited; BIGINT UNSIGNED is not a full
+  unsigned 64-bit type. Common string operations, binary CONCAT and indexed integer comparisons are
+  covered, but arbitrary combinations of MySQL functions and custom types are not fully implemented.
+  BIT result metadata and user-variable numeric typing still differ from MySQL.
+- CHAR/VARCHAR intentionally retain native PostgreSQL character storage: values containing NUL
+  fail with 1366. Bytes are never stripped or replaced to make an insert succeed. The NUL-preserving
+  representation applies to TINYTEXT/TEXT/MEDIUMTEXT/LONGTEXT and binary types. Changing a column to
+  one of these types is an explicit migration decision, including its length and comparison rules.
 - No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
-- Every MySQL collation name in a table or column definition is accepted and mapped to the closest
-  aux_mysql collation, not reproduced (in expressions, `COLLATE utf8mb4_bin` is not mapped): `*_ci`
-  compares case-insensitively but, unlike MySQL's `*_general_ci` / `*_unicode_ci`, tells accents apart
-  (`'e' <> 'é'`); VARCHAR and TEXT do not pad trailing spaces as MySQL's PAD SPACE collations do
-  (`'a' <> 'a '`; CHAR(n) ignores them, as in MySQL); other weights follow ICU or code point order. So
-  rows MySQL treats as duplicates can coexist under a unique key, and `ON DUPLICATE KEY UPDATE` with
-  such a value inserts a new row where MySQL updates the existing one.
-- `SHOW CREATE TABLE` shows PostgreSQL collation names (`COLLATE case_insensitive`); they replay into
-  aux_mysql, not into MySQL. Generated column expressions carry PostgreSQL casts (`'a'::text`) alike.
-- `ON DUPLICATE KEY UPDATE` and `REPLACE` find duplicates in one unique key: the PRIMARY KEY or the
-  first UNIQUE key whose columns the statement supplies, else the PRIMARY KEY or the first UNIQUE key
-  (a table without one just inserts, as in MySQL, also when created earlier in the same packet). A
-  duplicate in another unique key fails with 1062, a key repeated within one multi-row statement
-  with 1105, where MySQL updates. Their affected rows (and `ROW_COUNT()`) are MySQL's: 2 per updated or
-  replaced row, 0 per row left unchanged (1 for CLIENT_FOUND_ROWS clients), but a plain `UPDATE` counts
-  the rows it matches (MySQL without CLIENT_FOUND_ROWS: only those it changes).
-- Generated columns: MODIFY / CHANGE cannot turn a column into a generated one (drop it and add it
-  again; it moves to the end of the table). In non-strict `sql_mode` a generated value that does not fit
-  its column fails (1406; MySQL truncates it with a warning). Accepted although MySQL refuses them:
-  VIRTUAL primary keys, references to AUTO_INCREMENT columns, nondeterministic functions (computed when
-  the row is written), VIRTUAL to ordinary column by MODIFY (keeps the values). Dropping a column that
-  another generated column reads reports 1105 (MySQL: 3108). A table moved to another schema with
-  PostgreSQL's `ALTER TABLE ... SET SCHEMA` still calls the `aux_mysql_gen_*` functions of the old one:
-  dropping that schema drops those columns. Before 1.8, `col type AS (expr)` made an ordinary column,
-  always NULL, and `GENERATED ALWAYS AS (expr)` a default; such columns stay so until added again.
-- Foreign keys created before PostgreSQL 18 enforcement was enabled in aux_mysql are `NOT ENFORCED`
-  (`pg_constraint.conenforced = false`). Re-create them as enforced without checking old rows, then
-  validate when convenient:
-  ```sql
-  DO $$ DECLARE c record; BEGIN
-    FOR c IN SELECT conrelid::regclass AS tbl, conname, pg_get_constraintdef(oid) AS def
-             FROM pg_constraint WHERE contype = 'f' AND NOT conenforced LOOP
-      EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I, ADD CONSTRAINT %I %s NOT VALID',
-                     c.tbl, c.conname, c.conname, replace(c.def, ' NOT ENFORCED', ''));
-    END LOOP; END $$;
-  ```
-  After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
-  AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0` (1.6)
-  and SHOW / information_schema report DECIMAL precision and scale, SHOW prefix key parts (1.7), and
-  `GET_LOCK()` locks, SHOW / information_schema show key names and generated columns, hexadecimal
-  literals are binary strings and numbers, `HEX()` / `UNHEX()` exist (1.8: in 1.7, `GET_LOCK()`,
-  `RELEASE_LOCK()`, `IS_FREE_LOCK()` and `IS_USED_LOCK()` were stubs that let every session "hold"
-  every lock).
-  With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
-  table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
-  fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION
-  reports 1452 (MySQL: 1451), RESTRICT reports 1451.
+- Four names have exact dedicated implementations: `utf8_general_ci`, `utf8mb4_general_ci`, `utf8_bin`,
+  and `utf8mb4_bin`. Other MySQL collation names are accepted and mapped by their suffix to the closest
+  rule: `_ci` names use MySQL 5.7 `general_ci` weights with PAD SPACE, and other names use binary
+  codepoint order with PAD SPACE. Every approximation emits warning 1105 through `SHOW WARNINGS`,
+  including expression-level `COLLATE`, `CREATE TABLE AS`, and views; `SHOW CREATE` shows the effective
+  `utf8mb4_general_ci` or `utf8mb4_bin` name. Language-specific and unicode_ci tailoring is not
+  reproduced, so comparisons, ordering, UNIQUE and `ON DUPLICATE KEY` arbitration can differ.
+  Existing ICU collations and indexes are not changed in place. Rebuild from reviewed original DDL to
+  adopt the new rules and resolve duplicates before cutover.
+- True prefix/oversized indexes require heap rechecks and do not provide index-only scans or ORDER BY
+  ordering. Large groups sharing the same candidate prefix add work during scans and unique checks.
+  Benchmark such distributions; ordinary bounded full-column keys retain native btree behavior.
+- ODKU checks every unique key; REPLACE deletes each conflicting row and inserts the proposed row,
+  applying defaults, FK actions and triggers. Repeated keys in one statement are processed in order.
+  Their affected counts include actual replaced rows and distinguish changed/unchanged updates.
+  A plain UPDATE still counts matching rows rather than only changed rows.
+- Generated VIRTUAL columns are physically stored and use the writer's expression and conversion
+  settings. A later reader's sql_mode does not recompute existing values. Row-only deterministic
+  expressions retain their values; expressions affected by session settings need migration review.
+  This trades additional storage/write work for avoiding repeated read-time calculation. A VIRTUAL
+  primary key and a generated expression referencing AUTO_INCREMENT remain OpenHalo extensions;
+  MySQL 5.7 rejects those declarations. They are not part of the MySQL dump round-trip guarantee.
+  Generated expressions and views using PostgreSQL-only syntax likewise need conversion before
+  replay on MySQL.
+- Generated expressions admit reviewed function implementations, not every MySQL function variant.
+  DATE_FORMAT accepts typed temporal input; implicit text-to-date/time conversion is not yet
+  admitted by the validator because the current PG-backed parser can read relative dates such as
+  `now` from text. Use a DATE/DATETIME input column for these generated expressions. This boundary
+  does not change ordinary SELECT function calls.
+- Before 1.8, generated expressions could be discarded or stored as defaults. Before enforcement
+  support, foreign keys could be NOT ENFORCED. Extension upgrade preserves these existing objects;
+  it cannot recover discarded expressions or decide how to repair orphan rows. Run the explicit
+  [object migration audit](MIGRATION.md#updating-an-existing-openhalo-18-installation) before cutover.
+  Earlier generators could also wrap nondeterministic expressions as IMMUTABLE. Upgrading does not
+  repair their stored values or rewrite their functions. LIKE and ALTER reject retained unsafe
+  generators; dropping or replacing the affected generated column remains available for repair.
+- Foreign keys intentionally require a referenced PRIMARY KEY or UNIQUE key, with PostgreSQL's
+  type requirements. A non-unique parent index is rejected, including with FOREIGN_KEY_CHECKS=0;
+  no approximate foreign-key implementation is provided. Pending FK metadata is kept in ordinary
+  extension-managed triggers; do not strip these triggers from a native dump.
 - A read-write REPEATABLE READ transaction does not keep one snapshot for its plain SELECTs (see above);
   set `READ ONLY` or `WITH CONSISTENT SNAPSHOT` where a stable view matters.
-- A UNIQUE prefix of a column whose values fit a btree entry, and any PRIMARY KEY prefix, is enforced on
-  the whole column (a warning says so), which accepts rows that differ only after the prefix; a long
-  PRIMARY KEY value can then fail. A key turned into a hash index shows no prefix length. When the
-  prefixes of a UNIQUE key may exceed 2000 bytes, its BLOB prefixes are compared by MD5; long
-  multi-byte TEXT prefixes can still exceed a btree entry, and so can whole VARCHAR parts of a
-  composite key together (~2.7kB after compression), which are not shortened.
-- With `autocommit = 0`, a `SET TRANSACTION` issued after the transaction began (even with a SELECT
-  without tables) does not reach that transaction.
-- PostgreSQL's MVCC differs from InnoDB locking reads for concurrent delete + insert of the same key
-  (duplicate key errors where MySQL waits).
+- MySQL GTID replication is unavailable: `gtid_mode` reports `OFF` and GTID sets are empty.
+  PostgreSQL WAL positions are not MySQL GTIDs. Logical MySQL backups use ordinary data/schema dumps.
 
 ## openHalo upstream
 
@@ -253,6 +241,7 @@ Every run keeps separate logs. Exit 0 means all required groups passed; exit 1 m
 exit 2 means missing dependencies (incomplete). Set `JAR` to the Connector/J jar and `LOG_DIR`
 to a new output directory. `sysbench.sh` separately counts completed and error-free scenarios;
 ignored database errors produce a nonzero exit. `ab_regress.py` additionally requires psycopg2.
+The 1.9 integration suites and isolated-instance requirements are listed in [TESTING.md](TESTING.md).
 
 ## License
 

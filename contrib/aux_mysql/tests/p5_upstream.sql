@@ -43,7 +43,7 @@ alter table c2 add column e varchar(5) collate latin1_bin;
 insert into c2 values ('x', 'x', 'xyz');
 select (select count(*) from c2 where a = 'ABC') as a_modified,
        (select count(*) from c2 where e = 'XYZ') as e_bin;
--- f3518a1: Collation column / COLLATE in SHOW CREATE TABLE (PostgreSQL collation names)
+-- f3518a1: Collation column / COLLATE in SHOW CREATE TABLE (portable MySQL names)
 show full columns from c1;
 show create table c2;
 -- SHOW CREATE TABLE output replays

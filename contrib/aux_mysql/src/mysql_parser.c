@@ -119,6 +119,8 @@ List *
 mysql_raw_parser(const char *str)
 {
 #ifdef HALO_MYSQL_GRAMMAR
+	/* Syscache-dirty refresh: connections can span ALTER EXTENSION UPDATE. */
+	mys_binary_session_init();
 	return mys_raw_parser(str);
 #else
 	/* grammar not ported yet: fall back to the PostgreSQL grammar */

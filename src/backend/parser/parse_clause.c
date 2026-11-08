@@ -3305,7 +3305,8 @@ transformOnConflictArbiter(ParseState *pstate,
 	*arbiterWhere = NULL;
 	*constraint = InvalidOid;
 
-	if (onConflictClause->action == ONCONFLICT_UPDATE && !infer)
+	if (onConflictClause->action == ONCONFLICT_UPDATE && !infer &&
+		!onConflictClause->allIndexes)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("ON CONFLICT DO UPDATE requires inference specification or constraint name"),

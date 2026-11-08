@@ -28,6 +28,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "postmaster/protocol_extension.h"
 
 #include "access/genam.h"
 #include "access/multixact.h"
@@ -3712,6 +3713,10 @@ heap_truncate_check_FKs(List *relations, bool tempTables)
 	List	   *oids = NIL;
 	List	   *dependents;
 	ListCell   *cell;
+
+	if (MyProtocolExtension && MyProtocolExtension->foreign_key_checks &&
+		!MyProtocolExtension->foreign_key_checks())
+		return;
 
 	/*
 	 * Build a list of OIDs of the interesting relations.

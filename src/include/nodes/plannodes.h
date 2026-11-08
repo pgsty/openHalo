@@ -313,6 +313,9 @@ typedef struct ModifyTable
 	int			epqParam;
 	/* ON CONFLICT action */
 	OnConflictAction onConflictAction;
+	bool		onConflictAll;
+	bool		onConflictReplace;
+	bool		onConflictIgnore;
 	/* List of ON CONFLICT arbiter index OIDs  */
 	List	   *arbiterIndexes;
 	/* INSERT ON CONFLICT DO UPDATE targetlist */

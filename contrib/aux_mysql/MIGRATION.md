@@ -48,6 +48,9 @@ remain effective. With it on, a later superuser MySQL connection reinstalls it.
 |---|---|
 | AUTO_INCREMENT | Identity plus an explicit-value trigger. Atomic advancement requires INCREMENT 1 CACHE 1 NO CYCLE. Empty-table reset is serialized against writes. Partition-parent changes raise an error; complete MySQL partition support is not claimed. |
 | UNSIGNED identity | Retains the original domain checks via a table CHECK; inspect and repair negative values loaded with the earlier 18 build before validating the new constraints. |
+| Foreign-key parent keys | PRIMARY KEY or UNIQUE is required. Referencing a non-unique parent index is deliberately rejected even with FOREIGN_KEY_CHECKS=0. Review the relationship and existing duplicates before adding uniqueness; never add a unique constraint automatically. |
+| NUL in CHAR/VARCHAR | Rejected with 1366. Retaining native PG character types is an intentional boundary. Use an explicit TEXT or binary representation when the application needs NUL, and review length constraints, comparison behavior and indexes. Never remove NUL bytes during import. |
+| VIRTUAL generated columns | Physically stored, evaluated under writer settings. Do not rely on a reader's sql_mode changing existing generated values. Account for storage and write work. Virtual primary keys and references to AUTO_INCREMENT are OpenHalo extensions whose DDL does not replay on MySQL 5.7. |
 | Table collation default | New MySQL tables retain it in an `aux_mysql` object label. PG dump/restore carries it; do not use `--no-security-labels` when this metadata matters. Existing 18 tables without metadata fall back to `mysql.default_collation`: set a reviewed label explicitly with `SECURITY LABEL FOR aux_mysql ON TABLE schema.table IS 'case_sensitive'`. Do not infer it from an arbitrary column. |
 | FLOAT | New unqualified FLOAT uses float4 and wire type FLOAT; DOUBLE/FLOAT(25..53) use float8. Existing float8 data is not automatically narrowed. Use DOUBLE explicitly to preserve the old storage precision. Deprecated FLOAT(M,D) does not implement decimal-place constraints. |
 | DATETIME(n) | New declarations keep precision 0..6 on a native timestamp without time zone; DATETIME without `(n)` uses 0. Text and prepared results retain the stored precision. Earlier 18 declarations used an unconstrained datetime domain: review existing values before narrowing them. SHOW CREATE may normalize the spelling to TIMESTAMP(n). |
@@ -80,11 +83,79 @@ SQL dump files from OpenHalo14 may refer to fork-specific functions, casts and
 catalogs. Restore the reviewed user schema and data into a freshly installed 18
 extension; do not replay the old extension's internal SQL/catalog modifications.
 
-## Updating an existing experimental 18.6 installation
+## Updating an existing OpenHalo 18 installation
 
-These repairs are a source baseline, not an in-place extension upgrade script.
-The extension remains version 1.5; reinstalling a shared library alone does not
-refresh its SQL functions or add table metadata/guards. Use a fresh instance for
-acceptance and a reviewed logical migration for existing data. Do not use DROP
-EXTENSION CASCADE on a populated instance to force an update. A supported upgrade
-package needs a separately tested extension-version transition before publication.
+Version 1.9 supplies an extension update path from 1.6 through 1.7 and 1.8.
+Install matching OpenHalo kernel and extension binaries, restart, and run this
+through a PostgreSQL connection in the MySQL database:
+
+```sql
+ALTER EXTENSION aux_mysql UPDATE TO '1.9';
+```
+
+The protocol callback and node layouts changed: rebuild the kernel and extension
+together, using `--enable-depend` or a clean build. Do not mix old kernel objects
+with a newly linked extension. New binaries retain the old SQL type behavior
+until the SQL upgrade; existing sessions refresh type availability after catalog
+invalidation. This compatibility window does not install new SQL semantics by
+itself. Do not DROP EXTENSION CASCADE on a populated database.
+
+Catalog equality with a fresh install does not imply historical data or user
+objects were repaired. Inventory each application schema before cutover:
+
+```sh
+psql -X -v review_schema=app -v check_fk=1 -f tools/review_fix_migration.sql
+```
+
+The default audit lists real enforcement/validation flags and repair statements.
+`check_fk=1` also counts orphans and may scan large tables. After resolving those
+rows using the application's data rules, enforce and validate in place:
+
+```sh
+psql -X -v review_schema=app -v enforce_fk=1 -v validate_fk=1 \
+  -f tools/review_fix_migration.sql
+```
+
+These operations retain constraint identity and fail transactionally if orphans
+remain. An old NOT ENFORCED foreign key is never reported as repaired merely
+because its catalog definition exists.
+
+Recover old generated expressions and BINARY/VARBINARY lengths from an original
+MySQL schema dump or migration source. NULL values and old defaults cannot reveal
+a discarded generation expression. Supply generated definitions in a trusted SQL
+manifest, for example:
+
+```sql
+INSERT INTO pg_temp.review_fix_generated_source
+ (table_schema,table_name,column_name,type_sql,expression_sql,kind,attributes_sql,provenance)
+VALUES ('app','t','g','varchar(2)','v','STORED','','original MySQL schema dump');
+```
+
+Pass it with `-v generated_manifest=/absolute/path/manifest.sql`. Review the
+emitted MODIFY statements and execute them through the MySQL connection in
+column-dependency order, with an appropriate sql_mode. Existing generator bodies
+also need reviewed MODIFY statements to adopt new result coercion semantics.
+
+Review the generator function definitions printed by the audit as well as the
+column expressions. Earlier releases could hide RAND, current time, session
+variables or external reads inside an IMMUTABLE wrapper. New CREATE/ALTER/LIKE
+operations reject these expressions; upgrading alone does not repair existing
+rows or remove old wrappers. Replace or drop the affected generated column using
+an authoritative deterministic expression, then verify the recomputed values.
+An expression already folded or discarded cannot be reconstructed from stored
+values. Legal compatibility functions and writer sql_mode conversions remain
+supported; arbitrary user-defined functions are outside this compatibility path.
+
+Old binary domains and native PG TEXT columns retain their old representation.
+Use explicit type migration based on original DDL, then verify byte lengths,
+padding, generated values and unique constraints. The upgrade does not silently
+rewrite them. Old ICU collations and whole-column/MD5 prefix indexes likewise
+retain their original definitions; create replacement tables/indexes from the
+original MySQL DDL to obtain correct prefix and general_ci/PAD SPACE semantics.
+Resolve newly discovered duplicate keys before replacing the old objects.
+
+Keep both native and MySQL logical backups and exercise restore before cutover.
+Native dumps must retain extension-managed triggers and aux_mysql security labels.
+Compare row counts, HEX values, defaults, generated expressions, FK actions and
+unique conflicts after restore. Legacy index names without the per-table suffix
+remain recognized and do not need a naming-only rebuild.

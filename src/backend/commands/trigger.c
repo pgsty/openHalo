@@ -12,6 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "postmaster/protocol_extension.h"
 
 #include "access/genam.h"
 #include "access/htup_details.h"
@@ -3490,6 +3491,12 @@ TriggerEnabled(EState *estate, ResultRelInfo *relinfo,
 			   Bitmapset *modifiedCols,
 			   TupleTableSlot *oldslot, TupleTableSlot *newslot)
 {
+	/* A dialect may disable RI without disabling ordinary user triggers. */
+	if (MyProtocolExtension && MyProtocolExtension->foreign_key_checks &&
+		!MyProtocolExtension->foreign_key_checks() &&
+		RI_FKey_trigger_type(trigger->tgfoid) != RI_TRIGGER_NONE)
+		return false;
+
 	/* Check replication-role-dependent enable state */
 	if (SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA)
 	{

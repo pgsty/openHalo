@@ -140,6 +140,14 @@ struct pg_locale_struct
 	}			info;
 };
 
+/* Optional provider customization, run once per cached collation in every
+ * backend (including parallel, replication and maintenance workers). The
+ * callback runs in the locale cache memory context; it must not recursively
+ * request the same collation. Uninterested extensions leave it unchanged. */
+#define PG_LOCALE_CREATE_HOOK 1
+typedef void (*pg_locale_create_hook_type) (Oid collid, pg_locale_t locale);
+extern PGDLLIMPORT pg_locale_create_hook_type pg_locale_create_hook;
+
 extern void init_database_collation(void);
 extern pg_locale_t pg_newlocale_from_collation(Oid collid);
 

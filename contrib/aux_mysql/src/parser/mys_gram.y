@@ -74,6 +74,7 @@
 #include "utils/xml.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "mys_binary.h"
 #include "miscadmin.h"
 
 /* PG18 exports a makeStringConst() of its own; keep the grammar's copy private */
@@ -1628,14 +1629,14 @@ VariableSetStmt:
                         funcName = list_make2(makeString(pstrdup("mysql")),
                                               makeString(pstrdup("set_system_session_variable")));
                         defElem = (DefElem *) lfirst(lc);
-                        if (IsA(&((A_Const*)(defElem->arg))->val, Integer))
+						if (IsA(&((A_Const*)(defElem->arg))->val, Integer))
                         {
-                            int val = ((A_Const*)(defElem->arg))->val.ival.ival;
+							int val = ((A_Const*)(defElem->arg))->val.ival.ival;
                             snprintf(arg, 256, "%d", val);
                         }
                         else
                         {
-                            char *val = ((A_Const*)(defElem->arg))->val.sval.sval;
+							char *val = ((A_Const*)(defElem->arg))->val.sval.sval;
                             int valLen = strlen(val);
                             memcpy(arg, val, valLen);
                             arg[valLen] = '\0';
@@ -1677,14 +1678,14 @@ VariableSetStmt:
                         funcName = list_make2(makeString(pstrdup("mysql")),
                                               makeString(pstrdup("set_system_session_variable")));
                         defElem = (DefElem *) lfirst(lc);
-                        if (IsA(&((A_Const*)(defElem->arg))->val, Integer))
+						if (IsA(&((A_Const*)(defElem->arg))->val, Integer))
                         {
-                            int val = ((A_Const*)(defElem->arg))->val.ival.ival;
+							int val = ((A_Const*)(defElem->arg))->val.ival.ival;
                             snprintf(arg, 256, "%d", val);
                         }
                         else
                         {
-                            char *val = ((A_Const*)(defElem->arg))->val.sval.sval;
+							char *val = ((A_Const*)(defElem->arg))->val.sval.sval;
                             int valLen = strlen(val);
                             memcpy(arg, val, valLen);
                             arg[valLen] = '\0';
@@ -1726,14 +1727,14 @@ VariableSetStmt:
                         funcName = list_make2(makeString(pstrdup("mysql")),
                                               makeString(pstrdup("set_system_global_variable")));
                         defElem = (DefElem *) lfirst(lc);
-                        if (IsA(&((A_Const*)(defElem->arg))->val, Integer))
+						if (IsA(&((A_Const*)(defElem->arg))->val, Integer))
                         {
-                            int val = ((A_Const*)(defElem->arg))->val.ival.ival;
+							int val = ((A_Const*)(defElem->arg))->val.ival.ival;
                             snprintf(arg, 256, "%d", val);
                         }
                         else
                         {
-                            char *val = ((A_Const*)(defElem->arg))->val.sval.sval;
+							char *val = ((A_Const*)(defElem->arg))->val.sval.sval;
                             int valLen = strlen(val);
                             memcpy(arg, val, valLen);
                             arg[valLen] = '\0';
@@ -1790,10 +1791,10 @@ mysql_system_variable:
                         ColumnRef *c = castNode(ColumnRef, $3);
                         foreach(lc, c->fields)
                         {
-                            Node *v = (Node *) lfirst(lc);
-                            if (strncasecmp(strVal(v), "off", 3) != 0)
+							Node *v = (Node *) lfirst(lc);
+							if (strncasecmp(strVal(v), "off", 3) != 0)
                             {
-                                argList = list_make2(makeStringConst($1, @1), makeStringConst(strVal(v), -1));
+								argList = list_make2(makeStringConst($1, @1), makeStringConst(strVal(v), -1));
                             }
                             else
                             {
@@ -1833,10 +1834,10 @@ mysql_system_variable:
                             ColumnRef *c = castNode(ColumnRef, $4);
                             foreach(lc, c->fields)
                             {
-                                Node *v = (Node *) lfirst(lc);
-                                if (strncasecmp(strVal(v), "off", 3) != 0)
+								Node *v = (Node *) lfirst(lc);
+								if (strncasecmp(strVal(v), "off", 3) != 0)
                                 {
-                                    argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
+									argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
                                 }
                                 else
                                 {
@@ -1883,10 +1884,10 @@ mysql_system_variable:
                             ColumnRef *c = castNode(ColumnRef, $4);
                             foreach(lc, c->fields)
                             {
-                                Node *v = (Node *) lfirst(lc);
-                                if (strncasecmp(strVal(v), "off", 3) != 0)
+								Node *v = (Node *) lfirst(lc);
+								if (strncasecmp(strVal(v), "off", 3) != 0)
                                 {
-                                    argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
+									argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
                                 }
                                 else
                                 {
@@ -1933,10 +1934,10 @@ mysql_system_variable:
                             ColumnRef *c = castNode(ColumnRef, $4);
                             foreach(lc, c->fields)
                             {
-                                Node *v = (Node *) lfirst(lc);
-                                if (strncasecmp(strVal(v), "off", 3) != 0)
+								Node *v = (Node *) lfirst(lc);
+								if (strncasecmp(strVal(v), "off", 3) != 0)
                                 {
-                                    argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
+									argList = list_make2(makeStringConst($2, @2), makeStringConst(strVal(v), -1));
                                 }
                                 else
                                 {
@@ -1984,10 +1985,10 @@ mysql_system_variable:
                             ColumnRef *c = castNode(ColumnRef, $3);
                             foreach(lc, c->fields)
                             {
-                                Node *v = (Node *) lfirst(lc);
-                                if (strncasecmp(strVal(v), "off", 3) != 0)
+								Node *v = (Node *) lfirst(lc);
+								if (strncasecmp(strVal(v), "off", 3) != 0)
                                 {
-                                    argList = list_make2(makeStringConst(($1 + 6), @1), makeStringConst(strVal(v), -1));
+									argList = list_make2(makeStringConst(($1 + 6), @1), makeStringConst(strVal(v), -1));
                                 }
                                 else
                                 {
@@ -2012,10 +2013,10 @@ mysql_system_variable:
                             ColumnRef *c = castNode(ColumnRef, $3);
                             foreach(lc, c->fields)
                             {
-                                Node *v = (Node *) lfirst(lc);
-                                if (strncasecmp(strVal(v), "off", 3) != 0)
+								Node *v = (Node *) lfirst(lc);
+								if (strncasecmp(strVal(v), "off", 3) != 0)
                                 {
-                                    argList = list_make2(makeStringConst(($1 + 8), @1), makeStringConst(strVal(v), -1));
+									argList = list_make2(makeStringConst(($1 + 8), @1), makeStringConst(strVal(v), -1));
                                 }
                                 else
                                 {
@@ -2040,10 +2041,10 @@ mysql_system_variable:
                             ColumnRef *c = castNode(ColumnRef, $3);
                             foreach(lc, c->fields)
                             {
-                                Node *v = (Node *) lfirst(lc);
-                                if (strncasecmp(strVal(v), "off", 3) != 0)
+								Node *v = (Node *) lfirst(lc);
+								if (strncasecmp(strVal(v), "off", 3) != 0)
                                 {
-                                    argList = list_make2(makeStringConst(($1 + 7), @1), makeStringConst(strVal(v), -1));
+									argList = list_make2(makeStringConst(($1 + 7), @1), makeStringConst(strVal(v), -1));
                                 }
                                 else
                                 {
@@ -2068,10 +2069,10 @@ mysql_system_variable:
                             ColumnRef *c = castNode(ColumnRef, $3);
                             foreach(lc, c->fields)
                             {
-                                Node *v = (Node *) lfirst(lc);
-                                if (strncasecmp(strVal(v), "off", 3) != 0)
+								Node *v = (Node *) lfirst(lc);
+								if (strncasecmp(strVal(v), "off", 3) != 0)
                                 {
-                                    argList = list_make2(makeStringConst($1, @1), makeStringConst(strVal(v), -1));
+									argList = list_make2(makeStringConst($1, @1), makeStringConst(strVal(v), -1));
                                 }
                                 else
                                 {
@@ -2446,31 +2447,31 @@ FunctionSetResetClause:
 
 
 VariableShowStmt:
-            SHOW IDENT opt_select_limit
-                {
-                    SelectStmt *sel = makeNode(SelectStmt);
-                    RangeFunction *rf = makeNode(RangeFunction);
-                    ResTarget *target = makeNode(ResTarget);
-                    ColumnRef *star = makeNode(ColumnRef);
-                    FuncCall *call;
+			SHOW IDENT opt_select_limit
+				{
+					SelectStmt *sel = makeNode(SelectStmt);
+					RangeFunction *rf = makeNode(RangeFunction);
+					ResTarget *target = makeNode(ResTarget);
+					ColumnRef *star = makeNode(ColumnRef);
+					FuncCall *call;
 
-                    if (pg_strcasecmp($2, "warnings") != 0 && pg_strcasecmp($2, "errors") != 0)
-                        ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
-                            errmsg("unsupported SHOW command: %s", $2), parser_errposition(@2)));
-                    call = makeFuncCall(list_make2(makeString("mysql"), makeString("show_diagnostics")),
-                        list_make1(makeBoolAConst(pg_strcasecmp($2, "errors") == 0, @2)),
-                        COERCE_EXPLICIT_CALL, @1);
-                    rf->functions = list_make1(list_make2(call, NIL));
-                    sel->fromClause = list_make1(rf);
-                    star->fields = list_make1(makeNode(A_Star));
-                    star->location = -1;
-                    target->val = (Node *) star;
-                    target->location = -1;
-                    sel->targetList = list_make1(target);
-                    insertSelectOptions(sel, NIL, NIL, $3, NULL, yyscanner);
-                    $$ = (Node *) sel;
-                }
-            |
+					if (pg_strcasecmp($2, "warnings") != 0 && pg_strcasecmp($2, "errors") != 0)
+						ereport(ERROR, (errcode(ERRCODE_SYNTAX_ERROR),
+							errmsg("unsupported SHOW command: %s", $2), parser_errposition(@2)));
+					call = makeFuncCall(list_make2(makeString("mysql"), makeString("show_diagnostics")),
+						list_make1(makeBoolAConst(pg_strcasecmp($2, "errors") == 0, @2)),
+						COERCE_EXPLICIT_CALL, @1);
+					rf->functions = list_make1(list_make2(call, NIL));
+					sel->fromClause = list_make1(rf);
+					star->fields = list_make1(makeNode(A_Star));
+					star->location = -1;
+					target->val = (Node *) star;
+					target->location = -1;
+					sel->targetList = list_make1(target);
+					insertSelectOptions(sel, NIL, NIL, $3, NULL, yyscanner);
+					$$ = (Node *) sel;
+				}
+			|
 			//SHOW var_name
 			//	{
 			//		VariableShowStmt *n = makeNode(VariableShowStmt);
@@ -6003,11 +6004,11 @@ alter_table_option:
                     }
                 | ENCRYPTION opt_equal Sconst
                     {
-                        $$ = makeDefElem("encryption", (Node *)makeString($3), @1);
+						$$ = makeDefElem("encryption", (Node *)makeString($3), @1);
                     }
                 | ENGINE opt_equal IDENT
                     {
-                        $$ = makeDefElem("engine", (Node *)makeString($3), @1);
+						$$ = makeDefElem("engine", (Node *)makeString($3), @1);
                     }
                 | INSERT_METHOD opt_equal NO
                     {
@@ -6144,11 +6145,11 @@ create_table_option:
                     }
                 | ENCRYPTION opt_equal Sconst
                     {
-                        $$ = makeDefElem("encryption", (Node *)makeString($3), @1);
+						$$ = makeDefElem("encryption", (Node *)makeString($3), @1);
                     }
                 | ENGINE opt_equal IDENT
                     {
-                        $$ = makeDefElem("engine", (Node *)makeString($3), @1);
+						$$ = makeDefElem("engine", (Node *)makeString($3), @1);
                     }
                 | INSERT_METHOD opt_equal NO
                     {
@@ -6368,7 +6369,7 @@ columnDef:	ColId Typename optColumnCompression create_generic_options ColQualLis
                     }
                     else if (list_length($2->names) == 2)
                     {
-                        typeName = strVal(lsecond($2->names));
+						typeName = strVal(lsecond($2->names));
                     }
                     //if ((strncasecmp(typeName, "char", 4) == 0) || 
                     //    (strncasecmp(typeName, "bpchar", 6) == 0) || 
@@ -6605,7 +6606,7 @@ ColConstraint:
                 {
                     char *str = (char *)palloc(64);
                     int len;
-                    String *v;
+					String *v;
 
                     len = pg_sprintf(str, "on update current_timestamp(%d)", $3);
                     str[len] = '\0';
@@ -7042,8 +7043,8 @@ ConstraintElem:
                             foreach (lc, $7)
                             {
                                 Node *node = lfirst(lc);
-                                Node *value = (Node *)node;
-                                n->access_method = strVal(value);
+								Node *value = (Node *)node;
+								n->access_method = strVal(value);
                             }
                         }
                         else
@@ -12322,7 +12323,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 					n->renameType = OBJECT_TABLE;
 					n->relation = $5;
 					// 为了传递新表名的schema
-                    n->object = (Node *)$8;
+					n->object = (Node *)$8;
 					n->subname = NULL;
 					n->newname = NULL;
 					n->missing_ok = true;
@@ -12334,7 +12335,7 @@ RenameStmt: ALTER AGGREGATE aggregate_with_argtypes RENAME TO name
 					n->renameType = OBJECT_TABLE;
 					n->relation = $5;
 					// 为了传递新表名的schema
-                    n->object = (Node *)$8;
+					n->object = (Node *)$8;
 					n->subname = NULL;
 					n->newname = NULL;
 					n->missing_ok = true;
@@ -13906,7 +13907,9 @@ createdb_opt_items:
 		;
 
 createdb_opt_item:
-			createdb_opt_name opt_equal SignedIconst
+			character_set_collate
+				{ $$ = makeDefElem("mysql_database_option", NULL, @1); }
+			| createdb_opt_name opt_equal SignedIconst
 				{
 					$$ = makeDefElem($1, (Node *)makeInteger($3), @1);
 				}
@@ -14708,8 +14711,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -14724,8 +14727,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -14814,8 +14817,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -14830,8 +14833,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -14878,8 +14881,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -14894,8 +14897,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -14985,8 +14988,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->lexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -15001,8 +15004,8 @@ MysInsertStmt:
                                             ListCell *subLc;
                                             foreach (subLc, columnRef->fields)
                                             {
-                                                Node *val = (Node *)lfirst(subLc);
-                                                Node *colNode = (Node *)makeString(strVal(val));
+												Node *val = (Node *)lfirst(subLc);
+												Node *colNode = (Node *)makeString(strVal(val));
                                                 List *indi = list_make1(colNode);
                                                 ((A_Expr *)(resTarget->val))->rexpr = (Node *)makeColumnRef(tableName, indi, -1, 0);
                                                 break;
@@ -15029,7 +15032,7 @@ MysInsertStmt:
 
                     $5->relation = $4;
                     $5->onConflictClause = onconflict;
-                    $5->returningClause = makeReturningClauseFromList(NIL);
+					$5->returningClause = makeReturningClauseFromList(NIL);
                     $5->withClause = NULL;
                     $$ = (Node *) $5;
                 }
@@ -15102,7 +15105,7 @@ MysInsertStmt:
 
                     $4->relation = $3;
                     $4->onConflictClause = onconflict;
-                    $4->returningClause = makeReturningClauseFromList(NIL);
+					$4->returningClause = makeReturningClauseFromList(NIL);
                     $4->withClause = NULL;
                     $$ = (Node *) $4;
                 }
@@ -15168,6 +15171,8 @@ MysInsertStmt:
                 {
                     OnConflictClause *onconflict = makeNode(OnConflictClause);
                     onconflict->action = ONCONFLICT_NOTHING;
+					onconflict->allIndexes = true;
+					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
@@ -15175,7 +15180,7 @@ MysInsertStmt:
 
                     $6->relation = $5;
                     $6->onConflictClause = onconflict;
-                    $6->returningClause = makeReturningClauseFromList(NIL);
+					$6->returningClause = makeReturningClauseFromList(NIL);
                     $6->withClause = NULL;
                     $$ = (Node *) $6;
                 }
@@ -15183,6 +15188,8 @@ MysInsertStmt:
                 {
                     OnConflictClause *onconflict = makeNode(OnConflictClause);
                     onconflict->action = ONCONFLICT_NOTHING;
+					onconflict->allIndexes = true;
+					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
@@ -15190,7 +15197,7 @@ MysInsertStmt:
 
                     $5->relation = $4;
                     $5->onConflictClause = onconflict;
-                    $5->returningClause = makeReturningClauseFromList(NIL);
+					$5->returningClause = makeReturningClauseFromList(NIL);
                     $5->withClause = NULL;
                     $$ = (Node *) $5;
                 }
@@ -15205,6 +15212,8 @@ MysInsertStmt:
                     int i;
 
                     onconflict->action = ONCONFLICT_NOTHING;
+					onconflict->allIndexes = true;
+					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
@@ -15263,6 +15272,8 @@ MysInsertStmt:
                     int i;
 
                     onconflict->action = ONCONFLICT_NOTHING;
+					onconflict->allIndexes = true;
+					onconflict->ignoreFailure = true;
                     onconflict->infer = NULL;
                     onconflict->targetList = NIL;
                     onconflict->whereClause = NULL;
@@ -15349,6 +15360,11 @@ insert_rest:
 					$$->cols = NIL;
 					$$->selectStmt = $1;
 				}
+			| '(' ')' VALUES '(' ')'
+				{
+					$$ = makeNode(InsertStmt);
+					$$->selectStmt = NULL;
+				}
             | VALUES '(' ')'
                 {
                     SelectStmt *n = makeNode(SelectStmt);
@@ -15358,6 +15374,11 @@ insert_rest:
                     $$->cols = NIL;
                     $$->selectStmt = (Node*)n;
                 }
+			| '(' ')' VALUE_P '(' ')'
+				{
+					$$ = makeNode(InsertStmt);
+					$$->selectStmt = NULL;
+				}
             | VALUE_P '(' ')'
                 {
                     SelectStmt *n = makeNode(SelectStmt);
@@ -15555,8 +15576,8 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 					n->relation = $5;
 					n->usingClause = $6;
 					n->whereClause = $7;
-                    if ($8 != NIL || $9 != NULL)
-                    	n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $8, $9, @1);
+					if ($8 != NIL || $9 != NULL)
+						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $8, $9, @1);
 					n->returningClause = makeReturningClauseFromList($10);
 					n->withClause = $1;
 					$$ = (Node *)n;
@@ -15568,8 +15589,8 @@ DeleteStmt: with_clause DELETE_P delete_options FROM relation_expr_opt_alias usi
 					n->relation = $4;
 					n->usingClause = $5;
 					n->whereClause = $6;
-                    if ($7 != NIL || $8 != NULL)
-                    	n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $7, $8, @1);
+					if ($7 != NIL || $8 != NULL)
+						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $7, $8, @1);
 					n->returningClause = makeReturningClauseFromList($9);
 					n->withClause = NULL;
 					$$ = (Node *)n;
@@ -15732,7 +15753,7 @@ MysUpdateStmt:
                                     rel = castNode(A_Const, node);
                                     if (i == 0)
                                     {
-                                        targetRelationName = rel->val.sval.sval;
+										targetRelationName = rel->val.sval.sval;
                                     }
                                     else
                                     {
@@ -15811,9 +15832,9 @@ MysUpdateStmt:
                         }
                     }
                     n->whereClause = $7;
-                    if ($8 != NIL || $9 != NULL)
-                    	n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $8, $9, @1);
-                    n->returningClause = makeReturningClauseFromList($10);
+					if ($8 != NIL || $9 != NULL)
+						n->whereClause = makeLimitedModifyQual(n->relation, n->whereClause, $8, $9, @1);
+					n->returningClause = makeReturningClauseFromList($10);
                     n->withClause = NULL;
 
 					$$ = (Node *)n;
@@ -15887,12 +15908,12 @@ MysUpdateStmt:
                     //    //        rel = castNode(A_Const, node);
                     //    //        if (i == 0)
                     //    //        {
-                    //    //            targetRelationName = rel->val.sval.sval;
+					//    //            targetRelationName = rel->val.sval.sval;
                     //    //            len = strlen(targetRelationName);
                     //    //        }
                     //    //        else
                     //    //        {
-                    //    //            if (strncasecmp(targetRelationName, rel->val.sval.sval, len) != 0)
+					//    //            if (strncasecmp(targetRelationName, rel->val.sval.sval, len) != 0)
                     //    //            {
                     //    //                ereport(ERROR,
                     //    //                        (errcode(ERRCODE_SYNTAX_ERROR),
@@ -15924,7 +15945,7 @@ MysUpdateStmt:
                     n->fromClause = $6;
                     if ($4 == JOIN_INNER)
                     {
-                        n->whereClause = $10 ? makeAndExpr($7, $10, -1) : $7;
+						n->whereClause = $10 ? makeAndExpr($7, $10, -1) : $7;
                         //if ($10 != NULL)
                         //{
                         //    n->whereClause = makeAndExpr($10, $7, -1);
@@ -17809,28 +17830,21 @@ opt_array_bounds:
 SimpleTypename:
 			GenericType								{ $$ = $1; }
 			| Numeric								{ $$ = $1; }
-            | BINARY                                {
-                //$$ = SystemTypeName("bytea");
-                $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-                                                         makeString("binary")));
-                //$$->typmods = list_make1(makeIntConst(1, -1));
-                }
-            | BINARY '(' Iconst ')'                 {
-                //$$ = SystemTypeName("bytea");
-                $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-                                                         makeString("binary")));
-                //$$->typmods = list_make1(makeIntConst($3, -1));
-                }
-            | VARBINARY '(' Iconst ')'              {
-                //$$ = SystemTypeName("bytea");
-                $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-                                                         makeString("varbinary")));
-                //$$->typmods = list_make1(makeIntConst($3, -1));
-                }
+			| BINARY
+				{
+					$$ = mys_binary_type_name("binary_n", 1, @1);
+				}
+			| BINARY '(' Iconst ')'
+				{
+					$$ = mys_binary_type_name("binary_n", $3, @1);
+				}
+			| VARBINARY '(' Iconst ')'
+				{
+					$$ = mys_binary_type_name("varbinary_n", $3, @1);
+				}
 			| VARBINARY
 				{
-					$$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
-															 makeString("varbinary")));
+					$$ = makeTypeNameFromNameList(list_make2(makeString("mysql"), makeString("varbinary")));
 				}
             | YEAR_P opt_field_length opt_field_option
                 {
@@ -18215,7 +18229,12 @@ MySQLConvertType:
                 } */
             | BINARY
                 {
-					$$ = SystemTypeName("bytea");
+					$$ = mys_binary_types_available ? mys_binary_type_name("binary_n", -1, @1) : SystemTypeName("bytea");
+					$$->location = @1;
+				}
+			| BINARY '(' Iconst ')'
+				{
+					$$ = mys_binary_types_available ? mys_binary_type_name("binary_n", $3, @1) : SystemTypeName("bytea");
 					$$->location = @1;
                 }
 		;
@@ -18244,7 +18263,7 @@ opt_float:	'(' Iconst ')'
             | '(' Iconst ',' Iconst ')'
                 {
                     // TOTO: float(M,D)怎么处理
-                    $$ = SystemTypeName("float4");
+					$$ = SystemTypeName("float4");
                 }
 			| /*EMPTY*/
 				{
@@ -18325,9 +18344,9 @@ Text:
                     //    Node *n = linitial($3);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
@@ -18351,9 +18370,9 @@ Text:
                     //    Node *n = linitial($2);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
@@ -18365,7 +18384,7 @@ Text:
                     //    $$ = SystemTypeName("text");
                     //}
 
-                    $$ = SystemTypeName("text");
+					$$ = mys_binary_type_name("text_string", 255, @1);
                     $$->location = @1;
                 }
             | TEXT_P opt_field_length opt_charset_with_opt_binary
@@ -18377,13 +18396,13 @@ Text:
                     //    Node *n = linitial($3);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
-                    //        //else if (strncasecmp(strVal(v), "byte", 4) == 0)
+					//        //else if (strncasecmp(strVal(v), "byte", 4) == 0)
                     //        //{
                     //        //    //$$ = SystemTypeName("bytea");
                     //        //    $$ = makeTypeNameFromNameList(list_make2(makeString("mysql"),
@@ -18399,7 +18418,7 @@ Text:
                     //    //                                         makeString("text")));
                     //}
 
-                    $$ = SystemTypeName("text");
+					$$ = mys_binary_type_name("text_string", 65535, @1);
                     $$->location = @1;
                 }
             | MEDIUMTEXT opt_charset_with_opt_binary
@@ -18411,9 +18430,9 @@ Text:
                     //    Node *n = linitial($2);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
@@ -18425,7 +18444,7 @@ Text:
                     //    $$ = SystemTypeName("text");
                     //}
 
-                    $$ = SystemTypeName("text");
+					$$ = mys_binary_type_name("text_string", 16777215, @1);
                     $$->location = @1;
                 }
             | LONGTEXT opt_charset_with_opt_binary
@@ -18437,9 +18456,9 @@ Text:
                     //    Node *n = linitial($2);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
@@ -18451,7 +18470,7 @@ Text:
                     //    $$ = SystemTypeName("text");
                     //}
 
-                    $$ = SystemTypeName("text");
+					$$ = mys_binary_type_name("text_string", -1, @1);
                     $$->location = @1;
                 }
             | LONG opt_charset_with_opt_binary
@@ -18463,9 +18482,9 @@ Text:
                     //    Node *n = linitial($2);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
@@ -18529,9 +18548,9 @@ CharacterWithLength:  character '(' Iconst ')' opt_charset_with_opt_binary
                     //    Node *n = linitial($5);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
@@ -18565,9 +18584,9 @@ CharacterWithoutLength:	 character opt_charset_with_opt_binary
                     //    Node *n = linitial($2);
                     //    if (nodeTag(n) == T_String)
                     //    {
-                    //        Node *v = (Node *)n;
+					//        Node *v = (Node *)n;
 
-                    //        if (strncasecmp(strVal(v), "binary", 6) == 0)
+					//        if (strncasecmp(strVal(v), "binary", 6) == 0)
                     //        {
                     //            $$ = SystemTypeName("bytea");
                     //        }
@@ -18724,16 +18743,16 @@ ConstDatetime:
 					$$->location = @1;
 				}
 			| DATETIME '(' Iconst ')'
-                {
-                    $$ = SystemTypeName("timestamp");
-                    $$->typmods = list_make1(makeIntConst($3, @3));
-                    $$->location = @1;
+				{
+					$$ = SystemTypeName("timestamp");
+					$$->typmods = list_make1(makeIntConst($3, @3));
+					$$->location = @1;
                 }
             | DATETIME
                 {
-                    $$ = SystemTypeName("timestamp");
-                    $$->typmods = list_make1(makeIntConst(0, -1));
-                    $$->location = @1;
+					$$ = SystemTypeName("timestamp");
+					$$->typmods = list_make1(makeIntConst(0, -1));
+					$$->location = @1;
                 }
             | DATE
                 {
@@ -18902,11 +18921,11 @@ a_expr:		c_expr									{ $$ = $1; }
 		 * also to b_expr and to the MathOp list below.
 		 */
 			| '+' a_expr					%prec UMINUS
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", NULL, $2, @1); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", NULL, $2, @1); }
 			| '-' a_expr					%prec UMINUS
 				{ $$ = doNegate($2, @1); }
 			| a_expr '+' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", $1, $3, @2); }
             | a_expr '+' interval_expr
                 {
                     TypeCast *expr2Text = NULL;
@@ -18914,7 +18933,7 @@ a_expr:		c_expr									{ $$ = $1; }
                     if (IsA($1, A_Const))
                     {
                         A_Const *n = (A_Const *) $1;
-                        if (IsA(&n->val, String))
+						if (IsA(&n->val, String))
                         {
                             TypeName *textType = makeTypeName(pstrdup("text"));
                             textType->typmods = NIL;
@@ -18928,11 +18947,11 @@ a_expr:		c_expr									{ $$ = $1; }
                     }
                     if (expr2Text != NULL)
                     {
-                        $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", (Node *)expr2Text, $3, @2);
+						$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", (Node *)expr2Text, $3, @2);
                     }
                     else
                     {
-                        $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", $1, $3, @2);
+						$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", $1, $3, @2);
                     }
                 }
             | interval_expr '+' a_expr
@@ -18942,7 +18961,7 @@ a_expr:		c_expr									{ $$ = $1; }
                     if (IsA($3, A_Const))
                     {
                         A_Const *n = (A_Const *) $3;
-                        if (IsA(&n->val, String))
+						if (IsA(&n->val, String))
                         {
                             TypeName *textType = makeTypeName(pstrdup("text"));
                             textType->typmods = NIL;
@@ -18956,15 +18975,15 @@ a_expr:		c_expr									{ $$ = $1; }
                     }
                     if (expr2Text != NULL)
                     {
-                        $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", $1, (Node *)expr2Text, @2);
+						$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", $1, (Node *)expr2Text, @2);
                     }
                     else
                     {
-                        $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", $1, $3, @2);
+						$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", $1, $3, @2);
                     }
                 }
 			| a_expr '-' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "-", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "-", $1, $3, @2); }
             | a_expr '-' interval_expr
                 {
                     TypeCast *expr2Text = NULL;
@@ -18972,7 +18991,7 @@ a_expr:		c_expr									{ $$ = $1; }
                     if (IsA($1, A_Const))
                     {
                         A_Const *n = (A_Const *) $1;
-                        if (IsA(&n->val, String))
+						if (IsA(&n->val, String))
                         {
                             TypeName *textType = makeTypeName(pstrdup("text"));
                             textType->typmods = NIL;
@@ -18986,30 +19005,30 @@ a_expr:		c_expr									{ $$ = $1; }
                     }
                     if (expr2Text != NULL)
                     {
-                        $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "-", (Node *)expr2Text, $3, @2);
+						$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "-", (Node *)expr2Text, $3, @2);
                     }
                     else
                     {
-                        $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "-", $1, $3, @2);
+						$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "-", $1, $3, @2);
                     }
                 }
 			| a_expr '*' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "*", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "*", $1, $3, @2); }
 			| a_expr '/' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "/", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "/", $1, $3, @2); }
 			| a_expr DIV a_expr
 				{
 					$$ = (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString("int_div")),
 											   list_make2($1, $3), COERCE_EXPLICIT_CALL, @2);
 				}
 			| a_expr '%' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "%", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "%", $1, $3, @2); }
 			| a_expr MOD a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "%", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "%", $1, $3, @2); }
 			| a_expr '^' a_expr
 				{
 				    $$ = (Node *) makeA_Expr(AEXPR_OP, list_make1(makeString("^#")), $1, $3, @2);
-                    //$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "^", $1, $3, @2);
+					//$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "^", $1, $3, @2);
                     //ereport(ERROR,
                     //        (errcode(ERRCODE_SYNTAX_ERROR),
                     //         errmsg("Halo-MySQL does not support ^ operator"),
@@ -19018,17 +19037,17 @@ a_expr:		c_expr									{ $$ = $1; }
 			| a_expr XOR a_expr               %prec Op
 				{ $$ = (Node *) makeA_Expr(AEXPR_OP, list_make1(makeString("^^")), $1, $3, @2); }
 			| a_expr '<' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "<", $1, $3, @2); }
 			| a_expr '>' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, ">", $1, $3, @2); }
 			| a_expr '=' a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "=", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "=", $1, $3, @2); }
 			| a_expr LESS_EQUALS a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<=", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "<=", $1, $3, @2); }
 			| a_expr GREATER_EQUALS a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, ">=", $1, $3, @2); }
 			| a_expr NOT_EQUALS a_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "<>", $1, $3, @2); }
 
 			| a_expr qual_Op a_expr				%prec Op
 				{ $$ = (Node *) makeA_Expr(AEXPR_OP, $2, $1, $3, @2); }
@@ -19053,12 +19072,12 @@ a_expr:		c_expr									{ $$ = $1; }
 			| a_expr AND a_expr
 				{
 					$$ = makeAndExpr($1, $3, @2);
-					//$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "&&", $1, $3, @2);
+					//$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "&&", $1, $3, @2);
 				}
 			| a_expr OR a_expr
 				{ 
                     $$ = makeOrExpr($1, $3, @2); 
-					/* $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "||", $1, $3, @2); */
+					/* $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "||", $1, $3, @2); */
                     /* $$ = (Node *) makeA_Expr(AEXPR_OP, list_make2(makeString("mysql"), makeString("||")), $1, $3, @2); */
                 }
 			| NOT a_expr
@@ -19453,8 +19472,8 @@ interval_expr:
 
                     if (nodeTag(linitial($3)) == T_String)
                     {
-                        Node *unit = (Node *)linitial($3);
-                        if (strcmp(strVal(unit), "week") == 0)
+						Node *unit = (Node *)linitial($3);
+						if (strcmp(strVal(unit), "week") == 0)
                         {
                             multiple = 7;
                             intervalTypeMods = list_make1(makeIntConst(INTERVAL_MASK(DAY), @3));
@@ -19464,7 +19483,7 @@ interval_expr:
                             multiple = 3;
                             intervalTypeMods = list_make1(makeIntConst(INTERVAL_MASK(MONTH), @3));
                         }
-                        else // if (strcmp(strVal(unit), "microsecond") == 0)
+						else // if (strcmp(strVal(unit), "microsecond") == 0)
                         {
                             divisor = 1000000;
                             intervalTypeMods = list_make1(makeIntConst(INTERVAL_MASK(SECOND), @3));
@@ -19496,7 +19515,7 @@ interval_expr:
                     // 暂时没有multiple 与 divisor同时大于0的情况
                     if (multiple > 0)
                     {
-                        result = (Node *) makeSimpleA_Expr(AEXPR_OP, "*", (Node *)transferType2Interval, (Node *)makeIntConst(multiple, -1), -1);
+						result = (Node *) mys_hexlit_operator(AEXPR_OP, "*", (Node *)transferType2Interval, (Node *)makeIntConst(multiple, -1), -1);
                     }
                     else if (divisor > 0)
                     {
@@ -19510,7 +19529,7 @@ interval_expr:
                         int2Numeric->typeName = numericType;
                         int2Numeric->location = -1;
 
-                        result = (Node *) makeSimpleA_Expr(AEXPR_OP, "/", (Node *)transferType2Interval, (Node *)int2Numeric, -1);
+						result = (Node *) mys_hexlit_operator(AEXPR_OP, "/", (Node *)transferType2Interval, (Node *)int2Numeric, -1);
                     }
                     else
                     {
@@ -19662,39 +19681,39 @@ b_expr:		c_expr
 			| b_expr TYPECAST Typename
 				{ $$ = makeTypeCast($1, $3, @2); }
 			| '+' b_expr					%prec UMINUS
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", NULL, $2, @1); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", NULL, $2, @1); }
 			| '-' b_expr					%prec UMINUS
 				{ $$ = doNegate($2, @1); }
 			| b_expr '+' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "+", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "+", $1, $3, @2); }
 			| b_expr '-' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "-", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "-", $1, $3, @2); }
 			| b_expr '*' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "*", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "*", $1, $3, @2); }
 			| b_expr '/' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "/", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "/", $1, $3, @2); }
 			| b_expr '%' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "%", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "%", $1, $3, @2); }
 			| b_expr '^' b_expr
 				{
-                  //$$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "^", $1, $3, @2);
+				  //$$ = (Node *) mys_hexlit_operator(AEXPR_OP, "^", $1, $3, @2);
                   ereport(ERROR,
                           (errcode(ERRCODE_SYNTAX_ERROR),
                            errmsg("Halo-MySQL does not support ^ operator"),
                            parser_errposition(@2)));
                 }
 			| b_expr '<' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "<", $1, $3, @2); }
 			| b_expr '>' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, ">", $1, $3, @2); }
 			| b_expr '=' b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "=", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "=", $1, $3, @2); }
 			| b_expr LESS_EQUALS b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<=", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "<=", $1, $3, @2); }
 			| b_expr GREATER_EQUALS b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, ">=", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, ">=", $1, $3, @2); }
 			| b_expr NOT_EQUALS b_expr
-				{ $$ = (Node *) makeSimpleA_Expr(AEXPR_OP, "<>", $1, $3, @2); }
+				{ $$ = (Node *) mys_hexlit_operator(AEXPR_OP, "<>", $1, $3, @2); }
 			| b_expr qual_Op b_expr				%prec Op
 				{ $$ = (Node *) makeA_Expr(AEXPR_OP, $2, $1, $3, @2); }
 			| qual_Op b_expr					%prec Op
@@ -19733,15 +19752,15 @@ c_expr:		columnref								{ $$ = $1; }
 			| AexprConst							{ $$ = $1; }
             | MysqlUserVariableName
                 {
-                    $$ = makeUserVarRefCall($1, @1);
+					$$ = makeUserVarRefCall($1, @1);
                 }
             | MysqlUserVariableName COLON_EQUALS a_expr
                 {
-                    $$ = makeUserVarAssignCall($1, $3, @1);
+					$$ = makeUserVarAssignCall($1, $3, @1);
                 }
             | MysSysVarName
                 {
-                    $$ = makeSysVarRefCall($1, @1);
+					$$ = makeSysVarRefCall($1, @1);
                 }
 			| PARAM opt_indirection
 				{
@@ -19889,7 +19908,7 @@ func_application:
 											   COERCE_EXPLICIT_CALL,
 											   @1);
 					n->agg_order = $4;
-					$$ = (Node *)n;
+					$$ = mys_binary_func_call(n);
 				}
 			| func_name '(' VARIADIC func_arg_expr opt_sort_clause ')'
 				{
@@ -20441,28 +20460,28 @@ func_expr_common_subexpr:
 					/* various trim expressions are defined in SQL
 					 * - thomas 1997-07-19
 					 */
-					$$ = (Node *) makeFuncCall(SystemFuncName("btrim"),
+					$$ = (Node *) makeFuncCall(list_make1(makeString("btrim")),
 											   $4,
 											   COERCE_SQL_SYNTAX,
 											   @1);
 				}
 			| TRIM '(' LEADING trim_list ')'
 				{
-					$$ = (Node *) makeFuncCall(SystemFuncName("ltrim"),
+					$$ = (Node *) makeFuncCall(list_make1(makeString("ltrim")),
 											   $4,
 											   COERCE_SQL_SYNTAX,
 											   @1);
 				}
 			| TRIM '(' TRAILING trim_list ')'
 				{
-					$$ = (Node *) makeFuncCall(SystemFuncName("rtrim"),
+					$$ = (Node *) makeFuncCall(list_make1(makeString("rtrim")),
 											   $4,
 											   COERCE_SQL_SYNTAX,
 											   @1);
 				}
 			| TRIM '(' trim_list ')'
 				{
-					$$ = (Node *) makeFuncCall(SystemFuncName("btrim"),
+					$$ = (Node *) makeFuncCall(list_make1(makeString("btrim")),
 											   $3,
 											   COERCE_SQL_SYNTAX,
 											   @1);
@@ -23983,12 +24002,12 @@ rectifyColumnsName(Node *node)
             ColumnRef *columnRef = castNode(ColumnRef, node);
             foreach (lc, columnRef->fields)
             {
-                Node *val = (Node *)lfirst(lc);
+				Node *val = (Node *)lfirst(lc);
                 if (val->type == T_String)
                 {
-                    if (('a' <= strVal(val)[0]) && (strVal(val)[0] <= 'z'))
+					if (('a' <= strVal(val)[0]) && (strVal(val)[0] <= 'z'))
                     {
-                        strVal(val)[0] -= 32;
+						strVal(val)[0] -= 32;
                     }
                 }
             }

@@ -29,8 +29,9 @@
 #include "utils/snapmgr.h"
 
 #include "halo_mysql.h"
+#include "mys_prefix.h"
 
-PG_MODULE_MAGIC_EXT(.name = "aux_mysql", .version = "1.8");
+PG_MODULE_MAGIC_EXT(.name = "aux_mysql", .version = "1.9");
 
 bool		halo_mysql_listener_on = true;
 int			halo_mysql_port = 3306;
@@ -141,9 +142,18 @@ halo_mysql_ensure_extension(void)
 	pgstat_report_activity(STATE_IDLE, NULL);
 }
 
+static bool
+current_insert_ignore(void)
+{
+	MysStmtInfo *info = mys_current_stmt_info();
+
+	return info != NULL && info->ignore;
+}
+
 void
 _PG_init(void)
 {
+	mys_binary_ignore_hook = current_insert_ignore;
 	if (!process_shared_preload_libraries_in_progress)
 		ereport(ERROR,
 				(errmsg("aux_mysql must be loaded via \"shared_preload_libraries\"")));
@@ -265,6 +275,7 @@ _PG_init(void)
 	shmem_startup_hook = halo_mysql_shmem_startup;
 
 	mysql_utility_init();
+	mys_prefix_init();
 
 #ifdef HALO_BABELFISH_API
 	mysql_babelfish_register();
