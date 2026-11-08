@@ -259,6 +259,18 @@ def _():
  eq(val(c,'select /*!50000 !*/0'),1)
  eq(val(c,'select /*!+1*/'),1)
 
+@test('X04 START TRANSACTION WITH CONSISTENT SNAPSHOT keeps one snapshot (mysqldump --single-transaction)')
+def _():
+ o=my();q(o,'use abfix')
+ q(c,'create table cs_t (id int primary key, v int)');q(c,'insert into cs_t values (1, 10)')
+ for opts in ('/*!40100 WITH CONSISTENT SNAPSHOT */','WITH CONSISTENT SNAPSHOT, READ ONLY'):
+  before=val(o,'select v from cs_t')
+  q(c,'start transaction '+opts)
+  q(o,'update cs_t set v = v + 1')  # committed after START, before the first read
+  eq(val(c,'select v from cs_t'),before);eq(val(c,'select v from cs_t'),before);q(c,'commit')
+ rejects(c,'start transaction with foo snapshot')
+ o.close()
+
 try:
     c.close()
     q(p,'reset role')

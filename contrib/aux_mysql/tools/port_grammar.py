@@ -634,6 +634,29 @@ rep('VariableShowStmt:\n', '''VariableShowStmt:
 ''')
 
 # ---------------------------------------------------------------------------
+# START TRANSACTION WITH CONSISTENT SNAPSHOT
+# ---------------------------------------------------------------------------
+# mysqldump --single-transaction sends START TRANSACTION /*!40100 WITH
+# CONSISTENT SNAPSHOT */, now that executable comments run; mydumper and
+# CDC snapshots send it plainly.  InnoDB creates the read view at START:
+# mys_utility.c runs it as REPEATABLE READ and takes the snapshot then.
+# CONSISTENT is no keyword here.
+rep('\t\t\t| READ ONLY\n'
+    '\t\t\t\t\t{ $$ = makeDefElem("transaction_read_only",\n',
+    '\t\t\t| WITH IDENT SNAPSHOT\n'
+    '\t\t\t\t\t{\n'
+    '\t\t\t\t\t\tif (pg_strcasecmp($2, "consistent") != 0)\n'
+    '\t\t\t\t\t\t\tereport(ERROR,\n'
+    '\t\t\t\t\t\t\t\t\t(errcode(ERRCODE_SYNTAX_ERROR),\n'
+    '\t\t\t\t\t\t\t\t\t errmsg("syntax error at or near \\"%s\\"", $2),\n'
+    '\t\t\t\t\t\t\t\t\t parser_errposition(@2)));\n'
+    '\t\t\t\t\t\t$$ = makeDefElem("mysql_consistent_snapshot",\n'
+    '\t\t\t\t\t\t\t\t\t\t makeIntConst(true, @1), @1);\n'
+    '\t\t\t\t\t}\n'
+    '\t\t\t| READ ONLY\n'
+    '\t\t\t\t\t{ $$ = makeDefElem("transaction_read_only",\n')
+
+# ---------------------------------------------------------------------------
 # Multi-table UPDATE
 # ---------------------------------------------------------------------------
 # set_clause_list_for_mysql yields [qualifier, ResTarget] pairs (qualifier is

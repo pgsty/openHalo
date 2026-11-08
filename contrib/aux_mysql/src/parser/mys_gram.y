@@ -13790,6 +13790,16 @@ transaction_mode_item:
 			ISOLATION LEVEL iso_level
 					{ $$ = makeDefElem("transaction_isolation",
 									   makeStringConst($3, @3), @1); }
+			| WITH IDENT SNAPSHOT
+					{
+						if (pg_strcasecmp($2, "consistent") != 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_SYNTAX_ERROR),
+									 errmsg("syntax error at or near \"%s\"", $2),
+									 parser_errposition(@2)));
+						$$ = makeDefElem("mysql_consistent_snapshot",
+										 makeIntConst(true, @1), @1);
+					}
 			| READ ONLY
 					{ $$ = makeDefElem("transaction_read_only",
 									   makeIntConst(true, @1), @1); }

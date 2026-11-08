@@ -27,6 +27,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/array.h"
 #include "utils/acl.h"
@@ -638,6 +639,21 @@ has_mysql_subcommands(AlterTableStmt *stmt)
 	return false;
 }
 
+/* START TRANSACTION WITH CONSISTENT SNAPSHOT (see port_grammar.py) */
+static bool
+is_consistent_snapshot_start(Node *stmt)
+{
+	TransactionStmt *start = (TransactionStmt *) stmt;
+
+	if (!IsA(stmt, TransactionStmt) ||
+		(start->kind != TRANS_STMT_START && start->kind != TRANS_STMT_BEGIN))
+		return false;
+	foreach_node(DefElem, opt, start->options)
+		if (strcmp(opt->defname, "mysql_consistent_snapshot") == 0)
+			return true;
+	return false;
+}
+
 static void
 mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				   bool readOnlyTree, ProcessUtilityContext context,
@@ -693,6 +709,35 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	{
 		mysql_alter_table(copyObject((AlterTableStmt *) parsetree), pstmt,
 						  queryString, params, queryEnv);
+		return;
+	}
+
+	/*
+	 * START TRANSACTION WITH CONSISTENT SNAPSHOT: one snapshot for the whole
+	 * transaction (REPEATABLE READ), taken now as InnoDB creates its read
+	 * view at START, not at the first query: parallel dumpers rely on that.
+	 */
+	if (is_consistent_snapshot_start(parsetree))
+	{
+		TransactionStmt *start = copyObject((TransactionStmt *) parsetree);
+		bool		isolation = false;
+
+		foreach_node(DefElem, opt, start->options)
+			if (strcmp(opt->defname, "transaction_isolation") == 0)
+				isolation = true;
+		if (!isolation)
+			start->options = lappend(start->options,
+									 makeDefElem("transaction_isolation",
+												 makeStringConst("repeatable read", -1), -1));
+		pstmt = copyObject(pstmt);
+		pstmt->utilityStmt = (Node *) start;
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+		(void) GetTransactionSnapshot();
 		return;
 	}
 
