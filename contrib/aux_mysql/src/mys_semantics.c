@@ -257,6 +257,23 @@ mys_on_update_trigger(PG_FUNCTION_ARGS)
 		!TRIGGER_FIRED_BEFORE(td->tg_event) || !TRIGGER_FIRED_FOR_ROW(td->tg_event))
 		elog(ERROR, "mysql.on_update_current_timestamp() must be a BEFORE UPDATE row trigger");
 
+	/*
+	 * MySQL's foreign key actions (ON DELETE SET NULL, ON UPDATE CASCADE) do
+	 * not touch ON UPDATE CURRENT_TIMESTAMP columns; PostgreSQL runs them as
+	 * UPDATEs from its RI triggers, which alone set SECURITY_NOFORCE_RLS.
+	 */
+	if (InNoForceRLSOperation())
+		return PointerGetDatum(td->tg_newtuple);
+
+	/*
+	 * ENABLE ALWAYS lets the trigger fire for FOREIGN_KEY_CHECKS=0 (replica
+	 * role) in MySQL sessions; logical replication apply and other replica
+	 * sessions replay rows that already carry their timestamps.
+	 */
+	if (SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA &&
+		!mys_is_mysql_session())
+		return PointerGetDatum(td->tg_newtuple);
+
 	desc = RelationGetDescr(td->tg_relation);
 	oldt = td->tg_trigtuple;
 	newt = td->tg_newtuple;

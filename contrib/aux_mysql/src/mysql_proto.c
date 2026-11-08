@@ -402,6 +402,8 @@ mys_errno(int sqlerrcode)
 			return 1048;		/* ER_BAD_NULL_ERROR */
 		case ERRCODE_FOREIGN_KEY_VIOLATION:
 			return 1452;		/* ER_NO_REFERENCED_ROW_2 */
+		case ERRCODE_RESTRICT_VIOLATION:
+			return 1451;		/* ER_ROW_IS_REFERENCED_2: ON DELETE/UPDATE RESTRICT */
 		case ERRCODE_CHECK_VIOLATION:
 			return 3819;		/* ER_CHECK_CONSTRAINT_VIOLATED */
 		case ERRCODE_STRING_DATA_RIGHT_TRUNCATION:
@@ -1223,6 +1225,10 @@ static List *
 mys_parse_query(const char *query_string)
 {
 	List	   *stmts;
+
+	/* a rollback may have restored session_replication_role */
+	if (!IsAbortedTransactionBlockState())
+		mys_sync_foreign_key_checks();
 
 	if (halo_mysql_parser == MYS_PARSER_POSTGRES)
 	{

@@ -54,6 +54,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "catalog/namespace.h"
+#include "commands/trigger.h"
 #include "executor/tuptable.h"
 #include "storage/ipc.h"
 #include "storage/lockdefs.h"
@@ -123,7 +124,7 @@ static List *readBaseVariableRecord(TupleTableSlot *slot);
 static List *readBaseVariablesTable();
 static bool add2BaseSystemVars(SystemVar *systemVar);
 static void add2GlobalSystemVars(SystemVar *systemVar);
-static void add2SessionSystemVars(SystemVar *systemVar);
+static void add2SessionSystemVars(SystemVar *systemVar, bool at_init);
 static SystemVar *initBaseSystemVar(List *systemVarColumnVals);
 static void initSystemVariables(void);
 static void initBaseSystemVars(void);
@@ -280,6 +281,48 @@ getSystemVariableValueForShow(char *varName,
 }
 
 
+static bool
+foreign_key_checks_off(const char *value)
+{
+	return value != NULL &&
+		(pg_strcasecmp(value, "0") == 0 || pg_strcasecmp(value, "off") == 0 ||
+		 pg_strcasecmp(value, "false") == 0 || pg_strcasecmp(value, "f") == 0);
+}
+
+/* @@foreign_key_checks of this session */
+bool
+mys_foreign_key_checks(void)
+{
+	SystemVar  *var;
+	bool		found;
+
+	if (sessionSystemVars == NULL)
+		return true;
+	var = (SystemVar *) hash_search(sessionSystemVars, "foreign_key_checks",
+									HASH_FIND, &found);
+	return !found || !foreign_key_checks_off(var->varConfValue);
+}
+
+/*
+ * FOREIGN_KEY_CHECKS=0: as in InnoDB, foreign keys are neither checked nor
+ * acted on (no CASCADE).  PostgreSQL fires RI triggers only while
+ * session_replication_role is origin or local; like the MySQL variable, any
+ * MySQL user may change it.  The GUC is transactional and MySQL session
+ * variables are not, so a rolled back SET would leave the two apart: this
+ * runs on SET and again before every MySQL statement.
+ */
+void
+mys_sync_foreign_key_checks(void)
+{
+	bool		off = !mys_foreign_key_checks();
+
+	if (off != (SessionReplicationRole == SESSION_REPLICATION_ROLE_REPLICA))
+		(void) set_config_option("session_replication_role",
+								 off ? "replica" : "origin",
+								 PGC_SUSET, PGC_S_SESSION,
+								 GUC_ACTION_SET, true, 0, false);
+}
+
 void
 setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
 {
@@ -304,6 +347,9 @@ setSystemVariableValue(char *varName, char *varValue, bool isSessionSystemVar)
     lowerSystemVarName(varName);
 
     rectifySystemVarValue(varName, &varValue, isSessionSystemVar);
+
+	if (varValue == NULL && strcmp(varName, "foreign_key_checks") == 0)
+		elog(ERROR, "Variable '%s' can't be set to the value of 'NULL'", varName);
 
     if (isSessionSystemVar)
     {
@@ -465,6 +511,17 @@ initSystemVariables(void)
     initGlobalSystemVars(baseSystemVars, baseSystemVarsNum);
     initSessionSystemVars(baseSystemVars, baseSystemVarsNum);
     unlockGlobalSystemVars();
+
+	/* outside the spinlock: applying a value can allocate or fail */
+	for (int i = 0; i < baseSystemVarsNum; i++)
+	{
+		SystemVar  *var = (SystemVar *) hash_search(sessionSystemVars,
+												  baseSystemVars[i]->varName,
+												  HASH_FIND, NULL);
+
+		if (var)
+			applySystemVarValue(var->varName, var->varConfValue);
+	}
 
     MemoryContextSwitchTo(oldContext);
 }
@@ -786,8 +843,12 @@ initGlobalSystemVars(SystemVar *systemVars[], int systemVarsNum)
 }
 
 
+/*
+ * at_init: called by initSystemVariables() under the global spinlock, which
+ * applies the values once the lock is released.
+ */
 static void 
-add2SessionSystemVars(SystemVar *systemVar)
+add2SessionSystemVars(SystemVar *systemVar, bool at_init)
 {
     SystemVar *sessionSystemVar;
     bool found;
@@ -799,10 +860,22 @@ add2SessionSystemVars(SystemVar *systemVar)
     if (!found)
     {
         copySystemVar(systemVar, sessionSystemVar);
-    }
+		/* as in MySQL, a new connection starts from the GLOBAL value */
+		if (at_init && sessionSystemVar->sessionDefValueFromGlobal)
+		{
+			SystemVar  *global = (SystemVar *) hash_search(globalSystemVars,
+														   sessionSystemVar->varName,
+														   HASH_FIND, NULL);
 
-    applySystemVarValue(sessionSystemVar->varName, 
-                        sessionSystemVar->varConfValue);
+			if (global)
+				strlcpy(sessionSystemVar->varConfValue, global->varConfValue,
+						sizeof(sessionSystemVar->varConfValue));
+		}
+	}
+
+	if (!at_init)
+		applySystemVarValue(sessionSystemVar->varName,
+							sessionSystemVar->varConfValue);
 }
 
 
@@ -821,7 +894,7 @@ initSessionSystemVars(SystemVar *systemVars[], int systemVarsNum)
     for (int i = 0; i < systemVarsNum; i++)
     {
         SystemVar *systemVar = systemVars[i];
-        add2SessionSystemVars(systemVar);
+		add2SessionSystemVars(systemVar, true);
     }
 }
 
@@ -905,7 +978,7 @@ dynAddSystemVar(char *varName)
     }
 
     add2GlobalSystemVars(systemVar);
-    add2SessionSystemVars(systemVar);
+	add2SessionSystemVars(systemVar, false);
 
     MemoryContextSwitchTo(oldContext);
     return systemVar;
@@ -1459,6 +1532,8 @@ applySystemVarValue(const char *varName, const char *varValue)
             autoCommit = 0;
         }
     }
+	else if (pg_strcasecmp(varName, "foreign_key_checks") == 0)
+		mys_sync_foreign_key_checks();
     else if (strncasecmp(varName, "time_zone", 9) == 0)
     {
         VariableSetStmt *variableSetStmt;

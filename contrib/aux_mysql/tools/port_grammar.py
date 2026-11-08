@@ -705,5 +705,28 @@ rep(' ' * 32 + 'if (strncasecmp(targetRelationName, rangeVar->alias->aliasname, 
 rep(' ' * 32 + 'if ((strncasecmp(targetRelationName, rangeVar->relname, len)) == 0)',
     '\t' * 8 + 'if (pg_strcasecmp(targetRelationName, rangeVar->relname) == 0)')
 
+# ---------------------------------------------------------------------------
+# FOREIGN KEY
+# ---------------------------------------------------------------------------
+# PG18 added Constraint.is_enforced (NOT ENFORCED); gram.y sets it before
+# processCASbits.  This PG14 grammar left it zero, so every MySQL foreign key
+# was created NOT ENFORCED: no checks, no ON DELETE/UPDATE actions.
+rep('\t\t\t\t\tn->conname = NULL;\n\t\t\t\t\tn->pktable\t\t\t= $8;\n',
+    '\t\t\t\t\tn->conname = NULL;\n\t\t\t\t\tn->is_enforced = true;\n\t\t\t\t\tn->pktable\t\t\t= $8;\n')
+# PG18's AT_AlterConstraint takes an ATAlterConstraint node, not the PG14
+# Constraint built here (an assertion failure on cassert builds, a misread
+# node otherwise).  ALTER CONSTRAINT is not MySQL syntax; MySQL rejects it too.
+start = s.index('\t\t\t| ALTER CONSTRAINT name ConstraintAttributeSpec\n')
+end = s.index('\t\t\t\t}\n', start) + len('\t\t\t\t}\n')
+rep(s[start:end], (
+    '\t\t\t| ALTER CONSTRAINT name ConstraintAttributeSpec\n'
+    '\t\t\t\t{\n'
+    '\t\t\t\t\tereport(ERROR,\n'
+    '\t\t\t\t\t\t\t(errcode(ERRCODE_SYNTAX_ERROR),\n'
+    '\t\t\t\t\t\t\t errmsg("ALTER CONSTRAINT is not supported"),\n'
+    '\t\t\t\t\t\t\t parser_errposition(@1)));\n'
+    '\t\t\t\t\t$$ = NULL;\n'
+    '\t\t\t\t}\n'))
+
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 print("ported grammar written to", dst)

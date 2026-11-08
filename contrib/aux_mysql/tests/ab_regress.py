@@ -270,6 +270,80 @@ def _():
   eq(val(c,'select v from cs_t'),before);eq(val(c,'select v from cs_t'),before);q(c,'commit')
  rejects(c,'start transaction with foo snapshot')
  o.close()
+@test('X03 FOREIGN_KEY_CHECKS=0 keeps MySQL session semantics and aux_mysql triggers')
+def _():
+ import datetime
+ q(c,'create table fkx_p (id int primary key)')
+ q(c,'create table fkx_c (id int primary key, pid int, foreign key (pid) references fkx_p (id) on delete cascade)')
+ q(c,'insert into fkx_p values (1)');q(c,'insert into fkx_c values (1, 1)')
+ rejects(c,'set foreign_key_checks=NULL');eq(str(val(c,'select @@foreign_key_checks')),'1')
+ # a rolled back SET must not leave the checks off behind @@foreign_key_checks
+ q(c,'set foreign_key_checks=0');q(c,'begin');q(c,'set foreign_key_checks=1');q(c,'rollback')
+ eq(str(val(c,'select @@foreign_key_checks')),'1');rejects(c,'insert into fkx_c values (2, 99)','foreign key')
+ # aux_mysql's AUTO_INCREMENT and ON UPDATE triggers keep firing
+ q(c,'create table fkx_ai (id int auto_increment primary key, v int, ts timestamp(6) null on update current_timestamp(6))')
+ q(c,'set foreign_key_checks=0');q(c,'insert into fkx_ai (id, v) values (1, 1)');q(c,'update fkx_ai set v=2 where id=1')
+ assert val(c,'select ts from fkx_ai where id=1') is not None
+ q(c,'set foreign_key_checks=1');q(c,'insert into fkx_ai (v) values (3)')
+ eq(q(c,'select id from fkx_ai order by id'),((1,),(2,)))
+ # ADD FOREIGN KEY does not check existing rows; TRUNCATE empties just the parent
+ q(c,'create table fkx_old (id int primary key, pid int)');q(c,'insert into fkx_old values (1, 99)')
+ q(c,'set foreign_key_checks=0');q(c,'alter table fkx_old add foreign key (pid) references fkx_p (id)')
+ q(c,'truncate table fkx_p')
+ eq(val(c,'select count(*) from fkx_p'),0);eq(val(c,'select count(*) from fkx_c'),1)
+ q(c,'set foreign_key_checks=1')
+ rejects(c,'insert into fkx_old values (2, 98)','foreign key')
+ eq(val(c,'select count(*) from fkx_old'),1)
+ # decided per statement, also inside one multi-statement packet
+ from pymysql.constants import CLIENT
+ m=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),
+                   autocommit=True,database=SCHEMA,client_flag=CLIENT.MULTI_STATEMENTS)
+ def multi(sql):
+  with m.cursor() as t:
+   t.execute(sql)
+   while t.nextset(): pass
+ q(m,'insert into fkx_p values (5)');q(m,'insert into fkx_c values (5, 5)')
+ q(m,'set foreign_key_checks=0')
+ try: multi('set foreign_key_checks=1; truncate table fkx_p')
+ except pymysql.err.MySQLError: pass
+ else: raise AssertionError('TRUNCATE of a referenced table with checks on')
+ eq(val(m,'select count(*) from fkx_c where id=5'),1)
+ q(m,'set foreign_key_checks=0');q(m,'begin');q(m,'set foreign_key_checks=1')
+ try: multi('rollback; insert into fkx_c values (9, 99)')
+ except pymysql.err.MySQLError as e: assert e.args[0]==1452,e
+ else: raise AssertionError('orphan accepted after a rollback in the same packet')
+ m.close()
+ # foreign key actions leave ON UPDATE CURRENT_TIMESTAMP alone, as InnoDB does
+ q(c,'create table fkx_ts (id int primary key, pid int, ts timestamp null default null on update current_timestamp, foreign key (pid) references fkx_p (id) on delete set null on update cascade)')
+ q(c,'insert into fkx_p values (6),(7)');q(c,"insert into fkx_ts values (1, 6, '2000-01-01 00:00:00'), (2, 7, '2000-01-01 00:00:00')")
+ q(c,'delete from fkx_p where id=6');q(c,'update fkx_p set id=70 where id=7')
+ eq(q(c,'select pid, ts from fkx_ts order by id'),((None,datetime.datetime(2000,1,1)),(70,datetime.datetime(2000,1,1))))
+ # new connections take GLOBAL foreign_key_checks
+ q(c,'set global foreign_key_checks=0')
+ try:
+  g=my();q(g,'use abfix');eq(str(val(g,'select @@foreign_key_checks')),'0')
+  q(g,'insert into fkx_c values (11, 999)');g.close()
+ finally:
+  q(c,'set global foreign_key_checks=1')
+ # TRUNCATE needs only the TRUNCATE privilege and empties the whole table, RLS or not
+ user=SCHEMA+'_tr'
+ q(c,'create table fkx_rp (id int primary key)');q(c,'create table fkx_rc (id int primary key, pid int, foreign key (pid) references fkx_rp (id))')
+ q(c,'insert into fkx_rp values (1),(2)');q(c,'insert into fkx_rc values (1, 1)')
+ q(p,"create role %s login password 'Tr.12345'"%user);q(p,'grant usage on schema abfix to %s'%user)
+ q(p,'grant truncate on abfix.fkx_rp to %s'%user)
+ q(p,'alter table abfix.fkx_rp enable row level security');q(p,'alter table abfix.fkx_rp force row level security')
+ t=pymysql.connect(host=HOST,port=MP,user=user,password='Tr.12345',autocommit=True,database=SCHEMA)
+ q(t,'set foreign_key_checks=0');q(t,'truncate table fkx_rp');t.close()
+ q(p,'alter table abfix.fkx_rp no force row level security');q(p,'alter table abfix.fkx_rp disable row level security')
+ eq(val(c,'select count(*) from fkx_rp'),0);eq(val(c,'select count(*) from fkx_rc'),1)
+ q(p,'drop owned by %s'%user);q(p,'drop role %s'%user)
+ # replica-role sessions outside MySQL (logical replication apply) replay timestamps unchanged
+ q(c,"create table fkx_rep (id int primary key, v int, ts timestamp null default null on update current_timestamp)")
+ q(c,"insert into fkx_rep values (1, 1, '2000-01-01 00:00:00')")
+ q(p,'set session_replication_role = replica');q(p,'update abfix.fkx_rep set v = 2');q(p,'set session_replication_role = origin')
+ eq(val(c,'select ts from fkx_rep'),datetime.datetime(2000,1,1))
+ q(c,'set foreign_key_checks=0');q(c,'update fkx_rep set v = 3');q(c,'set foreign_key_checks=1')
+ assert val(c,'select ts from fkx_rep')>datetime.datetime(2000,1,1)
 
 try:
     c.close()

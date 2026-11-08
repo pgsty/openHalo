@@ -13,8 +13,10 @@
 #include "postgres.h"
 
 #include "access/relation.h"
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
+#include "catalog/heap.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_constraint.h"
@@ -22,6 +24,8 @@
 #include "commands/defrem.h"
 #include "commands/trigger.h"
 #include "commands/seclabel.h"
+#include "executor/executor.h"
+#include "executor/spi.h"
 #include "nodes/makefuncs.h"
 #include "tcop/utility.h"
 #include "utils/lsyscache.h"
@@ -30,6 +34,7 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/array.h"
+#include "utils/builtins.h"
 #include "utils/acl.h"
 #include "miscadmin.h"
 
@@ -37,6 +42,7 @@
 #include "mys_parsenodes.h"
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static bool collation_provider_registered = false;
 
 /* row triggers maintained by mysql_table_setup() */
@@ -507,6 +513,19 @@ create_row_trigger(const char *nsp, const char *rel, const char *name,
 	t->events = events;
 	t->columns = columns;
 	run_utility((Node *) t, pstmt, queryString, params, queryEnv);
+
+	/* also with FOREIGN_KEY_CHECKS=0, i.e. session_replication_role = replica */
+	{
+		AlterTableStmt *alter = makeNode(AlterTableStmt);
+		AlterTableCmd *cmd = makeNode(AlterTableCmd);
+
+		cmd->subtype = AT_EnableAlwaysTrig;
+		cmd->name = pstrdup(name);
+		alter->relation = makeRangeVar(pstrdup(nsp), pstrdup(rel), -1);
+		alter->cmds = list_make1(cmd);
+		alter->objtype = OBJECT_TABLE;
+		run_utility((Node *) alter, pstmt, queryString, params, queryEnv);
+	}
 }
 
 static void
@@ -654,6 +673,83 @@ is_consistent_snapshot_start(Node *stmt)
 	return false;
 }
 
+/*
+ * FOREIGN_KEY_CHECKS=0: PostgreSQL refuses TRUNCATE of a table that another
+ * table's foreign key references, also under session_replication_role =
+ * replica.  MySQL empties just that table: delete its rows instead (no RI
+ * action fires in replica mode).  TRUNCATE does not reset AUTO_INCREMENT
+ * here either.
+ */
+static bool
+truncate_referenced_tables(TruncateStmt *stmt)
+{
+	List	   *relids = NIL;
+
+	if (mys_foreign_key_checks() || stmt->restart_seqs || stmt->behavior != DROP_RESTRICT)
+		return false;
+	foreach_node(RangeVar, rv, stmt->relations)
+	{
+		Oid			relid = RangeVarGetRelid(rv, NoLock, true);
+
+		if (!OidIsValid(relid))
+			return false;		/* TRUNCATE reports it */
+		relids = lappend_oid(relids, relid);
+	}
+	if (heap_truncate_find_FKs(relids) == NIL)
+		return false;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	foreach_node(RangeVar, rv, stmt->relations)
+	{
+		Relation	rel = table_openrv(rv, RowExclusiveLock);
+		Oid			relid = RelationGetRelid(rel);
+		AclResult	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_TRUNCATE);
+		Oid			save_userid;
+		int			save_sec_context;
+		char	   *sql;
+
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, get_relkind_objtype(rel->rd_rel->relkind),
+						   RelationGetRelationName(rel));
+		sql = psprintf("DELETE FROM %s%s", rv->inh ? "" : "ONLY ",
+					   quote_qualified_identifier(get_namespace_name(RelationGetNamespace(rel)),
+												  RelationGetRelationName(rel)));
+
+		/*
+		 * TRUNCATE semantics: the TRUNCATE privilege checked above suffices
+		 * and no row is filtered out, so delete as the owner with row level
+		 * security bypassed, as the RI triggers do.  An error restores the
+		 * user at abort.
+		 */
+		GetUserIdAndSecContext(&save_userid, &save_sec_context);
+		SetUserIdAndSecContext(rel->rd_rel->relowner,
+							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
+							   SECURITY_NOFORCE_RLS);
+		if (SPI_execute(sql, false, 0) != SPI_OK_DELETE)
+			elog(ERROR, "could not empty table \"%s\"", RelationGetRelationName(rel));
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+		table_close(rel, NoLock);
+	}
+	SPI_finish();
+	return true;
+}
+
+/*
+ * session_replication_role follows @@foreign_key_checks before every
+ * statement, also within a multi-statement packet (a ROLLBACK earlier in the
+ * packet may have restored the GUC).
+ */
+static void
+mys_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	if (mys_is_mysql_session())
+		mys_sync_foreign_key_checks();
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
 static void
 mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				   bool readOnlyTree, ProcessUtilityContext context,
@@ -672,6 +768,9 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		collation_provider_registered = true;
 	}
 
+	if (mys_is_mysql_session())
+		mys_sync_foreign_key_checks();
+
 	/* Resolve ADD/MODIFY defaults at execution, including multi-statement DDL. */
 	if (mys_is_mysql_session() && halo_mysql_parser == MYS_PARSER_MYSQL &&
 		IsA(parsetree, AlterTableStmt))
@@ -681,11 +780,22 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 
 		if (OidIsValid(relid))
 			foreach_node(AlterTableCmd, cmd, alter->cmds)
+			{
 				if (cmd->def && IsA(cmd->def, ColumnDef) &&
 					(cmd->subtype == AT_AddColumn || (int) cmd->subtype == AT_ModifyColumn ||
 					 (int) cmd->subtype == AT_ChangeColumn))
 					mys_rectify_column_collation((ColumnDef *) cmd->def,
 												mys_table_default_collation(relid));
+				/* FOREIGN_KEY_CHECKS=0: MySQL does not check existing rows */
+				if (cmd->subtype == AT_AddConstraint && cmd->def &&
+					IsA(cmd->def, Constraint) &&
+					((Constraint *) cmd->def)->contype == CONSTR_FOREIGN &&
+					!mys_foreign_key_checks())
+				{
+					((Constraint *) cmd->def)->skip_validation = true;
+					((Constraint *) cmd->def)->initially_valid = false;
+				}
+			}
 		pstmt = copyObject(pstmt);
 		pstmt->utilityStmt = parsetree = (Node *) alter;
 	}
@@ -697,6 +807,10 @@ mys_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	/* syntax error of a statement inside a transaction (mys_txn.c) */
 	if (mys_txn_is_deferred_error(parsetree))
 		mys_txn_raise_deferred_error();
+
+	if (mys_is_mysql_session() && IsA(parsetree, TruncateStmt) &&
+		truncate_referenced_tables((TruncateStmt *) parsetree))
+		return;
 
 	if (is_table_setup(parsetree))
 	{
@@ -754,4 +868,6 @@ mysql_utility_init(void)
 {
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = mys_ProcessUtility;
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = mys_ExecutorStart;
 }

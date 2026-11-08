@@ -44,6 +44,8 @@ extern void mysql_listen_init(void);
 extern bool mys_is_mysql_session(void);
 extern void halo_mysql_ensure_extension(void);
 extern void halo_mysql_lock_setup(void);
+extern bool mys_foreign_key_checks(void);
+extern void mys_sync_foreign_key_checks(void);
 
 /* how a MySQL statement interacts with transactions (mys_txn.c) */
 typedef enum MysTxnKind

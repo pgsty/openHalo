@@ -1,6 +1,6 @@
 # aux_mysql
 
-openHalo's MySQL Supplementary Extension (version 1.5, same name and settings as in openHalo 1.0) on
+openHalo's MySQL Supplementary Extension (version 1.6, same name and settings as in openHalo 1.0) on
 PostgreSQL 18. In openHalo 1.0 the MySQL protocol, parser and semantics were compiled into the kernel and
 aux_mysql held the SQL layer; here aux_mysql carries all of it, on top of the kernel's generic protocol
 extension hooks and its atomic sequence-advancement API. Other kernels need both APIs and separate validation. It must be
@@ -39,6 +39,12 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   case-sensitive), lenient conversions when `sql_mode` is not strict, `ON UPDATE CURRENT_TIMESTAMP`,
   AUTO_INCREMENT (identity columns: explicit values advance the counter, `ALTER TABLE ... AUTO_INCREMENT`,
   MODIFY / CHANGE keeping, adding or dropping it).
+- **Foreign keys**: enforced with their ON DELETE / ON UPDATE actions, as in InnoDB.
+  `FOREIGN_KEY_CHECKS=0` turns off both checking and actions for the session, as in MySQL: it sets
+  `session_replication_role = replica` (aux_mysql's own AUTO_INCREMENT and ON UPDATE triggers keep
+  firing; other PostgreSQL triggers are skipped), `ALTER TABLE ... ADD FOREIGN KEY` does not check
+  existing rows (`NOT VALID`), and `TRUNCATE` of a referenced table deletes just its rows. Turning it
+  back on does not recheck existing rows. Any MySQL user may set it, as in MySQL.
 - **Dialect**: openHalo's MySQL grammar (backquotes, `LIMIT m,n`, `"strings"`, `UPDATE ... JOIN`, inline
   `KEY`, `COMMENT`, `ALTER TABLE MODIFY/CHANGE/ADD INDEX/DROP PRIMARY KEY`, `ON DUPLICATE KEY UPDATE`,
   `REPLACE`, `INSERT IGNORE`, `CREATE USER ... IDENTIFIED BY`, `SHOW DATABASES/TABLES/COLUMNS/INDEX/CREATE TABLE/
@@ -61,6 +67,23 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
 - No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
 - `SHOW CREATE TABLE` shows PostgreSQL collation names (`COLLATE case_insensitive`); they replay into
   aux_mysql, not into MySQL.
+- Foreign keys created before PostgreSQL 18 enforcement was enabled in aux_mysql are `NOT ENFORCED`
+  (`pg_constraint.conenforced = false`). Re-create them as enforced without checking old rows, then
+  validate when convenient:
+  ```sql
+  DO $$ DECLARE c record; BEGIN
+    FOR c IN SELECT conrelid::regclass AS tbl, conname, pg_get_constraintdef(oid) AS def
+             FROM pg_constraint WHERE contype = 'f' AND NOT conenforced LOOP
+      EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I, ADD CONSTRAINT %I %s NOT VALID',
+                     c.tbl, c.conname, c.conname, replace(c.def, ' NOT ENFORCED', ''));
+    END LOOP; END $$;
+  ```
+  After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
+  AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0`.
+  With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
+  table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
+  fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION
+  reports 1452 (MySQL: 1451), RESTRICT reports 1451.
 - PostgreSQL's MVCC differs from InnoDB locking reads for concurrent delete + insert of the same key
   (duplicate key errors where MySQL waits).
 

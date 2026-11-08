@@ -4817,17 +4817,11 @@ alter_table_cmd:
 			/* ALTER TABLE <name> ALTER CONSTRAINT ... */
 			| ALTER CONSTRAINT name ConstraintAttributeSpec
 				{
-					AlterTableCmd *n = makeNode(AlterTableCmd);
-					Constraint *c = makeNode(Constraint);
-					n->subtype = AT_AlterConstraint;
-					n->def = (Node *) c;
-					c->contype = CONSTR_FOREIGN; /* others not supported, yet */
-					c->conname = $3;
-					processCASbits($4, @4, "ALTER CONSTRAINT statement",
-									&c->deferrable,
-									&c->initdeferred,
-									NULL, NULL, yyscanner);
-					$$ = (Node *)n;
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("ALTER CONSTRAINT is not supported"),
+							 parser_errposition(@1)));
+					$$ = NULL;
 				}
 			/* ALTER TABLE <name> VALIDATE CONSTRAINT ... */
 			| VALIDATE CONSTRAINT name
@@ -7108,6 +7102,7 @@ ConstraintElem:
 					n->contype = CONSTR_FOREIGN;
 					n->location = @1;
 					n->conname = NULL;
+					n->is_enforced = true;
 					n->pktable			= $8;
 					n->fk_attrs			= $5;
 					n->pk_attrs			= $9;
