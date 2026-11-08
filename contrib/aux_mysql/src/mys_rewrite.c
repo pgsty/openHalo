@@ -103,16 +103,39 @@ static const char *const clause_keywords[] = {
 	"limit", "union", "intersect", "except", "for", "lock", NULL
 };
 
+/*
+ * End of the select-list expression at start: the last character that is
+ * neither space nor comment before the next ',' ';' ')' or clause keyword.
+ * MySQL names an item after its tokens, so a comment after the expression is
+ * no part of the name ("select 1+1 # sum" is named 1+1); one inside it is.
+ * Comments are those of mys_scan.l: '#' to \n, "--" to \n or \r, slash-star
+ * to star-slash.  An executable comment (slash-star-bang) holds SQL.
+ */
 static int
 expr_text_end(const char *q, int start, int end)
 {
 	int			depth = 0;
 	int			i = start;
+	int			last = start;
 
 	while (i < end)
 	{
 		char		c = q[i];
 
+		if (c == '#' || (c == '-' && i + 1 < end && q[i + 1] == '-'))
+		{
+			while (i < end && q[i] != '\n' && (c == '#' || q[i] != '\r'))
+				i++;
+			continue;
+		}
+		if (c == '/' && i + 1 < end && q[i + 1] == '*' &&
+			!(i + 2 < end && q[i + 2] == '!'))
+		{
+			for (i += 2; i < end && !(q[i] == '*' && i + 1 < end && q[i + 1] == '/'); i++)
+				;
+			i += 2;
+			continue;
+		}
 		if (c == '\'' || c == '"' || c == '`')
 		{
 			i++;
@@ -123,6 +146,7 @@ expr_text_end(const char *q, int start, int end)
 				i++;
 			}
 			i++;
+			last = Min(i, end);
 			continue;
 		}
 		if (c == '(')
@@ -130,11 +154,11 @@ expr_text_end(const char *q, int start, int end)
 		else if (c == ')')
 		{
 			if (depth == 0)
-				return i;
+				return last;
 			depth--;
 		}
 		else if (depth == 0 && (c == ',' || c == ';'))
-			return i;
+			return last;
 		else if (depth == 0 && isalpha((unsigned char) c) &&
 				 (i == start || !(isalnum((unsigned char) q[i - 1]) || q[i - 1] == '_')))
 		{
@@ -144,12 +168,14 @@ expr_text_end(const char *q, int start, int end)
 
 				if (i + len <= end && pg_strncasecmp(q + i, clause_keywords[k], len) == 0 &&
 					(i + len == end || !(isalnum((unsigned char) q[i + len]) || q[i + len] == '_')))
-					return i;
+					return last;
 			}
 		}
+		if (!isspace((unsigned char) c))
+			last = i + 1;
 		i++;
 	}
-	return end;
+	return last;
 }
 
 /*

@@ -234,6 +234,10 @@ extern void core_yyset_column(int column_no, yyscan_t yyscanner);
  *
  * XXX if you change the set of whitespace characters, fix scanner_isspace()
  * to agree.
+ *
+ * As in MySQL, '#' starts a comment that runs to the next \n (a lone \r
+ * does not end it); '#' is therefore no operator character.  Inside an
+ * executable comment it may swallow the closing star-slash, as in MySQL.
  */
 
 space			[ \t\n\r\f]
@@ -241,7 +245,7 @@ horiz_space		[ \t\f]
 newline			[\n\r]
 non_newline		[^\n\r]
 
-comment			("--"{non_newline}*)
+comment			("--"{non_newline}*|"#"[^\n]*)
 
 whitespace		({space}+|{comment})
 newline2        ({newline}|{space}*)
@@ -414,10 +418,10 @@ not_equals		"!="
  * that the sets overlap, but each has some chars that are not in the other.
  *
  * If you change either set, adjust the character lists appearing in the
- * rule for "operator"!
+ * rule for "operator"!  '#' is a comment start, not an operator character.
  */
 self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=]
-op_chars		[\~\!\#\^\&\|\+\-\*\/\%\<\>\=]
+op_chars		[\~\!\^\&\|\+\-\*\/\%\<\>\=]
 operator		{op_chars}+
 
 /*

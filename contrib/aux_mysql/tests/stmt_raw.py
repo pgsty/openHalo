@@ -8,6 +8,7 @@ import struct
 import sys
 
 import pymysql
+from pymysql.constants import CLIENT
 
 COM_STMT_PREPARE, COM_STMT_EXECUTE, COM_STMT_SEND_LONG_DATA = 0x16, 0x17, 0x18
 COM_STMT_CLOSE, COM_STMT_RESET = 0x19, 0x1a
@@ -165,6 +166,18 @@ r = read()
 check('unterminated executable comment: prepare fails cleanly', r[:1] == b'\xff' and r[1:3] == struct.pack('<H', 1064), r)
 r = prepare('select ? /*!50000 + 1 */ as v')
 check('executable comment text is prepared', 'id' in r, r)
+r = prepare('select ? # ?\n + 1 as v')
+check('a marker in a # comment is no parameter', r.get('nparams') == 1, r)
+
+# COM_QUERY answers a trailing comment-only statement with an extra OK when
+# the client enabled multiple statements; COM_STMT_EXECUTE never does
+conn.close()
+conn = pymysql.connect(host='127.0.0.1', port=int(os.environ.get('MYSQL_PORT', '3306')), user='dbuser_mysql',
+                       password='Mysql.123', database='test', client_flag=CLIENT.MULTI_STATEMENTS)
+DEPRECATE_EOF = bool(conn.server_capabilities & (1 << 24)) and bool(conn.client_flag & (1 << 24))
+r = prepare('select 1 as v; -- done')
+e = execute(r['id'], [])
+check('execute with a trailing comment: one result set', len(e.get('rows', [])) == 1, e)
 
 with conn.cursor() as cur:
     cur.execute('select 1')

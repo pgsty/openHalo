@@ -65,6 +65,9 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   access method of that name, `ENCRYPTION='Y'` to `tde_heap` when pg_tde is installed. Executable comments
   `/*! ... */` and `/*!NNNNN ... */` run as SQL when NNNNN is not newer than `mysql.halo_mysql_version`
   (mysqldump's `SET NAMES`, `FOREIGN_KEY_CHECKS`, `TIME_ZONE`, `SQL_MODE` and view definitions).
+  `#` comments run to the end of the line as in MySQL (so PostgreSQL's `#` operators are not available
+  under `mysql.parser = mysql`); with multiple statements enabled, comments after the last `;` get an OK
+  of their own, as MySQL sends for that empty statement.
 - **Prefix key parts** `KEY (col(n))`: a column that may hold values beyond a btree entry (TEXT, BLOB,
   VARCHAR over 600 characters) is not indexed whole, so long values insert as in MySQL. A key starting
   with one becomes a hash index on that column, which serves `=` lookups (also for TEXT / BLOB keys
@@ -84,6 +87,8 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   `mysql.statement_rollback = off`.
 - `bigint unsigned` is an int8 domain (no values above 2^63-1); no zero dates; `'a' = 'A'` between two
   literals is case-sensitive (literals use the database collation); `1.5e0` is numeric, not DOUBLE.
+- `--` starts a comment even without a space after it, as in PostgreSQL (MySQL reads `1--1` as `1 - -1`),
+  and a lone `\r` ends it (MySQL: only `\n`).
 - No MySQL Unix socket, `KILL [QUERY]`, `COM_CHANGE_USER`, stored procedures.
 - Every MySQL collation name in a table or column definition is accepted and mapped to the closest
   aux_mysql collation, not reproduced (in expressions, `COLLATE utf8mb4_bin` is not mapped): `*_ci`

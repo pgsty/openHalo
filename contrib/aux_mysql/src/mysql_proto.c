@@ -41,6 +41,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "parser/parser.h"
+#include "parser/scansup.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/protocol_extension.h"
 #include "storage/ipc.h"
@@ -151,6 +152,8 @@ static List *bf_receivers = NIL;	/* result receiver state (MysDR) */
 static List *stmt_infos = NIL;
 static int	stmt_index = 0;
 static uint64 cur_insert_id = 0;	/* last_insert_id for the next OK packet */
+static bool com_query = false;		/* the command is COM_QUERY */
+static bool trailing_comment_ok = false;	/* an OK follows the last statement */
 
 static MysStmtInfo *
 current_stmt_info(void)
@@ -190,6 +193,37 @@ more_visible_results(void)
 	for (int i = stmt_index + 1; i < list_length(stmt_infos); i++)
 	{
 		if (!((MysStmtInfo *) list_nth(stmt_infos, i))->suppress_response)
+			return true;
+	}
+	return trailing_comment_ok;
+}
+
+/*
+ * MySQL first strips trailing ';' and spaces from a COM_QUERY.  When what
+ * then follows the last ';' is only comments ("select 1; -- done"), it runs
+ * that as an empty statement and answers it with an OK of its own, if the
+ * client enabled multiple statements.  The grammar has dropped the empty
+ * statements, so look at the text after the last statement: the parse left
+ * only ';', space and comments there.
+ */
+static bool
+has_trailing_comment(List *raw, const char *query_string)
+{
+	RawStmt    *last;
+	const char *p;
+
+	if (!com_query || !(mys_client_caps & CLIENT_MULTI_STATEMENTS) || raw == NIL)
+		return false;
+	last = llast_node(RawStmt, raw);
+	/* stmt_len 0: the statement runs to the end of the text */
+	if (last->stmt_len <= 0)
+		return false;
+	p = query_string + last->stmt_location + last->stmt_len;
+	if (*p != ';')
+		return false;
+	for (; *p; p++)
+	{
+		if (*p != ';' && !scanner_isspace(*p))
 			return true;
 	}
 	return false;
@@ -1062,6 +1096,7 @@ mys_send_ready_for_query(CommandDest dest)
 	resultset_active = false;
 	stmt_infos = NIL;
 	stmt_index = 0;
+	trailing_comment_ok = false;
 	mys_stmt_query_done();
 	mys_flush();
 }
@@ -1085,12 +1120,14 @@ mys_read_command(StringInfo inBuf)
 	diagnostics_pending = true;
 	stmt_infos = NIL;
 	stmt_index = 0;
+	trailing_comment_ok = false;
 	if (inBuf->len == 0)
 		ereport(FATAL,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("empty MySQL command packet")));
 
 	cmd = (uint8) inBuf->data[0];
+	com_query = (cmd == COM_QUERY);
 	switch (cmd)
 	{
 		case COM_QUIT:
@@ -1280,9 +1317,14 @@ mys_parse_query(const char *query_string)
 			PG_END_TRY();
 			if (perr)
 				raw = mys_txn_deferred_error(perr);
+			else
+				trailing_comment_ok = has_trailing_comment(raw, query_string);
 		}
 		else
+		{
 			raw = mysql_raw_parser(query_string);
+			trailing_comment_ok = has_trailing_comment(raw, query_string);
+		}
 
 		stmts = mys_rewrite_raw_stmts(raw, query_string, &stmt_infos);
 		/* autocommit / implicit commit rules */
@@ -1314,7 +1356,7 @@ mys_parse_query(const char *query_string)
 }
 
 static void
-mys_end_command(const QueryCompletion *qc, CommandDest dest)
+end_statement(const QueryCompletion *qc)
 {
 	MysStmtInfo *info = current_stmt_info();
 	MysStmtInfo *following;
@@ -1342,6 +1384,7 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 		mys_send_err(1180, "40000",
 					 "Transaction was rolled back, not committed: an earlier statement failed");
 		affectedRows = -1;
+		trailing_comment_ok = false;
 		return;
 	}
 
@@ -1388,6 +1431,21 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 	}
 }
 
+static void
+mys_end_command(const QueryCompletion *qc, CommandDest dest)
+{
+	end_statement(qc);
+
+	/* after the last statement, the empty one of a trailing comment */
+	if (trailing_comment_ok && stmt_index >= list_length(stmt_infos))
+	{
+		trailing_comment_ok = false;
+		/* a statement of its own: it clears the warnings, as in MySQL */
+		mys_clear_diagnostics();
+		mys_send_ok(0, 0, false, false);
+	}
+}
+
 #ifndef HALO_BABELFISH_API
 static void
 mys_null_command(CommandDest dest)
@@ -1416,6 +1474,7 @@ mys_send_message(ErrorData *edata)
 	resultset_active = false;
 	stmt_infos = NIL;
 	stmt_index = 0;
+	trailing_comment_ok = false;
 }
 
 static void

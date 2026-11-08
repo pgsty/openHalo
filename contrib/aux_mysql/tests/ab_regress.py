@@ -504,6 +504,63 @@ def _():
  q(c,'create table pk_h2 (a blob, b blob, unique key pk_h2u (a(1500), b(1500)))')
  q(c,'insert into pk_h2 values (%s, %s)',(bigb,bigb[1:]));eq(errno(lambda:q(c,'insert into pk_h2 values (%s, %s)',(bigb[:1500],bigb[1:1501]))),1062)
 
+# The mysql CLI strips comments itself: these go through the driver, as from an app.
+@test('C01 # starts a comment to the end of the line, as in MySQL; it is no operator')
+def _():
+ eq(val(c,'select 1 # trailing'),1)
+ eq(val(c,'# leading\nselect 2'),2)
+ eq(val(c,'select 2#3'),2)                       # not PostgreSQL's integer XOR (1)
+ eq(val(c,'select 1=#x\n1'),1)
+ eq(q(c,'select 1 #c\r, 2'),((1,),))             # only \n ends it
+ eq(q(c,'select 1 # c -- d\n, 2 -- e # f\n, 3 /* # */'),((1,2,3),))
+ eq(q(c,"select '#', \"#\", 'a#b' # x\n 'c'"),(('#','#','a#bc'),))
+ # executable comments: SQL inside, so '#' may swallow the closing star-slash
+ eq(val(c,'select 1 /*!40101 + 1 # c\n + 2 */'),4)
+ rejects(c,'select 1 /*!40101 + 1 # c */','unterminated')
+ eq(val(c,'select 1 /*!99999 + 1 # c\n */'),1)
+ # comment text never runs
+ q(c,'create table hc (id int primary key, `a#b` varchar(10))')
+ q(c,"insert into hc values (1, 'x#y') # , (2, 'z')")
+ q(c,'update hc set id = id + 1 # , id = 100\n where id = 1 # or 1 = 1')
+ eq(q(c,'select id, `a#b` from hc'),((2,'x#y'),))
+ # a column is named after its tokens, without a comment that follows
+ with c.cursor() as t:
+  t.execute('select 1+1 # sum');eq(t.description[0][0],'1+1')
+  t.execute('select 1+1 -- sum\n, 2 /* x, y */, 1 + /* in */ 2 # z')
+  eq([d[0] for d in t.description],['1+1','2','1 + /* in */ 2'])
+
+@test('C02 a trailing comment-only statement gets its own OK, as in MySQL')
+def _():
+ from pymysql.constants import CLIENT
+ m=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),
+                   autocommit=True,database=SCHEMA,client_flag=CLIENT.MULTI_STATEMENTS)
+ def results(cn,sql):
+  out=[]
+  with cn.cursor() as t:
+   t.execute(sql)
+   while True:
+    out.append(t.fetchall() if t.description else ('OK',t.rowcount,cn._result.warning_count))
+    if not t.nextset(): return out
+ def errno(f):
+  try: f()
+  except pymysql.err.MySQLError as e: return e.args[0]
+ # MySQL strips trailing ';' and spaces, then runs comments after the last ';'
+ for sql in ('select 1; -- tail','select 1; # tail','select 1; /* tail */ ;','select 1 ;  # a\n -- b\n',
+             '# lead\nselect 1; # tail','select 1; /*!99999 x */'):
+  eq((sql,results(m,sql)),(sql,[((1,),),('OK',0,0)]))
+ for sql in ('select 1;','select 1; \n','select 1 -- c\n;','select 1 # c'):
+  eq((sql,results(m,sql)),(sql,[((1,),)]))
+ eq(results(m,'-- only'),[('OK',0,0)])
+ eq(results(m,'select 1; select 2; # c'),[((1,),),((2,),),('OK',0,0)])
+ eq(results(m,'select 1/0; -- c'),[((None,),),('OK',0,0)])
+ eq(q(m,'show warnings'),())                     # the empty statement cleared them
+ eq(errno(lambda:results(m,'select 1; select * from no_such_tbl; -- c')),1146)
+ eq(val(m,'select 3'),3)
+ m.close()
+ # without CLIENT_MULTI_STATEMENTS there is no second result
+ eq(results(c,'select 1; # tail'),[((1,),)])
+ eq(val(c,'select 4'),4)
+
 try:
     c.close()
     q(p,'reset role')
