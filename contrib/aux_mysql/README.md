@@ -116,6 +116,12 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   such a value inserts a new row where MySQL updates the existing one.
 - `SHOW CREATE TABLE` shows PostgreSQL collation names (`COLLATE case_insensitive`); they replay into
   aux_mysql, not into MySQL.
+- `ON DUPLICATE KEY UPDATE` and `REPLACE` find duplicates in one unique key: the PRIMARY KEY or the
+  first UNIQUE key whose columns the statement supplies, else the PRIMARY KEY or the first UNIQUE key
+  (a table without one just inserts, as in MySQL, also when created earlier in the same packet). A
+  duplicate in another unique key fails with 1062, a key repeated within one multi-row statement
+  with 1105, where MySQL updates. An updated or replaced row counts as 1 affected row (MySQL: 2), and
+  `REPLACE` with a column list keeps the other columns' old values (MySQL: their defaults).
 - Foreign keys created before PostgreSQL 18 enforcement was enabled in aux_mysql are `NOT ENFORCED`
   (`pg_constraint.conenforced = false`). Re-create them as enforced without checking old rows, then
   validate when convenient:

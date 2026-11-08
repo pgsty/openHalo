@@ -795,6 +795,76 @@ def _():
  q(c,"do 'begin insert into do_t values (5); end' language plpgsql")
  eq(q(c,'select x from do_t order by x'),((1,),(2,),(4,),(5,)))
 
+@test('U01 ON DUPLICATE KEY UPDATE / REPLACE without a unique key insert, also in one packet')
+def _():
+ # expectations checked against MySQL 5.7.32
+ from pymysql.constants import CLIENT
+ def n(cn,sql):
+  with cn.cursor() as t: return t.execute(sql)
+ # no PRIMARY KEY / UNIQUE: nothing is a duplicate, every row is inserted (1 affected row each)
+ q(c,'create table up_t (id int, e blob)')
+ eq(n(c,"insert into up_t values (1,'x') on duplicate key update e = 'y'"),1)
+ eq(n(c,"insert into up_t values (1,'x'),(1,'z') on duplicate key update e = 'y'"),2)
+ eq(n(c,"insert into up_t set id=2, e='w' on duplicate key update e = values(e)"),1)
+ eq(n(c,"insert into up_t select 3, 'q' on duplicate key update e = 'r'"),1)
+ eq(q(c,'select id, e from up_t order by id, e'),((1,b'x'),(1,b'x'),(1,b'z'),(2,b'w'),(3,b'q')))
+ q(c,'create table up_r (id int, v int, key (id))')
+ eq(n(c,'replace into up_r values (1,1)'),1);eq(n(c,'replace into up_r values (1,2),(1,3)'),2)
+ eq(n(c,'replace into up_r set id=1, v=4'),1);eq(n(c,'replace into up_r (id) values (1)'),1)
+ eq(n(c,'replace into up_r select 2, 5'),1)
+ eq(q(c,'select id, v from up_r order by id, v'),((1,None),(1,1),(1,2),(1,3),(1,4),(2,5)))
+ # a UNIQUE key the statement does not supply still catches its default value
+ q(c,'create table up_u (a int not null default 0, b int, unique key (a))')
+ q(c,'insert into up_u (b) values (1) on duplicate key update b = b + 10')
+ q(c,'insert into up_u (b) values (2) on duplicate key update b = b + 10');eq(q(c,'select a, b from up_u'),((0,11),))
+ q(c,'replace into up_u (b) values (7)');eq(q(c,'select a, b from up_u'),((0,7),))
+ # tables created earlier in the same packet: their keys, or none
+ m=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),
+                   autocommit=True,database=SCHEMA,client_flag=CLIENT.MULTI_STATEMENTS)
+ def multi(sql,check):
+  with m.cursor() as t:
+   t.execute(sql)
+   while t.nextset(): pass
+  return q(m,check)
+ eq(multi("create table up_b1 (id int, e blob); insert into up_b1 values (1,'x') on duplicate key update e = 'y';"
+          "insert into up_b1 values (1,'x') on duplicate key update e = 'y'; replace into up_b1 values (1, 'z')",
+          'select id, e from up_b1 order by e'),((1,b'x'),(1,b'x'),(1,b'z')))
+ eq(multi('create table up_b2 (id int primary key, v int); insert into up_b2 values (1,1) on duplicate key update v = v + 1;'
+          'insert into up_b2 values (1,1) on duplicate key update v = v + 1; replace into up_b2 values (2, 7), (1, 9)',
+          'select * from up_b2 order by id'),((1,9),(2,7)))
+ eq(multi("create table up_b3 (id int, k varchar(10) unique, v int); insert into up_b3 values (1,'a',1) on duplicate key update v = v + 1;"
+          "insert into up_b3 values (2,'a',1) on duplicate key update v = v + 1; replace into up_b3 values (3,'a',5)",
+          'select * from up_b3'),((3,'a',5),))
+ eq(multi("create table up_b4 (b text, v int, unique key (b(5))); insert into up_b4 values ('abcdefg',1) on duplicate key update v = v + 1;"
+          "insert into up_b4 values ('abcdexx',1) on duplicate key update v = v + 1; replace into up_b4 values ('abcdezz', 9)",
+          'select * from up_b4'),(('abcdezz',9),))
+ q(c,'create table up_b5 (id int primary key, v int)')
+ eq(multi('drop table up_b5; create table up_b5 (id int, v int); insert into up_b5 values (1,1) on duplicate key update v = 5;'
+          'insert into up_b5 values (1,1) on duplicate key update v = 5','select * from up_b5'),((1,1),(1,1)))
+ q(c,'create table up_b6 (id int, v int)')
+ eq(multi('drop table if exists up_b6; create table up_b6 (id int primary key, v int); insert into up_b6 values (1,1) on duplicate key update v = 5;'
+          'insert into up_b6 values (1,1) on duplicate key update v = 5','select * from up_b6'),((1,5),))
+ eq(multi('create table up_b7 (a int, b int, v int); create unique index up_b7_u on up_b7 (a, b);'
+          'insert into up_b7 values (1,1,1) on duplicate key update v = 5; insert into up_b7 values (1,1,1) on duplicate key update v = 5',
+          'select * from up_b7'),((1,1,5),))
+ eq(multi('create table up_b8 (id int not null, v int); alter table up_b8 add primary key (id);'
+          'insert into up_b8 values (1,1) on duplicate key update v = 5; insert into up_b8 values (1,1) on duplicate key update v = 5',
+          'select * from up_b8'),((1,5),))
+ q(c,'create table up_b9s (id int primary key, v int)')
+ eq(multi('create table up_b9 like up_b9s; insert into up_b9 values (1,1) on duplicate key update v = 5;'
+          'insert into up_b9 values (1,1) on duplicate key update v = 5; replace into up_b9 values (1, 8), (2, 2)',
+          'select * from up_b9 order by id'),((1,8),(2,2)))
+ q(c,'insert into up_b9s values (1,1)')
+ eq(multi('create table up_b10 as select * from up_b9s; insert into up_b10 values (1,1) on duplicate key update v = 5; replace into up_b10 values (1, 9)',
+          'select * from up_b10 order by v'),((1,1),(1,1),(1,9)))
+ # mysqldump --replace
+ eq(multi("DROP TABLE IF EXISTS `up_d`; CREATE TABLE `up_d` (`id` int(11) NOT NULL AUTO_INCREMENT, `name` varchar(20) DEFAULT NULL,"
+          "PRIMARY KEY (`id`), UNIQUE KEY `uk_name` (`name`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+          "/*!40000 ALTER TABLE `up_d` DISABLE KEYS */; REPLACE INTO `up_d` VALUES (1,'a'),(2,'b'); REPLACE INTO `up_d` VALUES (1,'c');"
+          "INSERT INTO `up_d` VALUES (2,'x') ON DUPLICATE KEY UPDATE `name` = 'y'; /*!40000 ALTER TABLE `up_d` ENABLE KEYS */",
+          'select * from up_d order by id'),((1,'c'),(2,'y')))
+ m.close()
+
 try:
     c.close()
     q(p,'reset role')

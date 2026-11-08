@@ -1417,8 +1417,9 @@ name_in_list(List *names, const char *name)
 /*
  * Pick the unique index MySQL would most likely hit: the primary key if all
  * its columns are supplied, else the first unique index whose columns are
- * all supplied, else the primary key.  A prefix key part counts as its
- * column; other expressions make an index unusable.
+ * all supplied, else the primary key, else the first unique index (a
+ * column's default value can be a duplicate too).  A prefix key part counts
+ * as its column; other expressions make an index unusable.
  */
 static Oid
 choose_arbiter_index(Relation rel, List *insert_cols)
@@ -1426,6 +1427,7 @@ choose_arbiter_index(Relation rel, List *insert_cols)
 	List	   *indexes = RelationGetIndexList(rel);
 	Oid			pk = InvalidOid;
 	Oid			covered = InvalidOid;
+	Oid			first = InvalidOid;
 	ListCell   *lc;
 
 	foreach(lc, indexes)
@@ -1463,18 +1465,25 @@ choose_arbiter_index(Relation rel, List *insert_cols)
 		}
 		if (usable && form->indisprimary)
 			pk = indexoid;
+		if (usable && !OidIsValid(first))
+			first = indexoid;
 		if (all && (!OidIsValid(covered) || form->indisprimary))
 			covered = indexoid;
 		index_close(idx, AccessShareLock);
 	}
-	return OidIsValid(covered) ? covered : pk;
+	return OidIsValid(covered) ? covered : OidIsValid(pk) ? pk : first;
 }
 
+/*
+ * The arbiter clause for a unique index of rel: its constraint, or (always
+ * when by_columns: an index copied from rel) its columns and prefix key
+ * parts.
+ */
 static InferClause *
-make_infer_clause(Relation rel, Oid indexoid)
+make_infer_clause(Relation rel, Oid indexoid, bool by_columns)
 {
 	InferClause *infer = makeNode(InferClause);
-	Oid			conoid = get_index_constraint(indexoid);
+	Oid			conoid = by_columns ? InvalidOid : get_index_constraint(indexoid);
 
 	infer->location = -1;
 	if (OidIsValid(conoid))
@@ -1511,6 +1520,295 @@ make_infer_clause(Relation rel, Oid indexoid)
 	return infer;
 }
 
+/*
+ * Tables that statements earlier in the batch being rewritten create: a
+ * later INSERT ... ON DUPLICATE KEY UPDATE / REPLACE of the batch runs
+ * against them, but the catalog does not show them yet (or still shows the
+ * table that the batch drops and creates again).
+ */
+typedef struct BatchTable
+{
+	RangeVar   *relation;
+	List	   *columns;		/* names of the columns REPLACE assigns */
+	List	   *primary;		/* IndexElems of the PRIMARY KEY, or NIL */
+	List	   *uniques;		/* IndexElem lists of the UNIQUE keys */
+	Oid			like;			/* CREATE TABLE ... LIKE: the keys of this table */
+	bool		known;			/* false: columns and keys unknown */
+} BatchTable;
+
+static List *batch_tables = NIL;
+
+static BatchTable *
+find_batch_table(RangeVar *rel)
+{
+	foreach_ptr(BatchTable, bt, batch_tables)
+	{
+		if (strcmp(bt->relation->relname, rel->relname) == 0 &&
+			(bt->relation->schemaname == NULL || rel->schemaname == NULL ||
+			 strcmp(bt->relation->schemaname, rel->schemaname) == 0))
+			return bt;
+	}
+	return NULL;
+}
+
+static void
+forget_batch_table(RangeVar *rel)
+{
+	BatchTable *bt;
+
+	while ((bt = find_batch_table(rel)) != NULL)
+		batch_tables = list_delete_ptr(batch_tables, bt);
+}
+
+/* a key of a batch table: its columns and prefix key parts (prefix_key_parts()) */
+static void
+add_batch_key(BatchTable *bt, List *parts, bool primary)
+{
+	List	   *elems = NIL;
+
+	foreach_ptr(Node, part, parts)
+	{
+		IndexElem  *from = (IndexElem *) part;
+		IndexElem  *ie = makeNode(IndexElem);
+
+		if (IsA(part, String))
+			ie->name = strVal(part);
+		else if (IsA(part, IndexElem) && from->name)
+			ie->name = from->name;
+		else if (IsA(part, IndexElem) && from->indexcolname)
+		{
+			ie->expr = copyObject(from->expr);
+			ie->indexcolname = from->indexcolname;
+		}
+		else
+			return;				/* another expression: no MySQL key */
+		ie->ordering = SORTBY_DEFAULT;
+		ie->nulls_ordering = SORTBY_NULLS_DEFAULT;
+		elems = lappend(elems, ie);
+	}
+	if (primary)
+		bt->primary = elems;
+	else
+		bt->uniques = lappend(bt->uniques, elems);
+}
+
+static void
+add_batch_column(BatchTable *bt, ColumnDef *col)
+{
+	bool		generated = false;
+
+	foreach_ptr(Node, n, col->constraints)
+	{
+		Constraint *c = (Constraint *) n;
+
+		if (!IsA(n, Constraint))
+			continue;
+		if (c->contype == CONSTR_GENERATED)
+			generated = true;
+		else if (c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE)
+			add_batch_key(bt, list_make1(makeString(col->colname)),
+						  c->contype == CONSTR_PRIMARY);
+	}
+	if (!generated)
+		bt->columns = lappend(bt->columns, col->colname);
+}
+
+static void
+add_batch_constraint(BatchTable *bt, Constraint *c)
+{
+	if ((c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE) && !c->deferrable)
+		add_batch_key(bt, c->keys, c->contype == CONSTR_PRIMARY);
+}
+
+/* unique indexes that rewrite_create_stmt() / rewrite_alter_table() add */
+static void
+add_batch_indexes(BatchTable *bt, List *stmts)
+{
+	foreach_ptr(Node, n, stmts)
+	{
+		IndexStmt  *idx = (IndexStmt *) n;
+
+		if (IsA(n, IndexStmt) && idx->unique && idx->whereClause == NULL)
+			add_batch_key(bt, idx->indexParams, idx->primary);
+	}
+}
+
+/* CREATE TABLE (after rewrite_create_stmt(), which added extra) */
+static void
+remember_create_table(CreateStmt *stmt, List *extra)
+{
+	BatchTable *bt;
+
+	/* IF NOT EXISTS of a table that exists does nothing */
+	if (extra == NIL || (stmt->if_not_exists && find_batch_table(stmt->relation)))
+		return;
+	forget_batch_table(stmt->relation);
+	bt = palloc0(sizeof(BatchTable));
+	bt->relation = stmt->relation;
+	bt->known = stmt->inhRelations == NIL && stmt->partbound == NULL && stmt->ofTypename == NULL;
+	foreach_ptr(Node, elt, stmt->tableElts)
+	{
+		if (IsA(elt, ColumnDef))
+			add_batch_column(bt, (ColumnDef *) elt);
+		else if (IsA(elt, Constraint))
+			add_batch_constraint(bt, (Constraint *) elt);
+		else if (IsA(elt, TableLikeClause) && list_length(stmt->tableElts) == 1)
+		{
+			RangeVar   *source = ((TableLikeClause *) elt)->relation;
+			BatchTable *from = find_batch_table(source);
+
+			if (from)
+			{
+				*bt = *from;
+				bt->relation = stmt->relation;
+				bt->columns = list_copy(from->columns);
+				bt->uniques = list_copy(from->uniques);
+			}
+			else
+				bt->like = RangeVarGetRelid(source, NoLock, true);
+			bt->known = bt->known && (from || OidIsValid(bt->like));
+		}
+		else
+			bt->known = false;
+	}
+	add_batch_indexes(bt, extra);
+	batch_tables = lappend(batch_tables, bt);
+}
+
+/* ALTER TABLE of a batch table: added columns and keys */
+static void
+remember_alter_table(AlterTableStmt *stmt, List *extra)
+{
+	BatchTable *bt = find_batch_table(stmt->relation);
+
+	if (bt == NULL)
+		return;
+	foreach_ptr(AlterTableCmd, cmd, stmt->cmds)
+	{
+		if (cmd == NULL)
+			continue;
+		if (cmd->subtype == AT_AddColumn && cmd->def && IsA(cmd->def, ColumnDef))
+			add_batch_column(bt, (ColumnDef *) cmd->def);
+		else if (cmd->subtype == AT_AddConstraint && cmd->def && IsA(cmd->def, Constraint))
+			add_batch_constraint(bt, (Constraint *) cmd->def);
+		else
+			bt->known = false;
+	}
+	add_batch_indexes(bt, extra);
+}
+
+/* choose_arbiter_index() for a batch table */
+static InferClause *
+batch_infer_clause(BatchTable *bt, List *insert_cols)
+{
+	List	   *key = NIL;
+	List	   *keys = bt->uniques;
+	InferClause *infer;
+
+	if (bt->primary)
+		keys = lcons(bt->primary, list_copy(keys));
+	foreach_ptr(List, elems, keys)
+	{
+		bool		all = true;
+
+		foreach_node(IndexElem, ie, elems)
+		{
+			if (insert_cols != NIL &&
+				!name_in_list(insert_cols, ie->name ? ie->name : ie->indexcolname))
+				all = false;
+		}
+		if (all)
+		{
+			key = elems;
+			break;
+		}
+	}
+	if (key == NIL && keys != NIL)
+		key = linitial(keys);
+	if (key == NIL)
+		return NULL;
+	infer = makeNode(InferClause);
+	infer->indexElems = copyObject(key);
+	infer->location = -1;
+	return infer;
+}
+
+/*
+ * ON DUPLICATE KEY UPDATE / REPLACE: PostgreSQL's ON CONFLICT DO UPDATE
+ * needs the unique index that finds the duplicate.  A table without a
+ * PRIMARY KEY or UNIQUE key cannot have one, and MySQL simply inserts: so
+ * does the statement, without its ON CONFLICT clause.  rel is NULL when the
+ * catalog does not show the table; bt describes it when the batch creates
+ * it.
+ */
+static void
+rewrite_upsert(InsertStmt *stmt, List *insert_cols, Relation rel, BatchTable *bt)
+{
+	OnConflictClause *oc = stmt->onConflictClause;
+	List	   *columns = NIL;
+	bool		replace;
+
+	if (oc == NULL ||
+		(oc->action != ONCONFLICT_UPDATE && (int) oc->action != (int) ONCONFLICT_REPLACE))
+		return;
+	replace = (int) oc->action == (int) ONCONFLICT_REPLACE;
+	oc->action = ONCONFLICT_UPDATE;
+
+	if (bt && bt->known && !OidIsValid(bt->like))
+	{
+		if (oc->infer == NULL)
+			oc->infer = batch_infer_clause(bt, insert_cols);
+		columns = bt->columns;
+	}
+	else
+	{
+		/* the catalog's table, or the one a batch table copies */
+		Relation	keys = bt && bt->known ? relation_open(bt->like, AccessShareLock) : rel;
+
+		if (keys)
+		{
+			TupleDesc	tupdesc = RelationGetDescr(keys);
+
+			if (oc->infer == NULL)
+			{
+				Oid			arbiter = choose_arbiter_index(keys, insert_cols);
+
+				if (OidIsValid(arbiter))
+					oc->infer = make_infer_clause(keys, arbiter, keys != rel);
+			}
+			for (int i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+				if (!att->attisdropped && !att->attgenerated)
+					columns = lappend(columns, pstrdup(NameStr(att->attname)));
+			}
+			if (keys != rel)
+				relation_close(keys, NoLock);
+		}
+	}
+
+	if (oc->infer == NULL)
+	{
+		/* no unique key: no row is a duplicate */
+		stmt->onConflictClause = NULL;
+		return;
+	}
+	if (replace)
+	{
+		/* REPLACE: overwrite every supplied column with the new values */
+		oc->targetList = NIL;
+		foreach_ptr(char, name, columns)
+		{
+			if (insert_cols != NIL && !name_in_list(insert_cols, name))
+				continue;
+			oc->targetList = lappend(oc->targetList,
+									 make_target(pstrdup(name),
+												 make_colref("excluded", pstrdup(name))));
+		}
+	}
+}
+
 static void
 rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 {
@@ -1519,21 +1817,20 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 	TupleDesc	tupdesc;
 	List	   *insert_cols = NIL;
 	OnConflictClause *oc = stmt->onConflictClause;
-	ListCell   *lc;
+	BatchTable *bt = find_batch_table(stmt->relation);
+
+	foreach_node(ResTarget, rt, stmt->cols)
+		insert_cols = lappend(insert_cols, rt->name);
 
 	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
 	if (!OidIsValid(relid))
 	{
-		/* table created later in the same batch: no MySQL extras */
-		if (oc && (int) oc->action == (int) ONCONFLICT_REPLACE)
-			oc->action = ONCONFLICT_UPDATE;
+		/* table created earlier in the same batch: just its keys */
+		rewrite_upsert(stmt, insert_cols, NULL, bt);
 		return;
 	}
 	rel = relation_open(relid, AccessShareLock);
 	tupdesc = RelationGetDescr(rel);
-
-	foreach(lc, stmt->cols)
-		insert_cols = lappend(insert_cols, lfirst_node(ResTarget, lc)->name);
 
 	/*
 	 * bytes of string literals for binary columns; non-strict sql_mode:
@@ -1544,34 +1841,7 @@ rewrite_insert_stmt(InsertStmt *stmt, MysStmtInfo *info)
 		literal_targets(oc->targetList, tupdesc);
 
 	/* ON DUPLICATE KEY UPDATE / REPLACE need an explicit arbiter in PG */
-	if (oc && oc->infer == NULL &&
-		(oc->action == ONCONFLICT_UPDATE || (int) oc->action == (int) ONCONFLICT_REPLACE))
-	{
-		Oid			arbiter = choose_arbiter_index(rel, insert_cols);
-
-		if (OidIsValid(arbiter))
-			oc->infer = make_infer_clause(rel, arbiter);
-
-		if ((int) oc->action == (int) ONCONFLICT_REPLACE)
-		{
-			/* REPLACE: overwrite every supplied column with the new values */
-			oc->action = ONCONFLICT_UPDATE;
-			oc->targetList = NIL;
-			for (int i = 0; i < tupdesc->natts; i++)
-			{
-				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-				char	   *name = NameStr(att->attname);
-
-				if (att->attisdropped || att->attgenerated)
-					continue;
-				if (insert_cols != NIL && !name_in_list(insert_cols, name))
-					continue;
-				oc->targetList = lappend(oc->targetList,
-										 make_target(pstrdup(name),
-													 make_colref("excluded", pstrdup(name))));
-			}
-		}
-	}
+	rewrite_upsert(stmt, insert_cols, rel, bt);
 
 	/* hidden RETURNING of the AUTO_INCREMENT column for LAST_INSERT_ID() */
 	if (stmt->returningClause == NULL)
@@ -1609,6 +1879,7 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 
 	*infos = NIL;
 	rewrite_warnings = NIL;
+	batch_tables = NIL;
 	foreach(lc, raw_stmts)
 	{
 		RawStmt    *rs = lfirst_node(RawStmt, lc);
@@ -1685,6 +1956,7 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 				break;
 			case T_CreateStmt:
 				extra = rewrite_create_stmt((CreateStmt *) rs->stmt);
+				remember_create_table((CreateStmt *) rs->stmt, extra);
 				break;
 			case T_RenameStmt:
 				{
@@ -1710,6 +1982,10 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 							extra = list_make1(move);
 						}
 					}
+					if (rename->relation && rename->renameType == OBJECT_TABLE)
+						forget_batch_table(rename->relation);
+					else if (rename->relation && find_batch_table(rename->relation))
+						find_batch_table(rename->relation)->known = false;
 					break;
 				}
 			case T_InsertStmt:
@@ -1734,18 +2010,47 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 			case T_IndexStmt:
 				{
 					IndexStmt  *idx = (IndexStmt *) rs->stmt;
-
 					char	   *lookup;
+					BatchTable *bt;
 
 					lookup = prefix_key_parts(&idx->indexParams, idx->unique, false,
 											  &idx->accessMethod,
 											  RangeVarGetRelid(idx->relation, NoLock, true), NIL);
 					if (lookup)
 						extra = list_make1(make_lookup_index(idx->relation, lookup));
+					if ((bt = find_batch_table(idx->relation)) != NULL)
+						add_batch_indexes(bt, list_make1(idx));
 					break;
 				}
+			case T_CreateTableAsStmt:
+				{
+					CreateTableAsStmt *ctas = (CreateTableAsStmt *) rs->stmt;
+
+					/* a table without keys */
+					if (ctas->objtype == OBJECT_TABLE &&
+						!(ctas->if_not_exists &&
+						  (find_batch_table(ctas->into->rel) ||
+						   OidIsValid(RangeVarGetRelid(ctas->into->rel, NoLock, true)))))
+					{
+						BatchTable *bt = palloc0(sizeof(BatchTable));
+
+						forget_batch_table(ctas->into->rel);
+						bt->relation = ctas->into->rel;
+						bt->known = true;
+						batch_tables = lappend(batch_tables, bt);
+					}
+					break;
+				}
+			case T_DropStmt:
+				if (((DropStmt *) rs->stmt)->removeType == OBJECT_TABLE)
+				{
+					foreach_node(List, names, ((DropStmt *) rs->stmt)->objects)
+						forget_batch_table(makeRangeVarFromNameList(names));
+				}
+				break;
 			case T_AlterTableStmt:
 				extra = rewrite_alter_table((AlterTableStmt *) rs->stmt);
+				remember_alter_table((AlterTableStmt *) rs->stmt, extra);
 				if (((AlterTableStmt *) rs->stmt)->cmds == NIL && extra != NIL)
 				{
 					/* nothing left but the indexes */
@@ -1782,5 +2087,6 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 		if (stop)
 			break;
 	}
+	batch_tables = NIL;
 	return result;
 }
