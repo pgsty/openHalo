@@ -168,6 +168,10 @@ r = prepare('select ? /*!50000 + 1 */ as v')
 check('executable comment text is prepared', 'id' in r, r)
 r = prepare('select ? # ?\n + 1 as v')
 check('a marker in a # comment is no parameter', r.get('nparams') == 1, r)
+r = prepare('select ?--? as v')
+check('"--" before a marker is no comment', r.get('nparams') == 2, r)
+r = prepare('select ? --\t?\n as v')
+check('a marker in a "--" comment is no parameter', r.get('nparams') == 1, r)
 
 # COM_QUERY answers a trailing comment-only statement with an extra OK when
 # the client enabled multiple statements; COM_STMT_EXECUTE never does

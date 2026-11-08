@@ -235,31 +235,33 @@ extern void core_yyset_column(int column_no, yyscan_t yyscanner);
  * XXX if you change the set of whitespace characters, fix scanner_isspace()
  * to agree.
  *
- * As in MySQL, '#' starts a comment that runs to the next \n (a lone \r
- * does not end it); '#' is therefore no operator character.  Inside an
- * executable comment it may swallow the closing star-slash, as in MySQL.
+ * MySQL comments differ from those of PostgreSQL: '#' starts a comment, so
+ * '#' is no operator character, and "--" starts one only before a space or a
+ * control character ({dashdash_follow}) or at the end of the input.  In
+ * "a--1" the dashes are two minus signs, a - (-1).  Both comments run to the
+ * next \n; a lone \r does not end them.  Inside an executable comment they
+ * may swallow the closing star-slash, as in MySQL.  A "--" at the end of the
+ * input has a rule of its own, and the {operator} rule finds a comment that
+ * starts inside an operator.
  */
 
 space			[ \t\n\r\f]
-horiz_space		[ \t\f]
-newline			[\n\r]
-non_newline		[^\n\r]
 
-comment			("--"{non_newline}*|"#"[^\n]*)
+dashdash_follow	[\001-\040\177]
+/* the rest of a "--" comment that a character other than \n follows */
+dashdash_body	[\001-\011\013-\040\177][^\n]*
+comment			("--"(\n|{dashdash_body})|"#"[^\n]*)
+/* a whole comment and the \n that ends it */
+comment_newline	(("--"{dashdash_body}?|"#"[^\n]*)\n)
 
 whitespace		({space}+|{comment})
-newline2        ({newline}|{space}*)
 
 /*
- * SQL requires at least one newline in the whitespace separating
- * string literals that are to be concatenated.  Silly, but who are we
- * to argue?  Note that {whitespace_with_newline} should not have * after
- * it, whereas {whitespace} should generally have a * after it...
+ * MySQL joins string literals separated by spaces and comments, with or
+ * without a newline.  A comment there must end at a \n, else the quote is
+ * part of the comment ("'a' -- c 'b'" is 'a').
  */
-
-special_whitespace		({space}+|{comment}{newline})
-horiz_whitespace		({horiz_space}|{comment})
-whitespace_with_newline	({horiz_whitespace}*{newline2}{special_whitespace}*)
+whitespace_with_newline	({space}|{comment_newline})*
 
 quote			'
 dquote          \"
@@ -270,12 +272,12 @@ dquotecontinue	{whitespace_with_newline}{dquote}
 /*
  * {quotecontinuefail} is needed to avoid lexer backup when we fail to match
  * {quotecontinue}.  It might seem that this could just be {whitespace}*,
- * but if there's a dash after {whitespace_with_newline}, it must be consumed
- * to see if there's another dash --- which would start a {comment} and thus
- * allow continuation of the {quotecontinue} token.
+ * but if there are dashes after {whitespace_with_newline}, two must be
+ * consumed to see if a space or control character follows --- which would
+ * start a {comment} and thus allow continuation of the {quotecontinue} token.
  */
-quotecontinuefail	{whitespace}*"-"?
-dquotecontinuefail	{whitespace}*"-"?
+quotecontinuefail	{whitespace}*("-"|"--")?
+dquotecontinuefail	{whitespace}*("-"|"--")?
 
 /* Bit string
  * It is tempting to scan the string for only those characters
@@ -362,8 +364,10 @@ xbtinside		[^`]+
  *    if found throw it back with yyless().  This handles the plus-slash-star
  *    problem.
  * Dash-dash comments have similar interactions with the operator rule.
+ * {operator_comment} runs one character past {operator}, so xcstart may end
+ * the same way to win the tie.
  */
-xcstart			\/\*{op_chars}*
+xcstart			\/\*{op_chars}*("--"{dashdash_follow})?
 xcstop			\*+\/
 xcinside		[^*/]+
 
@@ -423,16 +427,19 @@ not_equals		"!="
 self			[,()\[\].;\:\+\-\*\/\%\^\<\>\=]
 op_chars		[\~\!\^\&\|\+\-\*\/\%\<\>\=]
 operator		{op_chars}+
+/* an operator followed by a "--" comment ("a+-- c"), see the operator rule */
+operator_comment	{op_chars}*"--"{dashdash_follow}
 
 /*
  * MySQL executable comments: the text of slash-star-bang ... star-slash is
  * scanned as SQL.  Five digits after the bang name the oldest server version
  * that runs it (MySQL 5.7 reads exactly five).  mysqldump relies on these
  * for SET NAMES, FOREIGN_KEY_CHECKS, TIME_ZONE, SQL_MODE and view bodies.
- * {xestop} must precede {operator} and {xestart} must precede {xcstart}.
+ * {xestop} must precede {operator} and {xestart} must precede {xcstart};
+ * {xestop} matches as much as {operator_comment} would.
  */
 xestart			\/\*!{digit}*
-xestop			\*\/{op_chars}*
+xestop			\*\/{op_chars}*("--"{dashdash_follow})?
 
 /* we no longer allow unary minus in numbers.
  * instead we pass it separately to parser. there it gets
@@ -996,7 +1003,22 @@ other			.
 					}
 				}
 
-{operator}		{
+"--"			{
+					/*
+					 * "--" before neither an operator character nor a space
+					 * or control character: a comment at the end of the
+					 * input, else a minus sign ("1--1" is 1 - -1).
+					 */
+					if ((Size) (yytext - yyextra->scanbuf + yyleng) < yyextra->scanbuflen)
+					{
+						SET_YYLLOC();
+						yyless(1);
+						return yytext[0];
+					}
+				}
+
+{operator}		|
+{operator_comment}	{
 					/*
 					 * Check for embedded slash-star or dash-dash; those
 					 * are comment starts, so operator must stop there.
@@ -1004,12 +1026,24 @@ other			.
 					 * character will match a prior rule, not this one.
 					 * Inside a MySQL executable comment, star-slash ends
 					 * the comment and so the operator as well.
+					 *
+					 * A dash-dash starts a comment only before a space or
+					 * control character, with which {operator_comment}
+					 * ends, or at the end of the input.  Elsewhere in an
+					 * operator it is two minus signs.
 					 */
 					int			nchars = yyleng;
 					char	   *slashstar = strstr(yytext, "/*");
-					char	   *dashdash = strstr(yytext, "--");
+					char	   *dashdash = NULL;
 					char	   *starslash = MYS_YYEXTRA(yyextra)->in_exec_comment ?
 						strstr(yytext, "*/") : NULL;
+					unsigned char last = (unsigned char) yytext[yyleng - 1];
+
+					if (last <= ' ' || last == '\177')
+						dashdash = yytext + yyleng - 3;
+					else if (yyleng > 2 && strcmp(yytext + yyleng - 2, "--") == 0 &&
+							 (Size) (yytext - yyextra->scanbuf + yyleng) >= yyextra->scanbuflen)
+						dashdash = yytext + yyleng - 2;
 
 					if (slashstar && dashdash)
 					{

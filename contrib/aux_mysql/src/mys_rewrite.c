@@ -108,8 +108,10 @@ static const char *const clause_keywords[] = {
  * neither space nor comment before the next ',' ';' ')' or clause keyword.
  * MySQL names an item after its tokens, so a comment after the expression is
  * no part of the name ("select 1+1 # sum" is named 1+1); one inside it is.
- * Comments are those of mys_scan.l: '#' to \n, "--" to \n or \r, slash-star
- * to star-slash.  An executable comment (slash-star-bang) holds SQL.
+ * Comments are those of mys_scan.l: '#' to \n; "--" to \n if a space or a
+ * control character follows it or the text ends there ("1--1" is 1 - -1);
+ * slash-star to star-slash.  An executable comment (slash-star-bang) holds
+ * SQL.  q is the whole text, so q[end] can be read.
  */
 static int
 expr_text_end(const char *q, int start, int end)
@@ -122,9 +124,11 @@ expr_text_end(const char *q, int start, int end)
 	{
 		char		c = q[i];
 
-		if (c == '#' || (c == '-' && i + 1 < end && q[i + 1] == '-'))
+		if (c == '#' ||
+			(c == '-' && i + 1 < end && q[i + 1] == '-' &&
+			 ((unsigned char) q[i + 2] <= ' ' || q[i + 2] == '\177')))
 		{
-			while (i < end && q[i] != '\n' && (c == '#' || q[i] != '\r'))
+			while (i < end && q[i] != '\n')
 				i++;
 			continue;
 		}

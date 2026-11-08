@@ -561,6 +561,47 @@ def _():
  eq(results(c,'select 1; # tail'),[((1,),)])
  eq(val(c,'select 4'),4)
 
+@test('C03 -- starts a comment only before a space or control character, as in MySQL')
+def _():
+ eq(val(c,'select 1--1'),2)                      # 1 - -1, not 1 and a comment
+ eq(val(c,'select 1 --1'),2)
+ for sql in ('select 1-- 1','select 1 --\t1','select 1--','select 1 --','select 1 --\x0b1',
+             'select 1 --\x011','select 1 --\x7f1'):
+  eq((sql,val(c,sql)),(sql,1))                   # any control character, or the end of the text
+ eq(q(c,'select 1--\n, 2'),((1,2),))
+ eq(q(c,'select 1 -- c\r, 2'),((1,),))           # only \n ends it
+ eq(q(c,'select 1 -- c\r\n, 2'),((1,2),))
+ eq(val(c,'select 1+--1'),2)
+ eq(val(c,'select 1<--1'),0)
+ eq(val(c,'select 1+--\n2'),3)
+ eq(val(c,'select 2 *-- c\n 3'),6)
+ eq(val(c,'select 1 &-- c\n 3'),1)
+ rejects(c,'select 1--- 1','syntax')            # 1 - and a comment
+ # strings: "--" in them is text; literals join across comments that end at \n
+ eq(q(c,"select '--1', '-- x', \"--1\""),(('--1','-- x','--1'),))
+ eq(val(c,"select 'a' --\n'b'"),'ab')
+ eq(val(c,"select 'a'\n--\n'b'"),'ab')
+ eq(val(c,"select \"a\" -- c\n\"b\""),'ab')
+ for sql in ("select 'a' -- c 'b'","select 'a' -- c\r'b'","select 'a' -- c '"):
+  eq((sql,val(c,sql)),(sql,'a'))
+ # executable comments: SQL inside, so "--" may be minus signs or swallow the star-slash
+ eq(val(c,'select 1 /*!--1*/'),2)
+ eq(val(c,'select 1 /*!40101 --1 */'),2)
+ eq(val(c,'select 1 /*! -- c\n + 2 */'),3)
+ rejects(c,'select 1 /*! -- c */','unterminated')
+ eq(val(c,'select /*! 1 */--1'),2)
+ eq(val(c,'select /*! 1 */-- c\n + 1'),2)
+ eq(val(c,'select 1 /*-- c */ + 1'),2)
+ # data: "a--1" adds 1, "a -- 1" ends the expression
+ q(c,'create table dc (a int)');q(c,'insert into dc values (5)')
+ q(c,'update dc set a = a--1');eq(val(c,'select a from dc'),6)
+ q(c,'update dc set a = a -- 1\n+ 1');eq(val(c,'select a from dc'),7)
+ # a column is named after its tokens, with "--" that is no comment
+ with c.cursor() as t:
+  t.execute('select 1--1, 2 --\t1\n, 3 -- c\r, 4\n, a--1, 1 + 1--1 from dc')
+  eq([d[0] for d in t.description],['1--1','2','3','a--1','1 + 1--1'])
+  eq(t.fetchall(),((2,2,3,8,3),))
+
 try:
     c.close()
     q(p,'reset role')
