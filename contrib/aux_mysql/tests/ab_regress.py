@@ -659,6 +659,10 @@ def _():
   eq((sql,results(m,sql)),(sql,[((1,),)]))
  eq(results(m,'-- only'),[('OK',0,0)])
  eq(results(m,'select 1; select 2; # c'),[((1,),),((2,),),('OK',0,0)])
+ # an EXECUTE runs its statement after the packet's: the comment's OK comes last
+ q(m,"prepare c02_ps from 'select 7'")
+ for sql in ('execute c02_ps; -- c','select 1; execute c02_ps; # c','execute c02_ps; select 1; /* c */'):
+  eq((sql,results(m,sql)[-2:]),(sql,[((1,),) if sql.endswith('/* c */') else ((7,),),('OK',0,0)]))
  eq(results(m,'select 1/0; -- c'),[((None,),),('OK',0,0)])
  eq(q(m,'show warnings'),())                     # the empty statement cleared them
  eq(errno(lambda:results(m,'select 1; select * from no_such_tbl; -- c')),1146)

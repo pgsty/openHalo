@@ -154,6 +154,8 @@ static int	stmt_index = 0;
 static uint64 cur_insert_id = 0;	/* last_insert_id for the next OK packet */
 static bool com_query = false;		/* the command is COM_QUERY */
 static bool trailing_comment_ok = false;	/* an OK follows the last statement */
+static bool trailing_ok_deferred = false;	/* ... of the last queued part */
+static bool last_queued_part = false;	/* running the last queued query */
 
 static MysStmtInfo *
 current_stmt_info(void)
@@ -248,6 +250,7 @@ static void
 discard_queued_queries(void)
 {
 	queued_queries = NIL;
+	trailing_ok_deferred = false;
 	if (queue_context)
 		MemoryContextReset(queue_context);
 }
@@ -1225,6 +1228,7 @@ mys_read_command(StringInfo inBuf)
 		queued_queries = list_delete_first(queued_queries);
 		if (queued_queries == NIL)
 			MemoryContextReset(queue_context);
+		last_queued_part = queued_queries == NIL;
 		diagnostics_pending = true;
 		stmt_infos = NIL;
 		stmt_index = 0;
@@ -1237,6 +1241,7 @@ mys_read_command(StringInfo inBuf)
 	stmt_infos = NIL;
 	stmt_index = 0;
 	trailing_comment_ok = false;
+	trailing_ok_deferred = last_queued_part = false;
 	if (inBuf->len == 0)
 		ereport(FATAL,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -1443,6 +1448,12 @@ mys_parse_query(const char *query_string)
 			raw = mysql_raw_parser(query_string);
 			trailing_comment_ok = has_trailing_comment(raw, query_string);
 		}
+		/* the trailing comment of a packet an EXECUTE split (mys_end_command) */
+		if (last_queued_part && trailing_ok_deferred)
+		{
+			trailing_comment_ok = true;
+			trailing_ok_deferred = false;
+		}
 
 		stmts = mys_rewrite_raw_stmts(raw, query_string, &stmt_infos);
 		/* autocommit / implicit commit rules */
@@ -1555,10 +1566,15 @@ mys_end_command(const QueryCompletion *qc, CommandDest dest)
 	end_statement(qc);
 
 	/*
-	 * after the last statement, the empty one of a trailing comment (an
-	 * EXECUTE queued the rest of the packet: the comment is answered there)
+	 * after the last statement, the empty one of a trailing comment; when an
+	 * EXECUTE queued its statement (and the rest of the packet), after those
 	 */
-	if (trailing_comment_ok && stmt_index >= list_length(stmt_infos) && queued_queries == NIL)
+	if (trailing_comment_ok && stmt_index >= list_length(stmt_infos) && queued_queries != NIL)
+	{
+		trailing_comment_ok = false;
+		trailing_ok_deferred = true;
+	}
+	else if (trailing_comment_ok && stmt_index >= list_length(stmt_infos))
 	{
 		trailing_comment_ok = false;
 		/* a statement of its own: it clears the warnings, as in MySQL */
