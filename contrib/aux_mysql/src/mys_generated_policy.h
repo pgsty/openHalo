@@ -18,6 +18,7 @@
 static const char *const gen_c_implementations[] = {
 	"text_concat", "text_concat_ws", "mys_concat_one", "mys_raw_bytes",
 	"mys_cast_char", "mys_convert_using", "mys_string_result", "mys_concat_ws_bytes", "mys_elt_index",
+	"mys_cast_source_identity", "mys_cast_binary_number",
 	"mys_generated_varchar", "mys_generated_numeric",
 	"mys_div_int8", "mys_div_numeric", "mys_div_float8",
 	"mys_mod_int8", "mys_mod_numeric", "mys_binary_truth",

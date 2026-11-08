@@ -51,6 +51,23 @@ BEGIN
     END LOOP;
 END $casts$;
 
+-- Only the MySQL CAST/CONVERT grammar calls these overloads. In particular,
+-- the native PG bytea -> int8 cast must keep its binary-integer semantics.
+CREATE FUNCTION mysql.cast_numeric_source(anyelement,int4) RETURNS anyelement
+    AS '$libdir/aux_mysql','mys_cast_source_identity' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.cast_numeric_source(text,int4) RETURNS text
+    AS '$libdir/aux_mysql','mys_cast_source_identity' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.cast_numeric_source(mysql.hexlit,int4) RETURNS mysql.hexlit
+    AS '$libdir/aux_mysql','mys_cast_source_identity' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+DO $numeric_sources$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['bytea','mysql.binary_n','mysql.varbinary_n'] LOOP
+        EXECUTE format($f$CREATE FUNCTION mysql.cast_numeric_source(%s,int4) RETURNS numeric
+            AS '$libdir/aux_mysql','mys_cast_binary_number' LANGUAGE C STABLE STRICT PARALLEL RESTRICTED$f$,t);
+    END LOOP;
+END $numeric_sources$;
+
 CREATE FUNCTION mysql.hexlit_cmp_support(internal) RETURNS internal
     AS '$libdir/aux_mysql', 'mys_hexlit_cmp_support' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 DO $support$

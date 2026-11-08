@@ -7,6 +7,7 @@ warning codes. Explicit representation boundaries are asserted separately.
 """
 import argparse
 import os
+import subprocess
 import uuid
 import pymysql
 
@@ -176,6 +177,51 @@ class Checks:
         self.count += 1
 
 
+    def numeric_cast(self):
+        for mode in ('','STRICT_TRANS_TABLES'):
+            for session in (self.oh,self.my):
+                session.q("SET sql_mode='"+mode+"'")
+            for b in (b'42',b' \t+42',b'-12',b'12.9foo',b'1e2',b'.5',
+                      b'abc',b'',b'42\x00',b'\xff42',b'12.34',b'42 '):
+                self.both('CREATE TABLE cast_t(b BLOB,v VARBINARY(40),f BINARY(40))')
+                h = "UNHEX('"+b.hex()+"')"
+                self.both('INSERT INTO cast_t VALUES('+','.join([h]*3)+')')
+                for src in ('b','v','f',h):
+                    for dest in ('SIGNED','UNSIGNED','DECIMAL(12,2)'):
+                        if b.startswith(b'-') and dest == 'UNSIGNED':
+                            continue  # full uint64 expressions are out of scope
+                        sql = 'SELECT CAST('+src+' AS '+dest+') FROM cast_t'
+                        a, e = self.oh.result(sql), self.my.result(sql)
+                        assert a[0] == e[0] and a[0] != 'error', (sql,b,a,e)
+                        if dest.startswith('DECIMAL'):
+                            # Explicit release policy uses 1292 for malformed
+                            # binary decimals; MySQL 5.7 omits tail warnings
+                            # and reports 1366 for a completely invalid number.
+                            payload = b.ljust(40,b'\0') if src == 'f' else b
+                            bad = payload not in (b'42',b' \t+42',b'-12',b'1e2',b'.5',b'12.34',b'42 ')
+                            assert a[1] == ((1292,) if bad else ()), (sql,b,a,e)
+                            reference_warnings = ((1366,) if b in (b'abc',b'',b'\xff42') else ())
+                            if bad and src in ('v','f'):
+                                reference_warnings += (1292,)
+                            assert e[1] == reference_warnings, (sql,b,e)
+                        else:
+                            assert a[1] == e[1], (sql,b,a,e)
+                        self.count += 1
+                self.both('DROP TABLE cast_t')
+        for source in ("X'3432'",'0x3432'):
+            self.both('SELECT CAST('+source+' AS SIGNED),CAST('+source+' AS UNSIGNED),CAST('+source+' AS DECIMAL(12,2))')
+        for source in ('42','42.2',"'42'",'NULL'):
+            self.both('SELECT CAST('+source+' AS SIGNED),CAST('+source+' AS DECIMAL(12,2))')
+        self.both("SELECT CONVERT(UNHEX('3432'),SIGNED),CAST(UNHEX('3432') AS SIGNED)")
+        for value in (b'123.456',b'123456789123',b'-123456789123',b'1e100'):
+            for target in ('DECIMAL','DECIMAL(5,2)','DECIMAL(3,3)'):
+                self.both("SELECT CAST(UNHEX('"+value.hex()+"') AS "+target+")")
+        pg = subprocess.check_output([os.getenv('PSQL','psql'),'-h','/tmp','-p',
+             str(self.oh.conn.port+2000),'-U','postgres','-AtX','-c',
+             "SELECT decode('3432','hex')::int8"],text=True).strip()
+        assert pg == '13362', pg
+        self.count += 1
+
     def collation(self):
         for coll in ('utf8mb4_general_ci','utf8mb4_bin','utf8_general_ci',
                      'utf8_bin','utf8mb4_unicode_ci','utf8_unicode_ci'):
@@ -243,7 +289,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

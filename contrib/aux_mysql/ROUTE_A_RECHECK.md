@@ -82,7 +82,7 @@ assertions against 3771 passed in default and PAD modes. The reported examples
 produce `782C21` and `78`. WP2 binary (110) and WP1 text (371) assertions passed
 again after the character overload changes.
 
-## WP4 — searches under MySQL collations
+## WP4 — searches under MySQL collations (`4419811`)
 
 MySQL-session LOCATE/INSTR and grammar-lowered POSITION use length-aware search.
 The dedicated general_ci collation uses the existing MySQL 5.7 weight table and
@@ -102,3 +102,23 @@ assertions, VARCHAR/CHAR/TEXT × utf8/utf8mb4 general_ci/bin/unicode_ci, plus al
 three historical aliases. Values, HEX and warning codes compared to 3771;
 unicode_ci's existing approximate mapping emits 1105 at DDL. Historical aliases
 have no namesake in MySQL and are asserted against their documented behavior.
+
+## WP5 — decimal interpretation of binary CAST sources
+
+The MySQL CAST/CONVERT lowering now dispatches exact binary sources through a
+length-aware decimal parser, retaining numeric hex literals and all nonbinary
+cast resolution. Integer casts consume the signed integer prefix; DECIMAL also
+accepts fractions/exponents and clips precision overflow with 1264. NUL and bad
+UTF-8 are numeric terminators, not text-conversion errors. Native PG bytea casts
+are untouched and still decode `3432` as the binary integer 13362.
+
+Debug rebuilt. `tests/route_a.py --port 3804 --wp numeric_cast`: 372 assertions
+passed, including strict/non-strict, BLOB/VARBINARY/BINARY/UNHEX, hex literals,
+CONVERT, DECIMAL rounding/ranges and a native PG protocol check. All six groups
+of `review_fix_generated_policy.py --ports 3804` passed.
+
+Diagnostic difference required by the product rule: malformed binary DECIMAL
+sources consistently get 1292. Reference 3771 emits no tail warning for BLOB or
+UNHEX, 1292 for VARBINARY/BINARY, and 1366 (plus 1292 for VARBINARY/BINARY) when
+there is no numeric prefix. Values agree; the assertions record these distinct
+reference warning sequences. Full uint64 expression results remain out of scope.

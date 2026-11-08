@@ -936,10 +936,120 @@ mys_mysql_cast(Node *arg, TypeName *type, int location)
 			type->typmods ? linitial(type->typmods) :
 			binary_make_const(T_Integer, NULL, -1)), location);
 	cast = makeNode(TypeCast);
+	if (mys_binary_types_available && type->names &&
+		(strcmp(strVal(llast(type->names)), "int8") == 0 ||
+		 strcmp(strVal(llast(type->names)), "numeric") == 0))
+	{
+		int typmod = 0;
+		if (strcmp(strVal(llast(type->names)), "numeric") == 0)
+		{
+			int mods[2] = {10, 0}, i = 0;
+			bool valid = list_length(type->typmods) <= 2;
+			foreach_ptr(Node, mod, type->typmods)
+			{
+				if (i >= 2 || !IsA(mod, A_Const) || ((A_Const *) mod)->isnull ||
+					!IsA(&((A_Const *) mod)->val, Integer))
+				{
+					valid = false;
+					break;
+				}
+				mods[i++] = intVal(&((A_Const *) mod)->val);
+			}
+			typmod = valid && mods[0] > 0 && mods[0] <= 1000 &&
+				mods[1] >= 0 && mods[1] <= mods[0] ?
+				((mods[0] << 16) | mods[1]) + VARHDRSZ : -1;
+		}
+		arg = (Node *) binary_call("cast_numeric_source", list_make2(arg,
+			binary_make_const(T_Integer, NULL, typmod)), location);
+	}
 	cast->arg = arg;
 	cast->typeName = type;
 	cast->location = location;
 	return (Node *) cast;
+}
+
+/* Preserve nonbinary cast resolution, including hex literals' numeric
+ * interpretation. Exact binary overloads alone parse their byte payload. */
+PG_FUNCTION_INFO_V1(mys_cast_source_identity);
+Datum
+mys_cast_source_identity(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_DATUM(PG_GETARG_DATUM(0));
+}
+
+PG_FUNCTION_INFO_V1(mys_cast_binary_number);
+Datum
+mys_cast_binary_number(PG_FUNCTION_ARGS)
+{
+	bytea *value = PG_GETARG_BYTEA_PP(0);
+	const char *s = VARDATA_ANY(value);
+	int len = VARSIZE_ANY_EXHDR(value), i = 0, start;
+	int typmod = PG_GETARG_INT32(1);
+	bool decimal = typmod != 0, digits = false;
+	char *number;
+	Datum result;
+
+	while (i < len && (s[i] == ' ' || s[i] == '\t' ||
+			(decimal && strchr("\n\r\v\f", s[i]) && s[i] != 0)))
+		i++;
+	start = i;
+	if (i < len && (s[i] == '+' || s[i] == '-')) i++;
+	while (i < len && s[i] >= '0' && s[i] <= '9') i++, digits = true;
+	if (decimal && i < len && s[i] == '.')
+	{
+		i++;
+		while (i < len && s[i] >= '0' && s[i] <= '9') i++, digits = true;
+	}
+	if (decimal && digits && i < len && (s[i] == 'e' || s[i] == 'E'))
+	{
+		int end = i + 1;
+		if (end < len && (s[end] == '+' || s[end] == '-')) end++;
+		if (end < len && s[end] >= '0' && s[end] <= '9')
+		{
+			do { end++; } while (end < len && s[end] >= '0' && s[end] <= '9');
+			i = end;
+		}
+	}
+	number = digits ? pnstrdup(s + start, i - start) : pstrdup("0");
+	if (decimal)
+		while (i < len && s[i] != 0 && strchr(" \t\n\r\v\f", s[i])) i++;
+	if (!digits || i != len)
+		mys_add_warning(1292, decimal ? "Truncated incorrect DECIMAL value" :
+						"Truncated incorrect INTEGER value");
+	result = DirectFunctionCall3(numeric_in, CStringGetDatum(number),
+								ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	pfree(number);
+	if (typmod >= (int) VARHDRSZ)
+	{
+		int precision = ((typmod - VARHDRSZ) >> 16) & 0xffff;
+		int scale = (((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024;
+		Datum mysql_limit = DirectFunctionCall3(numeric_in, CStringGetDatum("1e65"),
+			ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+		if (DatumGetBool(DirectFunctionCall2(numeric_ge,
+				DirectFunctionCall1(numeric_abs, result), mysql_limit)))
+			mys_add_warning(1292, "Truncated incorrect DECIMAL value");
+		if (precision > 0 && scale >= 0 && scale <= precision)
+		{
+			Datum maximum, minimum;
+			char *limit = palloc(precision + 3);
+			int k = 0;
+			for (int j = 0; j < precision - scale; j++) limit[k++] = '9';
+			if (precision == scale) limit[k++] = '0';
+			if (scale > 0) limit[k++] = '.';
+			for (int j = 0; j < scale; j++) limit[k++] = '9';
+			limit[k] = 0;
+			result = DirectFunctionCall2(numeric_round, result, Int32GetDatum(scale));
+			maximum = DirectFunctionCall3(numeric_in, CStringGetDatum(limit),
+				ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+			minimum = DirectFunctionCall1(numeric_uminus, maximum);
+			pfree(limit);
+			if (DatumGetBool(DirectFunctionCall2(numeric_gt, result, maximum)))
+				result = maximum, mys_add_warning(1264, "Out of range DECIMAL value");
+			else if (DatumGetBool(DirectFunctionCall2(numeric_lt, result, minimum)))
+				result = minimum, mys_add_warning(1264, "Out of range DECIMAL value");
+		}
+	}
+	PG_RETURN_DATUM(result);
 }
 
 /* Infer the result's string type from every argument without evaluating
