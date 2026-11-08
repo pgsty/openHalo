@@ -93,11 +93,23 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   the session do; the session that closes a cycle of waits gets error 3058. They are session-level
   advisory locks (`pg_locks`: `locktype = 'advisory'`, `objsubid = 19801`) of the MySQL database, and
   take room in the shared lock table (`max_locks_per_transaction`).
+- **Key names** are per table, as in MySQL: tables can share key names (`KEY idx_created` in each table
+  of a dump), a key can be named like a table, and a key without a name is named after its first
+  column (`a`, `a_2`, ...). PostgreSQL names indexes per schema, so the index of key `k` is named
+  `k$<8 hex digits>`. `SHOW INDEX`, `SHOW CREATE TABLE`, `information_schema.STATISTICS` and
+  duplicate-key errors show the key name; `DROP INDEX k ON t` and `ALTER TABLE t DROP INDEX k` /
+  `RENAME INDEX` find the key of that table (`PRIMARY` too); a key name used twice in one table is
+  error 1061. The index name alone carries the key name, so it survives `pg_dump`, `pg_upgrade` and
+  `RENAME TABLE`; an index without the suffix (from PostgreSQL, or created before 1.8) is known by its
+  name. `CREATE TABLE ... LIKE` keeps the key names.
 - **Clients tested**: Connector/J 8.4, go-sql-driver 1.9, PyMySQL, mysql / MariaDB CLI, mysqlslap, sysbench.
 
 ## Known gaps
 
-- `SHOW STATUS`, some `SHOW VARIABLES LIKE` forms; `information_schema` mapping is partial (GUI tools and ORMs need more).
+- `SHOW STATUS`, some `SHOW VARIABLES LIKE` forms; `information_schema` mapping is partial (`TABLE_CONSTRAINTS` is
+  empty, no `KEY_COLUMN_USAGE`; GUI tools and ORMs need more).
+- A key name longer than 54 bytes (18 CJK characters) is shortened to that length (PostgreSQL index
+  names hold 63 bytes, and the suffix takes 9); key names compare case-insensitively in ASCII only.
 - Native ENUM/SET, negative and long-duration TIME, and direct PG14 physical upgrades remain unsupported;
   [migration checks and explicit conversion examples](MIGRATION.md) describe the supported path.
 - Statement-level rollback uses a subtransaction per statement inside a transaction block: more than 64
@@ -142,8 +154,9 @@ loaded through `shared_preload_libraries` (the OpenHalo 18 default).
   After upgrading the binaries, run `ALTER EXTENSION aux_mysql UPDATE` in the MySQL database so the
   AUTO_INCREMENT and ON UPDATE triggers of existing tables also fire with `FOREIGN_KEY_CHECKS=0` (1.6)
   and SHOW / information_schema report DECIMAL precision and scale, SHOW prefix key parts (1.7), and
-  `GET_LOCK()` locks (1.8: in 1.7 it, `RELEASE_LOCK()`, `IS_FREE_LOCK()` and `IS_USED_LOCK()` were stubs
-  that let every session "hold" every lock).
+  `GET_LOCK()` locks and SHOW / information_schema show key names (1.8: in 1.7, `GET_LOCK()`,
+  `RELEASE_LOCK()`, `IS_FREE_LOCK()` and `IS_USED_LOCK()` were stubs that let every session "hold"
+  every lock).
   With `FOREIGN_KEY_CHECKS=0` a foreign key still needs its referenced table to exist, and a referenced
   table cannot be dropped. `INSERT IGNORE` skips duplicate keys only: a row violating a foreign key
   fails the statement (MySQL skips it with a warning). A parent row still referenced under NO ACTION

@@ -483,6 +483,10 @@ mys_send_err(uint16 code, const char *sqlstate, const char *msg)
 uint16
 mys_errno(int sqlerrcode)
 {
+	/* a MySQL error number of its own (halo_mysql.h) */
+	if (PGUNSIXBIT(sqlerrcode) == 'M')
+		return (uint16) atoi(unpack_sql_state(sqlerrcode) + 1);
+
 	switch (sqlerrcode)
 	{
 		case ERRCODE_SYNTAX_ERROR:
@@ -567,7 +571,10 @@ mys_errno(int sqlerrcode)
 	}
 }
 
-/* SQLSTATE of the ERR packet: MySQL's own for the aux_mysql-only codes */
+/*
+ * SQLSTATE of the ERR packet: MySQL's own for the aux_mysql-only codes, 42000
+ * for a MySQL error number (halo_mysql.h)
+ */
 static const char *
 mys_sqlstate(int sqlerrcode)
 {
@@ -578,7 +585,7 @@ mys_sqlstate(int sqlerrcode)
 		case ERRCODE_MYS_USER_LOCK_DEADLOCK:
 			return "40001";
 		default:
-			return unpack_sql_state(sqlerrcode);
+			return PGUNSIXBIT(sqlerrcode) == 'M' ? "42000" : unpack_sql_state(sqlerrcode);
 	}
 }
 
@@ -1582,6 +1589,16 @@ mys_send_message(ErrorData *edata)
 	}
 
 	msg = edata->message ? edata->message : "missing error text";
+	/* a key (a unique violation, ...): its MySQL name, not the PostgreSQL one */
+	if (edata->constraint_name)
+	{
+		char	   *pgname = psprintf("\"%s\"", edata->constraint_name);
+		char	   *key = mys_key_name(edata->constraint_name, false);
+		const char *at = strstr(msg, pgname);
+
+		if (at && strcmp(key, edata->constraint_name) != 0)
+			msg = psprintf("%.*s\"%s\"%s", (int) (at - msg), msg, key, at + strlen(pgname));
+	}
 	mys_send_err(mys_errno(edata->sqlerrcode),
 				 mys_sqlstate(edata->sqlerrcode), msg);
 	mys_flush();

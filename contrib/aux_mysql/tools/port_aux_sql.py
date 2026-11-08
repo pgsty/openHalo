@@ -293,6 +293,107 @@ $function$;
 ''' % stub for stub in lock_stubs)
 rep(stub_text, lock_definitions + '\n')
 
+# Key names: MySQL names a key per table, PostgreSQL an index per schema, so
+# aux_mysql 1.8 names a key's index "<key>$<8 hex digits>" (mys_rewrite.c).
+# SHOW INDEX, SHOW CREATE TABLE and information_schema read the MySQL name
+# from mysql.index_key_name(), which also replaces the guess that an index
+# named *_pkey is the PRIMARY KEY.  information_schema.STATISTICS was an empty
+# table; it lists the key parts as SHOW INDEX does.  SHOW CREATE TABLE puts a
+# space between the key name and its columns, as MySQL does.  These objects
+# form the 1.7 -> 1.8 update.
+name_helpers = r'''-- the MySQL name of an index: PRIMARY, or its name without a "$<hex>" key suffix
+CREATE OR REPLACE FUNCTION mysql.index_key_name(pg_catalog.oid)
+RETURNS pg_catalog.text
+AS '$libdir/aux_mysql', 'mys_sql_index_key_name'
+LANGUAGE C STABLE STRICT;
+'''
+name_definitions = []
+old_key = ("(select case when right(cl.relname, 5) = '_pkey' then 'PRIMARY' else cl.relname end "
+           "from pg_class cl where (cl.oid = records.indexrelid))::varchar(256) as key_name")
+new_key = 'mysql.index_key_name(records.indexrelid)::varchar(256) as key_name'
+for name in ('show_table_indexs', 'show_table_indexs_for_8', 'show_create_table_impl'):
+    prefix = 'CREATE OR REPLACE FUNCTION mysql.%s(' % name
+    assert s.count(prefix) == 1, prefix
+    start = s.index(prefix)
+    end = s.index('STABLE LANGUAGE plpgsql;', start) + len('STABLE LANGUAGE plpgsql;')
+    f = s[start:end]
+    if name == 'show_create_table_impl':
+        for old, new, n in (
+                ('(select cl.relname from pg_class cl where cl.oid = ind.indexrelid) as indname',
+                 'mysql.index_key_name(ind.indexrelid) as indname', 1),
+                ("records.indname, '`(', columnNames", "records.indname, '` (', columnNames", 2)):
+            assert f.count(old) == n, (name, old)
+            f = f.replace(old, new)
+    else:
+        assert f.count(old_key) == 1, name
+        f = f.replace(old_key, new_key)
+    s = s[:start] + f + s[end:]
+    name_definitions.append(f)
+
+prefix = 'drop view if exists mys_informa_schema.indexs cascade;\ncreate view mys_informa_schema.indexs as\n'
+terminator = "where (cons.contype = 'f');"
+assert s.count(prefix) == 1
+start = s.index(prefix)
+end = s.index(terminator, start) + len(terminator)
+f = s[start:end]
+old = ("    (select case when right(cl_sub.relname, 5) = '_pkey' then 'PRIMARY' else cl_sub.relname end\n"
+       "        from pg_class cl_sub\n"
+       "        where (cl_sub.oid = ind.indexrelid)\n"
+       "        )::varchar(256) as key_name,\n")
+assert f.count(old) == 1
+f = f.replace(old, '    mysql.index_key_name(ind.indexrelid)::varchar(256) as key_name,\n')
+s = s[:start] + f + s[end:]
+name_definitions.append(f.replace(prefix, 'CREATE OR REPLACE VIEW mys_informa_schema.indexs AS\n'))
+
+statistics_table = '''create table mys_informa_schema.statistics(
+    TABLE_CATALOG varchar(256),
+    TABLE_SCHEMA varchar(256),
+    TABLE_NAME varchar(256),
+    NON_UNIQUE bigint,
+    INDEX_SCHEMA varchar(256),
+    INDEX_NAME varchar(256),
+    SEQ_IN_INDEX bigint,
+    COLUMN_NAME varchar(256),
+    "collation" varchar(256),
+    CARDINALITY bigint,
+    SUB_PART bigint,
+    PACKED varchar(256),
+    NULLABLE varchar(256),
+    INDEX_TYPE varchar(256),
+    COMMENT varchar(256),
+    INDEX_COMMENT varchar(256)
+);
+'''
+statistics_view = '''-- the key parts of the tables' indexes, as SHOW INDEX shows them
+create view mys_informa_schema.statistics as
+select
+    'def'::varchar(256) as TABLE_CATALOG,
+    ns.nspname::varchar(256) as TABLE_SCHEMA,
+    tc.relname::varchar(256) as TABLE_NAME,
+    (case when ind.indisunique then 0 else 1 end)::bigint as NON_UNIQUE,
+    ns.nspname::varchar(256) as INDEX_SCHEMA,
+    mysql.index_key_name(ind.indexrelid)::varchar(256) as INDEX_NAME,
+    k.seq::bigint as SEQ_IN_INDEX,
+    k.column_name::varchar(256) as COLUMN_NAME,
+    'A'::varchar(256) as "collation",
+    0::bigint as CARDINALITY,
+    k.sub_part::bigint as SUB_PART,
+    NULL::varchar(256) as PACKED,
+    (case when att.attnotnull then '' else 'YES' end)::varchar(256) as NULLABLE,
+    pg_catalog.upper(am.amname)::varchar(256) as INDEX_TYPE,
+    ''::varchar(256) as COMMENT,
+    ''::varchar(256) as INDEX_COMMENT
+from pg_catalog.pg_index ind
+    join pg_catalog.pg_class tc on tc.oid = ind.indrelid
+    join pg_catalog.pg_namespace ns on ns.oid = tc.relnamespace
+    join pg_catalog.pg_class ic on ic.oid = ind.indexrelid
+    join pg_catalog.pg_am am on am.oid = ic.relam
+    cross join lateral mysql.index_key_parts(ind.indexrelid) k
+    join pg_catalog.pg_attribute att on att.attrelid = ind.indrelid and att.attname = k.column_name
+where tc.oid >= 16384 and tc.relkind in ('r', 'p');
+'''
+rep(statistics_table, statistics_view)
+
 prelude = r'''-- aux_mysql 1.8: openHalo's aux_mysql SQL layer, ported to PostgreSQL 18
 -- Generated by tools/port_aux_sql.py -- do not edit by hand.
 -- Hand-written objects go to sql/aux_mysql_additions.sql.
@@ -346,7 +447,7 @@ def guard_cast(m):
             "END $cast$;" % (indent, q(src), q(dst), stmt, src.replace("'", "''"), dst.replace("'", "''")))
 
 
-out, ncasts = cast_re.subn(guard_cast, prelude + '\n' + decimal_helpers + key_helpers + s)
+out, ncasts = cast_re.subn(guard_cast, prelude + '\n' + decimal_helpers + key_helpers + name_helpers + s)
 if ncasts < 40:
     sys.exit("expected the aux_mysql casts, found %d" % ncasts)
 print("guarded %d casts" % ncasts)
@@ -367,14 +468,22 @@ upgrade_path.write_text(upgrade, encoding='utf-8')
 print("extension update written to", upgrade_path)
 
 # 1.7 -> 1.8: the lock functions change their argument and result types, so
-# the stubs are dropped (nothing in the extension depends on them).
-upgrade = r'''-- Generated by tools/port_aux_sql.py -- do not edit by hand.
+# the stubs are dropped (nothing in the extension depends on them); the key
+# name objects above are replaced in place; the empty
+# information_schema.STATISTICS table becomes the view (a user view on it
+# makes the update fail rather than being dropped).
+upgrade = r"""-- Generated by tools/port_aux_sql.py -- do not edit by hand.
 -- aux_mysql 1.7 -> 1.8: GET_LOCK(), RELEASE_LOCK(), IS_FREE_LOCK(), IS_USED_LOCK() and
--- RELEASE_ALL_LOCKS() lock for real (the 1.7 functions were stubs that always succeeded).
+-- RELEASE_ALL_LOCKS() lock for real (the 1.7 functions were stubs that always succeeded);
+-- MySQL key names per table in SHOW and information_schema.
 \echo Use "ALTER EXTENSION aux_mysql UPDATE TO '1.8'" to load this file. \quit
 SET LOCAL search_path = mysql, pg_catalog, public;
+SET LOCAL check_function_bodies = off;
 
-''' + ''.join('DROP FUNCTION IF EXISTS mysql.%s;\n' % name for name, _ in lock_stubs) + '\n' + lock_definitions
+""" + ''.join('DROP FUNCTION IF EXISTS mysql.%s;\n' % name for name, _ in lock_stubs) + '\n' + lock_definitions + \
+    '\n' + name_helpers + '\n' + '\n\n'.join(name_definitions) + '\n\n' + \
+    'DROP TABLE mys_informa_schema.statistics;\n' + statistics_view + \
+    'GRANT ALL PRIVILEGES ON mys_informa_schema.statistics TO public;\n'
 upgrade_path = Path(dst).with_name('aux_mysql--1.7--1.8.sql')
 upgrade_path.write_text(upgrade, encoding='utf-8')
 print("extension update written to", upgrade_path)

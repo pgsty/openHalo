@@ -581,14 +581,14 @@ def _():
  q(c,'create table pk_t (id int primary key, a varchar(255), b text, c varchar(2000), key ka (a(191)), key kb (b(100)), key kbc (id, b(50)), unique key ua (a(10)))')
  assert any('whole column' in str(w[2]) for w in q(c,'show warnings')), q(c,'show warnings')
  q(c,'alter table pk_t add column d text, add key kd (d(20))');q(c,'create index kc on pk_t (c(30))')
- defs=dict(q(p,"select indexname, regexp_replace(indexdef, '.* USING ', '') from pg_indexes where schemaname='abfix' and tablename='pk_t'"))
+ defs=dict(q(p,"select mysql.index_key_name(indexrelid), regexp_replace(pg_get_indexdef(indexrelid), '.* USING ', '') from pg_index where indrelid='abfix.pk_t'::regclass"))
  eq((defs['ka'],defs['kb'],defs['kc'],defs['kd'],defs['ua']),('btree (a)','hash (b)','hash (c)','hash (d)','btree (a)'))
  assert '"left"(b, 50)' in defs['kbc'], defs['kbc']
  big=''.join(random.choice(string.ascii_letters) for _ in range(20000))
  q(c,'insert into pk_t values (1, %s, %s, %s, %s)',('x',big,big[:2000],big))
  eq(val(c,'select id from pk_t where b = %s and c = %s and d = %s',(big,big[:2000],big)),1)
  keys=[l.strip().rstrip(',') for l in q(c,'show create table pk_t')[0][1].split('\n') if 'KEY' in l]
- assert 'KEY `kbc`(`id`,`b`(50))' in keys, keys
+ assert 'KEY `kbc` (`id`,`b`(50))' in keys, keys
  # a UNIQUE prefix of a long column: same prefix is a duplicate, ON DUPLICATE KEY / REPLACE find the row
  q(c,'create table pk_u (b text, v int, unique key pk_ub (b(20)))');q(c,'insert into pk_u values (%s, 1)',(big,))
  eq(errno(lambda:q(c,'insert into pk_u values (%s, 2)',(big[:20]+'x',))),1062)
@@ -987,6 +987,72 @@ def _():
   eq(val(c,"select get_lock('abfix_e', 0) + release_lock('abfix_e')"),2)
  finally:
   b.close() if b.open else None;q(c,'select release_all_locks()')
+
+@test('X09 key names are per table, as in MySQL: SHOW, information_schema, DROP / RENAME INDEX, 1061')
+def _():
+ from pymysql.constants import CLIENT
+ def errno(f):
+  try: f()
+  except pymysql.err.MySQLError as e: return e.args[0]
+ def keys(t): return sorted((r[2],r[1],r[3],r[4]) for r in q(c,'show index from '+t))
+ def ddl_keys(t): return sorted(l.strip().rstrip(',') for l in q(c,'show create table '+t)[0][1].split('\n') if 'KEY' in l)
+ # two tables with the same key names (mysqldump files): the second failed with 1050
+ for t in ('kn_a','kn_b'):
+  q(c,'create table %s (id int primary key, created_at datetime, email varchar(100), key idx_created (created_at), unique key uk_email (email))'%t)
+  eq(keys(t),[('PRIMARY',0,1,'id'),('idx_created',1,1,'created_at'),('uk_email',0,1,'email')])
+  eq(ddl_keys(t),['KEY `idx_created` (`created_at`)','PRIMARY KEY (`id`)','UNIQUE KEY `uk_email` (`email`)'])
+ eq(sorted(q(c,"select table_name, index_name, seq_in_index, column_name, non_unique from information_schema.statistics where table_schema=database() and table_name in ('kn_a','kn_b') and index_name<>'PRIMARY'")),
+    [('kn_a','idx_created',1,'created_at',1),('kn_a','uk_email',1,'email',0),('kn_b','idx_created',1,'created_at',1),('kn_b','uk_email',1,'email',0)])
+ # CREATE INDEX / ADD KEY, a key named like another table, a PRIMARY KEY name MySQL ignores
+ q(c,'create table kn_c (id int, a int, b int, constraint pk primary key (id), key kn_a (a))');q(c,'create index idx_created on kn_c (a)')
+ q(c,'alter table kn_c add unique key uk_email (b)');q(c,'create table kn_d (id int, constraint pk primary key (id))')
+ eq([k[0] for k in keys('kn_c')],['PRIMARY','idx_created','kn_a','uk_email'])
+ # a duplicate on the same table is 1061 (case-insensitive), PRIMARY 1280, and nothing changes
+ for sql in ('create table kn_e (a int, b int, key k (a), unique key K (b))','alter table kn_a add key IDX_CREATED (id)',
+             'create index uk_email on kn_a (id)','alter table kn_a add column x int, add unique key idx_created (x)',
+             'alter table kn_a add key k1 (id), add key k1 (email)'):
+  eq(errno(lambda:q(c,sql)),1061)
+ eq(errno(lambda:q(c,'alter table kn_a add key `primary` (id)')),1280)
+ eq(errno(lambda:q(c,'select * from kn_e')),1146);eq(len(keys('kn_a')),3)
+ # keys without a name are named after their first column, as in MySQL
+ q(c,'create table kn_u (a int, b int, c int unique, key (a), key (a, b), unique (b))')
+ q(c,'alter table kn_u add key (a), add column d int unique')
+ eq(sorted({k[0] for k in keys('kn_u')}),['a','a_2','a_3','b','c','d'])
+ long='c'*54
+ q(c,'create table kn_long (%s int, key (%s), unique (%s))'%(long,long,long))
+ eq(sorted({k[0] for k in keys('kn_long')}),['c'*30+'_2',long])
+ # DROP INDEX k ON t and ALTER TABLE t DROP INDEX k find the key of that table only
+ q(c,'drop index idx_created on kn_a');q(c,'alter table kn_b drop index uk_email')
+ eq([k[0] for k in keys('kn_a')],['PRIMARY','uk_email']);eq([k[0] for k in keys('kn_b')],['PRIMARY','idx_created'])
+ q(c,"insert into kn_a values (1, now(), 'x@y')");q(c,"insert into kn_b values (1, now(), 'x@y'), (2, now(), 'x@y')")
+ e=rejects(c,"insert into kn_a values (2, now(), 'x@y')");assert 'uk_email' in e and '$' not in e, e
+ eq(errno(lambda:q(c,'drop index idx_created on kn_a')),1091);eq(errno(lambda:q(c,'alter table kn_a drop index nosuch')),1091)
+ q(c,'alter table kn_c drop index `PRIMARY`');eq([k[0] for k in keys('kn_c')],['idx_created','kn_a','uk_email'])
+ # RENAME INDEX renames the key (it renamed the table), with MySQL's errors
+ q(c,'alter table kn_a rename index uk_email to uk_mail');eq([k[0] for k in keys('kn_a')],['PRIMARY','uk_mail'])
+ eq(errno(lambda:q(c,'alter table kn_c rename key nosuch to x')),1176)
+ eq(errno(lambda:q(c,'alter table kn_c rename key kn_a to uk_email')),1061)
+ eq(errno(lambda:q(c,'alter table kn_c rename key kn_a to `PRIMARY`')),1280)
+ # one packet that drops and adds a key (golang-migrate): checked as each statement runs
+ m=pymysql.connect(host=HOST,port=MP,user=os.getenv('MYSQL_USER','postgres'),password=os.getenv('MYSQL_PASSWORD',''),
+                   autocommit=True,database=SCHEMA,client_flag=CLIENT.MULTI_STATEMENTS)
+ def multi(sql):
+  with m.cursor() as t:
+   t.execute(sql)
+   while t.nextset(): pass
+ multi('alter table kn_b drop index idx_created; alter table kn_b add key idx_created (id, created_at); alter table kn_b add unique key uk_email (id)')
+ eq(errno(lambda:multi('alter table kn_b add key k2 (id); alter table kn_b add key k2 (email)')),1061);m.close()
+ eq(keys('kn_b'),[('PRIMARY',0,1,'id'),('idx_created',1,1,'id'),('idx_created',1,2,'created_at'),('k2',1,1,'id'),('uk_email',0,1,'id')])
+ q(c,'alter table kn_b drop index k2, add key k2 (email)');eq([k[3] for k in keys('kn_b') if k[0]=='k2'],['email'])
+ # CREATE TABLE ... LIKE keeps the key names; RENAME TABLE keeps them
+ q(c,'create table kn_l like kn_u');eq(keys('kn_l'),keys('kn_u'))
+ q(c,'rename table kn_l to kn_l2');eq(keys('kn_l2'),keys('kn_u'))
+ # an index created in PostgreSQL (or by aux_mysql before 1.8) keeps its name as its key name
+ q(p,'create index kn_legacy on abfix.kn_a (created_at)')
+ eq([k[0] for k in keys('kn_a')],['PRIMARY','kn_legacy','uk_mail'])
+ eq(errno(lambda:q(c,'alter table kn_a add key KN_LEGACY (id)')),1061)
+ q(c,'alter table kn_a rename index kn_legacy to kn_new');q(c,'drop index kn_new on kn_a')
+ eq([k[0] for k in keys('kn_a')],['PRIMARY','uk_mail'])
 
 try:
     c.close()

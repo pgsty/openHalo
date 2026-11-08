@@ -844,6 +844,19 @@ mys_index_key_parts(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* mysql.index_key_name(index): the key's MySQL name (mys_rewrite.c) */
+PG_FUNCTION_INFO_V1(mys_sql_index_key_name);
+
+Datum
+mys_sql_index_key_name(PG_FUNCTION_ARGS)
+{
+	char	   *name = mys_index_key_name(PG_GETARG_OID(0));
+
+	if (name == NULL)
+		PG_RETURN_NULL();
+	PG_RETURN_TEXT_P(cstring_to_text(name));
+}
+
 PG_FUNCTION_INFO_V1(mys_column_extra);
 Datum
 mys_column_extra(PG_FUNCTION_ARGS)

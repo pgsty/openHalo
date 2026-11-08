@@ -30,7 +30,7 @@
 
 #include "halo_mysql.h"
 
-PG_MODULE_MAGIC_EXT(.name = "aux_mysql", .version = "1.7");
+PG_MODULE_MAGIC_EXT(.name = "aux_mysql", .version = "1.8");
 
 bool		halo_mysql_listener_on = true;
 int			halo_mysql_port = 3306;

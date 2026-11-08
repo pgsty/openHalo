@@ -33,6 +33,7 @@
 #include "catalog/pg_index.h"
 #include "commands/defrem.h"
 #include "common/hashfn.h"
+#include "mb/pg_wchar.h"
 #include "utils/formatting.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
@@ -750,13 +751,405 @@ mys_index_prefix(Node *expr, AttrNumber *attnum, int *length, bool *bytes, bool 
 	return true;
 }
 
+/* ----------------------------------------------------------------
+ * MySQL key names
+ *
+ * MySQL names a key per table; PostgreSQL names an index per schema, in the
+ * namespace of tables, too.  So with the MySQL name as the index name, two
+ * tables could not both have a KEY idx_created, nor could a key be named
+ * like another table.  A key's index is named "<key>$<8 hex digits>"
+ * instead: the digits, a hash of the table and key names (hashed again while
+ * the name is taken), make it unique in the schema, and mys_key_name()
+ * strips them.  The name alone tells the key's MySQL name, so it survives
+ * pg_dump, pg_upgrade and RENAME TABLE without metadata.  An index without
+ * the suffix (created in PostgreSQL, or by aux_mysql before 1.8) is known to
+ * MySQL by its PostgreSQL name, a primary key as PRIMARY.  Key names compare
+ * case-insensitively, as in MySQL; a key longer than 54 bytes is shortened.
+ * ----------------------------------------------------------------
+ */
+#define KEY_SUFFIX_LEN	9		/* "$" and 8 lowercase hex digits */
+
+static bool name_in_list(List *names, const char *name);
+
+char *
+mys_key_name(const char *relname, bool primary)
+{
+	size_t		len = strlen(relname);
+
+	if (primary)
+		return pstrdup("PRIMARY");
+	if (len > KEY_SUFFIX_LEN && relname[len - KEY_SUFFIX_LEN] == '$' &&
+		strspn(relname + len - KEY_SUFFIX_LEN + 1, "0123456789abcdef") == KEY_SUFFIX_LEN - 1)
+		return pnstrdup(relname, len - KEY_SUFFIX_LEN);
+	return pstrdup(relname);
+}
+
+/* the MySQL key name of an index, NULL if it does not exist */
+char *
+mys_index_key_name(Oid indexoid)
+{
+	HeapTuple	tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexoid));
+	char	   *relname = get_rel_name(indexoid);
+	bool		primary;
+
+	if (!HeapTupleIsValid(tup))
+		return NULL;
+	primary = ((Form_pg_index) GETSTRUCT(tup))->indisprimary;
+	ReleaseSysCache(tup);
+	return relname ? mys_key_name(relname, primary) : NULL;
+}
+
 /*
- * Lookup indexes go after the statement's other keys, so that they cannot
- * take the name of one (PostgreSQL picks a free name), and are left out when
- * a non-unique key of the statement starts with the same column.
+ * Whether key name "key" (from an index name) is "name": case-insensitively,
+ * and as far as an index name holds it.
+ */
+static bool
+key_names_match(const char *key, const char *name)
+{
+	int			klen = pg_mbcliplen(key, strlen(key), NAMEDATALEN - 1 - KEY_SUFFIX_LEN);
+	int			len = pg_mbcliplen(name, strlen(name), NAMEDATALEN - 1 - KEY_SUFFIX_LEN);
+
+	return klen == len && pg_strncasecmp(key, name, len) == 0;
+}
+
+/*
+ * MySQL key names of a table's indexes, in OID order (*indexoids).  From
+ * pg_index, not the relcache: the table need not be locked (the rewriter does
+ * not lock tables that the statement locks later more strongly).
  */
 static List *
-add_lookup_indexes(List *indexes, List *lookups)
+table_key_names(Oid relid, List **indexoids)
+{
+	Relation	pg_index = table_open(IndexRelationId, AccessShareLock);
+	ScanKeyData key;
+	SysScanDesc scan;
+	HeapTuple	tup;
+	List	   *indexes = NIL;
+	List	   *names = NIL;
+
+	ScanKeyInit(&key, Anum_pg_index_indrelid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_index, IndexIndrelidIndexId, true, NULL, 1, &key);
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+		indexes = lappend_oid(indexes, ((Form_pg_index) GETSTRUCT(tup))->indexrelid);
+	systable_endscan(scan);
+	table_close(pg_index, AccessShareLock);
+
+	list_sort(indexes, list_oid_cmp);
+	foreach_oid(indexoid, indexes)
+		names = lappend(names, mys_index_key_name(indexoid));
+	if (indexoids)
+		*indexoids = indexes;
+	return names;
+}
+
+/* the index of a table that MySQL knows as key "name", or InvalidOid */
+Oid
+mys_find_key(Oid relid, const char *name)
+{
+	List	   *indexes;
+	List	   *names = table_key_names(relid, &indexes);
+
+	for (int i = 0; i < list_length(names); i++)
+	{
+		char	   *key = list_nth(names, i);
+
+		if (key && key_names_match(key, name))
+			return list_nth_oid(indexes, i);
+	}
+	return InvalidOid;
+}
+
+/*
+ * The PostgreSQL name for key "key" of table "relname": free in schema nspid
+ * (InvalidOid: on the search path) and not in reserved.
+ */
+char *
+mys_key_pg_name(const char *relname, const char *key, Oid nspid, List *reserved)
+{
+	int			len = pg_mbcliplen(key, strlen(key), NAMEDATALEN - 1 - KEY_SUFFIX_LEN);
+	StringInfoData seed;
+
+	initStringInfo(&seed);
+	appendBinaryStringInfo(&seed, relname, strlen(relname) + 1);
+	appendStringInfoString(&seed, key);
+	for (uint64 n = 0;; n++)
+	{
+		char	   *name = psprintf("%.*s$%08x", len, key,
+									(uint32) hash_bytes_extended((const unsigned char *) seed.data,
+																 seed.len, n));
+
+		if (!name_in_list(reserved, name) &&
+			!OidIsValid(OidIsValid(nspid) ? get_relname_relid(name, nspid) : RelnameGetRelid(name)))
+			return name;
+	}
+}
+
+/*
+ * The keys of one table as one statement defines them.  CREATE TABLE names
+ * the keys of its new table while it is rewritten.  The keys ALTER TABLE and
+ * CREATE INDEX add are named when the statement runs (deferred, a marker in
+ * the index options, mys_name_keys()): an earlier statement of the same packet
+ * may drop or add keys of the table.  Until then, only the keys of the
+ * statement itself are checked against each other.
+ */
+typedef struct KeyNamer
+{
+	const char *relname;
+	Oid			nspid;			/* InvalidOid: not known yet */
+	List	   *keys;			/* MySQL names of its keys */
+	List	   *pgnames;		/* PostgreSQL names given in this statement */
+	bool		deferred;
+} KeyNamer;
+
+#define KEY_MARKER	"mysql_key"
+
+/* table_keys: the table's keys are in the catalog (not CREATE TABLE, not deferred) */
+static void
+init_key_namer(KeyNamer *kn, RangeVar *rel, bool table_keys, bool deferred)
+{
+	Oid			relid = table_keys ? RangeVarGetRelid(rel, NoLock, true) : InvalidOid;
+
+	kn->relname = rel->relname;
+	kn->nspid = InvalidOid;
+	kn->keys = NIL;
+	kn->pgnames = NIL;
+	kn->deferred = deferred;
+	if (OidIsValid(relid))
+	{
+		kn->nspid = get_rel_namespace(relid);
+		kn->keys = table_key_names(relid, NULL);
+	}
+	else if (rel->schemaname)
+		kn->nspid = get_namespace_oid(rel->schemaname, true);
+}
+
+static bool
+key_name_taken(KeyNamer *kn, const char *name)
+{
+	foreach_ptr(char, key, kn->keys)
+		if (key && key_names_match(key, name))
+			return true;
+	return false;
+}
+
+/* a key the statement drops (ALTER TABLE ... DROP INDEX): its name is free */
+static void
+release_key_name(KeyNamer *kn, const char *name)
+{
+	foreach_ptr(char, key, kn->keys)
+		if (key && key_names_match(key, name))
+		{
+			kn->keys = list_delete_ptr(kn->keys, key);
+			return;
+		}
+}
+
+/* the first column of a key, which names a key without a name */
+static const char *
+first_key_column(List *keys)
+{
+	if (keys == NIL)
+		return NULL;
+	if (IsA(linitial(keys), IndexElem))
+		return linitial_node(IndexElem, keys)->name;
+	return IsA(linitial(keys), String) ? strVal(linitial(keys)) : NULL;
+}
+
+/*
+ * The PostgreSQL name of a new key of the table named "name", NULL for one
+ * without a name, which is named, as in MySQL, after its first column
+ * (column, column_2, ...); NULL when that is an expression: PostgreSQL picks
+ * a name.  MySQL's errors for a key named PRIMARY or like another key.
+ */
+static char *
+key_pg_name(KeyNamer *kn, const char *name, const char *column)
+{
+	char	   *key;
+	char	   *pgname;
+
+	if (name == NULL && column == NULL)
+		return NULL;
+	if (name == NULL)
+	{
+		/* column_2, ...: of a long column, its first 30 bytes, as in MySQL 5.7 */
+		int			base = pg_mbcliplen(column, strlen(column), 30);
+
+		key = pstrdup(column);
+		for (int i = 2; key_name_taken(kn, key) || pg_strcasecmp(key, "PRIMARY") == 0; i++)
+		{
+			/* MySQL allows 64 keys in a table */
+			if (i == 100)
+				ereport(ERROR,
+						(errcode(MYS_ERRCODE_DUP_KEYNAME),
+						 errmsg("Duplicate key name '%s'", key)));
+			key = psprintf("%.*s_%d", base, column, i);
+		}
+	}
+	else if (pg_strcasecmp(name, "PRIMARY") == 0)
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_WRONG_NAME_FOR_INDEX),
+				 errmsg("Incorrect index name '%s'", name)));
+	else if (key_name_taken(kn, name))
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_DUP_KEYNAME),
+				 errmsg("Duplicate key name '%s'", name)));
+	else
+		key = pstrdup(name);
+	kn->keys = lappend(kn->keys, key);
+	pgname = mys_key_pg_name(kn->relname, key, kn->nspid, kn->pgnames);
+	kn->pgnames = lappend(kn->pgnames, pgname);
+	return pgname;
+}
+
+/*
+ * A new key "name" (NULL: none) starting with column: its PostgreSQL name in
+ * *pgname, or for a deferred namer the marker in *options
+ */
+static void
+name_key(KeyNamer *kn, const char *name, const char *column, char **pgname, List **options)
+{
+	if (!kn->deferred)
+	{
+		*pgname = key_pg_name(kn, name, column);
+		return;
+	}
+	if (name == NULL && column == NULL)
+		return;
+	if (name && pg_strcasecmp(name, "PRIMARY") == 0)
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_WRONG_NAME_FOR_INDEX),
+				 errmsg("Incorrect index name '%s'", name)));
+	if (name && key_name_taken(kn, name))
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_DUP_KEYNAME),
+				 errmsg("Duplicate key name '%s'", name)));
+	if (name)
+		kn->keys = lappend(kn->keys, pstrdup(name));
+	*pgname = NULL;
+	*options = lappend(*options,
+					   makeDefElem(KEY_MARKER,
+								   (Node *) list_make2(makeString(pstrdup(name ? name : "")),
+													   makeString(pstrdup(column ? column : ""))),
+								   -1));
+}
+
+/* a key constraint of the statement */
+static void
+name_key_constraint(KeyNamer *kn, Constraint *c, const char *column)
+{
+	if (c->contype == CONSTR_PRIMARY)
+		c->conname = NULL;		/* always PRIMARY in MySQL; PostgreSQL's <table>_pkey */
+	else if (c->contype == CONSTR_UNIQUE || c->contype == CONSTR_KEY)
+		name_key(kn, c->conname, column ? column : first_key_column(c->keys),
+				 &c->conname, &c->options);
+}
+
+/* the marker name_key() left in the options of an index or constraint, taken out */
+static bool
+take_key_marker(List **options, char **name, char **column)
+{
+	foreach_node(DefElem, opt, *options)
+	{
+		if (strcmp(opt->defname, KEY_MARKER) == 0)
+		{
+			List	   *arg = (List *) opt->arg;
+
+			*name = strVal(linitial(arg));
+			*column = strVal(lsecond(arg));
+			*name = (*name)[0] ? *name : NULL;
+			*column = (*column)[0] ? *column : NULL;
+			*options = list_delete_ptr(*options, opt);
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+has_key_marker(List *options)
+{
+	foreach_node(DefElem, opt, options)
+		if (strcmp(opt->defname, KEY_MARKER) == 0)
+			return true;
+	return false;
+}
+
+/* the key constraints an ALTER TABLE command adds */
+static List *
+alter_cmd_constraints(AlterTableCmd *cmd)
+{
+	if (cmd->subtype == AT_AddConstraint && cmd->def && IsA(cmd->def, Constraint))
+		return list_make1(cmd->def);
+	if (cmd->subtype == AT_AddColumn && cmd->def && IsA(cmd->def, ColumnDef))
+		return ((ColumnDef *) cmd->def)->constraints;
+	return NIL;
+}
+
+/*
+ * ALTER TABLE / CREATE INDEX about to run: a copy with the keys named (as
+ * name_key() deferred them), checked against the table's keys at this time;
+ * NULL if the statement adds none.  As in MySQL, the keys an ALTER TABLE
+ * drops are dropped before those it adds.
+ */
+Node *
+mys_name_keys(Node *stmt)
+{
+	bool		marked = false;
+	KeyNamer	kn;
+	char	   *name;
+	char	   *column;
+
+	if (IsA(stmt, IndexStmt))
+		marked = has_key_marker(((IndexStmt *) stmt)->options);
+	else if (IsA(stmt, AlterTableStmt))
+		foreach_node(AlterTableCmd, cmd, ((AlterTableStmt *) stmt)->cmds)
+			foreach_ptr(Node, n, alter_cmd_constraints(cmd))
+				marked |= IsA(n, Constraint) && has_key_marker(((Constraint *) n)->options);
+	if (!marked)
+		return NULL;
+
+	stmt = copyObject(stmt);
+	if (IsA(stmt, IndexStmt))
+	{
+		IndexStmt  *idx = (IndexStmt *) stmt;
+		Oid			relid = RangeVarGetRelid(idx->relation, NoLock, true);
+		Oid			existing = InvalidOid;
+
+		take_key_marker(&idx->options, &name, &column);
+		/* IF NOT EXISTS (not MySQL): PostgreSQL skips the existing key's index */
+		if (idx->if_not_exists && name && OidIsValid(relid))
+			existing = mys_find_key(relid, name);
+		init_key_namer(&kn, idx->relation, true, false);
+		idx->idxname = OidIsValid(existing) ? get_rel_name(existing) :
+			key_pg_name(&kn, name, column);
+		return stmt;
+	}
+
+	init_key_namer(&kn, ((AlterTableStmt *) stmt)->relation, true, false);
+	foreach_node(AlterTableCmd, cmd, ((AlterTableStmt *) stmt)->cmds)
+	{
+		if ((int) cmd->subtype == AT_DropIndex && cmd->name)
+			release_key_name(&kn, cmd->name);
+	}
+	foreach_node(AlterTableCmd, cmd, ((AlterTableStmt *) stmt)->cmds)
+		foreach_ptr(Node, n, alter_cmd_constraints(cmd))
+		{
+			Constraint *c = (Constraint *) n;
+
+			if (IsA(n, Constraint) && take_key_marker(&c->options, &name, &column))
+				c->conname = key_pg_name(&kn, name, column);
+		}
+	return stmt;
+}
+
+/*
+ * Lookup indexes go after the statement's other keys, named as a key without
+ * a name, and are left out when a non-unique key of the statement starts
+ * with the same column.
+ */
+static List *
+add_lookup_indexes(List *indexes, List *lookups, KeyNamer *kn)
 {
 	foreach_node(IndexStmt, lookup, lookups)
 	{
@@ -773,7 +1166,10 @@ add_lookup_indexes(List *indexes, List *lookups)
 				served = true;
 		}
 		if (!served)
+		{
+			name_key(kn, NULL, column, &lookup->idxname, &lookup->options);
 			indexes = lappend(indexes, lookup);
+		}
 	}
 	return indexes;
 }
@@ -800,6 +1196,7 @@ make_index_stmt(RangeVar *rel, Constraint *c)
 	IndexStmt  *idx = makeNode(IndexStmt);
 
 	idx->idxname = c->conname;
+	idx->options = c->options;	/* a deferred name (name_key()) */
 	idx->relation = copyObject(rel);
 	idx->accessMethod = c->access_method ? c->access_method : DEFAULT_INDEX_TYPE;
 	idx->indexParams = c->keys;
@@ -879,9 +1276,12 @@ rewrite_create_stmt(CreateStmt *stmt)
 	Constraint *identity = NULL;
 	ListCell   *lc;
 	const char *table_collation = table_collation_name(stmt->options);
+	KeyNamer	kn;
+	RangeVar   *like = NULL;
 
 	if (stmt->if_not_exists && OidIsValid(RangeVarGetRelid(stmt->relation, NoLock, true)))
 		return NIL;
+	init_key_namer(&kn, stmt->relation, false, false);	/* a new table */
 	/* LIKE copies the saved table default, independently of column overrides. */
 	foreach_ptr(Node, elt, stmt->tableElts)
 		if (IsA(elt, TableLikeClause))
@@ -889,6 +1289,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 			Oid source = RangeVarGetRelid(((TableLikeClause *) elt)->relation,
 										 AccessShareLock, false);
 			table_collation = mys_table_default_collation(source);
+			like = ((TableLikeClause *) elt)->relation;
 		}
 
 	foreach(lc, stmt->tableElts)
@@ -930,20 +1331,32 @@ rewrite_create_stmt(CreateStmt *stmt)
 				}
 				else if (IsA(n, Constraint) &&
 						 ((Constraint *) n)->contype == CONSTR_KEY)
+				{
+					name_key_constraint(&kn, (Constraint *) n, col->colname);
 					indexes = lappend(indexes, make_index_stmt(stmt->relation, (Constraint *) n));
+				}
 				else
+				{
+					/* UNIQUE / PRIMARY KEY of the column */
+					if (IsA(n, Constraint))
+						name_key_constraint(&kn, (Constraint *) n, col->colname);
 					cons = lappend(cons, n);
+				}
 			}
 			col->constraints = cons;
 			elts = lappend(elts, col);
 		}
 		else if (IsA(elt, Constraint) && ((Constraint *) elt)->contype == CONSTR_KEY)
+		{
+			name_key_constraint(&kn, (Constraint *) elt, NULL);
 			indexes = lappend(indexes, make_index_stmt(stmt->relation, (Constraint *) elt));
+		}
 		else if (IsA(elt, Constraint))
 		{
 			Constraint *c = (Constraint *) elt;
 			char	   *lookup = NULL;
 
+			name_key_constraint(&kn, c, NULL);
 			if (c->contype == CONSTR_PRIMARY || c->contype == CONSTR_UNIQUE)
 				lookup = prefix_key_parts(&c->keys, true, c->contype == CONSTR_PRIMARY, NULL,
 										  InvalidOid, stmt->tableElts);
@@ -959,7 +1372,7 @@ rewrite_create_stmt(CreateStmt *stmt)
 		if (IsA(n, IndexStmt) && !((IndexStmt *) n)->unique)
 			prefix_key_parts(&((IndexStmt *) n)->indexParams, false, false,
 							 &((IndexStmt *) n)->accessMethod, InvalidOid, stmt->tableElts);
-	indexes = add_lookup_indexes(indexes, lookups);
+	indexes = add_lookup_indexes(indexes, lookups, &kn);
 	stmt->tableElts = elts;
 
 	/* MySQL table options */
@@ -1003,6 +1416,9 @@ rewrite_create_stmt(CreateStmt *stmt)
 
 		setup->args = lappend(setup->args, makeDefElem("default_collation",
 									(Node *) makeString(pstrdup(table_collation)), -1));
+		if (like)
+			setup->args = lappend(setup->args, makeDefElem("like_key_names",
+														   (Node *) copyObject(like), -1));
 		indexes = lappend(indexes, setup);
 	}
 	return indexes;
@@ -1019,6 +1435,9 @@ rewrite_alter_table(AlterTableStmt *stmt)
 	List	   *on_update_drop = NIL;
 	bool		setup = false;
 	ListCell   *lc;
+	KeyNamer	kn;
+
+	init_key_namer(&kn, stmt->relation, false, true);
 
 	foreach(lc, stmt->cmds)
 	{
@@ -1084,7 +1503,12 @@ rewrite_alter_table(AlterTableStmt *stmt)
 					setup = true;
 				}
 				else
+				{
+					/* UNIQUE / PRIMARY KEY of the column */
+					if (IsA(n, Constraint))
+						name_key_constraint(&kn, (Constraint *) n, col->colname);
 					cons = lappend(cons, n);
+				}
 			}
 			col->constraints = cons;
 		}
@@ -1093,6 +1517,7 @@ rewrite_alter_table(AlterTableStmt *stmt)
 			Constraint *c = (Constraint *) cmd->def;
 			char	   *lookup = NULL;
 
+			name_key_constraint(&kn, c, NULL);
 			if (c->contype == CONSTR_KEY)
 			{
 				IndexStmt  *idx = (IndexStmt *) make_index_stmt(stmt->relation, c);
@@ -1115,7 +1540,7 @@ rewrite_alter_table(AlterTableStmt *stmt)
 		cmds = lappend(cmds, cmd);
 	}
 	stmt->cmds = cmds;
-	indexes = add_lookup_indexes(indexes, lookups);
+	indexes = add_lookup_indexes(indexes, lookups, &kn);
 	if (setup)
 		indexes = lappend(indexes, make_table_setup(stmt->relation, on_update_add, on_update_drop));
 	return indexes;
@@ -2019,12 +2444,17 @@ mys_rewrite_raw_stmts(List *raw_stmts, const char *query_string, List **infos)
 					IndexStmt  *idx = (IndexStmt *) rs->stmt;
 					char	   *lookup;
 					BatchTable *bt;
+					KeyNamer	kn;
 
+					init_key_namer(&kn, idx->relation, false, true);
+					name_key(&kn, idx->idxname, first_key_column(idx->indexParams),
+							 &idx->idxname, &idx->options);
 					lookup = prefix_key_parts(&idx->indexParams, idx->unique, false,
 											  &idx->accessMethod,
 											  RangeVarGetRelid(idx->relation, NoLock, true), NIL);
 					if (lookup)
-						extra = list_make1(make_lookup_index(idx->relation, lookup));
+						extra = add_lookup_indexes(NIL, list_make1(make_lookup_index(idx->relation, lookup)),
+												   &kn);
 					if ((bt = find_batch_table(idx->relation)) != NULL)
 						add_batch_indexes(bt, list_make1(idx));
 					break;

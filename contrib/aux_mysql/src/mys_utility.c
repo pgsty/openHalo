@@ -420,20 +420,31 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 				}
 
 			case AT_DropIndex:
-				if (OidIsValid(get_relation_constraint_oid(relid, cmd->name, true)))
-					cmds = lappend(cmds, make_cmd(AT_DropConstraint, cmd->name, NULL));
-				else
 				{
-					DropStmt   *drop = makeNode(DropStmt);
+					/* DROP INDEX k [ON t]: the key of this table, PRIMARY included */
+					Oid			indexoid = mys_find_key(relid, cmd->name);
+					Oid			conoid;
 
-					flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
-					drop->removeType = OBJECT_INDEX;
-					drop->objects = list_make1(list_make2(makeString(get_namespace_name(get_rel_namespace(relid))),
-														  makeString(cmd->name)));
-					drop->behavior = DROP_RESTRICT;
-					run_utility((Node *) drop, pstmt, queryString, params, queryEnv);
+					if (!OidIsValid(indexoid))
+						ereport(ERROR,
+								(errcode(ERRCODE_UNDEFINED_OBJECT),
+								 errmsg("Can't DROP '%s'; check that column/key exists", cmd->name)));
+					conoid = get_index_constraint(indexoid);
+					if (OidIsValid(conoid))
+						cmds = lappend(cmds, make_cmd(AT_DropConstraint, get_constraint_name(conoid), NULL));
+					else
+					{
+						DropStmt   *drop = makeNode(DropStmt);
+
+						flush_cmds(stmt, &cmds, pstmt, queryString, params, queryEnv);
+						drop->removeType = OBJECT_INDEX;
+						drop->objects = list_make1(list_make2(makeString(get_namespace_name(get_rel_namespace(indexoid))),
+															  makeString(get_rel_name(indexoid))));
+						drop->behavior = DROP_RESTRICT;
+						run_utility((Node *) drop, pstmt, queryString, params, queryEnv);
+					}
+					break;
 				}
-				break;
 
 			case AT_DropForeignKey:
 			case AT_DropCheck:
@@ -494,6 +505,51 @@ mysql_alter_table(AlterTableStmt *stmt, PlannedStmt *pstmt, const char *queryStr
 		run_utility(lfirst(lc), pstmt, queryString, params, queryEnv);
 }
 
+/*
+ * ALTER TABLE t RENAME {INDEX | KEY} old TO new, which PostgreSQL would read
+ * as a rename of the table itself: the key of that table, with MySQL's errors.
+ */
+static void
+mysql_rename_index(RenameStmt *stmt, PlannedStmt *pstmt, const char *queryString,
+				   ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	Oid			relid = RangeVarGetRelid(stmt->relation, ShareUpdateExclusiveLock,
+										 stmt->missing_ok);
+	Oid			indexoid;
+	Oid			other;
+	RenameStmt *rename;
+
+	if (!OidIsValid(relid))
+		return;
+	if (pg_strcasecmp(stmt->subname, "PRIMARY") == 0 || pg_strcasecmp(stmt->newname, "PRIMARY") == 0)
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_WRONG_NAME_FOR_INDEX),
+				 errmsg("Incorrect index name '%s'",
+						pg_strcasecmp(stmt->subname, "PRIMARY") == 0 ? stmt->subname : stmt->newname)));
+	indexoid = mys_find_key(relid, stmt->subname);
+	if (!OidIsValid(indexoid))
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_KEY_DOES_NOT_EXIST),
+				 errmsg("Key '%s' doesn't exist in table '%s'", stmt->subname,
+						stmt->relation->relname)));
+	other = mys_find_key(relid, stmt->newname);
+	if (OidIsValid(other) && other != indexoid)
+		ereport(ERROR,
+				(errcode(MYS_ERRCODE_DUP_KEYNAME),
+				 errmsg("Duplicate key name '%s'", stmt->newname)));
+	if (strcmp(mys_index_key_name(indexoid), stmt->newname) == 0)
+		return;
+
+	/* ALTER INDEX renames the constraint of a UNIQUE key, too */
+	rename = makeNode(RenameStmt);
+	rename->renameType = OBJECT_INDEX;
+	rename->relation = makeRangeVar(get_namespace_name(get_rel_namespace(indexoid)),
+									get_rel_name(indexoid), -1);
+	rename->newname = mys_key_pg_name(get_rel_name(relid), stmt->newname,
+									  get_rel_namespace(relid), NIL);
+	run_utility((Node *) rename, pstmt, queryString, params, queryEnv);
+}
+
 /* ----------------------------------------------------------------
  * Per-table setup after MySQL DDL: triggers for ON UPDATE CURRENT_TIMESTAMP
  * and the AUTO_INCREMENT counter (see mys_rewrite.c make_table_setup()).
@@ -540,6 +596,49 @@ create_row_trigger(const char *nsp, const char *rel, const char *name,
 		alter->cmds = list_make1(cmd);
 		alter->objtype = OBJECT_TABLE;
 		run_utility((Node *) alter, pstmt, queryString, params, queryEnv);
+	}
+}
+
+/*
+ * CREATE TABLE t LIKE source: PostgreSQL clones the source's indexes, in
+ * OID order, under names of its own; MySQL keeps the key names.
+ */
+static void
+copy_key_names(Oid relid, RangeVar *source, PlannedStmt *pstmt, const char *queryString,
+			   ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	Oid			sourceid = RangeVarGetRelid(source, NoLock, true);
+	Relation	rel;
+	List	   *from;
+	List	   *to;
+	ListCell   *lc1;
+	ListCell   *lc2;
+
+	if (!OidIsValid(sourceid))
+		return;
+	rel = relation_open(sourceid, AccessShareLock);
+	from = RelationGetIndexList(rel);
+	relation_close(rel, AccessShareLock);
+	rel = relation_open(relid, AccessShareLock);
+	to = RelationGetIndexList(rel);
+	relation_close(rel, AccessShareLock);
+	if (list_length(from) != list_length(to))
+		return;
+
+	forboth(lc1, from, lc2, to)
+	{
+		char	   *key = mys_index_key_name(lfirst_oid(lc1));
+		char	   *now = mys_index_key_name(lfirst_oid(lc2));
+		RenameStmt *rename;
+
+		if (key == NULL || now == NULL || strcmp(key, now) == 0 || strcmp(key, "PRIMARY") == 0)
+			continue;
+		rename = makeNode(RenameStmt);
+		rename->renameType = OBJECT_INDEX;
+		rename->relation = makeRangeVar(get_namespace_name(get_rel_namespace(relid)),
+										get_rel_name(lfirst_oid(lc2)), -1);
+		rename->newname = mys_key_pg_name(get_rel_name(relid), key, get_rel_namespace(relid), NIL);
+		run_utility((Node *) rename, pstmt, queryString, params, queryEnv);
 	}
 }
 
@@ -602,6 +701,11 @@ mysql_table_setup(DoStmt *d, PlannedStmt *pstmt, const char *queryString,
 		DefElem    *e = lfirst_node(DefElem, lc);
 		AttrNumber	attnum;
 
+		if (strcmp(e->defname, "like_key_names") == 0)
+		{
+			copy_key_names(relid, (RangeVar *) e->arg, pstmt, queryString, params, queryEnv);
+			continue;
+		}
 		if (strcmp(e->defname, "default_collation") == 0)
 		{
 			ObjectAddress object;
@@ -928,6 +1032,18 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 	if (mys_is_mysql_session())
 		mys_sync_foreign_key_checks();
 
+	/* keys that ALTER TABLE / CREATE INDEX add get their names now */
+	if (IsA(parsetree, IndexStmt) || IsA(parsetree, AlterTableStmt))
+	{
+		Node	   *named = mys_name_keys(parsetree);
+
+		if (named)
+		{
+			pstmt = copyObject(pstmt);
+			pstmt->utilityStmt = parsetree = named;
+		}
+	}
+
 	/* Resolve ADD/MODIFY defaults at execution, including multi-statement DDL. */
 	if (mys_is_mysql_session() && halo_mysql_parser == MYS_PARSER_MYSQL &&
 		IsA(parsetree, AlterTableStmt))
@@ -976,6 +1092,15 @@ process_utility(PlannedStmt *pstmt, const char *queryString,
 	if (is_table_setup(parsetree))
 	{
 		mysql_table_setup((DoStmt *) parsetree, pstmt, queryString, params, queryEnv);
+		return;
+	}
+
+	/* only the MySQL grammar names the table and the index of an index rename */
+	if (IsA(parsetree, RenameStmt) &&
+		((RenameStmt *) parsetree)->renameType == OBJECT_INDEX &&
+		((RenameStmt *) parsetree)->subname != NULL)
+	{
+		mysql_rename_index((RenameStmt *) parsetree, pstmt, queryString, params, queryEnv);
 		return;
 	}
 

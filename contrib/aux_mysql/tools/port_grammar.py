@@ -852,5 +852,84 @@ rep(s[start:end], (
     '\t\t;\n'
     '\n'))
 
+# DROP INDEX k ON t
+# ---------------------------------------------------------------------------
+# openHalo prepended the table to the index name, so PostgreSQL took the
+# table for a schema ("schema t does not exist").  MySQL key names are per
+# table: run it as ALTER TABLE t DROP INDEX k, which finds the key of that
+# table (mys_utility.c), PRIMARY included.  ON is only valid with INDEX.
+for n in (2, 3):
+    first = n + 1
+    old = ('\t\t\t\t\tDropStmt *n = makeNode(DropStmt);\n'
+           '\t\t\t\t\tn->removeType = $%d;\n'
+           '\t\t\t\t\tn->missing_ok = false;\n'
+           '                    n->objects = $%d;\n'
+           '                    if ($%d != NULL)\n'
+           '                    {\n'
+           '                        ListCell   *lc;\n'
+           '                        foreach(lc, $%d)\n'
+           '                        {\n'
+           '                            List *names = (List *)lfirst(lc);\n'
+           '                            if (list_length(names) == 1)\n'
+           '                            {\n'
+           '                                names = lcons(makeString(pstrdup($%d->relname)), names);\n'
+           '                            }\n'
+           '                            else\n'
+           '                            {\n'
+           '                                names = list_insert_nth(names, 1, makeStringConst(pstrdup($%d->relname), -1));\n'
+           '                            }\n'
+           '\n'
+           '                            break;\n'
+           '                        }\n'
+           '                    }\n'
+           '\t\t\t\t\tn->behavior = $%d;\n'
+           '\t\t\t\t\tn->concurrent = false;\n'
+           '\t\t\t\t\t$$ = (Node *)n;\n') % (n, first, n + 3, first, n + 3, n + 3, n + 2)
+    new = ('\t\t\t\t\tif ($%d != NULL)\n'
+           '\t\t\t\t\t\t$$ = makeMysqlDropIndex($%d, $%d, $%d, @%d, yyscanner);\n'
+           '\t\t\t\t\telse\n'
+           '\t\t\t\t\t{\n'
+           '\t\t\t\t\t\tDropStmt *n = makeNode(DropStmt);\n'
+           '\t\t\t\t\t\tn->removeType = $%d;\n'
+           '\t\t\t\t\t\tn->missing_ok = false;\n'
+           '\t\t\t\t\t\tn->objects = $%d;\n'
+           '\t\t\t\t\t\tn->behavior = $%d;\n'
+           '\t\t\t\t\t\tn->concurrent = false;\n'
+           '\t\t\t\t\t\t$$ = (Node *)n;\n'
+           '\t\t\t\t\t}\n') % (n + 3, n, first, n + 3, n, n, first, n + 2)
+    rep(old, new)
+rep('static TypeName *makeMysqlDecimalType(List *mods, int location, bool column);\n',
+    'static TypeName *makeMysqlDecimalType(List *mods, int location, bool column);\n'
+    'static Node *makeMysqlDropIndex(ObjectType type, List *names, RangeVar *table,\n'
+    '\t\t\t\t\t\t\t\tint location, core_yyscan_t yyscanner);\n')
+s = s.rstrip('\n') + '\n' + (
+    '\n'
+    '/* DROP INDEX k, ... ON t: ALTER TABLE t DROP INDEX k, ... */\n'
+    'static Node *\n'
+    'makeMysqlDropIndex(ObjectType type, List *names, RangeVar *table, int location,\n'
+    '\t\t\t\t   core_yyscan_t yyscanner)\n'
+    '{\n'
+    '\tAlterTableStmt *stmt = makeNode(AlterTableStmt);\n'
+    '\tListCell   *lc;\n'
+    '\n'
+    '\tif (type != OBJECT_INDEX)\n'
+    '\t\tereport(ERROR,\n'
+    '\t\t\t\t(errcode(ERRCODE_SYNTAX_ERROR),\n'
+    '\t\t\t\t errmsg("syntax error at or near \\"ON\\""),\n'
+    '\t\t\t\t parser_errposition(location)));\n'
+    '\tstmt->relation = table;\n'
+    '\tstmt->objtype = OBJECT_TABLE;\n'
+    '\tforeach(lc, names)\n'
+    '\t{\n'
+    '\t\tAlterTableCmd *cmd = makeNode(AlterTableCmd);\n'
+    '\n'
+    '\t\tcmd->subtype = AT_DropIndex;\n'
+    '\t\tcmd->name = strVal(llast((List *) lfirst(lc)));\n'
+    '\t\tcmd->behavior = DROP_RESTRICT;\n'
+    '\t\tstmt->cmds = lappend(stmt->cmds, cmd);\n'
+    '\t}\n'
+    '\treturn (Node *) stmt;\n'
+    '}\n')
+
 open(dst, 'w', encoding='utf-8', errors='surrogateescape').write(s)
 print("ported grammar written to", dst)

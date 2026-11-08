@@ -199,6 +199,8 @@ static Node *makeStringConst(char *str, int location);
 static Node *makeStringConstCast(char *str, int location, TypeName *typename);
 static Node *makeIntConst(int val, int location);
 static TypeName *makeMysqlDecimalType(List *mods, int location, bool column);
+static Node *makeMysqlDropIndex(ObjectType type, List *names, RangeVar *table,
+								int location, core_yyscan_t yyscanner);
 static Node *makeFloatConst(char *str, int location);
 static Node *makeBitStringConst(char *str, int location);
 static Node *makeByteaStringConst(char *str, int location);
@@ -9622,59 +9624,33 @@ DropStmt:	DROP object_type_any_name IF_P EXISTS any_name_list opt_drop_behavior
 				}
 			| DROP object_type_any_name any_name_list opt_drop_behavior on_table index_algorithm_opt
 				{
-					DropStmt *n = makeNode(DropStmt);
-					n->removeType = $2;
-					n->missing_ok = false;
-                    n->objects = $3;
-                    if ($5 != NULL)
-                    {
-                        ListCell   *lc;
-                        foreach(lc, $3)
-                        {
-                            List *names = (List *)lfirst(lc);
-                            if (list_length(names) == 1)
-                            {
-                                names = lcons(makeString(pstrdup($5->relname)), names);
-                            }
-                            else
-                            {
-                                names = list_insert_nth(names, 1, makeStringConst(pstrdup($5->relname), -1));
-                            }
-
-                            break;
-                        }
-                    }
-					n->behavior = $4;
-					n->concurrent = false;
-					$$ = (Node *)n;
+					if ($5 != NULL)
+						$$ = makeMysqlDropIndex($2, $3, $5, @2, yyscanner);
+					else
+					{
+						DropStmt *n = makeNode(DropStmt);
+						n->removeType = $2;
+						n->missing_ok = false;
+						n->objects = $3;
+						n->behavior = $4;
+						n->concurrent = false;
+						$$ = (Node *)n;
+					}
 				}
 			| DROP TEMPORARY object_type_any_name any_name_list opt_drop_behavior on_table index_algorithm_opt
 				{
-					DropStmt *n = makeNode(DropStmt);
-					n->removeType = $3;
-					n->missing_ok = false;
-                    n->objects = $4;
-                    if ($6 != NULL)
-                    {
-                        ListCell   *lc;
-                        foreach(lc, $4)
-                        {
-                            List *names = (List *)lfirst(lc);
-                            if (list_length(names) == 1)
-                            {
-                                names = lcons(makeString(pstrdup($6->relname)), names);
-                            }
-                            else
-                            {
-                                names = list_insert_nth(names, 1, makeStringConst(pstrdup($6->relname), -1));
-                            }
-
-                            break;
-                        }
-                    }
-					n->behavior = $5;
-					n->concurrent = false;
-					$$ = (Node *)n;
+					if ($6 != NULL)
+						$$ = makeMysqlDropIndex($3, $4, $6, @3, yyscanner);
+					else
+					{
+						DropStmt *n = makeNode(DropStmt);
+						n->removeType = $3;
+						n->missing_ok = false;
+						n->objects = $4;
+						n->behavior = $5;
+						n->concurrent = false;
+						$$ = (Node *)n;
+					}
 				}
 			| DROP drop_type_name IF_P EXISTS name_list opt_drop_behavior
 				{
@@ -24366,4 +24342,31 @@ makeMysqlDecimalType(List *mods, int location, bool column)
 	result->typmods = mods;
 	result->location = location;
 	return result;
+}
+
+/* DROP INDEX k, ... ON t: ALTER TABLE t DROP INDEX k, ... */
+static Node *
+makeMysqlDropIndex(ObjectType type, List *names, RangeVar *table, int location,
+				   core_yyscan_t yyscanner)
+{
+	AlterTableStmt *stmt = makeNode(AlterTableStmt);
+	ListCell   *lc;
+
+	if (type != OBJECT_INDEX)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("syntax error at or near \"ON\""),
+				 parser_errposition(location)));
+	stmt->relation = table;
+	stmt->objtype = OBJECT_TABLE;
+	foreach(lc, names)
+	{
+		AlterTableCmd *cmd = makeNode(AlterTableCmd);
+
+		cmd->subtype = AT_DropIndex;
+		cmd->name = strVal(llast((List *) lfirst(lc)));
+		cmd->behavior = DROP_RESTRICT;
+		stmt->cmds = lappend(stmt->cmds, cmd);
+	}
+	return (Node *) stmt;
 }

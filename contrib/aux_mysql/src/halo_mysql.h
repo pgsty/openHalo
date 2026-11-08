@@ -58,6 +58,22 @@ extern void mys_discard_rewrite_warnings(void);
 extern bool mys_index_prefix(Node *expr, AttrNumber *attnum, int *length, bool *bytes,
 							 bool *digest);
 
+/* mys_rewrite.c: MySQL key names, per table (see there) */
+extern char *mys_key_name(const char *relname, bool primary);
+extern char *mys_index_key_name(Oid indexoid);
+extern Oid	mys_find_key(Oid relid, const char *name);
+extern char *mys_key_pg_name(const char *relname, const char *key, Oid nspid, List *reserved);
+extern Node *mys_name_keys(Node *stmt);
+
+/*
+ * SQLSTATEs for MySQL errors that no PostgreSQL SQLSTATE maps to: "M" and the
+ * MySQL error number (mys_errno()).  The client gets SQLSTATE 42000, which
+ * MySQL sends for each of them.
+ */
+#define MYS_ERRCODE_DUP_KEYNAME			MAKE_SQLSTATE('M','1','0','6','1')
+#define MYS_ERRCODE_KEY_DOES_NOT_EXIST	MAKE_SQLSTATE('M','1','1','7','6')
+#define MYS_ERRCODE_WRONG_NAME_FOR_INDEX	MAKE_SQLSTATE('M','1','2','8','0')
+
 /* how a MySQL statement interacts with transactions (mys_txn.c) */
 typedef enum MysTxnKind
 {

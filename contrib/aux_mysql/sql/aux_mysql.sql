@@ -59,6 +59,11 @@ CREATE OR REPLACE FUNCTION mysql.index_key_parts(pg_catalog.oid, OUT seq pg_cata
 RETURNS SETOF record
 AS '$libdir/aux_mysql', 'mys_index_key_parts'
 LANGUAGE C STABLE STRICT;
+-- the MySQL name of an index: PRIMARY, or its name without a "$<hex>" key suffix
+CREATE OR REPLACE FUNCTION mysql.index_key_name(pg_catalog.oid)
+RETURNS pg_catalog.text
+AS '$libdir/aux_mysql', 'mys_sql_index_key_name'
+LANGUAGE C STABLE STRICT;
 
 -- ==== from aux_mysql--1.1.sql ====
 
@@ -29945,24 +29950,33 @@ GRANT ALL PRIVILEGES ON ALL tables IN SCHEMA mys_sys TO public;
 -- ==== from aux_mysql--1.3--1.4.sql ====
 
 drop table if exists mys_informa_schema.statistics;
-create table mys_informa_schema.statistics(
-    TABLE_CATALOG varchar(256),
-    TABLE_SCHEMA varchar(256),
-    TABLE_NAME varchar(256),
-    NON_UNIQUE bigint,
-    INDEX_SCHEMA varchar(256),
-    INDEX_NAME varchar(256),
-    SEQ_IN_INDEX bigint,
-    COLUMN_NAME varchar(256),
-    "collation" varchar(256),
-    CARDINALITY bigint,
-    SUB_PART bigint,
-    PACKED varchar(256),
-    NULLABLE varchar(256),
-    INDEX_TYPE varchar(256),
-    COMMENT varchar(256),
-    INDEX_COMMENT varchar(256)
-);
+-- the key parts of the tables' indexes, as SHOW INDEX shows them
+create view mys_informa_schema.statistics as
+select
+    'def'::varchar(256) as TABLE_CATALOG,
+    ns.nspname::varchar(256) as TABLE_SCHEMA,
+    tc.relname::varchar(256) as TABLE_NAME,
+    (case when ind.indisunique then 0 else 1 end)::bigint as NON_UNIQUE,
+    ns.nspname::varchar(256) as INDEX_SCHEMA,
+    mysql.index_key_name(ind.indexrelid)::varchar(256) as INDEX_NAME,
+    k.seq::bigint as SEQ_IN_INDEX,
+    k.column_name::varchar(256) as COLUMN_NAME,
+    'A'::varchar(256) as "collation",
+    0::bigint as CARDINALITY,
+    k.sub_part::bigint as SUB_PART,
+    NULL::varchar(256) as PACKED,
+    (case when att.attnotnull then '' else 'YES' end)::varchar(256) as NULLABLE,
+    pg_catalog.upper(am.amname)::varchar(256) as INDEX_TYPE,
+    ''::varchar(256) as COMMENT,
+    ''::varchar(256) as INDEX_COMMENT
+from pg_catalog.pg_index ind
+    join pg_catalog.pg_class tc on tc.oid = ind.indrelid
+    join pg_catalog.pg_namespace ns on ns.oid = tc.relnamespace
+    join pg_catalog.pg_class ic on ic.oid = ind.indexrelid
+    join pg_catalog.pg_am am on am.oid = ic.relam
+    cross join lateral mysql.index_key_parts(ind.indexrelid) k
+    join pg_catalog.pg_attribute att on att.attrelid = ind.indrelid and att.attname = k.column_name
+where tc.oid >= 16384 and tc.relkind in ('r', 'p');
 
 DROP TABLE IF EXISTS MYS_INFORMA_SCHEMA.administrable_role_authorizations;
 CREATE TABLE MYS_INFORMA_SCHEMA.administrable_role_authorizations (
@@ -33132,10 +33146,7 @@ select
         where (cl_sub.oid = ind.indrelid)
         )::varchar(256) as table_name,
     (case when ind.indisunique = 1 then 0 else 1 end)::int as Non_unique,
-    (select case when right(cl_sub.relname, 5) = '_pkey' then 'PRIMARY' else cl_sub.relname end
-        from pg_class cl_sub
-        where (cl_sub.oid = ind.indexrelid)
-        )::varchar(256) as key_name,
+    mysql.index_key_name(ind.indexrelid)::varchar(256) as key_name,
     (mysql.get_seq_in_index(att.attnum::pg_catalog.text, ind.indkey))::int as Seq_in_index,
     att.attname::varchar(256) as Column_name,
     'A'::varchar(256) as Collation,
@@ -34609,7 +34620,7 @@ BEGIN
                 select
                     (select cl.relname from pg_class cl where (cl.oid = tabOid))::varchar(256) as table_name,
                     (case when records.indisunique = 1 then 0 else 1 end)::int as Non_unique,
-                    (select case when right(cl.relname, 5) = '_pkey' then 'PRIMARY' else cl.relname end from pg_class cl where (cl.oid = records.indexrelid))::varchar(256) as key_name,
+                    mysql.index_key_name(records.indexrelid)::varchar(256) as key_name,
                     k.seq::int as Seq_in_index,
                     att.attname::varchar(256) as Column_name,
                     'A'::varchar(256) as Collation,
@@ -34804,7 +34815,7 @@ BEGIN
         --    from pg_class cl,
         --        (select * from pg_index where indrelid = tabOid) ind
         --    where cl.oid = ind.indexrelid
-        select ind.indexrelid, ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, (select cl.relname from pg_class cl where cl.oid = ind.indexrelid) as indname
+        select ind.indexrelid, ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, mysql.index_key_name(ind.indexrelid) as indname
             from pg_index ind where ind.indrelid = tabOid
         --select ind.indrelid, ind.indkey, ind.indnatts, ind.indnkeyatts, ind.indisunique, ind.indisprimary, cl.relname
         --    from pg_index ind join pg_class cl on ind.indrelid = cl.oid
@@ -34822,9 +34833,9 @@ BEGIN
         if (records.indisprimary = 1) then
             ret := pg_catalog.concat(ret, 'PRIMARY KEY (', columnNames, ')');
         elsif (records.indisunique = 1) then
-            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', records.indname, '`(', columnNames, ')');
+            ret := pg_catalog.concat(ret, 'UNIQUE KEY `', records.indname, '` (', columnNames, ')');
         else
-            ret := pg_catalog.concat(ret, 'KEY `', records.indname, '`(', columnNames, ')');
+            ret := pg_catalog.concat(ret, 'KEY `', records.indname, '` (', columnNames, ')');
         end if;
     END LOOP;
 
@@ -34961,7 +34972,7 @@ BEGIN
                 select
                     (select cl.relname from pg_class cl where (cl.oid = tabOid))::varchar(256) as table_name,
                     (case when records.indisunique = 1 then 0 else 1 end)::int as Non_unique,
-                    (select case when right(cl.relname, 5) = '_pkey' then 'PRIMARY' else cl.relname end from pg_class cl where (cl.oid = records.indexrelid))::varchar(256) as key_name,
+                    mysql.index_key_name(records.indexrelid)::varchar(256) as key_name,
                     k.seq::int as Seq_in_index,
                     att.attname::varchar(256) as Column_name,
                     'A'::varchar(256) as Collation,
