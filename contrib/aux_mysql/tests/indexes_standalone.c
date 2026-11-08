@@ -9,6 +9,15 @@
 #include "utils/builtins.h"
 #include "mys_prefix.h"
 
+/* Deliberately bypass text input validation in this private test module.
+ * Production character input rejects NUL; the AM must still be defensive. */
+PG_FUNCTION_INFO_V1(mys_prefix_test_text);
+Datum
+mys_prefix_test_text(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P((text *) PG_GETARG_BYTEA_P_COPY(0));
+}
+
 /* Catalog lookup seam, for connections spanning an extension SQL upgrade. */
 PG_FUNCTION_INFO_V1(mys_prefix_test_available);
 Datum

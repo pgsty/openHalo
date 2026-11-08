@@ -443,6 +443,21 @@ string_part(Relation index, int col)
 	return OidIsValid(index_getprocid(index, col + 1, BTOPTIONS_PROC));
 }
 
+/* Unlike pg_mbcharcliplen, embedded NUL is one character, not the end.
+ * Character input rejects NUL, but index safety must not depend on that. */
+static int
+prefix_charcliplen(const char *data, int len, int characters)
+{
+	int offset = 0;
+	while (offset < len && characters-- > 0)
+	{
+		int width = data[offset] == 0 ? 1 : pg_mblen(data + offset);
+		if (width > len - offset) break;
+		offset += width;
+	}
+	return offset;
+}
+
 static bytea *
 string_key(Relation index, int col, Datum value, bool physical, bool pattern)
 {
@@ -457,7 +472,7 @@ string_key(Relation index, int col, Datum value, bool physical, bool pattern)
 		key = general_key(data, len, n, !pattern);
 	else if (is_mysql_bin(collid))
 	{
-		if (n > 0) len = pg_mbcharcliplen(data, len, n);
+		if (n > 0) len = prefix_charcliplen(data, len, n);
 		if (!pattern) while (len > 0 && data[len - 1] == ' ') len--;
 		key = palloc(VARHDRSZ + len);
 		SET_VARSIZE(key, VARHDRSZ + len);
@@ -468,7 +483,7 @@ string_key(Relation index, int col, Datum value, bool physical, bool pattern)
 		pg_locale_t locale = pg_newlocale_from_collation(collid);
 		size_t needed;
 		if (n > 0)
-			len = pg_mbcharcliplen(data, len, n);
+			len = prefix_charcliplen(data, len, n);
 		if (locale->collate_is_c || locale->deterministic)
 		{
 			key = palloc(VARHDRSZ + len);

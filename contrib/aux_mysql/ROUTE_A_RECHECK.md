@@ -123,7 +123,7 @@ UNHEX, 1292 for VARBINARY/BINARY, and 1366 (plus 1292 for VARBINARY/BINARY) when
 there is no numeric prefix. Values agree; the assertions record these distinct
 reference warning sequences. Full uint64 expression results remain out of scope.
 
-## WP6 — prevent loss of legal uint64 values
+## WP6 — prevent loss of legal uint64 values (`bc1d29c`)
 
 The lenient integer assignment helper distinguishes the representable int8 bound
 from MySQL's uint64 bound. A value in the legal uint64 high half raises 1264,
@@ -143,3 +143,20 @@ Out-of-MySQL-range literals retain the requested existing lenient clipping with
 1264: negatives become 0; values above UINT64_MAX become the representable
 INT64_MAX, whereas MySQL stores UINT64_MAX. This remaining boundary difference
 requires full uint64 storage to eliminate. Legal high-half values never clip.
+
+## WP7 — NUL-safe character prefix clipping
+
+Both bin and historical collation paths now clip by explicit character count;
+NUL consumes one character and cannot terminate the key. A private standalone
+test bridge bypasses text input validation to exercise this defense; production
+character writers still reject NUL with 1366. The new regression failed before
+the change with an erroneous 23505 between `a\0A` and `a\0B`, then passed after
+it, including multibyte prefixes, C/bin/general_ci and REINDEX. The test-only
+bridge is never installed in the product. Fixed Python 3.9 compatibility in the
+earlier custom-binary fixture while running the complete prefix suite.
+
+Debug rebuilt. Stock-PG18 `tests/indexes_standalone.py` passed its complete suite,
+including concurrent keys and pg_dump/restore; `tests/indexes_btree.py` passed
+on 3804/5804. `tests/route_a.py --port 3804 --wp prefix_nul`: 19 assertions
+against 3771 passed, covering the character 1366 boundary and byte-preserving
+binary ODKU/REPLACE with distinct NUL-containing prefix keys.

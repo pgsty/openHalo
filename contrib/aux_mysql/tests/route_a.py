@@ -195,6 +195,26 @@ class Checks:
         self.count += 1
 
 
+    def prefix_nul(self):
+        for coll in ('utf8mb4_bin','utf8mb4_general_ci'):
+            self.both('CREATE TABLE prefix_nul(id INT,s TEXT COLLATE '+coll+',UNIQUE KEY sk(s(3)))')
+            for sql in ("INSERT INTO prefix_nul VALUES(1,UNHEX('610041'))",
+                        "INSERT INTO prefix_nul VALUES(2,UNHEX('610042'))",
+                        "INSERT INTO prefix_nul VALUES(3,UNHEX('610041')) ON DUPLICATE KEY UPDATE id=3",
+                        "REPLACE INTO prefix_nul VALUES(4,UNHEX('610042'))"):
+                assert self.oh.result(sql) == ('error',1366), sql
+                assert self.my.result(sql) == ((),()), sql
+                self.count += 1
+            assert self.oh.q('SELECT count(*) FROM prefix_nul') == ((0,),)
+            assert self.my.q('SELECT id,HEX(s) FROM prefix_nul ORDER BY id') == ((3,'610041'),(4,'610042'))
+            self.count += 1
+            self.both('DROP TABLE prefix_nul')
+        self.both('CREATE TABLE prefix_bytes(id INT,s VARBINARY(10),UNIQUE KEY sk(s(3)))')
+        self.both("INSERT INTO prefix_bytes VALUES(1,UNHEX('610041')),(2,UNHEX('610042'))")
+        self.both("INSERT INTO prefix_bytes VALUES(3,UNHEX('610041')) ON DUPLICATE KEY UPDATE id=3")
+        self.both("REPLACE INTO prefix_bytes VALUES(4,UNHEX('610042'))")
+        self.both('SELECT id,HEX(s) FROM prefix_bytes ORDER BY id')
+
     def uint64(self):
         self.both('CREATE TABLE u64(id INT PRIMARY KEY,u BIGINT UNSIGNED UNIQUE)')
         for mode in ('','STRICT_TRANS_TABLES','STRICT_ALL_TABLES'):
@@ -366,7 +386,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast', 'uint64'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast', 'uint64', 'prefix_nul'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

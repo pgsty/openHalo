@@ -186,8 +186,9 @@ try:
         db.q('SELECT mysql.prefix_test_ddl(' + lit('CREATE TABLE pk_custom('
              'a mysql.varbinary_n, PRIMARY KEY(a) '
              "WITH(prefix_lengths='2'))") + ')')
-        db.q(f"INSERT INTO pk_custom VALUES ({blob(b'a\0b')}::mysql.varbinary_n)")
-        fails(db, f"INSERT INTO pk_custom VALUES ({blob(b'a\0z')}::mysql.varbinary_n)")
+        nul_binary = blob(bytes([97,0,98]))
+        db.q(f"INSERT INTO pk_custom VALUES ({nul_binary}::mysql.varbinary_n)")
+        fails(db, f"INSERT INTO pk_custom VALUES ({blob(bytes([97,0,122]))}::mysql.varbinary_n)")
 
 
     db.q('CREATE TABLE multibyte(a text COLLATE mysql.utf8mb4_general_ci)')
@@ -197,6 +198,20 @@ try:
     db.q("INSERT INTO multibyte VALUES ('😀x')")
     fails(db, "INSERT INTO multibyte VALUES ('😇y')")
     passed('character prefixes and MySQL supplementary-character weights')
+
+    # Fault injection only: character writers reject NUL, but an internal
+    # value must not truncate the index key and collide with an unrelated row.
+    for coll in ('mysql.utf8mb4_bin','"C"','mysql.utf8mb4_general_ci'):
+        db.q('CREATE TABLE nul_defense(s text COLLATE '+coll+',v int)')
+        db.q("CREATE UNIQUE INDEX nul_defense_u ON nul_defense USING mysql_prefix(s) WITH(prefix_lengths='3')")
+        for h,n in [('610041',1),('610042',2),('c3a90041',3),('c3a90042',4)]:
+            db.q("INSERT INTO nul_defense VALUES(mysql.prefix_test_text(decode('"+h+"','hex')),"+str(n)+")")
+        assert db.q('SELECT count(*),sum(v) FROM nul_defense') == [('4','10')]
+        fails(db,"INSERT INTO nul_defense VALUES(mysql.prefix_test_text(decode('61004158','hex')),5)",'23505')
+        db.q('REINDEX INDEX nul_defense_u')
+        assert db.q('SELECT sum(v) FROM nul_defense') == [('10',)]
+        db.q('DROP TABLE nul_defense')
+    passed('NUL counts as a character in bin/C/general_ci prefix keys, including multibyte prefixes')
 
     db.q('CREATE TABLE plans(a text COLLATE mysql.utf8mb4_general_ci,b int)')
     db.q("CREATE INDEX plans_ab ON plans USING mysql_prefix(a,b) WITH(prefix_lengths='10,0')")
@@ -291,7 +306,7 @@ try:
                 fails(restored, "INSERT INTO pk_copy VALUES ('ABC9',1)")
                 fails(restored, "INSERT INTO pk VALUES (NULL,1)", '23502')
                 fails(restored, f"INSERT INTO custom_options VALUES ({blob(b'abz')}::mysql.varbinary_n)")
-                fails(restored, f"INSERT INTO pk_custom VALUES ({blob(b'a\0z')}::mysql.varbinary_n)")
+                fails(restored, f"INSERT INTO pk_custom VALUES ({blob(bytes([97,0,122]))}::mysql.varbinary_n)")
                 fails(restored, "INSERT INTO pk_custom VALUES (NULL)", '23502')
                 assert restored.q('SELECT count(*) FROM collision') == [('4',)]
                 passed('native dump to a different database retains PRIMARY and custom-type opclass options despite changed type OIDs')

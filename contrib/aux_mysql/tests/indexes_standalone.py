@@ -67,6 +67,7 @@ try:
     sql = (root / 'tests/indexes_types_fixture.sql').read_text()
     sql += (root / 'sql/aux_mysql_fix_indexes.sql').read_text()
     sql += "\nCREATE FUNCTION mysql.prefix_test_ddl(text) RETURNS void AS '$libdir/aux_mysql', 'mys_prefix_test_ddl' LANGUAGE C STRICT;\n"
+    sql += "\nCREATE FUNCTION mysql.prefix_test_text(bytea) RETURNS text AS '$libdir/aux_mysql', 'mys_prefix_test_text' LANGUAGE C STRICT IMMUTABLE;\n"
     sql = sql.replace('$libdir/aux_mysql', str(module).replace("'", "''"))
     install = build / 'install.sql'
     install.write_text(sql)
