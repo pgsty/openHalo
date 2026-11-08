@@ -79,8 +79,10 @@ and separate validation. Load it through `shared_preload_libraries` (the OpenHal
   and `'50\%'` is four characters.
 - **Binary and character strings**: new BINARY(n) columns pad with zero bytes; VARBINARY(n) enforces
   its byte limit. Strict writes reject overflow, while non-strict and INSERT IGNORE writes truncate
-  with warnings. BLOB values preserve every byte. TEXT-family columns use native PostgreSQL text. CHAR/VARCHAR/TEXT reject NUL
-  with error 1366 in every sql_mode, including IGNORE. Text and prepared result packets retain complete values.
+  with warnings. BLOB values preserve every byte. TEXT-family columns use native PostgreSQL text.
+  CHAR/VARCHAR/TEXT reject NUL with error 1366 in every sql_mode, including IGNORE.
+  Text and prepared result packets retain complete values. Binary-to-character assignments and
+  CAST preserve UTF8 bytes; invalid UTF8 and NUL (including BINARY padding) produce 1366.
   Literal backslash escapes, `_binary`, hex/bit literals and BLOB parameters preserve binary payloads.
   Native PostgreSQL I/O for these new types uses bytea escaping, so pg_dump can round-trip NUL and
   non-UTF8 binary bytes. Existing columns keep their old types until explicitly migrated.
@@ -163,7 +165,11 @@ explicit product choice.
   literals is case-sensitive (literals use the database collation); `1.5e0` is numeric, not DOUBLE.
 - Old BINARY/VARBINARY columns are bytea domains with discarded lengths. Installing 1.9 does not
   infer their original lengths or pad historical values. TEXT-family columns retain native PG text storage. Use the original schema and the [migration procedure](MIGRATION.md) to convert them.
-- Hexadecimal numeric contexts above signed int8 remain limited; BIGINT UNSIGNED is not a full
+- Index hints accept USE/IGNORE/FORCE INDEX or KEY, optional FOR JOIN/ORDER BY/GROUP BY,
+  aliases, repeated hints and index lists (including empty USE lists). All hints are ignored.
+- Legal BIGINT UNSIGNED values above INT64_MAX fail with 1264 in every sql_mode and under
+  IGNORE, preventing distinct 64-bit keys from collapsing onto INT64_MAX.
+  Hexadecimal numeric contexts above signed int8 remain limited; BIGINT UNSIGNED is not a full
   unsigned 64-bit type. Common string operations, binary CONCAT and indexed integer comparisons are
   covered, but arbitrary combinations of MySQL functions and custom types are not fully implemented.
   BIT result metadata and user-variable numeric typing still differ from MySQL.

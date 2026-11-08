@@ -182,7 +182,12 @@ from `pg14` in a temporary directory and compares their bytes.
 asserts character functions, mixed expressions, value/HEX assignments, and the
 intentional 1366 boundary for NUL in every character family and write mode.
 The other work packages are selected with `--wp binary`, `char`, `collation`,
-`numeric_cast`, `uint64`, `prefix_nul`, and `hints`. The numeric CAST check also uses
+`collation_all`, `numeric_cast`, `uint64`, `prefix_nul`, and `hints`.
+`collation_all` enumerates every character collation returned by MySQL 5.7
+SHOW COLLATION (221 names), on VARCHAR/CHAR/TEXT, checking all substring-search
+entry points and their UTF8 logical results. Binary-character-set columns are
+covered by `binary`. Language/encoding approximations explicitly assert 1105.
+The numeric CAST check also uses
 `PSQL` (or psql on PATH) over PG at the MySQL port plus 2000.
 The standalone expression harness omits executor-only conflict node assignments
 when compiled against stock PG18 headers; production parser byte identity is

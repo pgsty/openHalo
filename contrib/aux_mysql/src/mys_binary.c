@@ -1266,6 +1266,8 @@ binary_arg(FunctionCallInfo fcinfo, int i)
 		return PG_GETARG_BYTEA_PP(i);
 	if (base == BPCHAROID)
 		return mys_bpchar_bytes(PG_GETARG_DATUM(i));
+	if (base == BOOLOID)
+		return (bytea *) cstring_to_text(PG_GETARG_BOOL(i) ? "1" : "0");
 	getTypeOutputInfo(t, &out, &varlena);
 	return (bytea *) cstring_to_text(OidOutputFunctionCall(out, PG_GETARG_DATUM(i)));
 }

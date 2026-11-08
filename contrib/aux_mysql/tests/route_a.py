@@ -138,6 +138,12 @@ class Checks:
 
 
     def binary(self):
+        # MySQL predicates are numeric, including when the new generic
+        # character conversion would otherwise call PostgreSQL boolout.
+        for value in ('1=1','1=0','NULL'):
+            for expr in ('CAST(('+value+') AS CHAR)', "ELT(1,("+value+"),'x')",
+                         'CONVERT(('+value+') USING utf8mb4)', "CONCAT_WS(',',("+value+"),'x')"):
+                self.both('SELECT '+expr+',HEX('+expr+')')
         self.both("SET sql_mode=CAST('ANSI_QUOTES' AS BINARY)")
         self.both('SELECT @@sql_mode')
         self.both("SET sql_mode=''")
@@ -394,6 +400,58 @@ class Checks:
                     self.count += 1
                 self.oh.q('DROP TABLE aliases')
 
+    def collation_all(self):
+        # Enumerate the actual 5.7 server, including non-UTF8 and language-
+        # specific names. The binary character set produces binary columns,
+        # already covered by the binary suite; it has no character collation.
+        collations = [(r[0], r[1]) for r in self.my.q('SHOW COLLATION') if r[1] != 'binary']
+        exact = {'utf8_general_ci','utf8mb4_general_ci','utf8_bin','utf8mb4_bin'}
+        expressions = ["LOCATE('l',s)","INSTR(s,'l')","POSITION('l' IN s)",
+                       "LOCATE('L',s)","LOCATE('l',s,4)","LOCATE('',s,2)",
+                       "REPLACE(s,'H','x')","SUBSTRING_INDEX(s,'l',1)",
+                       "SUBSTRING_INDEX(s,'L',-1)","FIND_IN_SET(s,'abc,HELLO,xHello')",
+                       "s LIKE '%L%'","s NOT LIKE '%L%'"]
+        def select(expr, table):
+            hex_arg = 'CONVERT('+expr+' USING utf8mb4)' if expr.startswith(('REPLACE','SUBSTRING_INDEX')) else expr
+            return 'SELECT '+expr+',HEX('+hex_arg+') FROM '+table+' ORDER BY id'
+        models = {}
+        for kind in ('general_ci','bin'):
+            self.my.q('CREATE TABLE coll_model(id INT,s VARCHAR(30) CHARACTER SET utf8mb4 COLLATE utf8mb4_'+kind+')')
+            self.my.q("INSERT INTO coll_model VALUES(1,'Hello'),(2,'xHello'),(3,'hello'),(4,NULL)")
+            models[kind] = {expr:self.my.result(select(expr,'coll_model')) for expr in expressions}
+            self.my.q('DROP TABLE coll_model')
+        differences = []
+        for coll, charset in collations:
+            for typ in ('VARCHAR(30)','CHAR(30)','TEXT'):
+                ddl = 'CREATE TABLE all_coll(id INT,s '+typ+' CHARACTER SET '+charset+' COLLATE '+coll+')'
+                # PG stores UTF8; only the reference needs its native charset
+                # declaration to admit the requested collation name.
+                oh_ddl = 'CREATE TABLE all_coll(id INT,s '+typ+' COLLATE '+coll+')'
+                a, e = self.oh.result(oh_ddl), self.my.result(ddl)
+                assert a == ((), () if coll in exact else (1105,)), (ddl,a)
+                assert e == ((),()), (ddl,e)
+                self.count += 1
+                self.both("INSERT INTO all_coll VALUES(1,'Hello'),(2,'xHello'),(3,'hello'),(4,NULL)")
+                for expr in expressions:
+                    # Compare logical strings and their UTF8 bytes. MySQL's
+                    # UTF16/UCS2/etc storage bytes differ from PG's UTF8 store.
+                    query = select(expr,'all_coll')
+                    a, e = self.oh.result(query), self.my.result(query)
+                    # Unknown names explicitly warn and map to general_ci/bin.
+                    # Verify that precise contract against live MySQL too, and
+                    # report every difference from the requested locale.
+                    model = models['general_ci' if coll.endswith('_ci') else 'bin'][expr]
+                    assert a == model and a[0] != 'error' and e[0] != 'error', (coll,typ,expr,a,e,model)
+                    if a != e:
+                        assert coll not in exact, (coll,typ,expr,a,e)
+                        differences.append((coll,typ,expr,a,e))
+                    self.count += 1
+                self.both('DROP TABLE all_coll')
+        print('PASS complete character-collation matrix:',len(collations),'names x 3 column types')
+        for difference in differences:
+            print('APPROXIMATION (DDL warning 1105):',repr(difference))
+        print('Requested-locale differences:',len(differences))
+
     def char(self):
         self.both('CREATE TABLE padding(c CHAR(5),v VARBINARY(20),b BINARY(5))')
         self.both("INSERT INTO padding(c) VALUES('x'),('é'),('xy ')")
@@ -419,7 +477,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--port', type=int, required=True)
     p.add_argument('--reference-port', type=int, default=3771)
-    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'numeric_cast', 'uint64', 'prefix_nul', 'hints'], default='text')
+    p.add_argument('--wp', choices=['text', 'binary', 'char', 'collation', 'collation_all', 'numeric_cast', 'uint64', 'prefix_nul', 'hints'], default='text')
     a = p.parse_args()
     tests = Checks(a.port, a.reference_port)
     try:

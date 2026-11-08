@@ -4,6 +4,7 @@ Base: clean main `6821954a3f8387287e655d7e91036a3ea0d80c28`.
 Branch: `fix/aux-mysql-1.9-route-a`. Nothing pushed.
 Builds, clusters and raw logs: ohdev `/tmp/aux-route-a/`.
 Debug: MySQL 3804 / PG 5804 (ports checked before initialization).
+Release: MySQL 3805 / PG 5805. Both instances remain available for inspection.
 Reference: MySQL 5.7.32 on 3771. Baselines 3792/3793 remain intact.
 
 ## WP1 — native TEXT (`8cf384d`)
@@ -42,8 +43,8 @@ regression assertions explicitly distinguish this diagnostic difference.
 CHAR/VARCHAR mixed IFNULL/IF overloads are ambiguous on both baseline 3793 and the
 new build; the extra CHAR scan excludes those two pre-existing combinations.
 
-Remaining packages and final debug/release acceptance are in progress. A package
-being committed or built does not imply the final full suite has passed.
+Final debug/release acceptance is recorded below, separately from the initial
+per-package checks.
 
 ## WP2 — binary-to-character conversions (`894b949`)
 
@@ -199,7 +200,7 @@ Debug validation:
 - `tests/release_online_upgrade.py --allow-listener-reload` on 3804/5804 passed
   the separate same-session 1.8→1.9 refresh test.
 
-Release build repetition and final full acceptance are still pending.
+The final section records the successful release repetition and full acceptance.
 
 ## WP9 — ignored index hints (`311ef83`)
 
@@ -220,7 +221,7 @@ All 315 assertions passed against 3771. `release_dml.py` passed its SQL,
 concurrency, trigger and privilege cases, including reference-port repetition.
 Generator byte identity passed.
 
-## WP10 — pending FK owner permissions
+## WP10 — pending FK owner permissions (`2a7f1e7`)
 
 Before privileged binding, check the child owner's schema USAGE and table-level
 or every-column REFERENCES, including implicit composite primary keys. Missing
@@ -238,3 +239,158 @@ parent deletion. `review_fix_pending_fk.py --ports 3804 3771` passed all five
 groups on both servers. The real-upgrade runner now includes the ACL suite.
 This PG security boundary intentionally differs from MySQL 5.7's REFERENCES
 permission policy. Release repetition and final full validation follow below.
+
+## Final acceptance — 2026-11-09
+
+All ten implementation packages are committed separately. Debug and release
+kernel/extension builds are installed outside the repository. Both use OpenSSL
+and `--enable-depend`; debug additionally uses `--enable-debug --enable-cassert`.
+No core kernel source or native PG cast was changed. Main remains at the starting
+commit; nothing was pushed. A final validation commit records the wider
+collation scan, removes the standalone harness's obsolete REPLACE stub (now
+provided by production SQL), and fixes MySQL boolean conversion through the new
+generic byte path to use `1`/`0` rather than PG boolout's `t`/`f`. Twelve added
+value/HEX/warning assertions cover CAST CHAR, ELT, CONVERT USING and CONCAT_WS
+for true, false and NULL. No expected value file was changed to accept an
+incorrect result.
+
+The common environment below selects either isolated instance. Commands run from
+`/w/openhalo/contrib/aux_mysql` inside ohdev. Credential values are the existing
+test fixtures documented by the test scripts.
+
+```sh
+export PGBIN=/tmp/aux-route-a/debug/bin  # release: /tmp/aux-route-a/release/bin
+export PGHOST=/tmp PGPORT=5804 PGUSER=postgres PGDATABASE=postgres
+export MYSQL_PORT=3804 MYSQL_USER=dbuser_mysql MYSQL_REFERENCE_PORT=3771
+export PGPASSWORD=Mysql.123 MYSQL_PASSWORD=Mysql.123 MYSQL_PWD=Mysql.123
+export PSQL="$PGBIN/psql"
+export MYSQLDUMP=/root/openhalo-release-fixes/mysql57-client/mysqldump-run
+export MYSQL_CLIENT=/root/openhalo-release-fixes/mysql57-client/mysql-run
+# Release uses PGPORT=5805 and MYSQL_PORT=3805.
+```
+
+| WP | Commit | Assertion command / final result on both builds |
+| --- | --- | --- |
+| 1 TEXT | `8cf384d` | `python3 tests/route_a.py --port "$MYSQL_PORT" --wp text`: 371 |
+| 2 binary conversions | `894b949` | Same runner, `--wp binary`: 122 including the final boolean conversion checks |
+| 3 CHAR padding | `29a3d6d` | `--wp char`: 42, default and PAD mode |
+| 4 substring collations | `4419811` | `--wp collation`: 468; `--wp collation_all`: 9945 contract checks, with the explicit approximations below |
+| 5 numeric binary CAST | `3f26bed` | `--wp numeric_cast`: 372, including unchanged native PG bytea→int8 |
+| 6 legal uint64 writes | `bc1d29c` | `--wp uint64`: 115, including raw unsigned prepared parameters |
+| 7 prefix NUL defense | `9ef2a83` | `--wp prefix_nul`: 19; full standalone prefix suite and integrated index suites |
+| 8 actual 1.5 upgrade | `0dc12fe` | `release_real_upgrade.py`, `release_upgrade.py`, `release_online_upgrade.py`: passed |
+| 9 ignored hints | `311ef83` | `--wp hints`: 315; bison remains at 47 expected conflicts |
+| 10 FK owner ACLs | `2a7f1e7` | `python3 tests/route_a_fk_privileges.py`: 46, including two roles and dump/restore |
+
+The eight Route A selections total 1824 assertions; FK ACLs add 46.
+These pass on fresh debug/release 1.9 and after each real 1.5 upgrade. The complete
+221-name collation scan was also run on fresh debug and release (9945 checks
+each). It checks every function result against the declared general_ci/bin
+mapping and separately reports any difference from the requested MySQL locale;
+its approximation results are not represented as exact MySQL agreement.
+
+Final validation results:
+
+- Full `make -j12 && make install`: debug and release passed.
+- `PGHOST=/tmp PGPORT=5804 PGUSER=postgres make -C
+  /tmp/aux-route-a/build-debug/src/test/regress installcheck`, run as OS user pg:
+  **231/231**; release at 5805: **231/231**. The first debug run as root hit
+  COPY/largeobject fixture filesystem permissions in five groups; after making
+  the external build trees writable by pg, the complete rerun passed.
+- `bash tests/run.sh`: **26/26**, zero skips on each build, including 46 AB cases,
+  raw prepared packets, TLS/password rejection, mysqlslap, Go and Connector/J.
+- All **22** integration invocations in each `logs/acceptance-{debug,release}/`
+  passed: release_dml, binary mysql_check, sql_generated, generated_export,
+  generated_policy, pending_fk, FK ACLs, collation_mapping, indexes_mysql,
+  indexes_btree, release_txn, eight Route A selections, release_upgrade,
+  release_roundtrip, and release_online_upgrade. Exact flags are in TESTING.md;
+  `status.json` retains every command and exit code.
+- `release_roundtrip.py`: native pg_dump/pg_restore, OpenHalo's own Oracle
+  MySQL 5.7.32 mysqldump/mysql replay, and replay of the same unmodified dump into
+  3771 all passed on both builds, including binary NUL, generated columns,
+  prefix keys, pending FKs, existing orphans and cascades.
+- `release_real_upgrade.py --old-prefix /tmp/aux-route-a/v18.6 --new-prefix
+  /tmp/aux-route-a/debug --work-dir /tmp/aux-route-a/real-upgrade-debug-accepted
+  --mysql-port 3807 --pg-port 5807 --reference-port 3771`: passed; repeated with
+  release and `real-upgrade-release-accepted`: passed. Each work directory retains
+  old DDL/data snapshots, full catalogs, AB and Route A/ACL results; its server
+  is stopped on exit.
+- Real 1.5→1.9 versus fresh 1.9: **zero catalog differences** in 3372 members,
+  1761 functions, 20 views/272 descriptors, 82 casts, 665 operators and 27
+  opclasses (including support members). Both builds yield normalized digest
+  `345b2d341c9310f59effd5f2164b2e6d4f5a87046c1607e87e12042a6ec2036d`.
+- Historical 1.6→1.7→1.8→1.9: only `mys_informa_schema.columns.EXTRA` retains
+  pg_catalog.default instead of fresh pg_catalog.C. The view definition and its
+  column descriptor both reflect that one preserved property. All other
+  compared definitions match. The released 1.5 catalog already used C.
+- `python3 tests/check_generated.py`: all five outputs byte-identical to fresh
+  pg14 regeneration. Removed-type search returns zero references throughout the
+  repository. Native PG `decode('3432','hex')::int8` remains 13362.
+- Stock PG18 standalone binary harness, including libpq binary I/O and native
+  dump/restore: passed after removing the duplicate test-only REPLACE stub.
+  Full standalone prefix harness passed in WP7, including the previously failing
+  NUL-prefix reproducer, multibyte clipping, concurrency and dump/restore.
+- `/root/claude-ab.py /root/claude-ab-cases/{p01,p02,p03,p04,p04b,p04c,p05,nul}.sql`
+  was run sequentially against each build. The observed differences are listed
+  below. Debug/release results are identical except the excluded current-time
+  values. Both baselines 3792/3793 were left running and their files untouched.
+
+Raw evidence is under ohdev `/tmp/aux-route-a/logs/`, with build trees, data
+directories, real-upgrade snapshots and standalone outputs elsewhere under the
+same external root. No binaries, build trees or raw logs are committed.
+
+## Remaining differences and exact limits of verification
+
+1. **Character NUL and invalid UTF8:** 1366 even under IGNORE; BINARY padding is
+   also NUL. The resulting missing rows in p01/p02/nul are consequences of this
+   explicit product boundary. Binary payloads retain every byte.
+2. **TEXT subtype names:** TINYTEXT/TEXT/MEDIUMTEXT/LONGTEXT all show `text` in
+   SHOW CREATE TABLE and information_schema DATA_TYPE/COLUMN_TYPE.
+3. **uint64 representation:** legitimate high-half writes fail 1264 instead of
+   corrupting keys. Truly above-UINT64_MAX lenient inputs still clip to the
+   representable INT64_MAX with 1264, whereas MySQL clips to UINT64_MAX. Full
+   unsigned expressions, negative-to-UNSIGNED and unsigned overflow arithmetic
+   remain outside scope. This is not full uint64 storage compatibility.
+4. **Numeric diagnostics:** malformed binary DECIMAL follows the requested 1292
+   policy; reference BLOB/UNHEX can omit truncation warnings or use 1366, while
+   VARBINARY/BINARY can add 1292. Table TEXT arithmetic `s+0` emits 1292 here but
+   3771 omits it in the observed column case. Values match. Some existing
+   arithmetic wire metadata remains int/Decimal rather than MySQL DOUBLE.
+5. **Collation approximation:** the four exact utf8/utf8mb4 general_ci/bin names
+   match the tested values/HEX/warnings. Other names warn 1105 and use the
+   documented closest mapping. All 221 character collation names × three types
+   executed without substring-search errors. Across the exhaustive ASCII probe,
+   246 results differ from the requested locale, with these complete causes:
+
+   | Requested names | Expression and input | OpenHalo / MySQL | Cases |
+   | --- | --- | --- | --- |
+   | `latin2_czech_cs` | `LOCATE('L',s)`, Hello/xHello/hello | 0,0,0 / 3,4,3; existing non-ci mapping uses bin | 3 column types |
+   | All 27 `ucs2_*`, 26 `utf16_*`, 2 `utf16le_*` names on 3771 | `LOCATE('',s,2)` | 2 / 3; PG retains UTF8 rather than these two-byte encodings | 165 |
+   | All 26 `utf32_*` names on 3771 | `LOCATE('',s,2)` | 2 / 5; PG retains UTF8 rather than UTF32 | 78 |
+
+   The matrix emits every differing name/type/expression/value/HEX/warning in
+   `logs/collation-all-{debug,release}.log`. Reference DDL declares each native
+   character set; OpenHalo DDL supplies the same collation name over UTF8.
+   String HEX comparisons normalize to UTF8. Binary-character-set columns are
+   binary types and use the separate binary suite. This does not claim full
+   language-specific weights or non-UTF8 storage/transcoding support.
+6. **Existing generated-expression policy:** p05's CAST(CONCAT(...) AS DATE)
+   generator still fails 3102 (`cast_text_to_date`); a disposable temporary-table
+   probe confirms the same failure on baseline 3793. YEAR/MONTH/DATE_ADD and
+   CAST AS SIGNED over-restriction, and SHOW output's casts/COLLATE placement,
+   were left unchanged. PG special date words remain accepted intentionally.
+7. **Existing function gaps:** JSON, SHA1, CRC32, TO_BASE64, QUOTE, SOUNDEX, ORD,
+   CHAR() and SHOW DATABASES LIKE were not implemented. Mixed CHAR/VARCHAR
+   IFNULL/IF remains ambiguous. Native MySQL routine/trigger body parsing is not
+   added; the real 1.5 fixture uses its accepted routine syntax over MySQL wire.
+8. **Other observed limits:** explicit `CHARACTER SET ascii` still has the
+   baseline 1064 keyword-parser gap. MySQL's sql_mode deprecation warnings
+   3090/3135 and exact diagnostic prose are not reproduced.
+   p04's GROUP BY row order differs without ORDER BY; its row values are equal.
+9. **FK authorization:** PG owner USAGE/REFERENCES checks are intentional even
+   though MySQL 5.7 does not perform the same permission check. Denied binding
+   warns 1142 and preserves both the parent DDL and pending declaration.
+
+All requested build/test workflows have been executed. Not validated: real
+customer data/workloads, other hardware/third-party kernel ABIs, excluded missing
+features, and the deferred long-prefix performance/DDL-serialization questions.

@@ -30,7 +30,6 @@ CREATE FUNCTION mysql.release_all_locks() RETURNS int8 AS '$libdir/aux_mysql','m
 s+="""CREATE FUNCTION mysql.locate(text,text) RETURNS int4 AS '$libdir/aux_mysql','mys_string_locate' LANGUAGE C IMMUTABLE STRICT;
 CREATE FUNCTION mysql.locate(text,text,int4) RETURNS int4 AS '$libdir/aux_mysql','mys_string_locate' LANGUAGE C IMMUTABLE;
 CREATE FUNCTION mysql.instr(text,text) RETURNS int4 AS '$libdir/aux_mysql','mys_string_instr' LANGUAGE C IMMUTABLE STRICT;
-CREATE FUNCTION mysql.replace(text,text,text) RETURNS text AS 'replace_text' LANGUAGE internal IMMUTABLE STRICT;
 CREATE FUNCTION mysql.if(int4,text,text) RETURNS text LANGUAGE sql AS 'SELECT CASE WHEN $1<>0 THEN $2 ELSE $3 END';
 CREATE FUNCTION mysql.ifnull(text,text) RETURNS text LANGUAGE sql AS 'SELECT coalesce($1,$2)';
 """
