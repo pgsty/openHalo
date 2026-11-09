@@ -56,21 +56,28 @@ class ReleaseChecks(Checks):
         # TRUE/FALSE and predicates are MySQL's integers 1/0: numbers 1/0 and
         # strings '1'/'0' in any sql_mode.  A wrong value also selects the
         # wrong unique-key row for ON DUPLICATE KEY UPDATE and REPLACE.
+        # DECIMAL, FLOAT/DOUBLE and binary strings ('1'/'0' bytes, BINARY
+        # zero-padded) also take predicates and IF(), not only literals.
         for mode in ('', 'STRICT_TRANS_TABLES'):
             for session in (self.oh, self.my):
                 session.q("SET sql_mode='"+mode+"'")
             self.both('CREATE TABLE ba(id INT PRIMARY KEY,i INT,b BOOL,d DECIMAL(6,2),f DOUBLE,'
-                      'v VARCHAR(20),c CHAR(4),t TEXT)')
-            self.both('INSERT INTO ba VALUES(1,TRUE,TRUE,TRUE,TRUE,TRUE,FALSE,1=1),'
-                      '(2,FALSE,FALSE,FALSE,FALSE,1=0,IF(0,TRUE,FALSE),IF(1,TRUE,FALSE)),'
-                      '(3,NULL,NULL,NULL,NULL,NULL=1,NULL>0,IF(NULL,TRUE,FALSE))')
-            self.both('UPDATE ba SET i=TRUE,b=FALSE,v=(id=3),c=CASE WHEN id=3 THEN TRUE ELSE id>5 END WHERE id=3')
-            self.both('INSERT INTO ba(id,v,c,t) SELECT 10,1=1,1=0,IF(1,TRUE,FALSE)')
-            self.both("INSERT INTO ba(id,v) VALUES(10,'x') ON DUPLICATE KEY UPDATE v=(id=1),t=(id=10)")
-            self.both('SELECT id,i,b,d,f,v,HEX(v),c,HEX(c),t FROM ba ORDER BY id')
+                      'v VARCHAR(20),c CHAR(4),t TEXT,fl FLOAT,du DECIMAL(6,2) UNSIGNED,'
+                      'vb VARBINARY(8),bn BINARY(3),bl BLOB)')
+            self.both('INSERT INTO ba VALUES(1,TRUE,TRUE,TRUE,TRUE,TRUE,FALSE,1=1,2>1,1=1,TRUE,1=1,IF(1,TRUE,FALSE)),'
+                      '(2,FALSE,FALSE,1=0,IF(0,TRUE,FALSE),1=0,IF(0,TRUE,FALSE),IF(1,TRUE,FALSE),1=0,FALSE,FALSE,1=0,2<1),'
+                      '(3,NULL,NULL,NULL=1,NULL>0,NULL=1,NULL>0,IF(NULL,TRUE,FALSE),NULL>0,NULL=1,NULL=1,NULL>0,NULL=1)')
+            self.both('UPDATE ba SET i=TRUE,b=FALSE,v=(id=3),c=CASE WHEN id=3 THEN TRUE ELSE id>5 END,'
+                      'd=(id=3),f=IF(id=3,TRUE,FALSE),fl=(id>2),du=(id<>3),vb=(id=3),bn=FALSE,bl=(id<>3) WHERE id=3')
+            self.both('INSERT INTO ba(id,v,c,t,d,f,fl,du,vb,bn,bl) '
+                      'SELECT 10,1=1,1=0,IF(1,TRUE,FALSE),TRUE,1=1,FALSE,2>1,TRUE,1=0,IF(1,TRUE,FALSE)')
+            self.both("INSERT INTO ba(id,v) VALUES(10,'x') ON DUPLICATE KEY UPDATE v=(id=1),t=(id=10),d=(id=10),vb=(id=1)")
+            self.both('SELECT id,i,b,d,f,v,HEX(v),c,HEX(c),t,fl,du,HEX(vb),HEX(bn),HEX(bl) FROM ba ORDER BY id')
             self.both('DROP TABLE ba')
             for typ, seed, expr in (('INT', '0', 'TRUE'), ('BOOL', '0', 'TRUE'),
-                                    ('VARCHAR(20)', "'true'", '1=1'), ('VARCHAR(20)', "'true'", 'IF(1,TRUE,FALSE)')):
+                                    ('VARCHAR(20)', "'true'", '1=1'), ('VARCHAR(20)', "'true'", 'IF(1,TRUE,FALSE)'),
+                                    ('DECIMAL(6,2)', '1', '1=1'), ('DOUBLE', '0', '1=0'),
+                                    ('VARBINARY(8)', "'1'", 'IF(1,TRUE,FALSE)'), ('BINARY(2)', "'0'", '2<1')):
                 self.both('CREATE TABLE bk(id INT PRIMARY KEY,k '+typ+' UNIQUE,note VARCHAR(10))')
                 for statement in ("INSERT INTO bk VALUES(20,"+expr+",'new') ON DUPLICATE KEY UPDATE note='changed'",
                                   "REPLACE INTO bk VALUES(20,"+expr+",'new')"):
@@ -82,10 +89,24 @@ class ReleaseChecks(Checks):
         for session in (self.oh, self.my):
             session.q("SET sql_mode=''")
         self.both('CREATE TABLE bg(id INT PRIMARY KEY,g VARCHAR(20) AS(id=1) STORED,'
-                  'h TEXT AS(IF(id=1,TRUE,FALSE)) STORED,c CHAR(4) AS(id>1) VIRTUAL)')
+                  'h TEXT AS(IF(id=1,TRUE,FALSE)) STORED,c CHAR(4) AS(id>1) VIRTUAL,'
+                  'd DECIMAL(6,2) AS(id=1) STORED,f DOUBLE AS(id>1) STORED,fl FLOAT AS(IF(id=1,TRUE,FALSE)) VIRTUAL,'
+                  'vb VARBINARY(4) AS(id=1) STORED,bn BINARY(2) AS(id>1) STORED,bl BLOB AS(id=1) STORED)')
         self.both('INSERT INTO bg(id) VALUES(1),(2)')
-        self.both('SELECT id,g,HEX(g),h,c FROM bg ORDER BY id')
+        self.both('SELECT id,g,HEX(g),h,c,d,f,fl,HEX(vb),HEX(bn),HEX(bl) FROM bg ORDER BY id')
         self.both('DROP TABLE bg')
+        self.both('CREATE TABLE bd(id INT PRIMARY KEY,d DECIMAL(5,2) DEFAULT TRUE,f DOUBLE DEFAULT FALSE,'
+                  'vb VARBINARY(4) DEFAULT TRUE,bn BINARY(2) DEFAULT FALSE)')
+        self.both('INSERT INTO bd(id) VALUES(1)')
+        self.both('SELECT id,d,f,HEX(vb),HEX(bn) FROM bd')
+        self.both("PREPARE bd_ins FROM 'INSERT INTO bd VALUES(?,?>0,?=1,?>0,?=1)'")
+        self.both('SET @a=2,@b=5,@c=0')
+        self.both('EXECUTE bd_ins USING @a,@b,@c,@b,@c')
+        self.both('DEALLOCATE PREPARE bd_ins')
+        self.both('SELECT id,d,f,HEX(vb),HEX(bn) FROM bd ORDER BY id')
+        self.both('DROP TABLE bd')
+        self.both('SELECT CAST(1=1 AS DECIMAL(5,2)),CAST(TRUE AS DECIMAL(5,2)),CONVERT(2>1,DECIMAL(4,1)),'
+                  'HEX(CAST(1=1 AS BINARY)),HEX(CAST(TRUE AS BINARY(2))),HEX(CONVERT(1=0,BINARY))')
 
     def collation_order(self):
         # Comparison stops at the first differing weight, and sorts compare

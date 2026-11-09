@@ -53,6 +53,43 @@ BEGIN
     END LOOP;
 END $conditional_strings$;
 
+-- MySQL booleans are the integers 1 and 0. PG has no boolean casts to
+-- numeric, floating point or binary strings, so a predicate, IF() or
+-- TRUE/FALSE assigned to DECIMAL, FLOAT/DOUBLE, BINARY/VARBINARY or BLOB
+-- failed. Assignment casts, like aux_mysql.sql's int2/int8 ones, also serve CAST,
+-- DEFAULT and generated columns; they are not implicit, so function and
+-- operator resolution is unchanged. Domains (DOUBLE, REAL, BLOB, ...) use
+-- their base type's cast.
+CREATE FUNCTION mysql.cast_boolean_to_numeric(pg_catalog.bool) RETURNS pg_catalog.numeric
+    AS '$libdir/aux_mysql','mys_bool_numeric' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.cast_boolean_to_float4(pg_catalog.bool) RETURNS pg_catalog.float4
+    AS '$libdir/aux_mysql','mys_bool_float4' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.cast_boolean_to_float8(pg_catalog.bool) RETURNS pg_catalog.float8
+    AS '$libdir/aux_mysql','mys_bool_float8' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.cast_boolean_to_bytea(pg_catalog.bool) RETURNS pg_catalog.bytea
+    AS '$libdir/aux_mysql','mys_bool_bytes' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.cast_boolean_to_binary_n(pg_catalog.bool) RETURNS mysql.binary_n
+    AS '$libdir/aux_mysql','mys_bool_bytes' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION mysql.cast_boolean_to_varbinary_n(pg_catalog.bool) RETURNS mysql.varbinary_n
+    AS '$libdir/aux_mysql','mys_bool_bytes' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+DO $bool_casts$
+DECLARE c text[];
+BEGIN
+    FOREACH c SLICE 1 IN ARRAY ARRAY[['pg_catalog.numeric','numeric'],
+        ['pg_catalog.float4','float4'], ['pg_catalog.float8','float8'],
+        ['pg_catalog.bytea','bytea'], ['mysql.binary_n','binary_n'],
+        ['mysql.varbinary_n','varbinary_n']]
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_cast
+                       WHERE castsource = 'pg_catalog.bool'::regtype AND casttarget = c[1]::regtype) THEN
+            EXECUTE format('CREATE CAST (pg_catalog.bool AS %s) WITH FUNCTION mysql.cast_boolean_to_%s(pg_catalog.bool) AS ASSIGNMENT',
+                           c[1], c[2]);
+        ELSE
+            RAISE NOTICE 'aux_mysql: keeping the existing cast (pg_catalog.bool AS %)', c[1];
+        END IF;
+    END LOOP;
+END $bool_casts$;
+
 -- Keep the one-argument identity for clients and pre-upgrade SQL catalogs.
 CREATE OR REPLACE FUNCTION mysql.set_system_names_variable(text) RETURNS void
     AS '$libdir/aux_mysql','mys_set_names' LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE;

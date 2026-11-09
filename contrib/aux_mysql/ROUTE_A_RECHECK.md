@@ -1,7 +1,8 @@
 # aux_mysql 1.9 Route A release recheck
 
-Latest follow-up: [final review corrections](#final-review-corrections--2026-11-09).
-The initial run below is historical and was superseded by the independent NO-GO review.
+Latest follow-up: [boolean assignment casts](#boolean-assignment-casts--2026-11-09).
+The initial run below is historical and was superseded by the independent NO-GO review;
+its base, branch and port lines describe that run only.
 
 Base: clean main `6821954a3f8387287e655d7e91036a3ea0d80c28`.
 Branch: `fix/aux-mysql-1.9-route-a`. Nothing pushed.
@@ -543,3 +544,68 @@ Evidence, builds and instances are under ohdev
 `/tmp/claude-aux19-boolsort-20261109/`. Earlier review instances were not used.
 Initial suite runs failed on two fixture omissions (postgres MySQL password,
 non-writable regress directory); both were corrected before the passes above.
+
+## Boolean assignment casts — 2026-11-09
+
+The 1105 rejections left by `6f9c4f3` were fixed in 1.9 at the user's request.
+A probe of every MySQL 5.7 column type against 3771 (45 types × 8 boolean
+expressions × 7 write forms × 2 sql_modes; ENUM/SET are unsupported in
+OpenHalo, leaving 4816 cases) found 2128 rejections on `6f9c4f3`, not 120:
+DECIMAL/NUMERIC, FLOAT/REAL/DOUBLE (and UNSIGNED), BINARY/VARBINARY/BLOB family,
+DATE/DATETIME/TIMESTAMP/TIME, YEAR and JSON. Integer expressions such as
+`(SELECT 1)` were accepted by the numeric types but rejected by the binary,
+temporal and YEAR types in the same way as booleans. v18.6 rejects the same
+boolean writes.
+
+PG has no boolean cast to numeric, floating point or binary strings. The patch
+adds six assignment casts from PG `boolean` (numeric, float4, float8, bytea,
+`mysql.binary_n`, `mysql.varbinary_n`) in `sql/aux_mysql_fix_compat.sql`, so
+fresh 1.9 and every upgrade path get them; four immutable C functions return
+1/0 or the byte `'1'`/`'0'`. BINARY(n) padding and length checks come from the
+existing length casts, and DOUBLE/REAL/BLOB domains use their base types. Like
+the existing int2/int8 casts they are assignment casts, not implicit casts:
+function and operator resolution is unchanged. The same casts serve
+CAST/CONVERT, DEFAULT, prepared parameters, INSERT SELECT, multi-table UPDATE
+and generated columns; the generated-column policy admits the four C symbols.
+SHOW CREATE TABLE prints the original expressions (`DEFAULT true`, `(id = 1)`;
+VARBINARY defaults as `X'31'`) and its output replays on both engines with the
+same values. In a database with aux_mysql, native PG sessions now also get
+`true::numeric = 1` and `true::bytea = '\x31'`; `true::text` is still `'true'`.
+
+| Verification | Debug | Release |
+|---|---|---|
+| PostgreSQL core regression | 231/231 (rerun, see below) | 231/231 |
+| tests/run.sh | 26/26 | 26/26 |
+| TESTING.md integration / Route A / upgrade / recovery invocations | 23/23 | 23/23 |
+| release_fixes.py (boolean_assignments extended) | 504 checks | 504 checks |
+| Actual released v18.6 binaries + 1.5 SQL → 1.9 | passed | passed |
+| Fresh versus released 1.5 upgrade catalog | 3476 members, 1859 functions, 88 casts, equal | equal |
+| All-type boolean probe vs MySQL 5.7 (also on the upgraded release copy) | 0 numeric/binary rejections | 0 numeric/binary rejections |
+| 512 boolean write cases from the previous round | 0 value/error/warning differences | 0 value/error/warning differences |
+
+The extended `release_fixes.py` fails on `6f9c4f3` (1105 on the first boolean
+insert). The standalone binary and prefix suites passed on stock PG18, and
+the new code adds no compiler warnings in either build.
+
+Remaining boolean differences, not changed here:
+
+- 488 rejections on DATE/DATETIME/TIMESTAMP/TIME, YEAR (check violation) and
+  JSON (NULL booleans only; MySQL rejects 1/0 with 3140). Integer expressions
+  fail on these types too. MySQL stores FALSE/NULL dates as `0000-00-00` or
+  NULL in both modes and TRUE as `0000-00-00` with 1265 only outside strict
+  mode (1292 in strict mode); TIME gets `00:00:01` and YEAR 2001.
+- 196 BIT(1)/BIT(8) values are returned as text `'1'` instead of byte `0x01`;
+  integer writes show the same BIT result format.
+- Booleans in arithmetic (`(1=1)+0.5`), aggregates (AVG/MIN/MAX/STD/BIT_OR),
+  ROUND/ABS and mixed-type GREATEST/COALESCE/IF still fail with 1305/1105.
+- Integer expressions assigned to BINARY/VARBINARY/BLOB are still rejected.
+- Duplicate-key failures return 1062 with PG's message text.
+
+Evidence, builds and instances are under ohdev
+`/tmp/claude-aux19-boolnum-20261109/`. The first debug core run failed only in
+`join_hash` with `could not resize shared memory segment ... No space left on
+device`: ohdev's 64 MB `/dev/shm` is shared with other long-running instances.
+The debug instance was then switched to `dynamic_shared_memory_type = mmap`
+(test host setting only) and the full core suite passed. Tests edited after the
+first source sync were synced and `release_fixes.py` was rerun on both builds;
+the final source tree in ohdev matches the patch byte for byte.

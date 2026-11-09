@@ -375,6 +375,43 @@ mys_hexlit_int8(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) v);
 }
 
+/*
+ * MySQL booleans are the integers 1 and 0.  These implement the boolean
+ * assignment casts to DECIMAL, FLOAT/DOUBLE and binary strings: a binary
+ * string gets the digit's byte, padded or checked by the target's length cast.
+ */
+PG_FUNCTION_INFO_V1(mys_bool_numeric);
+Datum
+mys_bool_numeric(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_NUMERIC(int64_to_numeric(PG_GETARG_BOOL(0) ? 1 : 0));
+}
+
+PG_FUNCTION_INFO_V1(mys_bool_float4);
+Datum
+mys_bool_float4(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT4(PG_GETARG_BOOL(0) ? 1.0f : 0.0f);
+}
+
+PG_FUNCTION_INFO_V1(mys_bool_float8);
+Datum
+mys_bool_float8(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_FLOAT8(PG_GETARG_BOOL(0) ? 1.0 : 0.0);
+}
+
+PG_FUNCTION_INFO_V1(mys_bool_bytes);
+Datum
+mys_bool_bytes(PG_FUNCTION_ARGS)
+{
+	bytea	   *result = (bytea *) palloc(VARHDRSZ + 1);
+
+	SET_VARSIZE(result, VARHDRSZ + 1);
+	*VARDATA(result) = PG_GETARG_BOOL(0) ? '1' : '0';
+	PG_RETURN_BYTEA_P(result);
+}
+
 PG_FUNCTION_INFO_V1(mys_hexlit_bool);
 Datum
 mys_hexlit_bool(PG_FUNCTION_ARGS)

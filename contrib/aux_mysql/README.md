@@ -183,9 +183,14 @@ explicit product choice.
   covered, but arbitrary combinations of MySQL functions and custom types are not fully implemented.
   BIT result metadata and user-variable numeric typing still differ from MySQL.
 - TRUE/FALSE and boolean results (comparisons, IF, CASE) are MySQL's integers 1/0 when stored:
-  numbers 1/0 and strings `'1'`/`'0'` in every sql_mode, including ODKU/REPLACE key arbitration and
-  generated columns. Boolean expressions assigned to DECIMAL, DOUBLE or VARBINARY are still rejected
-  with 1105 (literal TRUE/FALSE are accepted). Generated columns defined before 1.9 keep their stored
+  numbers 1/0 (including DECIMAL and FLOAT/DOUBLE), strings `'1'`/`'0'`, and binary strings
+  `'1'`/`'0'` (BINARY zero-padded) in every sql_mode, including ODKU/REPLACE key arbitration,
+  DEFAULT, CAST/CONVERT and generated columns. These are assignment casts from PG `boolean`, so in
+  a database with aux_mysql a native PG session also gets `true::numeric = 1` and
+  `true::bytea = '\x31'`; `true::text` stays `'true'`. Booleans in arithmetic, aggregates
+  (AVG/MIN/MAX/STD/BIT_*), numeric functions and mixed-type GREATEST/COALESCE/IF are still
+  rejected. DATE/TIME/DATETIME/TIMESTAMP, YEAR and JSON columns reject boolean expressions exactly as
+  they reject integer expressions. Generated columns defined before 1.9 keep their stored
   expression, and existing `'true'` strings or zeros are not rewritten.
 - CHAR/VARCHAR combinations in IFNULL/IF and boolean CONCAT/GROUP_CONCAT are supported.
   Broader mixed types, such as integer/VARCHAR or VARBINARY/CHAR conditional results, remain

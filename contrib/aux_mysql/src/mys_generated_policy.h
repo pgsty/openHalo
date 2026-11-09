@@ -27,6 +27,7 @@ static const char *const gen_c_implementations[] = {
 	"mys_hexlit_text", "mys_hexlit_varbit", "mys_hexlit_bit", "mys_hexlit_bool",
 	"mys_hex_bytes", "mys_hex_int8", "mys_hex_numeric", "mys_hex_float8",
 	"mys_hex_varbit", "mys_unhex",
+	"mys_bool_numeric", "mys_bool_float4", "mys_bool_float8", "mys_bool_bytes",
 	"mys_varbit_numeric", "mys_uint64_bitop", "mys_uint64_bitnot",
 	"mys_string_substr", "mys_string_replace", "mys_string_trim",
 	"mys_string_locate", "mys_string_instr",
