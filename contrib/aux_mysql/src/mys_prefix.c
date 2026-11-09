@@ -63,8 +63,6 @@
 PG_MODULE_MAGIC;
 void _PG_init(void);
 void _PG_init(void) { mys_prefix_init(); }
-#else
-extern void mys_assign_bool_as_int(Query *query);	/* mys_semantics.c */
 #endif
 
 typedef struct PrefixOptions
@@ -1231,9 +1229,6 @@ prefix_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	install_collation();
 #endif
 	query_tree_walker(query, rewrite_like, NULL, 0);
-#ifndef MYS_PREFIX_STANDALONE
-	mys_assign_bool_as_int(query);
-#endif
 }
 
 /* pg_dump already preserves index reloptions for PRIMARY/UNIQUE constraints.

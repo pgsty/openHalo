@@ -1,6 +1,6 @@
 # aux_mysql 1.9 Route A release recheck
 
-Latest follow-up: [boolean assignment casts](#boolean-assignment-casts--2026-11-09).
+Latest follow-up: [character boolean defaults](#character-boolean-defaults--2026-11-10).
 The initial run below is historical and was superseded by the independent NO-GO review;
 its base, branch and port lines describe that run only.
 
@@ -609,3 +609,69 @@ The debug instance was then switched to `dynamic_shared_memory_type = mmap`
 (test host setting only) and the full core suite passed. Tests edited after the
 first source sync were synced and `release_fixes.py` was rerun on both builds;
 the final source tree in ohdev matches the patch byte for byte.
+
+## Character boolean defaults — 2026-11-10
+
+Independent review of `a000baa` found a remaining wrong-row path:
+`VARCHAR DEFAULT TRUE/FALSE` stored `true`/`false` instead of `1`/`0`.
+Against an existing unique key `true`, an INSERT omitting the column should
+create a new key `1`; ODKU instead updated the old row and REPLACE deleted it.
+Both sql_modes, debug/release, ALTER defaults and a real 1.5 upgrade reproduced
+the issue. The stored-value bug was old, but v18.6 returned 1062 and kept the
+old row in this conflict case, making the 1.9 wrong-row behavior a blocker.
+
+The fix reuses the existing two conversions at the required stages:
+
+- CREATE/ADD/MODIFY/CHANGE/SET DEFAULT use the same boolean-literal 1/0
+  conversion as explicit assignments, before saving the default. This also
+  fixes ADD COLUMN's fill of existing rows and CHAR(1)/CHAR(4) FALSE defaults.
+- The existing implicit boolean-to-character assignment rewrite moves from
+  post-parse analysis to the planner hook, after omitted columns and DEFAULT
+  have been expanded and before constant folding. It therefore handles old
+  defaults without a catalog/data migration. MySQL session/parser guards and
+  the distinction between implicit assignments and explicit casts remain.
+- The MySQL LIKE grammar now copies defaults. The inherited PG14 grammar
+  excluded all defaults; PG18 copies AUTO_INCREMENT as an independent identity.
+  Tests cover both default preservation and separate identity counters.
+
+No kernel, SQL catalog, cast, extension-version or stored-key changes are
+needed. Native PG character defaults/assignments keep `true`/`false`; genuine
+quoted defaults retain their text. Existing rows are not rewritten. The
+previously disclosed database-wide numeric/binary assignment casts remain.
+
+| Verification | Debug | Release |
+|---|---|---|
+| PostgreSQL core regression | 231/231 | 231/231 |
+| tests/run.sh | 26/26, no skips | 26/26, no skips |
+| TESTING.md integration / Route A / upgrade / recovery invocations | 23/23 | 23/23 |
+| release_fixes.py | 922 checks | 922 checks |
+| Actual released v18.6 / 1.5 → 1.9, including inherited defaults | passed | passed |
+| Fresh vs upgraded catalog | 3476 members, 1859 functions, 88 casts, equal | equal |
+| Independent 480 boolean writes + 16 explicit conflict cases vs MySQL 5.7 | 0 value/error/warning differences | 0 value/error/warning differences |
+| Independent default/ALTER/commit probes from the NO-GO review | matched MySQL 5.7 | matched MySQL 5.7 |
+
+New regression tests fail on the unmodified `a000baa` binary. They cover
+TRUE/FALSE, VARCHAR/CHAR, both sql_modes, implicit/explicit DEFAULT, INSERT
+SELECT, IGNORE/ODKU/REPLACE/UPDATE, old row identity, rollback/commit,
+SQL/binary prepared execution, custom/generic plans, LIKE, SHOW CREATE replay,
+and native PG controls. The real upgrade test creates its defaults with the
+released 1.5 binary, then checks both existing and new MySQL sessions after
+upgrading. Generator checks reproduce all five tracked outputs byte for byte.
+
+The first tests exposed the LIKE default exclusion. A later SHOW CREATE test
+used a native PG fixture with `COLLATE default`, which is not a MySQL collation;
+that fixture now declares MySQL collations while retaining the old implicit
+boolean default expression. The genuine 1.5 upgrade tests do not use this
+simulation. MySQL 5.7's sql_mode deprecation warnings are excluded from fixture
+setup comparisons; every tested data write still compares warnings.
+
+The first three-sample performance check showed container noise, so a further
+ten samples alternated the two binaries after warmup on the same 300k rows.
+Median sorting time was 57.2 ms versus 56.0 ms on `a000baa`; FIND_IN_SET was
+0.624 s versus 0.618 s. Samples overlap and the earlier multi-fold sorting
+regression did not return. Sorting/comparison implementations are unchanged.
+
+Evidence, exact source/binary manifests, builds and retained data are under
+ohdev `/tmp/openhalo-aux19-default-fix-20261110/`. Full suites ran against private
+debug/release clusters using mmap dynamic shared memory; existing instances
+were not modified. The default-value release blocker is closed by these tests.

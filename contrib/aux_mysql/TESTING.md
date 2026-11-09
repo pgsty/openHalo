@@ -200,6 +200,9 @@ boolean string/aggregate values and HEX; TRUE/FALSE, predicate and IF
 assignments to integer/BOOL/DECIMAL/FLOAT/DOUBLE/string/binary columns in both
 sql_modes, unique-key ODKU/REPLACE against seeded rows, generated columns,
 DEFAULT, prepared parameters and CAST/CONVERT;
+character boolean defaults in CREATE/ALTER/LIKE, SHOW CREATE replay, inherited
+defaults, native PG controls, wrong-row ODKU/REPLACE, rollback/commit and repeated
+SQL/binary prepared executions;
 general_ci/bin ORDER BY, GROUP BY, DISTINCT, equality joins and index lookups
 over PAD SPACE, control characters below space, accents and supplementary
 characters; CHAR/VARCHAR IFNULL/IF, NULL and
@@ -209,3 +212,7 @@ and uint64 statement/trigger rollback inside an explicit transaction.
 `route_a.py --wp uint64` also seeds an existing INT64_MAX key before above-uint64
 INSERT, IGNORE, INSERT SELECT, UPDATE, ODKU and REPLACE. Never restore the old
 INT64_MAX clipping expectation: it hid wrong-row updates and deletions.
+
+`release_real_upgrade.py` creates character boolean defaults using the released
+1.5 binary and checks writes in both sql_modes and same/new sessions after the
+upgrade, including repeated prepared executions and a genuine quoted default.

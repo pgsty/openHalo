@@ -1765,22 +1765,14 @@ bool_assigned_as_int(Node **expr)
 	}
 }
 
-/* post parse analysis of a MySQL statement: INSERT / UPDATE assignments,
- * including ON DUPLICATE KEY UPDATE and multi-row VALUES */
+/* After query rewriting has expanded omitted columns / DEFAULT, but before
+ * planning can fold text(bool) to 'true'/'false'. This also covers defaults
+ * saved by older versions without changing their catalogs or PG sessions. */
 void
 mys_assign_bool_as_int(Query *query)
 {
 	if (query == NULL || !mys_is_mysql_session() || halo_mysql_parser != MYS_PARSER_MYSQL)
 		return;
-	if (query->commandType == CMD_UTILITY && query->utilityStmt &&
-		IsA(query->utilityStmt, ExplainStmt))
-	{
-		Node	   *explained = ((ExplainStmt *) query->utilityStmt)->query;
-
-		if (explained && IsA(explained, Query))
-			mys_assign_bool_as_int((Query *) explained);
-		return;
-	}
 	if (query->commandType != CMD_INSERT && query->commandType != CMD_UPDATE)
 		return;
 	foreach_node(TargetEntry, te, query->targetList)

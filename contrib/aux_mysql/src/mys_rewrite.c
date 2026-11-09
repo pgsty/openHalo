@@ -652,6 +652,7 @@ make_identity_column(ColumnDef *col, Constraint *c)
 }
 
 static Node *int_const(int32 v);
+static Node *bool_literal_value(Node *val, Oid typid);
 
 /*
  * Warnings are emitted with their statement's result, after execution. Raw
@@ -1494,7 +1495,13 @@ alter_added_columns(AlterTableStmt *stmt)
 	return cols;
 }
 
-/* DEFAULT 0x..: the literal of its value for the column's type (mys_binary.c) */
+/* Defaults use the same literal values as explicit column assignments. */
+static Node *
+fold_default(Node *expr, Oid typid)
+{
+	return mys_fold_hexlit_default(bool_literal_value(expr, typid), typid);
+}
+
 static void
 fold_column_default(ColumnDef *col)
 {
@@ -1509,7 +1516,7 @@ fold_column_default(ColumnDef *col)
 		t = LookupTypeName(NULL, col->typeName, NULL, true);
 		if (t == NULL)
 			continue;
-		c->raw_expr = mys_fold_hexlit_default(c->raw_expr, typeTypeId(t));
+		c->raw_expr = fold_default(c->raw_expr, typeTypeId(t));
 		ReleaseSysCache(t);
 	}
 }
@@ -1752,7 +1759,7 @@ rewrite_alter_table(AlterTableStmt *stmt)
 			AttrNumber	attnum = OidIsValid(relid) ? get_attnum(relid, cmd->name) : InvalidAttrNumber;
 
 			if (attnum > 0)
-				cmd->def = mys_fold_hexlit_default(cmd->def, get_atttype(relid, attnum));
+				cmd->def = fold_default(cmd->def, get_atttype(relid, attnum));
 		}
 
 		if (cmd->subtype == AT_AddColumn && cmd->def && IsA(cmd->def, ColumnDef))
@@ -2034,13 +2041,13 @@ binary_value(Node *val, Form_pg_attribute att)
  * keep their boolean conversions.
  */
 static Node *
-bool_literal_value(Node *val, Form_pg_attribute att)
+bool_literal_value(Node *val, Oid typid)
 {
 	A_Const    *c = (A_Const *) val;
 
 	if (val == NULL || !IsA(val, A_Const) || c->isnull || !IsA(&c->val, Boolean))
 		return val;
-	switch (getBaseType(att->atttypid))
+	switch (getBaseType(typid))
 	{
 		case INT2OID:
 		case INT4OID:
@@ -2061,7 +2068,7 @@ bool_literal_value(Node *val, Form_pg_attribute att)
 static Node *
 column_value(Node *val, Form_pg_attribute att)
 {
-	val = binary_value(bool_literal_value(val, att), att);
+	val = binary_value(bool_literal_value(val, att->atttypid), att);
 	return isStrictTransTablesOn ? val : lenient_value(val, att);
 }
 

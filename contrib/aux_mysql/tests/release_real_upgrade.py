@@ -76,7 +76,7 @@ def main():
             return tuple(cursor.fetchall())
 
     def snapshot(c):
-        tables = ('numbers','strings','parent','child','unchecked','generated','events')
+        tables = ('numbers','strings','parent','child','unchecked','generated','events','bool_defaults')
         return {t:query(c,'SELECT row_to_json(snapshot_row.*)::text FROM legacy15.'+t+' snapshot_row ORDER BY id') for t in tables}
 
     def current_behavior(c,name):
@@ -88,6 +88,35 @@ def main():
         try: mq(c,'INSERT INTO '+name+'(s) VALUES(0x410042)')
         except pymysql.MySQLError as e: assert e.args[0] == 1366,e.args
         else: raise AssertionError('character NUL accepted after upgrade')
+
+    def inherited_defaults(c):
+        mq(c,'USE legacy15')
+        for mode in ('', 'STRICT_TRANS_TABLES'):
+            mq(c,"SET sql_mode='"+mode+"'")
+            for statement in (
+                "INSERT INTO bool_defaults(id,note) VALUES(20,'new') ON DUPLICATE KEY UPDATE note='changed'",
+                "REPLACE INTO bool_defaults(id,note) VALUES(20,'new')",
+                "INSERT INTO bool_defaults(id,note) VALUES(20,'new')",
+            ):
+                mq(c,'DELETE FROM bool_defaults WHERE id<>10')
+                mq(c,statement)
+                assert mq(c,'SELECT id,k,z,literal,note FROM bool_defaults ORDER BY id') == (
+                    (10,'true','old','true','old'),(20,'1','0','true','new'))
+                assert mq(c,'SHOW WARNINGS') == ()
+            mq(c,"UPDATE bool_defaults SET k='other',z='x' WHERE id=20")
+            mq(c,'UPDATE bool_defaults SET k=DEFAULT,z=DEFAULT WHERE id=20')
+            assert mq(c,'SELECT k,z FROM bool_defaults WHERE id=20') == (('1','0'),)
+            mq(c,'DELETE FROM bool_defaults WHERE id<>10')
+            mq(c,"PREPARE defaults_ins FROM 'INSERT INTO bool_defaults(id,note) VALUES(?,?)'")
+            for i in range(7):
+                mq(c,'DELETE FROM bool_defaults WHERE id<>10')
+                mq(c,"SET @i="+str(20+i)+",@note='prepared'")
+                mq(c,'EXECUTE defaults_ins USING @i,@note')
+                assert mq(c,'SELECT id,k,z,literal,note FROM bool_defaults WHERE id<>10') == (
+                    (20+i,'1','0','true','prepared'),)
+            mq(c,'DEALLOCATE PREPARE defaults_ins')
+        mq(c,'DELETE FROM bool_defaults WHERE id<>10')
+        mq(c,"SET sql_mode=''")
 
     try:
         # 1.5 has a background auto-installer; disable it so the fixture's
@@ -114,6 +143,8 @@ def main():
             'CREATE VIEW legacy_view AS SELECT id,v FROM generated',
             "CREATE VIEW metadata_view AS SELECT column_name,extra FROM information_schema.columns WHERE table_schema='legacy15'",
             'CREATE TABLE events(id INT PRIMARY KEY,v INT)',
+            "CREATE TABLE bool_defaults(id INT PRIMARY KEY,k VARCHAR(20) UNIQUE DEFAULT TRUE,z CHAR(4) DEFAULT FALSE,literal VARCHAR(20) DEFAULT 'true',note VARCHAR(20))",
+            "INSERT INTO bool_defaults VALUES(10,'true','old','true','old')",
             'CREATE PROCEDURE add_event(IN n INT) BEGIN ATOMIC INSERT INTO legacy15.events VALUES(n,n); END',
             "DO $$ BEGIN EXECUTE 'CREATE FUNCTION legacy15.event_trigger() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN NEW.v:=NEW.v+1; RETURN NEW; END $f$'; END $$ LANGUAGE plpgsql",
             'CREATE TRIGGER event_insert BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION event_trigger()',
@@ -145,6 +176,7 @@ def main():
         assert query(admin,"SELECT pg_get_indexdef(indexrelid) FROM pg_index WHERE indrelid='legacy15.strings'::regclass ORDER BY indexrelid") == old_indexes
         assert query(admin,"SELECT 'legacy15.metadata_view'::regclass::oid") == old_view_oid
         assert query(admin,"SELECT conenforced FROM pg_constraint WHERE conrelid='legacy15.unchecked'::regclass AND contype='f'") == [(False,)]
+        inherited_defaults(wire)
         current_behavior(wire,'same_connection')
         mq(wire,'CALL add_event(2)')
         assert mq(wire,'SELECT * FROM events ORDER BY id') == ((1,2),(2,3))
@@ -153,6 +185,8 @@ def main():
         another_pg = pg()
         query(another_pg,'ALTER EXTENSION aux_mysql UPDATE')  # idempotent in a new connection
         current_behavior(mysql(),'new_connection')
+        inherited_defaults(mysql())
+        print('PASS inherited boolean defaults after real 1.5 upgrade: row identity, CHAR(4), quoted strings and prepared plans',flush=True)
         print('PASS same/new sessions after 1.5→1.9; stored procedure, trigger, dependent view and unchanged legacy data/indexes',flush=True)
         query(admin,'CREATE DATABASE upgrade_fresh19')
         fresh = pg('upgrade_fresh19')

@@ -41,6 +41,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/planner.h"
 #include "parser/parse_expr.h"
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
@@ -66,6 +67,7 @@
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static planner_hook_type prev_planner = NULL;
 /* utility commands aux_mysql runs itself to implement a MySQL statement */
 static int	internal_utility_depth = 0;
 static bool collation_provider_registered = false;
@@ -2140,6 +2142,17 @@ uses_application_table(List *rtable)
 	return false;
 }
 
+/* Defaults are expanded by the rewriter, after post_parse_analyze_hook. */
+static PlannedStmt *
+mys_planner(Query *query, const char *queryString, int cursorOptions,
+			ParamListInfo params)
+{
+	mys_assign_bool_as_int(query);
+	if (prev_planner)
+		return prev_planner(query, queryString, cursorOptions, params);
+	return standard_planner(query, queryString, cursorOptions, params);
+}
+
 /*
  * Before every statement, also within a multi-statement packet:
  * session_replication_role follows @@foreign_key_checks (a ROLLBACK earlier
@@ -2494,4 +2507,6 @@ mysql_utility_init(void)
 	ProcessUtility_hook = mys_ProcessUtility;
 	prev_ExecutorStart = ExecutorStart_hook;
 	ExecutorStart_hook = mys_ExecutorStart;
+	prev_planner = planner_hook;
+	planner_hook = mys_planner;
 }

@@ -935,6 +935,13 @@ rep(s[start:end], (
     '\t\t\t\t}\n'))
 
 # ---------------------------------------------------------------------------
+# CREATE TABLE LIKE must copy defaults; PG18 copies AUTO_INCREMENT separately
+# as an identity, so it no longer needs PG14's exclusion of all defaults.
+# ---------------------------------------------------------------------------
+rep('n->options = CREATE_TABLE_LIKE_ALL & ~CREATE_TABLE_LIKE_DEFAULTS;',
+    'n->options = CREATE_TABLE_LIKE_ALL;')
+
+# ---------------------------------------------------------------------------
 # Generated columns: col type [GENERATED ALWAYS] AS (expr) [VIRTUAL | STORED]
 # ---------------------------------------------------------------------------
 # PG18 reads Constraint.generated_kind; PG14 had stored columns only, so the

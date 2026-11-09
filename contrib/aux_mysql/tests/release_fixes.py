@@ -108,6 +108,132 @@ class ReleaseChecks(Checks):
         self.both('SELECT CAST(1=1 AS DECIMAL(5,2)),CAST(TRUE AS DECIMAL(5,2)),CONVERT(2>1,DECIMAL(4,1)),'
                   'HEX(CAST(1=1 AS BINARY)),HEX(CAST(TRUE AS BINARY(2))),HEX(CONVERT(1=0,BINARY))')
 
+    def boolean_defaults(self):
+        for mode in ('', 'STRICT_TRANS_TABLES'):
+            for session in (self.oh, self.my):
+                session.q("SET sql_mode='"+mode+"'")
+            for typ in ('VARCHAR(20)', 'CHAR(1)'):
+                self.both('CREATE TABLE bd(id INT PRIMARY KEY,t '+typ+' DEFAULT TRUE,'
+                          'f '+typ+" DEFAULT FALSE,q VARCHAR(20) DEFAULT 'true')")
+                self.both('INSERT INTO bd(id) VALUES(1)')
+                self.both('INSERT INTO bd VALUES(2,DEFAULT,DEFAULT,DEFAULT),(3,FALSE,TRUE,DEFAULT)')
+                self.both('INSERT INTO bd(id) SELECT 4')
+                self.both('UPDATE bd SET t=DEFAULT,f=DEFAULT WHERE id=3')
+                assert self.both('SELECT id,t,HEX(t),f,HEX(f),q FROM bd ORDER BY id')[0] == tuple(
+                    (i,'1','31','0','30','true') for i in range(1,5))
+                self.both('CREATE TABLE bd_like LIKE bd')
+                self.both('INSERT INTO bd_like(id) VALUES(1)')
+                self.both('SELECT t,f,q FROM bd_like')
+                self.both('DROP TABLE bd_like')
+                # Replay OpenHalo's SHOW CREATE on both engines.
+                ddl = self.oh.q('SHOW CREATE TABLE bd')[0][1]
+                self.both('DROP TABLE bd')
+                self.both(ddl)
+                self.both('INSERT INTO bd(id) VALUES(1)')
+                self.both('SELECT t,f,q FROM bd')
+                self.both('DROP TABLE bd')
+            self.both('CREATE TABLE bd(id INT PRIMARY KEY)')
+            self.both('INSERT INTO bd VALUES(1),(2)')
+            self.both('ALTER TABLE bd ADD COLUMN v CHAR(4) DEFAULT FALSE')
+            self.both('SELECT id,v FROM bd ORDER BY id')  # Existing rows get 0.
+            self.both('ALTER TABLE bd ALTER COLUMN v SET DEFAULT TRUE')
+            self.both('INSERT INTO bd(id) VALUES(3)')
+            self.both('ALTER TABLE bd MODIFY COLUMN v VARCHAR(20) DEFAULT FALSE')
+            self.both('INSERT INTO bd(id) VALUES(4)')
+            self.both('ALTER TABLE bd CHANGE COLUMN v k VARCHAR(20) DEFAULT TRUE')
+            self.both('INSERT INTO bd(id) VALUES(5)')
+            self.both("ALTER TABLE bd ALTER COLUMN k SET DEFAULT 'false'")
+            self.both('INSERT INTO bd(id) VALUES(6)')
+            assert self.both('SELECT id,k FROM bd ORDER BY id')[0] == (
+                (1,'0'),(2,'0'),(3,'1'),(4,'0'),(5,'1'),(6,'false'))
+            self.both('DROP TABLE bd')
+        self.both("SET sql_mode=''")
+        self.both('CREATE TABLE bd(id INT AUTO_INCREMENT PRIMARY KEY,k VARCHAR(1) DEFAULT TRUE)')
+        self.both('INSERT INTO bd(k) VALUES(DEFAULT)')
+        self.both('CREATE TABLE bd_copy LIKE bd')
+        self.both('INSERT INTO bd_copy(k) VALUES(DEFAULT)')
+        self.both('INSERT INTO bd(k) VALUES(DEFAULT)')
+        assert self.both('SELECT id,k FROM bd ORDER BY id')[0] == ((1,'1'),(2,'1'))
+        assert self.both('SELECT id,k FROM bd_copy')[0] == ((1,'1'),)
+        self.both('DROP TABLE bd,bd_copy')
+
+    def inherited_boolean_defaults(self):
+        # PG creates the same implicit bool->varchar defaults left by 1.5.
+        # Merely fixing MySQL CREATE TABLE would leave these writes corrupt.
+        pg = psycopg2.connect(host=os.getenv('PGHOST','/tmp'),
+                             port=os.getenv('PGPORT',str(self.oh.conn.port+2000)),
+                             user=os.getenv('PGUSER','postgres'),dbname=os.getenv('PGDATABASE','postgres'),
+                             password=os.getenv('PGPASSWORD','Mysql.123'))
+        pg.autocommit = True
+        try:
+            for mode in ('', 'STRICT_TRANS_TABLES'):
+                for session in (self.oh, self.my):
+                    session.q("SET sql_mode='"+mode+"'")
+                for truth, seed, value in (('TRUE','true','1'),('FALSE','false','0')):
+                    with pg.cursor() as c:
+                        c.execute(pgsql.SQL('CREATE TABLE {}.bd(id INT PRIMARY KEY,'
+                                  'k VARCHAR(20) COLLATE mysql.utf8mb4_general_ci UNIQUE DEFAULT '+truth+
+                                  ',note VARCHAR(20) COLLATE mysql.utf8mb4_general_ci)').format(
+                                  pgsql.Identifier(self.schema)))
+                        # Native PG assignment and defaults retain true/false.
+                        c.execute(pgsql.SQL('INSERT INTO {}.bd(id) VALUES(1)').format(pgsql.Identifier(self.schema)))
+                        c.execute(pgsql.SQL('SELECT k FROM {}.bd').format(pgsql.Identifier(self.schema)))
+                        assert c.fetchall() == [(seed,)]
+                        c.execute(pgsql.SQL('DELETE FROM {}.bd').format(pgsql.Identifier(self.schema)))
+                    self.my.q('CREATE TABLE bd(id INT PRIMARY KEY,k VARCHAR(20) UNIQUE DEFAULT '+truth+',note VARCHAR(20))')
+                    self.both('CREATE TABLE bd_copy LIKE bd')
+                    self.both('INSERT INTO bd_copy(id) VALUES(1)')
+                    assert self.both('SELECT k FROM bd_copy')[0] == ((value,),)
+                    self.both('DROP TABLE bd_copy')
+                    for statement in (
+                        "INSERT INTO bd(id,note) VALUES(20,'new')",
+                        "INSERT IGNORE INTO bd(id,note) VALUES(20,'new')",
+                        "INSERT INTO bd(id,note) VALUES(20,'new') ON DUPLICATE KEY UPDATE note='changed'",
+                        "REPLACE INTO bd(id,note) VALUES(20,'new')",
+                    ):
+                        self.both('DELETE FROM bd')
+                        self.both("INSERT INTO bd VALUES(10,'"+seed+"','old')")
+                        self.both('BEGIN')
+                        self.both(statement)
+                        assert self.both('SELECT id,k,note FROM bd ORDER BY id')[0] == (
+                            (10,seed,'old'),(20,value,'new'))
+                        self.both('ROLLBACK')
+                        assert self.both('SELECT id,k,note FROM bd ORDER BY id')[0] == ((10,seed,'old'),)
+                    self.both("INSERT INTO bd VALUES(20,'other','new')")
+                    self.both('UPDATE bd SET k=DEFAULT WHERE id=20')
+                    self.both('BEGIN')
+                    self.both("REPLACE INTO bd(id,note) VALUES(30,'replacement')")
+                    self.both('COMMIT')
+                    assert self.both('SELECT id,k,note FROM bd ORDER BY id')[0] == (
+                        (10,seed,'old'),(30,value,'replacement'))
+                    self.both('DELETE FROM bd')
+                    self.both("PREPARE bd_ins FROM 'INSERT INTO bd VALUES(?,DEFAULT,?)'")
+                    for i in range(7):  # Exercise generic as well as custom plans.
+                        self.both('DELETE FROM bd')
+                        self.both("SET @id="+str(i)+",@note='prepared'")
+                        self.both('EXECUTE bd_ins USING @id,@note')
+                        assert self.both('SELECT id,k,note FROM bd')[0] == ((i,value,'prepared'),)
+                    self.both('DEALLOCATE PREPARE bd_ins')
+                    self.both('DELETE FROM bd')
+                    for session in (self.oh, self.my):
+                        assert session.execute_u64('INSERT INTO bd(id) VALUES(?)',42) == ((),())
+                    self.both('SELECT id,k FROM bd')
+                    self.both('DELETE FROM bd')
+                    self.both('INSERT INTO bd(id) SELECT 1')
+                    self.both('UPDATE bd SET k=DEFAULT WHERE id=1')
+                    self.both('SELECT id,k FROM bd')
+                    ddl = self.oh.q('SHOW CREATE TABLE bd')[0][1]
+                    self.both('DROP TABLE bd')
+                    self.both(ddl)
+                    self.both('INSERT INTO bd(id) VALUES(1)')
+                    assert self.both('SELECT k FROM bd')[0] == ((value,),)
+                    self.both('DROP TABLE bd')
+            self.both("SET sql_mode=''")
+        finally:
+            self.oh.q('ROLLBACK')
+            self.my.q('ROLLBACK')
+            pg.close()
+
     def collation_order(self):
         # Comparison stops at the first differing weight, and sorts compare
         # abbreviated keys first; both must keep MySQL's weights and PAD SPACE,
@@ -278,7 +404,8 @@ def main():
     a=p.parse_args()
     checks=ReleaseChecks(a.port,a.reference_port)
     try:
-        for name in ('find_in_set','boolean_strings','boolean_assignments','collation_order','mixed_strings',
+        for name in ('find_in_set','boolean_strings','boolean_assignments','boolean_defaults',
+                     'inherited_boolean_defaults','collation_order','mixed_strings',
                      'connection_init','generated_strings','metadata'):
             getattr(checks,name)()
             print('PASS',name,checks.count,flush=True)

@@ -6901,7 +6901,7 @@ TableLikeClause:
 					n->relation = $2;
 					//n->options = $3;
 					//n->options = CREATE_TABLE_LIKE_ALL;
-					n->options = CREATE_TABLE_LIKE_ALL & ~CREATE_TABLE_LIKE_DEFAULTS;
+					n->options = CREATE_TABLE_LIKE_ALL;
 					n->relationOid = InvalidOid;
 					$$ = (Node *)n;
 				}

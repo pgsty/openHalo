@@ -185,7 +185,11 @@ explicit product choice.
 - TRUE/FALSE and boolean results (comparisons, IF, CASE) are MySQL's integers 1/0 when stored:
   numbers 1/0 (including DECIMAL and FLOAT/DOUBLE), strings `'1'`/`'0'`, and binary strings
   `'1'`/`'0'` (BINARY zero-padded) in every sql_mode, including ODKU/REPLACE key arbitration,
-  DEFAULT, CAST/CONVERT and generated columns. These are assignment casts from PG `boolean`, so in
+  DEFAULT, CAST/CONVERT and generated columns. Character boolean defaults are normalized in
+  CREATE/ALTER and copied by CREATE TABLE LIKE. Defaults inherited from older versions also
+  produce `'1'`/`'0'` on MySQL writes; genuine quoted `'true'`/`'false'` defaults and native PG
+  character assignments keep their meaning. Numeric/binary assignment casts from PG `boolean`
+  apply to every session, so in
   a database with aux_mysql a native PG session also gets `true::numeric = 1` and
   `true::bytea = '\x31'`; `true::text` stays `'true'`. Booleans in arithmetic, aggregates
   (AVG/MIN/MAX/STD/BIT_*), numeric functions and mixed-type GREATEST/COALESCE/IF are still
