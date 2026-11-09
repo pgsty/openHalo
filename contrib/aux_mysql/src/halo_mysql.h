@@ -174,6 +174,8 @@ extern void mys_hexlit_columns_binary(Node *query);
 extern void mys_set_auto_increment(Oid relid, int64 next);
 extern void mys_sync_auto_increment(Oid relid);
 extern void mys_sequence_write(struct RelationData *sequence);
+struct Query;
+extern void mys_assign_bool_as_int(struct Query *query);
 
 /* mys_rewrite.c: ENGINE= / ENCRYPTION= -> table access method, or NULL */
 struct DefElem;

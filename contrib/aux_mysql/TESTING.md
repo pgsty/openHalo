@@ -196,7 +196,12 @@ checked independently and DML is verified by the full wire suites.
 
 `release_fixes.py` covers the final release review corrections: FIND_IN_SET
 trailing spaces in both directions without changing FIELD/STRCMP/LIKE/IN;
-boolean string/aggregate values and HEX; CHAR/VARCHAR IFNULL/IF, NULL and
+boolean string/aggregate values and HEX; TRUE/FALSE, predicate and IF
+assignments to numeric/BOOL/string columns in both sql_modes, unique-key
+ODKU/REPLACE against seeded `0`/`'true'` rows and generated columns;
+general_ci/bin ORDER BY, GROUP BY, DISTINCT, equality joins and index lookups
+over PAD SPACE, control characters below space, accents and supplementary
+characters; CHAR/VARCHAR IFNULL/IF, NULL and
 unknown literals in both PAD modes; connection initialization spellings and
 session variables; text/prepared result charset metadata and raw binary rows;
 and uint64 statement/trigger rollback inside an explicit transaction.

@@ -480,3 +480,66 @@ numeric rejection and F8's empty-needle multibyte offset are accepted 1.9
 limits, not exact compatibility. No expected files were changed, and there was
 no commit, push, tag or publication. The original f0dc476 NO-GO report remains
 valid for that original binary.
+
+## Post-commit corrections to `aa25342` — 2026-11-09
+
+The post-commit review of `aa25342b14832838865dfa52456bd9f2db10d5ea` was NO-GO
+for two wrong-data paths and a general_ci sort regression against v18.6. This
+patch on `aa25342` changes only `contrib/aux_mysql`; the kernel is unchanged.
+
+- A: in `sql_mode=''` a TRUE literal reached the lenient conversion as the text
+  `true`, so INT/BOOL/BIGINT/DECIMAL/DOUBLE stored 0 with 1265 and ODKU/REPLACE
+  acted on an unrelated key-0 row. The literal assignment boundary
+  (`column_value`) now uses the integer 1/0 for numeric and string targets in
+  every mode, including strict UPDATE. Other targets (BIT, JSON, ...) are unchanged.
+- B: PG's assignment cast `text(bool)` stored `true`/`false` (or `fals`, or 1406)
+  for predicates, IF and TRUE in CHAR/VARCHAR/TEXT, in both modes, again moving
+  ODKU/REPLACE to a wrong row. After parse analysis of MySQL statements,
+  INSERT/UPDATE targets, ON DUPLICATE KEY UPDATE and multi-row VALUES replace
+  that implicit cast with `int4(bool)` through I/O. Explicit casts and native PG
+  sessions keep `true::text = 'true'`. String generated columns over a boolean
+  expression convert through `::int4` inside the generator; SHOW CREATE output is
+  unchanged. No SQL objects or upgrade steps were added.
+- Sort: `general_strncoll` built and freed two full weight keys per comparison,
+  and both MySQL collations disabled abbreviated keys. Comparison now streams
+  weights (128-entry ASCII table from the same weight data) and stops at the first
+  difference, keeping PAD SPACE below-space order. Both collations provide
+  `strnxfrm_prefix`, padded with the space weight, so memcmp order equals the
+  comparator; `strxfrm_is_safe` only enables these abbreviated sort keys, while
+  `strnxfrm` remains the hashing equality key. Stored keys and indexes do not change.
+
+| Verification | Debug | Release |
+|---|---|---|
+| PostgreSQL core regression | 231/231 | 231/231 |
+| tests/run.sh | 26/26 | 26/26 |
+| TESTING.md integration / Route A / upgrade / recovery invocations | 23/23 | 23/23 |
+| release_fixes.py (adds boolean_assignments, collation_order) | 414 checks | 414 checks |
+| Actual released v18.6 binaries + 1.5 SQL → 1.9 | passed | passed |
+| 512 boolean write cases vs MySQL 5.7 (also on the upgraded release copy) | 0 value/warning differences | 0 value/warning differences |
+| 120k adversarial strings vs MySQL 5.7: ORDER BY/GROUP BY/DISTINCT/join | identical | identical |
+| amcheck `bt_index_parent_check` after CREATE INDEX | passed | passed |
+
+The new `release_fixes.py` cases fail on `aa25342` (1406 on the first boolean
+insert). Stock PG18 standalone prefix and binary suites passed. The remaining
+boolean differences are the 120 pre-existing 1105 rejections of boolean
+expressions assigned to DECIMAL, DOUBLE and VARBINARY; no case stores a different
+value. Literal/variable collation propagation remains deferred.
+
+Release build, 300k rows, `work_mem=64MB`, no JIT or parallel workers, median of
+five EXPLAIN ANALYZE runs (FIND_IN_SET: client time); ordered ids are identical:
+
+| Workload | This patch | v18.6 (1.5, ICU) | `aa25342` |
+|---|---:|---:|---:|
+| ORDER BY 32-char general_ci | 60 ms | 92 ms | 3845 ms |
+| ORDER BY 8-char general_ci | 57 ms | 92 ms | 1070 ms |
+| ORDER BY 32-char utf8mb4_bin | 54 ms | 52 ms | 133 ms |
+| ORDER BY shared-prefix keys | 174 ms | 199 ms | 1599 ms |
+| COUNT(DISTINCT) | 55 ms | 90 ms | 3949 ms |
+| equality scan | 12 ms | 16 ms | 188 ms |
+| FIND_IN_SET aggregate | 0.62 s | 2.84 s | 15.3 s |
+| CREATE INDEX | 90 ms | 101 ms | 2495 ms |
+
+Evidence, builds and instances are under ohdev
+`/tmp/claude-aux19-boolsort-20261109/`. Earlier review instances were not used.
+Initial suite runs failed on two fixture omissions (postgres MySQL password,
+non-writable regress directory); both were corrected before the passes above.

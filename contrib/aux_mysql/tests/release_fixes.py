@@ -10,6 +10,7 @@ import struct
 
 import psycopg2
 from psycopg2 import sql as pgsql
+from pymysql import converters
 from pymysql.protocol import FieldDescriptorPacket
 
 from route_a import Checks
@@ -50,6 +51,61 @@ class ReleaseChecks(Checks):
         self.both('SELECT IF(1,TRUE,FALSE),IF(0,TRUE,FALSE),IF(NULL,TRUE,FALSE),IF(1=1,NULL,FALSE)')
         self.both('SELECT GROUP_CONCAT(c=1) FROM bo WHERE id=3')
         self.both('DROP TABLE bo')
+
+    def boolean_assignments(self):
+        # TRUE/FALSE and predicates are MySQL's integers 1/0: numbers 1/0 and
+        # strings '1'/'0' in any sql_mode.  A wrong value also selects the
+        # wrong unique-key row for ON DUPLICATE KEY UPDATE and REPLACE.
+        for mode in ('', 'STRICT_TRANS_TABLES'):
+            for session in (self.oh, self.my):
+                session.q("SET sql_mode='"+mode+"'")
+            self.both('CREATE TABLE ba(id INT PRIMARY KEY,i INT,b BOOL,d DECIMAL(6,2),f DOUBLE,'
+                      'v VARCHAR(20),c CHAR(4),t TEXT)')
+            self.both('INSERT INTO ba VALUES(1,TRUE,TRUE,TRUE,TRUE,TRUE,FALSE,1=1),'
+                      '(2,FALSE,FALSE,FALSE,FALSE,1=0,IF(0,TRUE,FALSE),IF(1,TRUE,FALSE)),'
+                      '(3,NULL,NULL,NULL,NULL,NULL=1,NULL>0,IF(NULL,TRUE,FALSE))')
+            self.both('UPDATE ba SET i=TRUE,b=FALSE,v=(id=3),c=CASE WHEN id=3 THEN TRUE ELSE id>5 END WHERE id=3')
+            self.both('INSERT INTO ba(id,v,c,t) SELECT 10,1=1,1=0,IF(1,TRUE,FALSE)')
+            self.both("INSERT INTO ba(id,v) VALUES(10,'x') ON DUPLICATE KEY UPDATE v=(id=1),t=(id=10)")
+            self.both('SELECT id,i,b,d,f,v,HEX(v),c,HEX(c),t FROM ba ORDER BY id')
+            self.both('DROP TABLE ba')
+            for typ, seed, expr in (('INT', '0', 'TRUE'), ('BOOL', '0', 'TRUE'),
+                                    ('VARCHAR(20)', "'true'", '1=1'), ('VARCHAR(20)', "'true'", 'IF(1,TRUE,FALSE)')):
+                self.both('CREATE TABLE bk(id INT PRIMARY KEY,k '+typ+' UNIQUE,note VARCHAR(10))')
+                for statement in ("INSERT INTO bk VALUES(20,"+expr+",'new') ON DUPLICATE KEY UPDATE note='changed'",
+                                  "REPLACE INTO bk VALUES(20,"+expr+",'new')"):
+                    self.both('DELETE FROM bk')
+                    self.both("INSERT INTO bk VALUES(10,"+seed+",'old')")
+                    self.both(statement)
+                    self.both('SELECT id,k,note FROM bk ORDER BY id')
+                self.both('DROP TABLE bk')
+        for session in (self.oh, self.my):
+            session.q("SET sql_mode=''")
+        self.both('CREATE TABLE bg(id INT PRIMARY KEY,g VARCHAR(20) AS(id=1) STORED,'
+                  'h TEXT AS(IF(id=1,TRUE,FALSE)) STORED,c CHAR(4) AS(id>1) VIRTUAL)')
+        self.both('INSERT INTO bg(id) VALUES(1),(2)')
+        self.both('SELECT id,g,HEX(g),h,c FROM bg ORDER BY id')
+        self.both('DROP TABLE bg')
+
+    def collation_order(self):
+        # Comparison stops at the first differing weight, and sorts compare
+        # abbreviated keys first; both must keep MySQL's weights and PAD SPACE,
+        # including characters that sort below the space.
+        values = ['', ' ', '  ', 'a', 'a ', 'a\t', 'a\x01', 'A', 'a b', 'a\tb', 'ab', 'aB ', 'b', '\x01', '\t',
+                  '!', 'é', 'É', 'e', 'ß', 'ss', 'Æ', 'æ', 'ae', '中', 'Ａ', '\U0001F600', '\U0001F601', '�',
+                  'abcdefgh', 'abcdefghi', 'ABCDEFGH ', 'abcdefg\t', 'abcdefg', 'abcdefghé', 'abcdefgÉ', 'abcdefgh\x01']
+        rows = ','.join('(%d,%s)' % (i, converters.escape_string(v).join("''")) for i, v in enumerate(values))
+        for collation in ('utf8mb4_general_ci', 'utf8mb4_bin'):
+            self.both('CREATE TABLE co(id INT PRIMARY KEY,k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE '+collation+')')
+            self.both('INSERT INTO co VALUES'+rows)
+            for query in ('SELECT id FROM co ORDER BY k,id', 'SELECT id FROM co ORDER BY k DESC,id',
+                          'SELECT MIN(id),COUNT(*) FROM co GROUP BY k ORDER BY MIN(id)', 'SELECT COUNT(DISTINCT k) FROM co',
+                          'SELECT a.id,b.id FROM co a JOIN co b ON a.k=b.k AND a.id<b.id ORDER BY 1,2'):
+                self.both(query)
+            self.both('CREATE INDEX co_k ON co(k)')
+            self.both("SELECT id FROM co WHERE k='a' ORDER BY id")
+            self.both("SELECT id FROM co WHERE k>'a' AND k<'b' ORDER BY id")
+            self.both('DROP TABLE co')
 
     def mixed_strings(self):
         self.both('CREATE TABLE ch(i INT,c CHAR(5),v VARCHAR(8))')
@@ -201,7 +257,8 @@ def main():
     a=p.parse_args()
     checks=ReleaseChecks(a.port,a.reference_port)
     try:
-        for name in ('find_in_set','boolean_strings','mixed_strings','connection_init','generated_strings','metadata'):
+        for name in ('find_in_set','boolean_strings','boolean_assignments','collation_order','mixed_strings',
+                     'connection_init','generated_strings','metadata'):
             getattr(checks,name)()
             print('PASS',name,checks.count,flush=True)
         checks.overflow_atomicity(a.port)

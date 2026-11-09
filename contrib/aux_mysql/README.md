@@ -182,6 +182,11 @@ explicit product choice.
   unsigned 64-bit type. Common string operations, binary CONCAT and indexed integer comparisons are
   covered, but arbitrary combinations of MySQL functions and custom types are not fully implemented.
   BIT result metadata and user-variable numeric typing still differ from MySQL.
+- TRUE/FALSE and boolean results (comparisons, IF, CASE) are MySQL's integers 1/0 when stored:
+  numbers 1/0 and strings `'1'`/`'0'` in every sql_mode, including ODKU/REPLACE key arbitration and
+  generated columns. Boolean expressions assigned to DECIMAL, DOUBLE or VARBINARY are still rejected
+  with 1105 (literal TRUE/FALSE are accepted). Generated columns defined before 1.9 keep their stored
+  expression, and existing `'true'` strings or zeros are not rewritten.
 - CHAR/VARCHAR combinations in IFNULL/IF and boolean CONCAT/GROUP_CONCAT are supported.
   Broader mixed types, such as integer/VARCHAR or VARBINARY/CHAR conditional results, remain
   incomplete. Multi-argument GROUP_CONCAT is also incomplete; `GROUP_CONCAT(CONCAT(...))`

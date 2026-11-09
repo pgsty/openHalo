@@ -63,6 +63,8 @@
 PG_MODULE_MAGIC;
 void _PG_init(void);
 void _PG_init(void) { mys_prefix_init(); }
+#else
+extern void mys_assign_bool_as_int(Query *query);	/* mys_semantics.c */
 #endif
 
 typedef struct PrefixOptions
@@ -208,17 +210,98 @@ pad_compare(const char *a, int alen, const char *b, int blen, int unit)
 	return 0;
 }
 
+/* ASCII weights, filled from mys_general_weights by mys_prefix_init(). */
+static uint16 general_ascii[128];
+
+static inline uint32
+general_next(const unsigned char **p)
+{
+	const unsigned char *s = *p;
+
+	if (*s < 0x80)
+	{
+		(*p)++;
+		return general_ascii[*s];
+	}
+	*p += pg_utf_mblen(s);
+	return general_weight(utf8_to_unicode(s));
+}
+
+/* The order of general_key() + pad_compare(), without building either key:
+ * the first differing weight decides, so stop there.  Equal ASCII bytes have
+ * equal weights.  PAD SPACE: the shorter operand continues with spaces. */
 static int
 general_strncoll(const char *a, ssize_t alen, const char *b, ssize_t blen,
 				pg_locale_t locale)
 {
-	bytea *ak = general_key(a, alen < 0 ? strlen(a) : alen, 0, true);
-	bytea *bk = general_key(b, blen < 0 ? strlen(b) : blen, 0, true);
-	int cmp = pad_compare(VARDATA(ak), VARSIZE_ANY_EXHDR(ak),
-						  VARDATA(bk), VARSIZE_ANY_EXHDR(bk), 2);
-	pfree(ak);
-	pfree(bk);
-	return cmp;
+	const unsigned char *p = (const unsigned char *) a;
+	const unsigned char *q = (const unsigned char *) b;
+	const unsigned char *pend = p + (alen < 0 ? strlen(a) : alen);
+	const unsigned char *qend = q + (blen < 0 ? strlen(b) : blen);
+	const unsigned char *tail, *tend;
+	int sign;
+
+	while (p < pend && q < qend)
+	{
+		uint32 wa, wb;
+
+		if (*p == *q && *p < 0x80)
+		{
+			p++;
+			q++;
+			continue;
+		}
+		wa = general_next(&p);
+		wb = general_next(&q);
+		if (wa != wb)
+			return wa < wb ? -1 : 1;
+	}
+	sign = p < pend ? 1 : -1;
+	tail = p < pend ? p : q;
+	tend = p < pend ? pend : qend;
+	while (tail < tend)
+	{
+		uint32 weight = general_next(&tail);
+
+		if (weight != ' ')
+			return weight < ' ' ? -sign : sign;
+	}
+	return 0;
+}
+
+/* Abbreviated sort keys (tuplesort only; equal prefixes fall back to
+ * general_strncoll).  memcmp() must never contradict general_strncoll():
+ * a weight below 0x80 takes one byte, any other 0xFF and two big-endian
+ * bytes, so the first differing byte orders the first differing weight.
+ * The rest is filled with the space weight, exactly as PAD SPACE compares a
+ * shorter operand.  Not pg_strnxfrm(), whose trimmed hash key has no order. */
+static size_t
+general_strnxfrm_prefix(char *dest, size_t size, const char *src, ssize_t len,
+						pg_locale_t locale)
+{
+	const unsigned char *p = (const unsigned char *) src;
+	const unsigned char *end = p + (len < 0 ? strlen(src) : len);
+	unsigned char *out = (unsigned char *) dest;
+	size_t n = 0;
+
+	while (p < end && n < size)
+	{
+		uint32 weight = general_next(&p);
+
+		if (weight < 0x80)
+			out[n++] = weight;
+		else
+		{
+			out[n++] = 0xff;
+			if (n < size)
+				out[n++] = weight >> 8;
+			if (n < size)
+				out[n++] = weight & 255;
+		}
+	}
+	while (n < size)
+		out[n++] = ' ';
+	return n;
 }
 
 /* pg_strnxfrm's result is binary and length-delimited (embedded NUL is OK). */
@@ -237,8 +320,10 @@ general_strnxfrm(char *dest, size_t size, const char *src, ssize_t len,
 	return n;
 }
 
+/* strxfrm_is_safe only enables abbreviated keys (varstr_sortsupport), which
+ * use the prefix method; pg_strnxfrm() stays the equality key for hashing. */
 static const struct collate_methods general_methods = {
-	general_strncoll, general_strnxfrm, NULL, false
+	general_strncoll, general_strnxfrm, general_strnxfrm_prefix, true
 };
 
 static int
@@ -320,8 +405,20 @@ binary_strnxfrm(char *dest, size_t size, const char *src, ssize_t len,
 	return len;
 }
 
+/* Abbreviated keys: the bytes, padded with spaces as pad_compare() does. */
+static size_t
+binary_strnxfrm_prefix(char *dest, size_t size, const char *src, ssize_t len,
+					   pg_locale_t locale)
+{
+	size_t n = Min(size, (size_t) (len < 0 ? strlen(src) : len));
+
+	memcpy(dest, src, n);
+	memset(dest + n, ' ', size - n);
+	return size;
+}
+
 static const struct collate_methods binary_methods = {
-	binary_strncoll, binary_strnxfrm, NULL, false
+	binary_strncoll, binary_strnxfrm, binary_strnxfrm_prefix, true
 };
 
 #ifdef PG_LOCALE_CREATE_HOOK
@@ -1134,6 +1231,9 @@ prefix_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	install_collation();
 #endif
 	query_tree_walker(query, rewrite_like, NULL, 0);
+#ifndef MYS_PREFIX_STANDALONE
+	mys_assign_bool_as_int(query);
+#endif
 }
 
 /* pg_dump already preserves index reloptions for PRIMARY/UNIQUE constraints.
@@ -1203,6 +1303,8 @@ mys_prefix_init(void)
 {
 	if (initialized) return;
 	initialized = true;
+	for (uint32 ch = 0; ch < lengthof(general_ascii); ch++)
+		general_ascii[ch] = general_weight(ch);
 	prefix_relopt_kind = add_reloption_kind();
 	add_string_reloption(prefix_relopt_kind, "prefix_lengths", "Declared MySQL prefixes, in key order",
 						 NULL, validate_lengths, AccessExclusiveLock);

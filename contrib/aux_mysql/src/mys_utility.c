@@ -1049,6 +1049,7 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 	Oid			marker_arg = ANYELEMENTOID;
 	bool		has_conversion_helpers;
 	bool		row_anchor;
+	bool		bool_string;
 
 	(void) gen_policy_raw(raw, NULL);
 	(void) collect_column_refs(raw, &names);
@@ -1071,7 +1072,11 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 	gen_policy_check(expr, false);
 	typenameTypeIdAndMod(NULL, type, &target, &typmod);
 	base = getBaseTypeAndTypmod(target, &typmod);
-	if (!contain_mutable_functions(expr) &&
+	/* MySQL stores a predicate as 1/0 in a string column, never true/false
+	 * (mys_assign_bool_as_int); the wrapper keeps SHOW's original text. */
+	bool_string = exprType(expr) == BOOLOID &&
+		(base == VARCHAROID || base == BPCHAROID || base == TEXTOID);
+	if (!bool_string && !contain_mutable_functions(expr) &&
 		!((base == VARCHAROID || base == BPCHAROID || base == NUMERICOID) && typmod >= VARHDRSZ))
 		return raw;
 
@@ -1099,6 +1104,14 @@ generation_expression(Node *raw, TypeName *type, List *columns, Oid nspid,
 	if (has_conversion_helpers)
 		body = (Node *) makeFuncCall(list_make2(makeString("mysql"), makeString("generated_value")),
 									 list_make1(body), COERCE_EXPLICIT_CALL, -1);
+	if (bool_string)
+	{
+		cast = makeNode(TypeCast);
+		cast->arg = body;
+		cast->typeName = makeTypeNameFromOid(INT4OID, -1);
+		cast->location = -1;
+		body = (Node *) cast;
+	}
 	if (has_conversion_helpers && (base == VARCHAROID || base == BPCHAROID) && typmod >= VARHDRSZ)
 	{
 		A_Const *limit = makeNode(A_Const);

@@ -2026,11 +2026,42 @@ binary_value(Node *val, Form_pg_attribute att)
 	return (Node *) tc;
 }
 
+/*
+ * MySQL's TRUE and FALSE are the integers 1 and 0.  Assigned to a number or
+ * string column they must store 1/0 and '1'/'0', in any sql_mode: as a PG
+ * boolean, the lenient text conversion below would read 'true' as 0, and
+ * the string assignment would store 'true'.  Other targets (BIT, JSON, ...)
+ * keep their boolean conversions.
+ */
+static Node *
+bool_literal_value(Node *val, Form_pg_attribute att)
+{
+	A_Const    *c = (A_Const *) val;
+
+	if (val == NULL || !IsA(val, A_Const) || c->isnull || !IsA(&c->val, Boolean))
+		return val;
+	switch (getBaseType(att->atttypid))
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case NUMERICOID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case VARCHAROID:
+		case BPCHAROID:
+		case TEXTOID:
+			return int_const(boolVal(&c->val) ? 1 : 0);
+		default:
+			return val;
+	}
+}
+
 /* the literal to assign to column "att" */
 static Node *
 column_value(Node *val, Form_pg_attribute att)
 {
-	val = binary_value(val, att);
+	val = binary_value(bool_literal_value(val, att), att);
 	return isStrictTransTablesOn ? val : lenient_value(val, att);
 }
 
@@ -2112,9 +2143,11 @@ rewrite_update_stmt(UpdateStmt *stmt)
 	{
 		bool		any = false;
 
-		/* only binary columns need a look at the table then */
+		/* only binary columns and TRUE/FALSE need a look at the table then */
 		foreach_node(ResTarget, rt, stmt->targetList)
-			any |= is_backslash_literal(rt->val);
+			any |= is_backslash_literal(rt->val) ||
+				(rt->val && IsA(rt->val, A_Const) && !((A_Const *) rt->val)->isnull &&
+				 IsA(&((A_Const *) rt->val)->val, Boolean));
 		if (!any)
 			return;
 	}

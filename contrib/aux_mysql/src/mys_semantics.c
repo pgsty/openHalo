@@ -1719,3 +1719,86 @@ mys_show_create_view(PG_FUNCTION_ARGS)
 	appendStringInfoString(&buf, mysql_expression_text(definition, NULL, NIL));
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
 }
+
+/*
+ * MySQL has no boolean type: TRUE, a predicate or IF(c, TRUE, FALSE) is the
+ * integer 1/0, and assigning it to a string column stores '1'/'0'.  The PG
+ * assignment cast text(bool) stores 'true'/'false' instead, which changes the
+ * data and the unique-key conflicts ON DUPLICATE KEY UPDATE / REPLACE act on.
+ * pg_cast admits bool -> text/varchar/bpchar for assignment only, so its
+ * implicit form sits right under the target's typmod/domain coercions; an
+ * explicit cast keeps PostgreSQL's meaning.  Convert through int4(bool) and
+ * I/O as MySQL does, before uniqueness is checked; NULL stays NULL.
+ */
+static void
+bool_assigned_as_int(Node **expr)
+{
+	for (Node *node = *expr; node; node = *expr)
+	{
+		if (IsA(node, FuncExpr) && ((FuncExpr *) node)->funcformat == COERCE_IMPLICIT_CAST)
+		{
+			FuncExpr   *f = (FuncExpr *) node;
+
+			if (f->args == NIL)
+				return;
+			if (f->funcid == F_TEXT_BOOL)
+			{
+				CoerceViaIO *io = makeNode(CoerceViaIO);
+
+				io->arg = (Expr *) makeFuncExpr(F_INT4_BOOL, INT4OID, f->args, InvalidOid,
+												InvalidOid, COERCE_IMPLICIT_CAST);
+				io->resulttype = f->funcresulttype;
+				io->resultcollid = f->funccollid;
+				io->coerceformat = COERCE_IMPLICIT_CAST;
+				io->location = f->location;
+				*expr = (Node *) io;
+				return;
+			}
+			expr = (Node **) &linitial(f->args);
+		}
+		else if (IsA(node, RelabelType))
+			expr = (Node **) &((RelabelType *) node)->arg;
+		else if (IsA(node, CoerceToDomain))
+			expr = (Node **) &((CoerceToDomain *) node)->arg;
+		else
+			return;
+	}
+}
+
+/* post parse analysis of a MySQL statement: INSERT / UPDATE assignments,
+ * including ON DUPLICATE KEY UPDATE and multi-row VALUES */
+void
+mys_assign_bool_as_int(Query *query)
+{
+	if (query == NULL || !mys_is_mysql_session() || halo_mysql_parser != MYS_PARSER_MYSQL)
+		return;
+	if (query->commandType == CMD_UTILITY && query->utilityStmt &&
+		IsA(query->utilityStmt, ExplainStmt))
+	{
+		Node	   *explained = ((ExplainStmt *) query->utilityStmt)->query;
+
+		if (explained && IsA(explained, Query))
+			mys_assign_bool_as_int((Query *) explained);
+		return;
+	}
+	if (query->commandType != CMD_INSERT && query->commandType != CMD_UPDATE)
+		return;
+	foreach_node(TargetEntry, te, query->targetList)
+		if (!te->resjunk)
+			bool_assigned_as_int((Node **) &te->expr);
+	if (query->onConflict)
+		foreach_node(TargetEntry, te, query->onConflict->onConflictSet)
+			bool_assigned_as_int((Node **) &te->expr);
+	foreach_node(RangeTblEntry, rte, query->rtable)
+	{
+		if (rte->rtekind != RTE_VALUES)
+			continue;
+		foreach_ptr(List, row, rte->values_lists)
+		{
+			ListCell   *lc;
+
+			foreach(lc, row)
+				bool_assigned_as_int((Node **) &lfirst(lc));
+		}
+	}
+}
