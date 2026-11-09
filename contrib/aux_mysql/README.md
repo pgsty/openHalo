@@ -31,6 +31,13 @@ and separate validation. Load it through `shared_preload_libraries` (the OpenHal
   TLS or RSA-OAEP) checked against the PostgreSQL SCRAM/MD5 verifier, so one password serves both protocols
   and `ALTER ROLE ... PASSWORD` invalidates the cache; TLS through PostgreSQL's `ssl_*` settings,
   `hostssl` and `pg_stat_ssl`; `pg_hba.conf`; `USE` / `COM_INIT_DB`.
+- **Connection initialization**: `SET NAMES charset [COLLATE collation]`, quoted names,
+  `SET NAMES DEFAULT`, `SET CHARACTER SET` and `SET CHARSET` (including DEFAULT).
+  Client/results/connection variables are updated together; CHARACTER SET takes the connection
+  defaults from the current database variables. Storage and wire strings remain UTF-8: other
+  encodings/locales map to UTF-8 general_ci/bin with warning 1105. Literal comparisons still have
+  the collation limitation below. Character result metadata uses MySQL 5.7's charset number 45;
+  binary results retain 63, including prepared statements.
 - **Prepared statements**: `COM_STMT_PREPARE/EXECUTE/CLOSE/RESET/SEND_LONG_DATA` with binary result sets;
   SQL `PREPARE name FROM 'text' | @var`, `EXECUTE name [USING @a, ...]`, `DEALLOCATE | DROP PREPARE name`
   (names are case-insensitive, a new PREPARE replaces the statement, `USING` also takes other expressions);
@@ -167,12 +174,26 @@ explicit product choice.
   infer their original lengths or pad historical values. TEXT-family columns retain native PG text storage. Use the original schema and the [migration procedure](MIGRATION.md) to convert them.
 - Index hints accept USE/IGNORE/FORCE INDEX or KEY, optional FOR JOIN/ORDER BY/GROUP BY,
   aliases, repeated hints and index lists (including empty USE lists). All hints are ignored.
-- Legal BIGINT UNSIGNED values above INT64_MAX fail with 1264 in every sql_mode and under
-  IGNORE, preventing distinct 64-bit keys from collapsing onto INT64_MAX.
+- BIGINT UNSIGNED writes above INT64_MAX fail with 1264 in every sql_mode and under
+  IGNORE, including positive overflow beyond UINT64_MAX: MySQL's clipped UINT64_MAX also
+  cannot fit int8. The statement rolls back before a wrong unique-key update or replacement.
+  Non-strict negative inputs still clip to 0 with warning 1264.
   Hexadecimal numeric contexts above signed int8 remain limited; BIGINT UNSIGNED is not a full
   unsigned 64-bit type. Common string operations, binary CONCAT and indexed integer comparisons are
   covered, but arbitrary combinations of MySQL functions and custom types are not fully implemented.
   BIT result metadata and user-variable numeric typing still differ from MySQL.
+- CHAR/VARCHAR combinations in IFNULL/IF and boolean CONCAT/GROUP_CONCAT are supported.
+  Broader mixed types, such as integer/VARCHAR or VARBINARY/CHAR conditional results, remain
+  incomplete. Multi-argument GROUP_CONCAT is also incomplete; `GROUP_CONCAT(CONCAT(...))`
+  supports explicit per-row concatenation.
+- Deferred DML forms: `DELETE target FROM ... JOIN ...` (including comma joins and orphan
+  cleanup with LEFT JOIN) and true multi-target UPDATE/DELETE. The supported single-target
+  `DELETE FROM target USING ...` form does not imply support for those spellings.
+- Accepted 1.9 differences: with PAD_CHAR_TO_FULL_LENGTH, some search/string-function inputs
+  still lose CHAR padding, although stored bytes are unchanged; binary numeric CAST may reject
+  extreme exponents such as `1e1000000`/`1e-1000000` and negative SIGNED overflow; empty-needle
+  `LOCATE('', multibyte_string, pos)` returns a character position rather than MySQL's byte
+  offset at these boundaries. These specific differences are not claims of exact compatibility.
 - CHAR/VARCHAR and all TEXT families retain native PostgreSQL character storage: values containing NUL
   fail with 1366. Bytes are never stripped or replaced to make an insert succeed. Only BLOB/BINARY/VARBINARY preserve NUL and arbitrary bytes. Changing a column to
   a binary type is an explicit migration decision, including its length and comparison rules.

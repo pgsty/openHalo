@@ -11,6 +11,7 @@
 #ifndef HALO_MYSQL_H
 #define HALO_MYSQL_H
 
+#include "fmgr.h"
 #include "nodes/pg_list.h"
 #include "mys_binary.h"
 #ifndef HALO_BABELFISH_API

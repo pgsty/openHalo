@@ -48,11 +48,86 @@
 
 #include "postgres.h"
 #include "mysm_compat.h"
+#include "halo_mysql.h"
 
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "adapter/mysql/systemVar.h"
+
+/* The wire/database representation is UTF-8. Keep initialization settings
+ * honest about approximated encodings; literal collation propagation is a
+ * separate compatibility boundary, not implemented by these setters. */
+static char *
+connection_charset(char *name)
+{
+	if (pg_strcasecmp(name, "utf8") == 0 || pg_strcasecmp(name, "utf8mb3") == 0)
+		return "utf8";
+	if (pg_strcasecmp(name, "utf8mb4") != 0)
+		mys_add_warning(1105, psprintf("Character set '%s' mapped to utf8mb4", name));
+	return "utf8mb4";
+}
+
+static void
+set_connection_charset(FunctionCallInfo fcinfo, bool names)
+{
+	char *charset = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *connection;
+	char *collation = NULL;
+	char *effective;
+	bool binary;
+	size_t len;
+
+	if (strcmp(charset, "halo_mysql_system_var_default") == 0)
+	{
+		getSystemVariableValueForSelect("character_set_server", false, &charset);
+		if (names)
+			getSystemVariableValueForSelect("collation_server", false, &collation);
+	}
+	charset = connection_charset(charset);
+	connection = charset;
+	if (names)
+	{
+		if (PG_NARGS() > 1 && !PG_ARGISNULL(1))
+			collation = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	}
+	else
+	{
+		getSystemVariableValueForSelect("character_set_database", true, &connection);
+		connection = connection_charset(connection);
+		getSystemVariableValueForSelect("collation_database", true, &collation);
+	}
+	len = collation ? strlen(collation) : 0;
+	/* Match the DDL mapper: *_ci uses general_ci, other names use bin. */
+	binary = collation && !(len > 3 && pg_strcasecmp(collation + len - 3, "_ci") == 0);
+	effective = strcmp(connection, "utf8") == 0 ?
+		(binary ? "utf8_bin" : "utf8_general_ci") :
+		(binary ? "utf8mb4_bin" : "utf8mb4_general_ci");
+	if (collation && pg_strcasecmp(collation, effective) != 0)
+		mys_add_warning(1105, psprintf("Collation '%s' mapped to %s", collation, effective));
+	setSystemVariableValue("character_set_client", charset, true);
+	setSystemVariableValue("character_set_results", charset, true);
+	setSystemVariableValue("character_set_connection", connection, true);
+	setSystemVariableValue("collation_connection", effective, true);
+}
+
+PG_FUNCTION_INFO_V1(mys_set_names);
+Datum
+mys_set_names(PG_FUNCTION_ARGS)
+{
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	set_connection_charset(fcinfo, true);
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(mys_set_charset);
+Datum
+mys_set_charset(PG_FUNCTION_ARGS)
+{
+	set_connection_charset(fcinfo, false);
+	PG_RETURN_VOID();
+}
 
 
 PG_FUNCTION_INFO_V1(setSystemVariable);

@@ -96,10 +96,6 @@ class Checks:
             self.both('CREATE TABLE t(id INT,s '+typ+',v VARCHAR(50))')
             self.both("INSERT INTO t VALUES(1,'Hello','Hello'),(2,'abc','abc')")
             for e in expressions:
-                # Pre-existing CHAR/VARCHAR IF overload ambiguity (also 3793);
-                # the Route A mixed-TEXT cases remain covered above.
-                if typ.startswith('CHAR(') and e in ('IFNULL(s,v)', 'IF(id=1,s,v)'):
-                    continue
                 self.both('SELECT '+e+' FROM t ORDER BY id')
                 self.both('SELECT HEX('+e+') FROM t ORDER BY id')
             self.both('SELECT MIN(s),MAX(s),HEX(MIN(s)),HEX(MAX(s)) FROM t')
@@ -297,15 +293,48 @@ class Checks:
             self.both('SELECT u,HEX(u) FROM u64 ORDER BY id')
         for s in (self.oh,self.my):
             s.q("SET sql_mode=''")
-        for value in (-1,18446744073709551616):
+        for value in (-1,):
             for ignore in ('','IGNORE '):
                 for s in (self.oh,self.my):
                     s.q('TRUNCATE u64')
                 sql = 'INSERT '+ignore+'INTO u64 VALUES(1,'+str(value)+')'
                 assert self.oh.result(sql) == self.my.result(sql) == ((),(1264,))
-                assert self.oh.q('SELECT u FROM u64') == ((0 if value<0 else 9223372036854775807,),)
-                assert self.my.q('SELECT u FROM u64') == ((0 if value<0 else 18446744073709551615,),)
+                assert self.oh.q('SELECT u FROM u64') == ((0,),)
+                assert self.my.q('SELECT u FROM u64') == ((0,),)
                 self.count += 1
+        # MySQL clips positive overflow to UINT64_MAX, which also cannot fit
+        # int8. Seed INT64_MAX: clipping here used to update/delete that row.
+        initial = ((1,9223372036854775807,'7FFFFFFFFFFFFFFF'),(10,10,'A'))
+        for mode in ('','STRICT_TRANS_TABLES','STRICT_ALL_TABLES'):
+            for value in ('18446744073709551616','999999999999999999999999999999'):
+                for statement in (
+                    'INSERT INTO u64 VALUES(2,{v})',
+                    'INSERT IGNORE INTO u64 VALUES(2,{v})',
+                    'INSERT INTO u64 SELECT 2,{v}',
+                    'INSERT IGNORE INTO u64 SELECT 2,{v}',
+                    'REPLACE INTO u64 VALUES(2,{v})',
+                    'UPDATE u64 SET u={v} WHERE id=10',
+                    'INSERT INTO u64 VALUES(2,{v}) ON DUPLICATE KEY UPDATE id=VALUES(id)',
+                    'INSERT IGNORE INTO u64 VALUES(2,{v}) ON DUPLICATE KEY UPDATE id=VALUES(id)',
+                    'INSERT INTO u64 VALUES(3,123),(2,{v})'):
+                    sql = statement.format(v=value)
+                    for s in (self.oh,self.my):
+                        s.q("SET sql_mode='"+mode+"'")
+                        s.q('TRUNCATE u64')
+                        s.q('INSERT INTO u64 VALUES(1,9223372036854775807),(10,10)')
+                    assert self.oh.result(sql) == ('error',1264), (mode,sql)
+                    assert self.oh.q('SELECT id,u,HEX(u) FROM u64 ORDER BY id') == initial, (mode,sql)
+                    expected = ('error',1264) if mode and 'IGNORE' not in sql else ((),(1264,))
+                    assert self.my.result(sql) == expected, (mode,sql)
+                    myrows = self.my.q('SELECT id,u,HEX(u) FROM u64 ORDER BY id')
+                    assert myrows[0] == initial[0], (mode,sql,myrows)
+                    if expected[0] == 'error':
+                        assert myrows == initial, (mode,sql,myrows)
+                    else:
+                        assert any(row[1:] == (18446744073709551615,'FFFFFFFFFFFFFFFF') for row in myrows), (mode,sql,myrows)
+                    self.count += 1
+        for s in (self.oh,self.my):
+            s.q("SET sql_mode=''")
         for s in (self.oh,self.my):
             s.q('TRUNCATE u64');s.q('INSERT INTO u64 VALUES(1,7)')
         for form in ('INTO u64 VALUES(1,8)','u64 VALUES(1,8)',

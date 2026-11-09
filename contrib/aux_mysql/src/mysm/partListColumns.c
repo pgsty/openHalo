@@ -48,6 +48,7 @@
 
 #include "postgres.h"
 #include "mysm_compat.h"
+#include "halo_mysql.h"
 
 #include <ctype.h>
 #include <limits.h>

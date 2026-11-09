@@ -41,6 +41,9 @@ static const char *const gen_c_implementations[] = {
  * recursively as well.  No arbitrary SQL UDF becomes trusted via IMMUTABLE. */
 static const char *const gen_sql_bodies[] = {
 	"SELECT $1", "SELECT $2", "SELECT coalesce($1, $2)",
+	"SELECT coalesce(mysql.concat_one($1)::varchar, mysql.concat_one($2)::varchar)",
+	"SELECT CASE WHEN mysql.binary_truth($1) THEN mysql.concat_one($2)::varchar ELSE mysql.concat_one($3)::varchar END",
+	"SELECT CASE WHEN mysql.binary_truth($1) THEN $2 ELSE $3 END",
 	"\nSELECT coalesce(p1::text, p2);\n",
 	"SELECT trunc(mysql.mys_div_numeric($1, $2))::int8",
 	"SELECT mysql.int_div(mysql.hexlit_numeric($1), $2)",

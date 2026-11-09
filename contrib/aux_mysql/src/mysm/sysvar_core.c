@@ -52,6 +52,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "access/relscan.h"
 #include "access/sdir.h"
 #include "access/table.h"

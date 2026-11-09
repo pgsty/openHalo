@@ -1327,6 +1327,47 @@ makeMysqlDeleteUsing(DeleteStmt *stmt, int location)
 }
 '''
 
+# Connection initialization spellings used by JDBC, PDO and dump clients.
+# Retain the one-argument SET NAMES call when no COLLATE is present so new
+# binaries can still connect to old SQL catalogs before ALTER EXTENSION.
+rep('%type <str>\t\tcharacter ncharacter charset_name opt_field_option',
+    '%type <str>\t\tcharacter ncharacter charset_name opt_field_option\n'
+    '%type <str>\t\tmysql_set_charset mysql_set_collation')
+resub(r'\t+\| NAMES IDENT\n.*?(?=\non_a_expr:)', '''
+            | NAMES mysql_set_charset mysql_set_collation
+                {
+                    ResTarget *result = makeNode(ResTarget);
+                    List *args = list_make1(makeStringConst($2, @2));
+                    if ($3)
+                        args = lappend(args, makeStringConst($3, @3));
+                    result->val = (Node *) makeFuncCall(
+                        list_make2(makeString("mysql"), makeString("set_system_names_variable")),
+                        args, COERCE_EXPLICIT_CALL, @1);
+                    result->location = @1;
+                    $$ = (Node *) result;
+                }
+            | character_set mysql_set_charset
+                {
+                    ResTarget *result = makeNode(ResTarget);
+                    result->val = (Node *) makeFuncCall(
+                        list_make2(makeString("mysql"), makeString("set_system_charset_variable")),
+                        list_make1(makeStringConst($2, @2)), COERCE_EXPLICIT_CALL, @1);
+                    result->location = @1;
+                    $$ = (Node *) result;
+                }
+        ;
+
+mysql_set_charset:
+            charset_name        { $$ = $1; }
+            | DEFAULT           { $$ = pstrdup("halo_mysql_system_var_default"); }
+        ;
+
+mysql_set_collation:
+            COLLATE charset_name { $$ = $2; }
+            | /* EMPTY */        { $$ = NULL; }
+        ;
+''', expect=1, flags=re.S)
+
 # Keep untouched upstream formatting. Normalize only generated replacement
 # lines to PostgreSQL's four-column tab style, including inherited indentation
 # on rewritten expressions. This is deterministic from the PG14 input alone.

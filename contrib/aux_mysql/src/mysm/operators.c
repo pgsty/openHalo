@@ -161,7 +161,7 @@ mys_timestampCmpText(Timestamp arg1, text *arg2)
 {
     char *argString1 = (char *)DirectFunctionCall1(timestamp_out, TimestampGetDatum(arg1));
     int argStringLen1 = strlen(argString1);
-    char* argString2 = TextDatumGetCString(arg2);
+	char* argString2 = text_to_cstring(arg2);
     int argStringLen2 = 0;
     int timeFlags = MYS_TIME_FUZZY_DATE | MYS_TIME_INVALID_DATES;
     struct pg_tm tt;
@@ -202,7 +202,7 @@ mys_timestampCmpText(Timestamp arg1, text *arg2)
 static int
 mys_textCmpTimestamp(text *arg1, Timestamp arg2)
 {
-    char *argString1 = TextDatumGetCString(arg1);
+	char *argString1 = text_to_cstring(arg1);
     int argStringLen1 = 0;
     char *argString2 = (char *)DirectFunctionCall1(timestamp_out, TimestampGetDatum(arg2));
     int argStringLen2 = strlen(argString2);
@@ -367,7 +367,7 @@ Datum
 mys_textPlInterval(PG_FUNCTION_ARGS)
 {
     Timestamp leftArg;
-    char *leftArgString = TextDatumGetCString(PG_GETARG_TEXT_P(0));
+	char *leftArgString = text_to_cstring(PG_GETARG_TEXT_P(0));
     int timeFlags = MYS_TIME_NO_ZERO_DATE;
     Timestamp result;
 
@@ -396,7 +396,7 @@ Datum
 mys_intervalPlText(PG_FUNCTION_ARGS)
 {
     Timestamp rightArg;
-    char *rightArgString = TextDatumGetCString(PG_GETARG_TEXT_P(1));
+	char *rightArgString = text_to_cstring(PG_GETARG_TEXT_P(1));
     int timeFlags = MYS_TIME_NO_ZERO_DATE;
     Timestamp result;
 
@@ -425,7 +425,7 @@ Datum
 mys_textMiInterval(PG_FUNCTION_ARGS)
 {
     Timestamp leftArg;
-    char *leftArgString = TextDatumGetCString(PG_GETARG_TEXT_P(0));
+	char *leftArgString = text_to_cstring(PG_GETARG_TEXT_P(0));
     int timeFlags = MYS_TIME_NO_ZERO_DATE;
     Timestamp result;
 

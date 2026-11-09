@@ -1903,25 +1903,25 @@ mys_type_info(Oid typid, int32 typmod, uint8 *mtype, uint32 *len,
 			*mtype = MYSQL_TYPE_JSON;
 			*len = 0xffffffff;
 			*flags = BLOB_FLAG;
-			*charset = MYS_CHARSET_UTF8MB4;
+			*charset = MYS_CHARSET_UTF8MB4_GENERAL;
 			break;
 		case TEXTOID:
 			*mtype = MYSQL_TYPE_BLOB;
 			*len = 0xffffffff;
 			*flags = BLOB_FLAG;
-			*charset = MYS_CHARSET_UTF8MB4;
+			*charset = MYS_CHARSET_UTF8MB4_GENERAL;
 			break;
 		case BPCHAROID:
 			*mtype = MYSQL_TYPE_STRING;
 			*len = typmod >= (int32) VARHDRSZ ? (typmod - VARHDRSZ) * 4 : 4;
-			*charset = MYS_CHARSET_UTF8MB4;
+			*charset = MYS_CHARSET_UTF8MB4_GENERAL;
 			break;
 		case UNKNOWNOID:
 		case VARCHAROID:
 		default:
 			*mtype = MYSQL_TYPE_VAR_STRING;
 			*len = typmod >= (int32) VARHDRSZ ? (typmod - VARHDRSZ) * 4 : 1024;
-			*charset = MYS_CHARSET_UTF8MB4;
+			*charset = MYS_CHARSET_UTF8MB4_GENERAL;
 			break;
 	}
 }

@@ -84,7 +84,7 @@ endif
 # TLS and RSA key exchange for caching_sha2_password
 SHLIB_LINK += $(filter -lssl -lcrypto, $(LIBS))
 
-sql/aux_mysql--1.9.sql: sql/aux_mysql.sql sql/aux_mysql_additions.sql sql/aux_mysql_binary.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql
+sql/aux_mysql--1.9.sql: sql/aux_mysql.sql sql/aux_mysql_additions.sql sql/aux_mysql_binary.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql sql/aux_mysql_fix_compat.sql
 	@$(MKDIR_P) sql
 	cat $^ > $@
 
@@ -92,7 +92,7 @@ sql/aux_mysql--1.7--1.8.sql: sql/aux_mysql_update18.sql sql/aux_mysql_binary.sql
 	@$(MKDIR_P) sql
 	cat $^ > $@
 
-sql/aux_mysql--1.8--1.9.sql: sql/aux_mysql_update19.sql sql/aux_mysql_fix_generated.sql sql/aux_mysql_fix_fk.sql sql/aux_mysql_fix_show.sql sql/aux_mysql_fix_metadata.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql
+sql/aux_mysql--1.8--1.9.sql: sql/aux_mysql_update19.sql sql/aux_mysql_fix_generated.sql sql/aux_mysql_fix_fk.sql sql/aux_mysql_fix_show.sql sql/aux_mysql_fix_metadata.sql sql/aux_mysql_fix_binary.sql sql/aux_mysql_fix_indexes.sql sql/aux_mysql_fix_compat.sql
 	@$(MKDIR_P) sql
 	cat $^ > $@
 

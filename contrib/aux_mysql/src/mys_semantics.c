@@ -732,19 +732,13 @@ mys_lenient_int(PG_FUNCTION_ARGS)
 	}
 	if (DatumGetBool(DirectFunctionCall2(numeric_gt, r, hid)))
 	{
-		/* A legal uint64 must never collapse onto an existing int8 key.
-		 * This is a representation error, including under INSERT IGNORE.
-		 * Values outside MySQL's own range retain lenient clipping. */
+		/* MySQL clips positive uint64 overflow to UINT64_MAX, which also
+		 * cannot fit in int8. Never collapse either case onto an existing
+		 * INT64_MAX key, including under INSERT IGNORE. */
 		if (lo == 0 && hi == PG_INT64_MAX)
-		{
-			Datum mysql_max = DirectFunctionCall3(numeric_in,
-				CStringGetDatum("18446744073709551615"),
-				ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
-			if (DatumGetBool(DirectFunctionCall2(numeric_le, r, mysql_max)))
-				ereport(ERROR, (errcode(MAKE_SQLSTATE('M','1','2','6','4')),
-					errmsg("BIGINT UNSIGNED value cannot be represented without data loss"),
-					errdetail("Values above 9223372036854775807 require uint64 storage.")));
-		}
+			ereport(ERROR, (errcode(MAKE_SQLSTATE('M','1','2','6','4')),
+				errmsg("BIGINT UNSIGNED value cannot be represented without data loss"),
+				errdetail("Values above 9223372036854775807 require uint64 storage.")));
 		mys_add_warning(1264, "Out of range value for column");
 		PG_RETURN_INT64(hi);
 	}

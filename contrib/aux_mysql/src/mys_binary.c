@@ -65,6 +65,8 @@ bool (*mys_binary_ignore_hook)(void) = NULL;
  */
 bool		mys_hexlit_available = false;
 
+static bytea *binary_arg(FunctionCallInfo fcinfo, int i);
+
 static bool
 is_mysql_type(Oid typid, const char *name)
 {
@@ -1174,17 +1176,7 @@ PG_FUNCTION_INFO_V1(mys_concat_one);
 Datum
 mys_concat_one(PG_FUNCTION_ARGS)
 {
-	Oid typid = get_fn_expr_argtype(fcinfo->flinfo, 0);
-	Oid base = mys_binary_base_type(typid);
-	Oid out;
-	bool varlena;
-
-	if (base == BYTEAOID || base == TEXTOID || base == VARCHAROID)
-		PG_RETURN_DATUM(PG_GETARG_DATUM(0));
-	if (base == BPCHAROID)
-		PG_RETURN_BYTEA_P(mys_bpchar_bytes(PG_GETARG_DATUM(0)));
-	getTypeOutputInfo(typid, &out, &varlena);
-	PG_RETURN_TEXT_P(cstring_to_text(OidOutputFunctionCall(out, PG_GETARG_DATUM(0))));
+	PG_RETURN_BYTEA_P(binary_arg(fcinfo, 0));
 }
 
 /* Bounds and negative counts follow MySQL, using byte positions for binary. */
@@ -1846,19 +1838,29 @@ mys_group_concat_binary(PG_FUNCTION_ARGS)
 	ArrayType *array = PG_GETARG_ARRAYTYPE_P(0);
 	text *sep = PG_GETARG_TEXT_PP(1);
 	ArrayIterator iterator = array_create_iterator(array, 0, NULL);
+	Oid base = mys_binary_base_type(ARR_ELEMTYPE(array));
+	Oid output = InvalidOid;
+	bool varlena;
 	StringInfoData out;
 	Datum value;
 	bool isnull;
 	bool first = true;
 
+	if (base != BYTEAOID && base != TEXTOID && base != VARCHAROID &&
+		base != BPCHAROID && base != BOOLOID)
+		getTypeOutputInfo(ARR_ELEMTYPE(array), &output, &varlena);
 	initStringInfo(&out);
 	while (array_iterate(iterator, &value, &isnull))
 	{
 		bytea *b;
 
 		if (isnull) continue;
-		b = getBaseType(ARR_ELEMTYPE(array)) == BPCHAROID ?
-			mys_bpchar_bytes(value) : DatumGetByteaPP(value);
+		if (base == BOOLOID)
+			b = (bytea *) cstring_to_text(DatumGetBool(value) ? "1" : "0");
+		else if (OidIsValid(output))
+			b = (bytea *) cstring_to_text(OidOutputFunctionCall(output, value));
+		else
+			b = base == BPCHAROID ? mys_bpchar_bytes(value) : DatumGetByteaPP(value);
 		if (!first)
 			appendBinaryStringInfo(&out, VARDATA_ANY(sep), VARSIZE_ANY_EXHDR(sep));
 		appendBinaryStringInfo(&out, VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));

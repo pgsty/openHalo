@@ -1,5 +1,8 @@
 # aux_mysql 1.9 Route A release recheck
 
+Latest follow-up: [final review corrections](#final-review-corrections--2026-11-09).
+The initial run below is historical and was superseded by the independent NO-GO review.
+
 Base: clean main `6821954a3f8387287e655d7e91036a3ea0d80c28`.
 Branch: `fix/aux-mysql-1.9-route-a`. Nothing pushed.
 Builds, clusters and raw logs: ohdev `/tmp/aux-route-a/`.
@@ -140,10 +143,11 @@ REPLACE, ODKU and unsigned binary prepared parameters are covered in three modes
 every representation error leaves existing rows unchanged. Generator byte check
 passed and bison's expected conflict count did not increase.
 
-Out-of-MySQL-range literals retain the requested existing lenient clipping with
-1264: negatives become 0; values above UINT64_MAX become the representable
-INT64_MAX, whereas MySQL stores UINT64_MAX. This remaining boundary difference
-requires full uint64 storage to eliminate. Legal high-half values never clip.
+The above original run accepted INT64_MAX clipping for inputs above UINT64_MAX.
+The independent final review rejected that expectation: it caused ODKU to update
+an unrelated row and REPLACE to delete it. The release correction rejects every
+positive BIGINT UNSIGNED write above INT64_MAX with 1264, including IGNORE.
+Non-strict negative inputs still become 0 with warning 1264.
 
 ## WP7 — NUL-safe character prefix clipping (`9ef2a83`)
 
@@ -240,7 +244,7 @@ groups on both servers. The real-upgrade runner now includes the ACL suite.
 This PG security boundary intentionally differs from MySQL 5.7's REFERENCES
 permission policy. Release repetition and final full validation follow below.
 
-## Final acceptance — 2026-11-09
+## Historical acceptance run — 2026-11-09 (superseded by final review)
 
 All ten implementation packages are committed separately. Debug and release
 kernel/extension builds are installed outside the repository. Both use OpenSSL
@@ -347,8 +351,9 @@ same external root. No binaries, build trees or raw logs are committed.
 2. **TEXT subtype names:** TINYTEXT/TEXT/MEDIUMTEXT/LONGTEXT all show `text` in
    SHOW CREATE TABLE and information_schema DATA_TYPE/COLUMN_TYPE.
 3. **uint64 representation:** legitimate high-half writes fail 1264 instead of
-   corrupting keys. Truly above-UINT64_MAX lenient inputs still clip to the
-   representable INT64_MAX with 1264, whereas MySQL clips to UINT64_MAX. Full
+   corrupting keys. Above-UINT64_MAX inputs now also fail 1264: MySQL clips to
+   UINT64_MAX, which is still unrepresentable. The earlier clipping expectation
+   was a release blocker, not an accepted approximation. Full
    unsigned expressions, negative-to-UNSIGNED and unsigned overflow arithmetic
    remain outside scope. This is not full uint64 storage compatibility.
 4. **Numeric diagnostics:** malformed binary DECIMAL follows the requested 1292
@@ -381,7 +386,8 @@ same external root. No binaries, build trees or raw logs are committed.
    were left unchanged. PG special date words remain accepted intentionally.
 7. **Existing function gaps:** JSON, SHA1, CRC32, TO_BASE64, QUOTE, SOUNDEX, ORD,
    CHAR() and SHOW DATABASES LIKE were not implemented. Mixed CHAR/VARCHAR
-   IFNULL/IF remains ambiguous. Native MySQL routine/trigger body parsing is not
+   IFNULL/IF was corrected in the release follow-up; broader integer/string and
+   binary/character combinations remain deferred. Native MySQL routine/trigger body parsing is not
    added; the real 1.5 fixture uses its accepted routine syntax over MySQL wire.
 8. **Other observed limits:** explicit `CHARACTER SET ascii` still has the
    baseline 1064 keyword-parser gap. MySQL's sql_mode deprecation warnings
@@ -394,3 +400,83 @@ same external root. No binaries, build trees or raw logs are committed.
 All requested build/test workflows have been executed. Not validated: real
 customer data/workloads, other hardware/third-party kernel ABIs, excluded missing
 features, and the deferred long-prefix performance/DDL-serialization questions.
+
+## Final review corrections — 2026-11-09
+
+The independent review of `f0dc47625bb541d44f258766bb9c2aec0c516341` was
+NO-GO. This follow-up is an **uncommitted patch on that commit**, not a release
+or a claim that the original commit passed. Evidence and builds are isolated
+under host/ohdev `/tmp/openhalo-aux19-fixes-20261109/`; the prior evidence and
+3792/3793, 3804/3805 instances were retained.
+
+Implemented the user's release disposition:
+
+- F1: every positive BIGINT UNSIGNED write above INT64_MAX fails 1264, including
+  above-UINT64_MAX and IGNORE. Negative non-strict clipping to zero remains.
+  Regressions seed the old INT64_MAX key, check row IDs/HEX, and verify statement
+  rollback, audit triggers and subsequent writes inside an explicit transaction.
+- F2: FIND_IN_SET requires collation equality and equal trailing-space counts
+  for each item, in both text and bigint overloads. FIELD/STRCMP/LIKE/IN/DISTINCT
+  and ordinary column/index equality are unchanged. Tests cover both trailing
+  directions, repeated items, empty/NULL, accents and multibyte input.
+- F3/F6: boolean CONCAT/GROUP_CONCAT use 1/0; boolean IF and CHAR/VARCHAR IFNULL/IF
+  are supported, including unknown literals, NULL and CHAR PAD mode. TEXT pairs
+  avoid introducing ambiguity for `IFNULL(varchar_column, '')`. Reviewed exact
+  SQL bodies were added to the generated-column policy; its recursive checks
+  still reject volatile inputs. The generic GROUP_CONCAT array identity is
+  retained to avoid making integer arrays ambiguous with a bool[] overload.
+- F10: grammar generator supports quoted/unquoted SET NAMES with COLLATE,
+  SET NAMES DEFAULT, SET CHARACTER SET and SET CHARSET. Session charset variables
+  are updated and non-UTF8/locale approximations warn 1105. Connection literal
+  collation propagation remains deferred; this does not implement transcoding.
+- F9: text and prepared character field metadata uses 45; binary fields stay 63.
+- Build: added missing declarations/includes and replaced invalid pointer/Datum
+  conversions with typed `text_to_cstring` calls. Actual EL10 GCC 14.3.1 build
+  and install passed; implicit-declaration/int-conversion warnings are gone.
+  Existing unused/shadow/missing-variable-declaration warnings remain recorded.
+
+`sql/aux_mysql_fix_compat.sql` is appended to both fresh 1.9 installation and
+1.8→1.9 upgrade, so the released 1.5 and historical chains get identical objects.
+
+| Final verification | Debug | Release |
+|---|---|---|
+| PostgreSQL core regression | 231/231 | 231/231 |
+| tests/run.sh | 26/26, zero SKIP | 26/26, zero SKIP |
+| TESTING.md integration / Route A / upgrade / recovery invocations | 25/25 | 25/25 |
+| release_fixes.py | 294 checks | 294 checks |
+| Route A text / uint64 | 375 / 167 | 375 / 167 |
+| Actual released v18.6 binaries + 1.5 SQL → 1.9 | passed | passed |
+| Fresh versus released upgrade catalog | no raw differences | no raw differences |
+
+Both released upgrade catalogs have 3464 members and 1853 functions; the
+comparison retained complete definitions, not just counts. The historical
+1.6→1.7→1.8→1.9 chain retains only its previously explained EXTRA collation
+difference. Stock PG18 standalone binary and prefix suites passed. All five
+generator outputs remain byte-identical to regeneration; bison retains 47
+expected conflicts. Final builds used `--with-openssl --enable-depend`, with
+`--enable-debug --enable-cassert` additionally for debug. Main ports were
+3904/5904 and 3905/5905; real upgrade ports 3907/5907 and 3908/5908.
+
+Connector/J **5.1.49** passed UTF8 text and byte-preserving ordinary/prepared
+reads with `connectionCollation=utf8mb4_general_ci`, using TLS and
+`mysql_clear_password` on the private 3906/5906 fixture. An exploratory 5.1.40
+run failed TLS negotiation on the installed JDK before field decoding; it is
+not evidence of a charset-255 failure or of 5.1.40 support. No claim is made for
+all old drivers or Clang builds.
+
+Failures during development were retained: initial missing postgres fixture
+password; new mixed-overload ambiguity and generated-body-policy rejection;
+integer GROUP_CONCAT ambiguity from a bool[] overload; root invocation of stock
+PG initdb; missing EL10 Perl FindBin dependency. The fixture/dependency errors
+were corrected and the product regressions fixed before the final passes.
+A probe also confirmed the pre-existing multi-argument GROUP_CONCAT syntax gap;
+that separate extension is recorded in README, with explicit per-row CONCAT
+as a supported alternative.
+
+Per user disposition, F7's other single-target DELETE spellings and true
+multi-target DML, literal/variable collation propagation, and broader mixed
+conditional types are deferred. F4's PAD search differences, F5's extreme
+numeric rejection and F8's empty-needle multibyte offset are accepted 1.9
+limits, not exact compatibility. No expected files were changed, and there was
+no commit, push, tag or publication. The original f0dc476 NO-GO report remains
+valid for that original binary.

@@ -602,6 +602,7 @@ static void makeOnClause(Node **expr, JoinExpr *joinExpr);
 /*				Bit ConstBit BitWithLength BitWithoutLength*/
 				Bit Blob
 %type <str>		character ncharacter charset_name opt_field_option
+%type <str>		mysql_set_charset mysql_set_collation
 %type <list>    opt_charset_with_opt_binary
 %type <str>		extract_arg
 %type <boolean> opt_varying opt_timezone opt_no_inherit
@@ -2095,32 +2096,38 @@ mysql_system_variable:
 					result->location = @1;
                     $$ = (Node *) result;
                 }
-			| NAMES IDENT
+
+			| NAMES mysql_set_charset mysql_set_collation
                 {
                     ResTarget *result = makeNode(ResTarget);
-                    List *funcName = list_make2(makeString(pstrdup("mysql")),
-                                                makeString(pstrdup("set_system_names_variable")));
-                    List *argList = list_make1(makeStringConst($2, @2));
-                    Node *funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-                    result->name = NULL;
-					result->indirection = NIL;
-					result->val = funcCall;
+					List *args = list_make1(makeStringConst($2, @2));
+					if ($3)
+						args = lappend(args, makeStringConst($3, @3));
+					result->val = (Node *) makeFuncCall(
+						list_make2(makeString("mysql"), makeString("set_system_names_variable")),
+						args, COERCE_EXPLICIT_CALL, @1);
 					result->location = @1;
                     $$ = (Node *) result;
                 }
-			| NAMES SCONST opt_collate_clause
+			| character_set mysql_set_charset
                 {
                     ResTarget *result = makeNode(ResTarget);
-                    List *funcName = list_make2(makeString(pstrdup("mysql")),
-                                                makeString(pstrdup("set_system_names_variable")));
-                    List *argList = list_make1(makeStringConst($2, @2));
-                    Node *funcCall = (Node *) makeFuncCall(funcName, argList, COERCE_EXPLICIT_CALL, @1);
-                    result->name = NULL;
-					result->indirection = NIL;
-					result->val = funcCall;
+					result->val = (Node *) makeFuncCall(
+						list_make2(makeString("mysql"), makeString("set_system_charset_variable")),
+						list_make1(makeStringConst($2, @2)), COERCE_EXPLICIT_CALL, @1);
 					result->location = @1;
                     $$ = (Node *) result;
                 }
+		;
+
+mysql_set_charset:
+			charset_name        { $$ = $1; }
+			| DEFAULT           { $$ = pstrdup("halo_mysql_system_var_default"); }
+		;
+
+mysql_set_collation:
+			COLLATE charset_name { $$ = $2; }
+			| /* EMPTY */        { $$ = NULL; }
         ;
 
 on_a_expr:

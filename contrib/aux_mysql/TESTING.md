@@ -32,6 +32,7 @@ The following suites create unique application schemas and remove them on exit:
 
 ```sh
 python3 tests/release_dml.py
+python3 tests/release_fixes.py --port "$MYSQL_PORT" --reference-port 3771
 python3 tests/binary_fix/mysql_check.py --port "$MYSQL_PORT"
 python3 tests/review_fix_sql_generated.py --ports "$MYSQL_PORT" --password "$MYSQL_PASSWORD"
 python3 tests/review_fix_generated_export.py --ports "$MYSQL_PORT" --password "$MYSQL_PASSWORD"
@@ -192,3 +193,13 @@ The numeric CAST check also uses
 The standalone expression harness omits executor-only conflict node assignments
 when compiled against stock PG18 headers; production parser byte identity is
 checked independently and DML is verified by the full wire suites.
+
+`release_fixes.py` covers the final release review corrections: FIND_IN_SET
+trailing spaces in both directions without changing FIELD/STRCMP/LIKE/IN;
+boolean string/aggregate values and HEX; CHAR/VARCHAR IFNULL/IF, NULL and
+unknown literals in both PAD modes; connection initialization spellings and
+session variables; text/prepared result charset metadata and raw binary rows;
+and uint64 statement/trigger rollback inside an explicit transaction.
+`route_a.py --wp uint64` also seeds an existing INT64_MAX key before above-uint64
+INSERT, IGNORE, INSERT SELECT, UPDATE, ODKU and REPLACE. Never restore the old
+INT64_MAX clipping expectation: it hid wrong-row updates and deletions.
