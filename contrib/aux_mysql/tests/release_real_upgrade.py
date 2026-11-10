@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Restart a real v18.6/1.5 cluster with new binaries, then upgrade to 1.9.
 
 Run inside ohdev as root (kernel_instance.sh runs PostgreSQL as OS user pg).

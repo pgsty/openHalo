@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Standalone-only bytea-layout fixtures for the binary worker interface.
 -- Not extension SQL; never run against a shared or integrated database.
 DO $fixture$

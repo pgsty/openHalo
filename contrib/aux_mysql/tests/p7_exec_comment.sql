@@ -1,4 +1,4 @@
--- MySQL executable comments: the text runs when no version is given or the
+-- MySQL executable comments: the text runs when no version is given or the | Copyright (c) 2026 PGSTY PTE. LTD.
 -- version is not newer than the reported server version (5.7.32).
 select 1 /*! + 1 */ as a, 1 /*!50000 + 1 */ as b, 1 /*!50732 + 1 */ as c,
        1 /*!50733 + 1 */ as d, 1 /*!80016 + 1 */ as e, 1 /*!+1*/ as f;

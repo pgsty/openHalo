@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Hand-written 1.8 -> 1.9 fragment. Append after the 1.8 binary objects.
 -- Do not drop the old binary/varbinary domains: existing dependencies survive.
 -- Extension scripts must use PostgreSQL concatenation, not MySQL's || (OR).

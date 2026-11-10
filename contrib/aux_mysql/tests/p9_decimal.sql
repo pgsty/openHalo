@@ -1,4 +1,4 @@
--- DECIMAL (issue #5): precision and scale reach SHOW COLUMNS and
+-- DECIMAL (issue #5): precision and scale reach SHOW COLUMNS and | Copyright (c) 2026 PGSTY PTE. LTD.
 -- information_schema (and so SHOW CREATE TABLE and dumps); a bare DECIMAL
 -- is DECIMAL(10,0) as in MySQL.
 drop table if exists dec_t;

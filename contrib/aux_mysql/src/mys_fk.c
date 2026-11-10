@@ -6,6 +6,11 @@
  * trigger guards new keys while the parent is absent. Once the parent exists,
  * ordinary PG18 NOT VALID foreign keys take over; old unchecked rows stay
  * unchecked, exactly as when MySQL FOREIGN_KEY_CHECKS is turned back on.
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

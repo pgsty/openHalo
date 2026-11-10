@@ -1,4 +1,7 @@
 #!/usr/bin/perl
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 # Check that the keyword lists $gram_filename and $kwlist_filename are sane.
 # Usage: check_myskeywords.pl mys_gram.y mys_kwlist.h

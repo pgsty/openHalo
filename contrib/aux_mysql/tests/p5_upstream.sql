@@ -1,4 +1,4 @@
--- openHalo upstream (2c26131..90fc8d7) behaviour carried into aux_mysql.
+-- openHalo upstream (2c26131..90fc8d7) behaviour carried into aux_mysql. | Copyright (c) 2026 PGSTY PTE. LTD.
 -- Expected output: expected/p5_upstream.out (tests/run.sh compares it).
 drop user if exists u5;
 

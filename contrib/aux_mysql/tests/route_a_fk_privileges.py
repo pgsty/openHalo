@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Pending FK authority belongs to the child owner, including pg_restore.
 
 Requires isolated MYSQL_PORT/PGPORT and PG superuser credentials; creates and

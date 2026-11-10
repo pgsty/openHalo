@@ -1,4 +1,4 @@
--- Multi-table UPDATE (issue #1): the JOIN form must not crash the backend,
+-- Multi-table UPDATE (issue #1): the JOIN form must not crash the backend, | Copyright (c) 2026 PGSTY PTE. LTD.
 -- and the comma form must match whole table names / aliases.
 drop table if exists uj_t, uj_u, uj_o, uj_oi;
 create table uj_t (id int primary key, v int, w int);

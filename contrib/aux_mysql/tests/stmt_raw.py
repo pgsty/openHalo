@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """
 Raw COM_STMT_* protocol checks that drivers rarely exercise.  PyMySQL only
 does the authentication; packets are built by hand.

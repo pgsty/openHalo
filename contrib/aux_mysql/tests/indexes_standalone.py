@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Build and test the prefix AM in a disposable PG18 cluster.
 
 PG_CONFIG selects PostgreSQL; BUILD_DIR retains all artifacts under that

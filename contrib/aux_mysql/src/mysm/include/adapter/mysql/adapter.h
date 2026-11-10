@@ -6,6 +6,11 @@
  * openHalo kept these MySQL session globals in its modified backend; in
  * aux_mysql they live in the extension (mys_compat.c).
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef ADAPTER_H

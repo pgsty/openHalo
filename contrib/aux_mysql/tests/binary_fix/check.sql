@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 SET search_path=mysql,pg_catalog;
 CREATE SCHEMA review_fix_binary;
 CREATE FUNCTION review_fix_binary.assert(ok bool, msg text) RETURNS void LANGUAGE plpgsql AS $$

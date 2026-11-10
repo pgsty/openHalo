@@ -1,3 +1,11 @@
+/*-------------------------------------------------------------------------
+ * indexes_standalone.c
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *-------------------------------------------------------------------------
+ */
 /* Test-only bridge: feed the same PRIMARY/UNIQUE Constraint nodes produced
  * by the MySQL rewriter into PostgreSQL's normal utility transformation.
  * This is not built into aux_mysql. */

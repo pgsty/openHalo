@@ -22,6 +22,11 @@
  * cycle of waits is normally the one that gets the deadlock error
  * (ER_USER_LOCK_DEADLOCK); it keeps the locks it holds.
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

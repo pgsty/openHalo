@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Exercise native and MySQL logical backups of the integrated SQL features.
 
 Uses a unique schema and an external temporary directory. PG* / MYSQL_* select

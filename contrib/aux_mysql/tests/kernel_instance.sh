@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 # Create and start an aux_mysql test instance on any PG18-based kernel
 # (inside the ohdev container).  The kernel must carry the protocol-hook
 # patch, and aux_mysql must be installed into its prefix.

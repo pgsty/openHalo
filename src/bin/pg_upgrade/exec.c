@@ -4,6 +4,8 @@
  *	execution functions
  *
  *	Copyright (c) 2010-2025, PostgreSQL Global Development Group
+ *	Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ *	Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *	src/bin/pg_upgrade/exec.c
  */
 

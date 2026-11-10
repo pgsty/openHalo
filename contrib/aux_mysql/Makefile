@@ -1,3 +1,5 @@
+# Portions Copyright (c) 2026, PGSTY PTE. LTD.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 # contrib/aux_mysql/Makefile
 #
 # aux_mysql: MySQL wire protocol & dialect for PostgreSQL 18 (needs the

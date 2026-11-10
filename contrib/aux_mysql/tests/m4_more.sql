@@ -1,4 +1,4 @@
-SET NAMES utf8mb4;
+/* Copyright (c) 2026 PGSTY PTE. LTD. */ SET NAMES utf8mb4;
 SET autocommit = 1;
 SELECT @@version, @@version_comment, @@autocommit, @@sql_mode;
 ALTER TABLE users MODIFY COLUMN age bigint NOT NULL DEFAULT 1;

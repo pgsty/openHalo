@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Final 1.9 review regressions: values, row identity and wire metadata.
 
 Run against an isolated 1.9 instance and MySQL 5.7, never a shared application

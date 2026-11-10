@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """DML/FK release regressions; disposable schemas, no global setting changes.
 
 MYSQL_PORT/PGPORT select OpenHalo. MYSQL_REFERENCE_PORT optionally repeats the

@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- PostgreSQL connection, table owner/superuser, one reviewed schema at a time:
 -- psql -X -v review_schema=app -f tools/review_fix_migration.sql
 -- Add -v check_fk=1 to execute orphan counts (read-only, may scan large tables).

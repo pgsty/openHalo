@@ -1,6 +1,11 @@
 /* Generated-column policy, private to mys_utility.c.  Check before planning:
  * several compatibility getters have historically been marked IMMUTABLE.
  * Volatility alone is neither a permission nor a reason to reject a builtin.
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  */
 #ifndef MYS_GENERATED_POLICY_H
 #define MYS_GENERATED_POLICY_H

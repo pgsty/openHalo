@@ -8,6 +8,11 @@
  * the same names.  The "mysql" prefix is not reserved, so other mysql.*
  * lines carried over from an openHalo postgresql.conf stay harmless.
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

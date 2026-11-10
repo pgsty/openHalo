@@ -1,3 +1,11 @@
+/*-------------------------------------------------------------------------
+ * mys_dml.c
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *-------------------------------------------------------------------------
+ */
 /* Final row accounting for MySQL INSERT ... ON DUPLICATE KEY / REPLACE. */
 #include "postgres.h"
 #include "executor/tuptable.h"

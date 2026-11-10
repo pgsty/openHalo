@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 # Ecosystem check: load the stock PG 18 builds of common extensions (PGDG / Pigsty
 # RPMs installed under /usr/pgsql-18, i.e. compiled against official PG 18
 # headers) into another kernel's install, unchanged, and smoke-test each one in

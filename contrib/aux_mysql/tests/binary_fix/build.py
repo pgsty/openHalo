@@ -1,3 +1,6 @@
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Build binary, lock and collation code into an isolated PG18 test module."""
 import os, pathlib, shlex, subprocess, sys
 src = pathlib.Path(__file__).resolve().parents[2]

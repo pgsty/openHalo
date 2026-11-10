@@ -3,6 +3,11 @@
  * mysm_compat.h
  *	  PG14 -> PG18 API compatibility for code ported from openHalo.
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef MYSM_COMPAT_H

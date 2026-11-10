@@ -8,6 +8,11 @@
  * utility statements at execution time, when the catalog can be consulted
  * (e.g. to find the primary key name for DROP PRIMARY KEY).
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

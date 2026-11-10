@@ -13,6 +13,11 @@
  * dirty-snapshot XID/speculative-token waits then protect uncommitted rows.
  * Bulk inserts therefore do not accumulate one lock per row. Unrelated keys
  * proceed concurrently. Hash collisions only over-serialize, never compare.
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

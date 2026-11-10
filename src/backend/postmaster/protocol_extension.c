@@ -9,6 +9,8 @@
  * stable across processes.
  *
  * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
  * IDENTIFICATION
  *	  src/backend/postmaster/protocol_extension.c

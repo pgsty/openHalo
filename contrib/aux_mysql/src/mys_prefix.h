@@ -1,3 +1,11 @@
+/*-------------------------------------------------------------------------
+ * mys_prefix.h
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *-------------------------------------------------------------------------
+ */
 /* Exact MySQL prefix indexes; no changes to PostgreSQL's btree opclasses. */
 #ifndef MYS_PREFIX_H
 #define MYS_PREFIX_H

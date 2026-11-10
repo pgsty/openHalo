@@ -1,4 +1,4 @@
--- FOREIGN KEY (issue #2): MySQL foreign keys are enforced and their actions
+-- FOREIGN KEY (issue #2): MySQL foreign keys are enforced and their actions | Copyright (c) 2026 PGSTY PTE. LTD.
 -- run; FOREIGN_KEY_CHECKS=0 turns both off for the session, as in InnoDB.
 drop table if exists fk_item, fk_order, fk_cust, fk_tree;
 create table fk_cust (id int primary key, name varchar(20));

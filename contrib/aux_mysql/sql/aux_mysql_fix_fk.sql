@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Handwritten 1.9 pending-FK objects. Include before aux_mysql_fix_metadata.sql
 -- and before the newly generated aux_mysql_fix_show.sql.
 CREATE OR REPLACE FUNCTION mysql.pending_fk_guard()

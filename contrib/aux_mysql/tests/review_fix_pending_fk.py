@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Isolated pending-FK regression; run after installing the integrated 1.9 build.
 MYSQL_PWD=... python3 tests/review_fix_pending_fk.py --ports 3790 3791 3771
 Only session FOREIGN_KEY_CHECKS changes; every review_fix_* database is cleaned.

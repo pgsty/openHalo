@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Compare a real 1.6 -> 1.7 -> 1.8 -> 1.9 update with a fresh 1.9 database.
 
 PG* must target a disposable cluster with the historical 1.6 installation

@@ -6,6 +6,9 @@
  * mys_gram.y
  *	  MySQL Compatible BISON rules/actions
  *
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
  * Portions Copyright (c) 2021, Jet C.X. ZHANG
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California

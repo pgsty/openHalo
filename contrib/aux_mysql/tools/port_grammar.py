@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """
 Port openHalo's PG14-based MySQL grammar (mys_gram.y) to PostgreSQL 18 parse
 node structures.
@@ -36,8 +38,13 @@ def resub(pattern, repl, expect=None, flags=0):
 
 
 # ---------------------------------------------------------------------------
-# 0. includes
+# 0. copyright & includes
 # ---------------------------------------------------------------------------
+rep(' * Portions Copyright (c) 2021, Jet C.X. ZHANG',
+    ' * Portions Copyright (c) 2026, PGSTY PTE. LTD.\n'
+    ' * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)\n'
+    ' * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.\n'
+    ' * Portions Copyright (c) 2021, Jet C.X. ZHANG')
 rep('#include "parser/mysql/mys_gramparse.h"', '#include "mys_gramparse.h"')
 rep('#include "parser/mysql/mys_parser.h"', '#include "mys_parser.h"')
 rep('#include "parser/parser_helper.h"', '#include "parser_helper.h"')

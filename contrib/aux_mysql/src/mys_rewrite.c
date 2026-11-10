@@ -17,6 +17,11 @@
  *	- INSERT into AUTO_INCREMENT tables: hidden RETURNING to feed
  *	  LAST_INSERT_ID() and the OK packet (same trick as openHalo)
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

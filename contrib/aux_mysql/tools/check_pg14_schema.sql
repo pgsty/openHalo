@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Read-only on OpenHalo14. Inventory all databases separately using psql.
 -- TIME entries need a value-range review; this script does not scan user data.
 WITH RECURSIVE type_chain AS (

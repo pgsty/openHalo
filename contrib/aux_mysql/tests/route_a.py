@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Route A release regressions; run inside ohdev against disposable instances.
 
 python3 tests/route_a.py --port 3804 --reference-port 3771 --wp text

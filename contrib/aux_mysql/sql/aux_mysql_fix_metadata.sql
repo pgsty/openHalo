@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Hand-written 1.9 objects; also appended by port_aux_sql.py for fresh installs.
 -- No CASCADE: an existing dependent view must be handled explicitly at upgrade.
 -- Missing-parent/deferred foreign keys can be UNIONed into each public view.

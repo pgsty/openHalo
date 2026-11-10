@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- ==== aux_mysql 1.8: MySQL binary strings (hand-written; C in src/mys_binary.c) ====
 -- Part of aux_mysql--1.8.sql, and alone the 1.7 -> 1.8 update (see Makefile).
 \echo Use "ALTER EXTENSION aux_mysql UPDATE TO '1.8'" to load this file. \quit

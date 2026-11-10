@@ -4,6 +4,11 @@
  *	  Functions that openHalo kept in its modified PostgreSQL core and that
  *	  the MySQL grammar depends on.
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

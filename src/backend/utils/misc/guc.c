@@ -15,6 +15,8 @@
  *
  *
  * Copyright (c) 2000-2025, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * IDENTIFICATION

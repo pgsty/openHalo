@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Minimum incremental coverage: actual regenerated MySQL grammar, typed
 -- return values, NUL/invalid-UTF8 bytes, lazy ELT, and real advisory locks.
 SET search_path=mysql,pg_catalog;

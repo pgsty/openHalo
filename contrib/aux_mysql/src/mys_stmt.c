@@ -33,6 +33,11 @@
  * SQL PREPARE / EXECUTE / DEALLOCATE PREPARE (at the end of this file) keep
  * their statements by name and use the same text, marker and literal rules.
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"

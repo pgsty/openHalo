@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Exercise the actual index owner's PAD SPACE collator and weight helper.
 -- This file runs only in the private cluster created by run.sh.
 SET search_path=mysql,pg_catalog;

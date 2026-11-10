@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Hand-written 1.9 objects. Integrate before the generated SHOW definitions.
 -- Installing these objects does NOT recover old discarded generation expressions
 -- or rewrite existing generators. See tools/review_fix_migration.sql.

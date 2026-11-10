@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Generated policy and execution-time assignment checks; unique disposable schemas.
 MYSQL_PWD=... python3 review_fix_generated_policy.py --ports 3792 3793 --password ...
 Native legacy fixtures use port+2000 (override with --pg-ports). Port 3771 is the

@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- Run ONLY in run.sh's private test cluster, never in the integrated/shared
 -- database. A transactional rename simulates the 1.9 type appearing on an
 -- existing connection, exercising real pg_type invalidations in that backend.

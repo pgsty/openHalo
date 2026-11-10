@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Exact prefix index regression; stdlib + libpq, no Python packages needed.
 
 Run via indexes_standalone.py, or set PREFIX_TEST_DSN and LIBPQ against a

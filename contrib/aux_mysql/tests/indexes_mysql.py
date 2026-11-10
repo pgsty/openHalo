@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Wire regression for an integrated 1.9 server or MySQL 5.7 reference.
 
 Needs pymysql. MYSQL_HOST/PORT/USER/PASSWORD select the server. Uses only a

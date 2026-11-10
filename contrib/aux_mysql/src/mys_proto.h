@@ -5,6 +5,11 @@
  *	  mysql_proto.c (connection, text protocol) and mys_stmt.c (prepared
  *	  statements, binary protocol).
  *
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef MYS_PROTO_H

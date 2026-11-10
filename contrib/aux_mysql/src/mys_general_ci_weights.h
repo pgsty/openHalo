@@ -1,3 +1,11 @@
+/*-------------------------------------------------------------------------
+ * mys_general_ci_weights.h
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *-------------------------------------------------------------------------
+ */
 /* MySQL 5.7.32 utf8mb4_general_ci simple weights.
  * Non-identity BMP mappings, verified against WEIGHT_STRING on 5.7.32.
  * Supplementary characters have the replacement-character weight 0xfffd.

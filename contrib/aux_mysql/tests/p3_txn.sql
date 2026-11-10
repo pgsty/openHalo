@@ -1,4 +1,4 @@
--- MySQL transaction rules: autocommit = 0, implicit commits, multi-statement autocommit
+-- MySQL transaction rules: autocommit = 0, implicit commits, multi-statement autocommit | Copyright (c) 2026 PGSTY PTE. LTD.
 drop table if exists tx;
 create table tx (id int primary key, note varchar(32));
 

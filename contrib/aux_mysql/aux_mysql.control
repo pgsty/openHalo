@@ -1,3 +1,5 @@
+# Portions Copyright (c) 2026, PGSTY PTE. LTD.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 comment = 'MySQL Supplementary Extension: MySQL wire protocol and SQL dialect (openHalo on PostgreSQL 18)'
 default_version = '1.9'
 module_pathname = '$libdir/aux_mysql'

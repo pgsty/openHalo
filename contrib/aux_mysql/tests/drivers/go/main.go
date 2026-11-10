@@ -1,3 +1,5 @@
+// Copyright (c) 2026, PGSTY PTE. LTD.
+// Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 // go-sql-driver/mysql against aux_mysql, default driver settings unless noted.
 //
 //	go run . [auth|stmt|txn|all]

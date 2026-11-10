@@ -1,4 +1,4 @@
-CREATE TABLE `users` (
+/* Copyright (c) 2026 PGSTY PTE. LTD. */ CREATE TABLE `users` (
   `id` bigint NOT NULL AUTO_INCREMENT COMMENT 'pk',
   `name` varchar(64) NOT NULL DEFAULT '',
   `email` varchar(128) DEFAULT NULL,

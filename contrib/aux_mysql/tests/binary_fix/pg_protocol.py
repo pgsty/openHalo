@@ -1,3 +1,6 @@
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Check actual PG result formats with libpq; no Python DB package required."""
 import ctypes as c, ctypes.util, os, pathlib, subprocess
 pgconfig=os.environ.get('PG_CONFIG','pg_config')

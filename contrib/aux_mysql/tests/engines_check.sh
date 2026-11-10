@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 # MySQL storage-engine options on kernels with table access methods:
 #   ENGINE=OrioleDB  -> USING orioledb      (OrioleDB kernel + orioledb)
 #   ENCRYPTION='Y'   -> USING tde_heap      (Percona kernel + pg_tde)

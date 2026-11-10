@@ -1,3 +1,6 @@
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """OID-independent extension catalog comparisons shared by upgrade tests."""
 import hashlib
 import json

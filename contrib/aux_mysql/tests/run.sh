@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 # Smoke and driver checks. Exit 0: all passed; 1: failed; 2: incomplete (SKIP).
 # Every invocation has its own logs; driver executables are rebuilt from source.
 set -uo pipefail

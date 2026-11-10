@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Run after the parent's 1.9 build/upgrade. Uses only isolated review_fix_* DBs.
 
 MYSQL_PWD=... python3 tests/review_fix_sql_generated.py --ports 3790 3791 3771

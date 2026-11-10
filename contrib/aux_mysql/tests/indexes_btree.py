@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Integrated 1.9 index routing, ORDER BY/LIMIT and prefix concurrency checks.
 
 Needs pymysql and psycopg2. MYSQL_PORT/PGPORT default to 3790/5790;

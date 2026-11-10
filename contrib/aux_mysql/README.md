@@ -284,4 +284,8 @@ The 1.9 integration suites and isolated-instance requirements are listed in [TES
 
 ## License
 
-Derived from openHalo: GNU GPL v3 (`../../LICENSE`), openHalo copyright notice in `COPYRIGHT`.
+`aux_mysql` is derived from `openHalo` and distributed under the **GNU General Public License v3.0 (GPLv3)** (see [`../../LICENSE`](../../LICENSE) and [`COPYRIGHT`](COPYRIGHT)).
+
+- Copyright (c) 2019-2026 Halo Tech Co., Ltd. (`openHalo`)
+- Copyright (c) 2026 PGSTY PTE. LTD.
+- Maintained by [Ruohang Feng](mailto:rh@vonng.com) @ [PGSTY](https://pgsty.com)

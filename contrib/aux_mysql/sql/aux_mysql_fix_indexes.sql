@@ -1,3 +1,6 @@
+-- Copyright (c) 2026, PGSTY PTE. LTD.
+-- Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+-- Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 -- aux_mysql 1.9 integration fragment. Append after the generated SQL and the
 -- binary type definitions. Compile src/mys_prefix.c and call mys_prefix_init()
 -- from _PG_init. Do not change existing collations in place: old indexes must

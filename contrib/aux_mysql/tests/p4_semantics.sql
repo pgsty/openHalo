@@ -1,4 +1,4 @@
--- MySQL value semantics (P0-4)
+-- MySQL value semantics (P0-4) | Copyright (c) 2026 PGSTY PTE. LTD.
 
 -- "/" yields DECIMAL (scale + 4), DIV is integer division, x/0 and x%0 are NULL
 select 5/2 as a, 7/7 as b, 1/3 as c, -7/2 as d, 5.0/2 as e, 2.5/0.5 as f, 10/4.000 as g;

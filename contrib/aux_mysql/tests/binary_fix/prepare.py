@@ -1,3 +1,6 @@
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 import os,pathlib,sys
 base=pathlib.Path(__file__).resolve().parent
 lib=sys.argv[1]

@@ -1,4 +1,4 @@
-select 1, 'a' as `col one`, 3 div 2, 5 % 3;
+/* Copyright (c) 2026 PGSTY PTE. LTD. */ select 1, 'a' as `col one`, 3 div 2, 5 % 3;
 select `id`, `name` from `t1` order by id limit 1, 1;
 select * from t1 where name = "alice";
 select concat('a','b');

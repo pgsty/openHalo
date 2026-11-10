@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 # Rebuild pgvector / Citus / TimescaleDB from source against another kernel and
 # install them into a fresh copy of that kernel, so eco_check.sh can tell
 # "the stock binary breaks, a rebuild is enough" from "the source needs changes".

@@ -25,6 +25,9 @@
  * Portions Copyright (c) 2021, Jet C.X. ZHANG
  * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
  *
  * IDENTIFICATION
  *	  src/backend/parser/mysql/mys_scan.l

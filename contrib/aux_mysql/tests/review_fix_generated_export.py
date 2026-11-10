@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Bounded generated assignment/export checks for integrated 1.9 and MySQL 5.7.
 MYSQL_PWD=... python3 tests/review_fix_generated_export.py --ports 3792 3793 3771
 Only unique review_fix_* schemas and session variables; no install or global SET.

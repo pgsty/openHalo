@@ -1,4 +1,4 @@
-create table t1 (id serial primary key, name varchar(32) not null, score numeric(10,2), created timestamptz default now(), data bytea);
+/* Copyright (c) 2026 PGSTY PTE. LTD. */ create table t1 (id serial primary key, name varchar(32) not null, score numeric(10,2), created timestamptz default now(), data bytea);
 insert into t1(name, score, data) values ('alice', 90.5, 'A'), ('bob', null, null);
 select id, name, score, data from t1 order by id;
 update t1 set score = 60 where name = 'bob';

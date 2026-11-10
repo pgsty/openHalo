@@ -3,6 +3,11 @@
  *
  *   javac -cp mysql-connector-j.jar DriverTest.java
  *   java -cp mysql-connector-j.jar:. DriverTest [auth|stmt|txn|all]
+ *
+ * Copyright (c) 2026, PGSTY PTE. LTD.
+ * Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+ * Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
+ *
  */
 import java.math.BigDecimal;
 import java.sql.*;

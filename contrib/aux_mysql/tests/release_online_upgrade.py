@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026, PGSTY PTE. LTD.
+# Portions Copyright (c) 2019-2026, Halo Tech Co.,Ltd.
+# Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 """Keep a MySQL session open while another backend upgrades aux_mysql 1.8→1.9.
 
 Requires an otherwise idle disposable cluster, its historical 1.6 install SQL,
