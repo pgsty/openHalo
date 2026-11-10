@@ -86,8 +86,9 @@ extension; do not replay the old extension's internal SQL/catalog modifications.
 
 ## Updating an existing OpenHalo 18 installation
 
-The released v18.6 tag installs extension 1.5. Version 1.9 supports that real
-upgrade path: 1.5 → 1.6 → 1.7 → 1.8 → 1.9. Versions 1.6–1.8 were not released.
+The released v18.6 tag installs extension 1.5; v18.6.1 installs 1.9. Version 1.9
+supports that real upgrade path: 1.5 → 1.6 → 1.7 → 1.8 → 1.9. Versions 1.6–1.8 were
+not released.
 Install matching OpenHalo kernel and extension binaries, restart, and run this
 through a PostgreSQL connection in the MySQL database:
 

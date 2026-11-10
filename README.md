@@ -2,16 +2,16 @@
 
 [![PGSTY: pgsty.com](https://img.shields.io/badge/PGSTY-pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://pgsty.com/)
 [![Pigsty: pigsty.io](https://img.shields.io/badge/Pigsty-pigsty.io-slategray?style=flat)](https://pigsty.io/)
-[![Version: v18.6](https://img.shields.io/badge/Version-v18.6-slategray?style=flat)](https://github.com/pgsty/openHalo/releases)
+[![Version: v18.6.1](https://img.shields.io/badge/Version-v18.6.1-slategray?style=flat)](https://github.com/pgsty/openHalo/releases)
 [![Extension: aux_mysql 1.9](https://img.shields.io/badge/aux__mysql-1.9-slategray?style=flat)](contrib/aux_mysql/README.md)
 [![License: PostgreSQL / GPL-3.0](https://img.shields.io/badge/License-PostgreSQL%20%2F%20GPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/openHalo?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/openHalo&Date)
 [![PostgreSQL: 18.6](https://img.shields.io/badge/PostgreSQL-18.6-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](README.postgresql.md)
 [![MySQL: 5.7 / 8.0](https://img.shields.io/badge/MySQL-5.7%20%2F%208.0-%234479A1?style=flat&logo=mysql&logoColor=white&labelColor=4479A1)](contrib/aux_mysql/README.md)
 
-**OpenHalo 18** is a PostgreSQL 18.6 kernel and `aux_mysql` (`1.9`) extension that speaks the MySQL wire protocol and SQL dialect natively—allowing MySQL clients, drivers, and applications on port `3306` and PostgreSQL clients on port `5432` to query the same data concurrently.
+**OpenHalo 18** (current release: **`v18.6.1`**) is a PostgreSQL 18.6 kernel and `aux_mysql` (`1.9`) extension that speaks the MySQL wire protocol and SQL dialect natively—allowing MySQL clients, drivers, and applications on port `3306` and PostgreSQL clients on port `5432` to query the same data concurrently.
 
-[PGSTY](https://pgsty.com) | [Pigsty](https://pigsty.io) | [`aux_mysql` Docs](contrib/aux_mysql/README.md) | [Migration Guide](contrib/aux_mysql/MIGRATION.md) | [Testing Guide](contrib/aux_mysql/TESTING.md) | [Upstream Port Log](contrib/aux_mysql/UPSTREAM.md) | [Releases](https://github.com/pgsty/openHalo/releases) | [Issues](https://github.com/pgsty/openHalo/issues) | [Upstream](https://github.com/HaloTech-Co-Ltd/openHalo)
+[PGSTY](https://pgsty.com) | [Pigsty](https://pigsty.io) | [`aux_mysql` Docs](contrib/aux_mysql/README.md) | [Migration Guide](contrib/aux_mysql/MIGRATION.md) | [Testing Guide](contrib/aux_mysql/TESTING.md) | [Upstream Port Log](contrib/aux_mysql/UPSTREAM.md) | [Changelog](CHANGELOG.md) | [Releases](https://github.com/pgsty/openHalo/releases) | [Issues](https://github.com/pgsty/openHalo/issues) | [Upstream](https://github.com/HaloTech-Co-Ltd/openHalo)
 
 ---
 
@@ -59,8 +59,8 @@ The MySQL dialect and `aux_mysql` SQL library incorporate all upstream `openHalo
 ## Features & Capabilities
 
 - **Dual-Protocol Single Engine**: Native PostgreSQL wire protocol (`5432`) and MySQL wire protocol (`3306`) served by standard PostgreSQL backends against the same tables, transactions, and `pg_hba.conf` rules.
-- **MySQL 8.0 & 5.7 Wire Compatibility**: Supports `caching_sha2_password` (TLS and ephemeral RSA-2048 key exchange verified against PostgreSQL `scram-sha-256` / `md5` / plaintext verifiers), TLS upgrade (`SSLRequest`), `COM_QUERY` multi-statements, `COM_PING`, `COM_INIT_DB`, `COM_RESET_CONNECTION`, and server-side prepared statements (`COM_STMT_PREPARE` / `EXECUTE` / `SEND_LONG_DATA` / `CLOSE` / `RESET`) with binary result sets.
-- **MySQL SQL Dialect & DDL Rewriting**: Bison grammar (`mys_gram.y`) and parse-tree rewriter supporting backtick identifiers, double-quoted strings, `AUTO_INCREMENT`, `INSERT ... ON DUPLICATE KEY UPDATE`, `INSERT IGNORE`, `REPLACE INTO`, multi-table `UPDATE` / `DELETE` (`JOIN` and `ORDER BY ... LIMIT`), `ALTER TABLE` (`MODIFY`, `CHANGE`, `ADD/DROP INDEX/FOREIGN KEY`), `SHOW` commands, and `information_schema` / `performance_schema` / `sys` views.
+- **MySQL 8.0 & 5.7 Wire Compatibility**: Supports `caching_sha2_password` (full authentication over TLS or an RSA-2048 public-key exchange, verified against PostgreSQL `scram-sha-256` / `md5` password verifiers), TLS upgrade (`SSLRequest`), `COM_QUERY` multi-statements, `COM_PING`, `COM_INIT_DB`, `COM_RESET_CONNECTION`, and server-side prepared statements (`COM_STMT_PREPARE` / `EXECUTE` / `SEND_LONG_DATA` / `CLOSE` / `RESET`) with binary result sets.
+- **MySQL SQL Dialect & DDL Rewriting**: Bison grammar (`mys_gram.y`) and parse-tree rewriter supporting backtick identifiers, double-quoted strings, `AUTO_INCREMENT`, `INSERT ... ON DUPLICATE KEY UPDATE`, `INSERT IGNORE`, `REPLACE INTO`, `UPDATE ... JOIN` and `DELETE ... USING` (one target table), `UPDATE` / `DELETE ... ORDER BY ... LIMIT`, `ALTER TABLE` (`MODIFY`, `CHANGE`, `ADD/DROP INDEX/FOREIGN KEY`), `SHOW` commands, and `information_schema` / `performance_schema` / `sys` views.
 - **MySQL Data Types & Semantics**: Length-preserving `BINARY(n)` and `VARBINARY(n)` (`mysql.binary_n`, `mysql.varbinary_n`), hybrid hex/bit literals (`mysql.hexlit`), case-insensitive `utf8mb4_general_ci` (`PAD SPACE`) and `utf8mb4_bin` collations, exact prefix indexes (`mysql_prefix` AM), `VIRTUAL` and `STORED` generated columns, MySQL decimal division, and session/global system variables (`@@var`) and user variables (`@var`).
 - **MySQL Transaction & Lock Semantics**: Lazy transaction start under `autocommit = 0`, statement-level rollback on errors without aborting the surrounding transaction, implicit commits around DDL, `FOREIGN_KEY_CHECKS=0` deferred parent creation, and real session-level advisory locks (`GET_LOCK`, `RELEASE_LOCK`, `IS_FREE_LOCK`, `IS_USED_LOCK`, `RELEASE_ALL_LOCKS`).
 
@@ -164,28 +164,29 @@ All parameters are defined by `aux_mysql` under the `mysql.*` prefix:
 | Parameter | Default | Context | Description |
 | :--- | :--- | :--- | :--- |
 | `mysql.listener_on` | `on` | `postmaster` | Listen for MySQL wire connections on `mysql.port` |
-| `mysql.port` | `3306` | `postmaster` | TCP port for the MySQL protocol listener |
-| `mysql.listen_addresses` | `""` | `postmaster` | Bind addresses for MySQL listener (empty = inherit `listen_addresses`) |
-| `mysql.database` | `"postgres"` | `sighup` | PostgreSQL database where MySQL connections land |
-| `mysql.auto_create_extension` | `on` | `sighup` | Auto-run `CREATE EXTENSION aux_mysql` on first superuser MySQL login |
-| `mysql.halo_mysql_version` | `"5.7.32-log"` | `sighup` | Server version string reported in handshake and `@@version` |
+| `mysql.port` | `3306` | `postmaster` | TCP port for the MySQL protocol listener (`0` disables it) |
+| `mysql.listen_addresses` | *(unset)* | `postmaster` | Bind addresses for the MySQL listener (unset = inherit `listen_addresses`) |
+| `mysql.database` | `postgres` | `sighup` | PostgreSQL database where MySQL connections land; MySQL databases are its schemas |
+| `mysql.auto_create_extension` | `on` | `postmaster` | Install `aux_mysql` on the first superuser MySQL connection (never on standbys or during `pg_upgrade`) |
+| `mysql.halo_mysql_version` | `5.7.32-log` | `sighup` | Server version reported in the handshake, `version()` and `@@version` |
 | `mysql.default_authentication_plugin` | `caching_sha2_password` | `sighup` | Handshake auth plugin (`caching_sha2_password` or `mysql_clear_password`) |
-| `mysql.require_secure_transport` | `off` | `sighup` | Require TLS on MySQL connections |
-| `mysql.explicit_defaults_for_timestamp` | `off` | `userset` | Standard vs MySQL traditional `TIMESTAMP` nullability/default rules |
-| `mysql.ci_collation` | `on` | `userset` | Apply `mysql.utf8mb4_general_ci` (`PAD SPACE`) to string columns by default |
-| `mysql.Standard_ParserEngine_Auxiliary` | `off` | `userset` | Fall back to the PostgreSQL parser when a statement fails the MySQL parser |
-| `mysql.table_access_method_orioledb` | `""` | `userset` | Target table AM for `ENGINE=OrioleDB` |
-| `mysql.table_access_method_tde` | `""` | `userset` | Target table AM for `ENCRYPTION='Y'` |
+| `mysql.auth_cache_size` | `1024` | `postmaster` | Users kept in the `caching_sha2_password` fast-auth cache (`0` disables it) |
+| `mysql.rsa_private_key_file` | `mysql_rsa_private_key.pem` | `postmaster` | RSA private key for the public-key exchange; generated in the data directory if missing |
+| `mysql.max_allowed_packet` | `67108864` | `sighup` | Byte limit for an incoming message or accumulated prepared long data |
+| `mysql.statement_rollback` | `on` | `user` | A failing statement inside a transaction rolls back only itself, as in MySQL |
+| `mysql.default_collation` | `case_insensitive` | `user` | Collation (schema `mysql`) of string columns created without `COLLATE`; empty = database default |
+| `mysql.parser` | `mysql` | `user` | SQL dialect of queries received over the MySQL protocol (`mysql` or `postgres`) |
 
 ---
 
 ## Upgrading & Migration
 
-- **Updating `aux_mysql` (`1.5` → `1.9`)**: Install the new OpenHalo 18 binaries and extension files, restart PostgreSQL, and run in `mysql.database`:
+- **Updating from `v18.6` (`aux_mysql` `1.5` → `1.9`)**: Install the `v18.6.1` kernel and extension files together, restart PostgreSQL, and run this over a PostgreSQL connection to `mysql.database`:
   ```sql
   ALTER EXTENSION aux_mysql UPDATE TO '1.9';
   ```
-- **Migrating from openHalo 1.0 (PG 14)**: OpenHalo 18 uses PostgreSQL 18 catalogs and is **not** binary-upgrade (`pg_upgrade`) compatible with openHalo 14 data directories. Migrate via logical dump and restore after running the read-only preflight tools (`tools/check_pg14_config.py` and `tools/check_pg14_schema.sql`). See the full [Migration Guide](contrib/aux_mysql/MIGRATION.md).
+  The update keeps existing objects as they are; follow the [object migration audit](contrib/aux_mysql/MIGRATION.md#updating-an-existing-openhalo-18-installation) for old binary columns, prefix keys, generated columns and unchecked foreign keys.
+- **Migrating from openHalo 1.0 (PG 14)**: OpenHalo 18 uses PostgreSQL 18 catalogs and is **not** binary-upgrade (`pg_upgrade`) compatible with openHalo 14 data directories. Migrate via logical dump and restore after running the read-only preflight tools (`contrib/aux_mysql/tools/check_pg14_config.py` and `check_pg14_schema.sql`). See the full [Migration Guide](contrib/aux_mysql/MIGRATION.md).
 
 ---
 
@@ -200,7 +201,7 @@ All parameters are defined by `aux_mysql` under the `mysql.*` prefix:
 ## Testing
 
 ```bash
-# 1. Verify byte-for-byte reproducibility of generated grammar and SQL scripts
+# 1. Verify byte-for-byte reproducibility of generated grammar and SQL scripts (reads the local pg14 branch)
 python3 contrib/aux_mysql/tests/check_generated.py
 
 # 2. PostgreSQL core regression suite (with aux_mysql preloaded)
@@ -224,6 +225,8 @@ See [`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md) for the compl
 - **[`contrib/aux_mysql/MIGRATION.md`](contrib/aux_mysql/MIGRATION.md)**: OpenHalo 14 → 18 logical migration workflow, preflight scripts, and post-upgrade repair procedures.
 - **[`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md)**: Verification suites and isolated test instance instructions.
 - **[`contrib/aux_mysql/UPSTREAM.md`](contrib/aux_mysql/UPSTREAM.md)**: Upstream `HaloTech-Co-Ltd/openHalo` synchronization and porting record.
+- **[`CHANGELOG.md`](CHANGELOG.md)**: OpenHalo 18 release notes.
+- **[`CONTRIBUTING.md`](CONTRIBUTING.md)**: Development setup, tests and pull requests.
 - **[`README.postgresql.md`](README.postgresql.md)**: Upstream PostgreSQL 18 documentation and resources.
 
 ---

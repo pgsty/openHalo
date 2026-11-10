@@ -1,99 +1,85 @@
 # Contributing
 
-### Getting started
-openHalo is developed on GitHub. Anyone who wishes to contribute to it must have a Github account and be familiar with Git tools and vscode workflow.
-Once you have your GitHub account, fork this repository so that you can have your private copy to start hacking on and to use as a source of pull requests.
+OpenHalo 18 is developed at [`pgsty/openHalo`](https://github.com/pgsty/openHalo). Bug
+reports and pull requests are welcome. For a compatibility bug, the most useful report
+is the statement, what MySQL returns and what OpenHalo returns.
 
-#### Server Setup
-- Create User & User Group
-```sh
-groupadd -g 1000 halo
-useradd -u 1000 -g halo halo
-```
+## Branches
 
-- Setup Environment Variables
-```sh
-sudo mkdir /var/run/openhalo
-sudo chown halo:halo /var/run/openhalo
+| Branch | Content |
+| :--- | :--- |
+| `master` | OpenHalo 18: PostgreSQL 18.6 with protocol and execution hooks, plus `contrib/aux_mysql` |
+| `pg14` | openHalo 1.0 on PostgreSQL 14 (tag `v1.0-pg14`); also the source the MySQL grammar and SQL layer are generated from |
 
-export HALO_HOME=/home/halo/openhalo/1.0
-export PGDATA=/home/halo/ohdata
-export PATH=$HALO_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$HALO_HOME/lib
-export PGHOST=/var/run/openhalo
-export COPT='-Werror'
-```
-#### Install from your source code
-- uuid is mandatory.
+Releases are tagged `v<PostgreSQL version>.<revision>` on `master`; see [`CHANGELOG.md`](CHANGELOG.md).
+
+## Build
+
+Build with GNU make (Meson is not supported). A development build with assertions:
 
 ```sh
-# --with-uuid=ossp can be replaced with --with-uuid=e2fs
-./configure --prefix=/home/halo/openhalo/1.0 --enable-debug --with-uuid=ossp --with-icu CFLAGS=-O0
-make && make install
-cd contrib
-make && make install
+./configure --prefix=$HOME/openhalo --with-openssl --enable-debug --enable-cassert --enable-depend
+make -j$(nproc) && make install             # kernel and contrib/aux_mysql
 ```
 
-- Initialize Database
+The kernel and `aux_mysql` share node and callback layouts: always build and install them
+together, with `--enable-depend` or from a clean tree after changing a header. Keep build
+trees, data directories and logs outside the repository.
+
+## Test
+
 ```sh
-pg_ctl init -D $PGDATA
+python3 contrib/aux_mysql/tests/check_generated.py       # generated files match their generators
+make check                                               # PostgreSQL regression tests
+contrib/aux_mysql/tests/kernel_instance.sh <prefix> <pgdata> <pgport> <mysqlport>
+PGBIN=<prefix>/bin PGPORT=<pgport> MYSQL_PORT=<mysqlport> contrib/aux_mysql/tests/run.sh
 ```
 
-- Server Configuration
+`kernel_instance.sh` creates a disposable instance with the fixture account the suites
+use; never point the suites at an instance holding real data.
+[`contrib/aux_mysql/TESTING.md`](contrib/aux_mysql/TESTING.md) lists the integration,
+upgrade and round-trip suites and what each one needs.
+
+Compare behavior with a real MySQL 5.7 server rather than with the manual alone: most
+suites take a reference port and run the same statements against both servers.
+
+## Changing `aux_mysql`
+
+- **Generated files.** `src/parser/mys_gram.y` and `sql/aux_mysql.sql` are generated from
+  the `pg14` branch by `tools/port_grammar.py` and `tools/port_aux_sql.py`. Change the
+  generator, regenerate, and keep `tests/check_generated.py` passing; do not edit the
+  outputs by hand. [`UPSTREAM.md`](contrib/aux_mysql/UPSTREAM.md) records how upstream
+  commits were ported.
+- **SQL objects.** A change to the extension's SQL objects needs a new extension version
+  with an update script from the last released one, so that existing installations can
+  run `ALTER EXTENSION aux_mysql UPDATE`. The `Makefile` shows how the install and update
+  scripts are assembled.
+- **Compatibility choices.** The target is legacy MySQL 5.7 applications, including
+  permissive SQL: accept what MySQL accepts and use the nearest semantics, with a
+  warning where exact behavior is unavailable. Raise an error only where MySQL does under
+  the same `sql_mode`, or to prevent a crash or silent data loss. See the end of
+  "What works" in [`contrib/aux_mysql/README.md`](contrib/aux_mysql/README.md), and list
+  a deliberate difference under "Known gaps" there.
+- **Tests.** Add a case that fails without the change, and check its expected values on
+  MySQL 5.7.
+
+## Debugging a MySQL session
+
+A MySQL connection is served by a regular PostgreSQL backend. Find its process and
+attach a debugger to it:
+
 ```
-...
-database_compat_mode = 'mysql'                 # database compat mode, values can be:
-                                               # mysql (mysql mode)
-                                               # postgresql (default)
-
-mysql.listener_on = true                       # (enable MySQL listener; change requires restart)
-mysql.port = 3306                              # (port for MySQL; change requires restart)
-...
-```
-
-- Start & Initialize MySQL Environment
-```sql
-psql -p 5432
-
-# CREATE EXTENSION aux_mysql CASCADE;
-```
-
-### Debugging
-1. Identify the Process: We may use the MySQL driver to connect to openHalo, and then run `SELECT pg_backend_pid()` to obtain the pid. For example:
-```
-[halo@halo-centos8 ~]$ mysql -P 3306 -h 127.0.0.1 -uhalo
-Welcome to the MySQL monitor.  Commands end with ; or \g.
-Your MySQL connection id is 1
-Server version: 5.7.32-log-zm MySQL Server (GPL)
-
-Copyright (c) 2000, 2021, Oracle and/or its affiliates.
-
-Oracle is a registered trademark of Oracle Corporation and/or its
-affiliates. Other names may be trademarks of their respective
-owners.
-
-Type 'help;' or '\h' for help. Type '\c' to clear the current input statement.
-
-mysql> CREATE DATABASE test;
-Query OK, 0 rows affected (0.00 sec)
-
-mysql> use test;
-Database changed
 mysql> SELECT pg_backend_pid();
-+----------------+
-| pg_backend_pid |
-+----------------+
-|        1773087 |
-+----------------+
-1 row in set (0.00 sec)
-
-mysql> 
 ```
-This pid (1773087 in this case) indicates the process that you should attach the debugger to.
 
-2. Start Debugging: Press F5 to start debugging. When prompted, you'll need to attach the debugger to the appropriate Postgres process.
+```sh
+gdb -p <pid>
+```
 
-3. Set Breakpoints and Debug: With the debugger attached, you can set breakpoints within the code. This allows you to step through the code execution, inspect variables, and fully debug the Postgres instance running in your container.
+Server messages go to the PostgreSQL log; `SHOW WARNINGS` shows what the session received.
 
-## Testing
-Currently, the standard regression tests using openHalo are employed. They are targeted at the PostgreSQL mode of openHalo. To run the tests, please execute the `make check` command. For the regression tests of MySQL, we will introduce Python to handle them in the future.
+## Licenses
+
+Kernel changes are under the PostgreSQL License and `contrib/aux_mysql` is under the
+GPL v3, as described in the [README](README.md#license). Keep the existing copyright
+headers of the files you touch.

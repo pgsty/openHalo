@@ -675,3 +675,28 @@ Evidence, exact source/binary manifests, builds and retained data are under
 ohdev `/tmp/openhalo-aux19-default-fix-20261110/`. Full suites ran against private
 debug/release clusters using mmap dynamic shared memory; existing instances
 were not modified. The default-value release blocker is closed by these tests.
+
+## v18.6.1 release candidate — 2026-11-10
+
+The copyright headers and regenerated outputs of `e1f2424` were committed after the
+acceptance above, so the release candidate was rebuilt from a `git archive` of
+`e1f2424` and the whole suite list was repeated on private debug
+(`--enable-debug --enable-cassert`, `-O0`) and release clusters. The release
+preparation commits after `e1f2424` change only Markdown files and `.gitignore`.
+
+| Verification | Debug | Release |
+|---|---|---|
+| Build (`--with-openssl --enable-depend`), compiler warnings | 3, all pre-existing in `mys_gram.y` / `date_func.c` | same 3 |
+| PostgreSQL core regression (`installcheck`, `aux_mysql` preloaded) | 231/231 | 231/231 |
+| tests/run.sh | 26/26, no skips | 26/26, no skips |
+| TESTING.md integration / Route A / upgrade / recovery invocations | 23/23 | 23/23 |
+| release_fixes.py | 922 checks | 922 checks |
+| Actual released v18.6 / 1.5 → 1.9 (`release_real_upgrade.py`) | passed | passed |
+| Fresh vs upgraded catalog | 3476 members, 1859 functions, 88 casts, equal | equal |
+| `tests/check_generated.py` (repository checkout) | five outputs byte-identical | — |
+
+The suite list, flags and fixtures are those of the previous section's driver; the 1.6
+fixture is byte-identical to the one used there. Both upgraded catalogs have the
+normalized digest `57c443ddd7d0e763df143c815a79cedc29353ddec17f74baa8bb3680fd8a49aa`.
+Builds, data directories, logs and per-case `status.json` are under ohdev
+`/root/claude-release-18.6.1/`; existing instances were not modified.
